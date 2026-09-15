@@ -25,3 +25,6 @@ Current history:
 - `0006-extraction-source-entries.sql`: records typed artifact-relative source
   entries for file-level reject accounting without adding them to declaration
   gap lookup.
+- `0007-acquisition-absence-receipts.sql`: records restart-safe verified
+  acquisition absence and invalidates it through a trigger-maintained semantic
+  catalog mutation epoch.

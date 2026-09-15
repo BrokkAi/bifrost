@@ -1777,6 +1777,7 @@ fn visit_rust_impl(
         let Some(child) = body.named_child(index) else {
             continue;
         };
+        let child = unwrap_attributes(child);
         match child.kind() {
             "function_item" => {
                 visit_rust_function(
@@ -2309,6 +2310,65 @@ fn rust_callable_dispatch_extensibility(node: Node<'_>) -> DispatchExtensibility
 #[cfg(test)]
 mod structured_package_tests {
     use super::*;
+
+    #[test]
+    fn attributed_impl_members_retain_identity_and_test_scope() {
+        let source = r#"
+pub struct Number { value: String }
+impl Number {
+    #[cfg(feature = "precision")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "precision")))]
+    pub fn as_str(&self) -> &str { &self.value }
+    pub fn ordinary(&self) -> &str { &self.value }
+    #[cfg(test)]
+    fn test_helper(&self) {}
+    #[allow(dead_code)]
+    const LIMIT: usize = 8;
+}
+trait View { type Item; fn view(&self) -> &str; }
+impl View for Number {
+    #[allow(dead_code)]
+    type Item = String;
+    #[inline]
+    fn view(&self) -> &str { &self.value }
+}
+"#;
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        assert!(!tree.root_node().has_error());
+        let temp = tempfile::tempdir().unwrap();
+        let file = ProjectFile::new(temp.path().canonicalize().unwrap(), "lib.rs");
+        let parsed = parse_rust_file(&file, source, &tree);
+        let owner = parsed
+            .declarations()
+            .iter()
+            .find(|unit| unit.short_name() == "Number")
+            .unwrap();
+        for (name, kind, test_region) in [
+            ("as_str", CodeUnitType::Function, false),
+            ("ordinary", CodeUnitType::Function, false),
+            ("test_helper", CodeUnitType::Function, true),
+            ("LIMIT", CodeUnitType::Field, false),
+            ("Item", CodeUnitType::Class, false),
+            ("view", CodeUnitType::Function, false),
+        ] {
+            let member = parsed.children[owner]
+                .iter()
+                .find(|unit| unit.identifier() == name)
+                .unwrap_or_else(|| panic!("missing {name}: {:?}", parsed.children[owner]));
+            assert_eq!(member.kind(), kind, "{member:?}");
+            assert_eq!(
+                parsed.test_region_units.contains(member),
+                test_region,
+                "{member:?}"
+            );
+            assert!(!parsed.ranges[member].is_empty(), "{member:?}");
+        }
+        assert!(!parsed.test_region_units.contains(owner));
+    }
 
     #[test]
     fn procedural_macro_kinds_preserve_declaration_identifiers() {

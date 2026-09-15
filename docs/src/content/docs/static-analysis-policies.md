@@ -36,6 +36,7 @@ Every `.rqlp` file contains exactly one top-level document:
 | --- | --- | --- |
 | `(policy ...)` | Defines one rule, its report metadata, and exactly one `match`, `taint`, `typestate`, or `assertion` analysis. | Yes. |
 | `(endpoint ...)` | Names one reusable, diagnostic-neutral source or sink selector with categories and a typed value/API binding. | No. It is loaded only as a dependency. |
+| `(endpoint-set-document ...)` | Groups reusable entries of one declared taint or flow endpoint-set kind. | No. Import it through `endpoint-set-file`. |
 
 Passing an endpoint to `--policy-file` is an error; Bifrost does not turn it
 into a match policy behind the author's back.
@@ -561,6 +562,116 @@ does not scan directories or access the network. Catalog JSON is a machine
 registration contract, not a second human `.rqlp` syntax; human reusable
 source/sink leaves should normally use endpoint documents.
 
+### Shared Typed Endpoint Sets
+
+When the same typed boundary belongs to several policies, put its entries in
+one standalone endpoint-set document and import that document from each policy.
+The document declares its entry kind (`sources`, `sinks`, `sanitizers`,
+`entry-points`, `transforms`, `external-models`, `stores`, `origins`,
+`observations`, `kills`, or `flow-transforms`). An import is a typed dependency:
+it copies the declared entries into the importing set after checking the kind,
+schema pins, path, and optional semantic hash. It is not textual substitution,
+and the imported document is not an executable policy root.
+
+Typestate `subject-set` and event triggers use different typed models: subjects
+seed protocol objects, while events bind observations to protocol transitions.
+They do not accept `:include-files`. Reuse their existing `:include-matches`
+endpoint references where supported; taint or flow entries cannot substitute
+for protocol subjects or events.
+
+Import paths are portable workspace-relative paths. Absolute paths, `..`,
+environment expansion, and symlinks escaping the workspace are rejected.
+Nested imports use the same workspace root and are subject to file, depth,
+entry, and retained-byte limits. Cycles, conflicting entries, and failed pins
+prevent registration of the importing policy.
+
+The following complete example declares a persistence boundary once. The
+write and read selectors are Java examples; the same document shape accepts
+the other analyzer languages supported by the selected entries.
+
+`policies/shared-store.rqlp`:
+
+```lisp
+(endpoint-set-document
+  :schema-version 1
+  :kind stores
+  :language java
+  :rql-schema-version 1
+  :set (endpoint-set :entries [
+    (store-write :id put-primary
+      :selector (rql :schema-version 1
+        (language java (call :callee (name "put"))))
+      :store primary
+      :key (argument :index 0)
+      :input (argument :index 1))
+    (store-read :id get-primary
+      :selector (rql :schema-version 1
+        (language java (call :callee (name "get"))))
+      :store primary
+      :key (argument :index 0)
+      :output return-value)]))
+```
+
+An importing policy keeps its own source and sink declarations and imports the
+store set at the `:stores` endpoint-set position. Save this policy as
+`policies/acme-user-input-reaches-shared-store.rqlp`:
+
+```lisp
+(policy
+  :schema-version 1
+  :id "acme.user-input-reaches-shared-store"
+  :name "User input reaches a shared store"
+  :message "tainted data reaches a sink through the shared store"
+  :severity warning
+  :analysis (analysis
+    :type taint
+    :mode may
+    :call-modeling (call-modeling :unmodeled require-model)
+    :sources (endpoint-set :entries [
+      (source :id request :display-name "request input"
+        :categories [input.user]
+        :selector (rql :schema-version 1
+          (language java (call :callee (name "source") :arity 0)))
+        :bind return-value
+        :labels [untrusted])])
+    :sinks (endpoint-set :entries [
+      (sink :id sensitive :display-name "sensitive sink"
+        :categories [data.sensitive]
+        :selector (rql :schema-version 1
+          (language java (call :callee (name "sink") :arity 1)))
+        :dangerous-operand (argument :index 0)
+        :accepts [untrusted])])
+    :stores (endpoint-set :include-files [
+      (endpoint-set-file
+        :path "policies/shared-store.rqlp")]))))
+```
+
+Run the policy from the workspace root with the CLI:
+
+```sh
+bifrost --root . \
+  --policy-file policies/acme-user-input-reaches-shared-store.rqlp \
+  --evaluation-date 2026-09-14 \
+  --fail-on warning
+```
+
+The same policy file is accepted by MCP `run_policy` in `policy_files` and by
+the LSP `bifrost/runPolicy` request. Both routes resolve the imported path
+relative to the workspace root. A second policy can import the same document;
+each policy retains its own finding identity while the report records the
+shared document's source, entry identities, and semantic hash; the resolved
+entries retain their analysis projection hashes and endpoint-set provenance.
+Changing an imported entry therefore changes every dependent policy hash. Add
+`:sha256` to `endpoint-set-file` when the workspace wants an exact lower-case
+SHA-256 semantic pin for the resolved document.
+
+Endpoint-set imports preserve the existing set-oriented taint batching: two
+compatible policies that import the same typed set remain eligible for one
+batch, while a missing or incompatible dependency fails closed during bounded
+loading. Use local entries when a boundary is specific to one policy; use a
+shared document when its typed meaning is authored once and reviewed as a
+dependency.
+
 ## Analysis Types
 
 | Type | Public authoring model | Evaluation in this release |
@@ -850,15 +961,22 @@ an undeclared write/read pair contributes nothing.
 ordinary value-flow port of the selected call. A write reaches a read only
 when the store names are equal and neither dimension separates the pair:
 
-- A key identity is proven only for a plain, escape-free string-literal
-  argument; the literal's content is the identity, so `put("a", x)` does not
-  reach `get("b")`, while `'k'` and `"k"` agree.
+- A direct plain, escape-free string literal proves a key identity from its
+  content, so `put("a", x)` does not reach `get("b")`.
+- Java local copies can also prove a finite set of literal keys. The analysis
+  uses every reaching definition before the selected call, including both
+  conditional arms. Two complete disjoint sets separate; overlapping sets
+  still join. The initial bounds are 64 origin links, 4096 work units, 16
+  distinct literals, and 1 MiB of source per query. These are analysis limits,
+  not a guarantee that every expression below them is supported.
 - An instance identity is proven only when the port's operand resolves to
   exactly one declaration (for example a static field or module binding), so
   `alpha.put(...)` does not reach `beta.get(...)`.
 - Every other case joins: an undeclared dimension means the whole store, and
-  a dimension the analysis cannot prove (a variable key, an unresolvable
-  receiver) must not manufacture a separation. Joining can only add flows,
+  a dimension the analysis cannot prove (an unknown origin, a field read,
+  a call result, an unresolvable receiver, or an exhausted bound) must not
+  manufacture a separation. Cyclic copy origins and unqualified language
+  binding contracts also join. Joining can only add flows,
   which is the sound direction for a may-analysis.
 
 A store declaration also models its selected call outright: nothing flows
@@ -2079,6 +2197,31 @@ The human report counts the blocked verdicts in its scan view and names each
 one in its audit view. SARIF publishes the census on the run-level
 `BIFROST_POLICY_INCONCLUSIVE` notification and mints no result, because an
 obligation is the absence of a claim and not a claim about a source location.
+
+An obligation that a solver-backed relation blocked also names the analysis
+partition it is about. A flow, taint, typestate or type-flow row carries what
+its own solve proved about the partition that solve enumerated -- the value-flow
+plan, the typestate protocol, the taint sink, or the member-access class set --
+so a query that returned every row it has can still leave a partition
+unenumerated. The relation's coverage is the meet of the executed query's
+envelope and every row's own coverage, and the blocked verdict reports which
+partitions made it weaker:
+
+```json
+{
+  "assertion": "no-tainted-sink",
+  "kind": "absence_requires_exhaustive_coverage",
+  "group": "by-sink",
+  "partitions": [{ "family": "flow_endpoint", "root": "value-flow:1" }],
+  "reasons": ["partial_discovery"]
+}
+```
+
+`partitions` is absent when the blocked claim is about the executed query's own
+scope rather than one solver root, and `partitions_truncated` is `true` when the
+bounded list dropped a name. A positive verdict never depends on this: a count
+above an upper bound publishes from an unfinished solve, because rows nobody
+read could only raise it.
 
 ### Activating the model
 

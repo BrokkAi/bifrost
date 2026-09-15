@@ -791,7 +791,7 @@ fn occurrence_filter_schema() -> Value {
 /// `MCP_DISCOVERY_TEXT_MAX_CHARS` budget: it names no step, so adding a step
 /// family cannot grow it. A test asserts that no registry step label appears
 /// here.
-const QUERY_CODE_DESCRIPTION: &str = "Query normalized code structure with CodeQuery or RQL. Match declarations and syntax, compose compatible typed branches with union, intersect, or except, then apply typed semantic steps. The steps parameter schema documents every available step: its name, its typed signature, and what it returns. Set branches must produce the same terminal domain, and a common steps suffix can continue from that domain. Steps that run a registered analysis take a host-registered reference and project retained production evidence; they do not compile selectors, run propagation, or imply policy classification. Example: {\"schema_version\":1,\"match\":{\"kind\":\"method\",\"name\":\"run\"}}. Guide: https://bifrost.brokk.ai/code-querying/";
+const QUERY_CODE_DESCRIPTION: &str = "Query normalized code structure with CodeQuery or RQL. Match declarations and syntax, compose compatible typed branches with union, intersect, or except, then apply typed semantic steps. The steps parameter schema documents every available step: its name, its typed signature, and what it returns. Set branches must produce the same terminal domain, and a common steps suffix can continue from that domain. Steps that run a registered analysis take a host-registered reference and project retained production evidence; they do not compile selectors, run propagation, or imply policy classification. Example: {\"schema_version\":\"1\",\"match\":{\"kind\":\"method\",\"name\":\"run\"}}. Guide: https://bifrost.brokk.ai/code-querying/";
 
 /// What a nested set branch says about its own `steps`. A branch accepts the
 /// same step vocabulary as the root, so the generated reference is attached
@@ -964,7 +964,10 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
         .iter()
         .map(|mode| mode.label())
         .collect::<Vec<_>>();
-    let schema_versions = supported_query_schema_versions();
+    let schema_versions = supported_query_schema_versions()
+        .into_iter()
+        .map(|version| version.to_string())
+        .collect::<Vec<_>>();
     query_code_properties.extend(
         json!({
             "limit": {
@@ -987,10 +990,10 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                 "description": QueryField::ExecutionMode.description()
             },
             "schema_version": {
-                "type": "integer",
-                "default": SCHEMA_VERSION,
+                "type": "string",
+                "default": SCHEMA_VERSION.to_string(),
                 "enum": schema_versions,
-                "description": "Optional query schema version. Version 1 is the only supported version; omit it or pin it explicitly."
+                "description": "Optional query schema version. Omit it or pin one of the supported string versions explicitly."
             },
             "query_file": {
                 "type": "string",
@@ -1398,6 +1401,38 @@ mod tests {
     }
 
     #[test]
+    fn tool_schema_enums_are_strings_and_query_version_default_decodes() {
+        for descriptor in extended_tool_descriptors() {
+            let mut pending = vec![&descriptor["inputSchema"]];
+            while let Some(value) = pending.pop() {
+                match value {
+                    Value::Object(object) => {
+                        if let Some(values) = object.get("enum").and_then(Value::as_array) {
+                            assert!(values.iter().all(Value::is_string), "{descriptor}");
+                        }
+                        pending.extend(object.values());
+                    }
+                    Value::Array(values) => pending.extend(values),
+                    _ => {}
+                }
+            }
+            if descriptor["name"] == "query_code" {
+                let version = &descriptor["inputSchema"]["properties"]["schema_version"];
+                assert_eq!(version["type"], "string");
+                let query = crate::rql::CodeQuery::from_json(&json!({
+                    "schema_version": version["default"],
+                    "match": {"kind": "call"}
+                }))
+                .expect("advertised default must decode");
+                assert_eq!(
+                    query.to_canonical_json()["schema_version"],
+                    version["default"]
+                );
+            }
+        }
+    }
+
+    #[test]
     fn query_code_schema_exposes_typed_pipeline_steps() {
         let query_code = extended_tool_descriptors()
             .into_iter()
@@ -1723,7 +1758,7 @@ mod tests {
         );
         assert_eq!(
             query_code["inputSchema"]["properties"]["schema_version"]["enum"],
-            json!([1])
+            json!(["1"])
         );
         assert_eq!(
             query_code["inputSchema"]["properties"]["execution_mode"]["enum"],

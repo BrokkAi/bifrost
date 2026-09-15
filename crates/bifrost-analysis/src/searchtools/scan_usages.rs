@@ -4360,9 +4360,17 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
     }
     let truncated_ids = truncated_by_id.keys().cloned().collect::<HashSet<_>>();
     for (id, total_callsites) in &truncated_by_id {
-        let index = catalog
-            .index_for_id(id)
-            .expect("every exact edge endpoint is cataloged");
+        // Not every truncated id is a graph node. Inbound edge endpoints were pushed into
+        // `declarations` and are cataloged, but `legacy_truncated` targets are resolved by name and
+        // may have had every edge dropped by the call-site cap. Preserve the incompleteness signal
+        // when such a target has no node instead of aborting the caller.
+        let Some(index) = catalog.index_for_id(id) else {
+            incomplete.insert((
+                "callsites_truncated".to_string(),
+                format!("call sites were truncated for {id:?}, which is not a usage-graph node"),
+            ));
+            continue;
+        };
         let node = &catalog.nodes[index];
         truncated_symbols.push(UsageGraphTruncatedSymbol {
             node_id: id.clone(),
@@ -6533,6 +6541,49 @@ mod tests {
     use super::*;
     use crate::analyzer::{Language, RustAnalyzer, TestProject};
     use crate::test_support::AnalyzerFixture;
+
+    #[test]
+    fn usage_graph_returns_when_a_truncated_target_is_not_a_graph_node() {
+        // Java uses the FQN edge arm that fills `legacy_truncated`. A callee over the cap has all of
+        // its call sites dropped and therefore may never be inserted into the result catalog.
+        let callsites = crate::analyzer::usages::inverted_edges::MAX_CALLSITES + 1;
+        let mut body = String::new();
+        for _ in 0..callsites {
+            body.push_str("    new Target().call();\n");
+        }
+        let root = format!("package app; class Root {{ void run() {{\n{body}  }} }}\n");
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Java,
+            &[
+                ("app/Root.java", root.as_str()),
+                (
+                    "app/Target.java",
+                    "package app; class Target { void call() {} }\n",
+                ),
+            ],
+        );
+
+        let graph = usage_graph(
+            fixture.analyzer.analyzer(),
+            UsageGraphParams {
+                include_tests: false,
+                paths: Some(vec!["app/Root.java".to_string()]),
+                depth: 1,
+            },
+        );
+
+        assert!(
+            !graph.complete,
+            "a target past MAX_CALLSITES must be reported as incomplete"
+        );
+        assert!(
+            graph
+                .incomplete_reasons
+                .iter()
+                .any(|reason| reason.code == "callsites_truncated"),
+            "the uncataloged truncated target must retain its incompleteness signal: {graph:?}"
+        );
+    }
 
     #[test]
     fn batch_reference_sites_preserve_files_beyond_interactive_limit() {

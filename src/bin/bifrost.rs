@@ -21,11 +21,10 @@ use brokk_bifrost::policy::{
     HumanRenderDetail, HumanRenderOptions, NearMissCandidates, POLICY_EXIT_CLEAN,
     POLICY_EXIT_UNRELIABLE, PolicyBaselineDocument, PolicyBaselineOptions, PolicyBaselineSource,
     PolicyBatchOutcome, PolicyEvaluationDate, PolicyEvaluationInput, PolicyEvaluationOptions,
-    PolicyFailOn, PolicyFindingId, PolicyRenderError, PolicyReportDocument, PolicyScopeOptions,
-    PolicyScopeSource, PolicySuppressionOptions, PolicySuppressionSource, SarifToolIdentity,
-    built_in_policy_catalog, escape_terminal_text, evaluate_policy_inputs, explain_policy_inputs,
-    rank_policy_near_misses, relation_schema_catalog, write_policy_human, write_policy_json,
-    write_policy_sarif,
+    PolicyFailOn, PolicyFindingId, PolicyRenderError, PolicyScopeOptions, PolicyScopeSource,
+    PolicySuppressionOptions, PolicySuppressionSource, SarifToolIdentity, built_in_policy_catalog,
+    escape_terminal_text, evaluate_policy_inputs, explain_policy_inputs, rank_policy_near_misses,
+    relation_schema_catalog, write_policy_human, write_policy_json, write_policy_sarif_for_outcome,
 };
 use brokk_bifrost::rmcp_host::{
     NamedWorkspace, run_named_workspace_stdio_server_with_build_identity,
@@ -1759,14 +1758,8 @@ fn write_policy_stdout(
     // Buffer the bounded encoding before touching stdout so size/serialization
     // failures cannot emit a partial machine document and remain stderr-only.
     let mut encoded = Vec::new();
-    render_policy_report(
-        format,
-        human_options,
-        outcome.report(),
-        &mut encoded,
-        outcome.max_serialized_report_bytes(),
-    )
-    .map_err(|error| error.to_string())?;
+    render_policy_report(format, human_options, outcome, &mut encoded)
+        .map_err(|error| error.to_string())?;
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
     stdout
@@ -1791,14 +1784,8 @@ fn write_policy_output_file(
             destination.display()
         )
     })?;
-    render_policy_report(
-        format,
-        human_options,
-        outcome.report(),
-        &mut temporary,
-        outcome.max_serialized_report_bytes(),
-    )
-    .map_err(|error| error.to_string())?;
+    render_policy_report(format, human_options, outcome, &mut temporary)
+        .map_err(|error| error.to_string())?;
     temporary.flush().map_err(|error| {
         format!(
             "failed to flush temporary output for {}: {error}",
@@ -1823,21 +1810,23 @@ fn write_policy_output_file(
 fn render_policy_report<W: Write>(
     format: PolicyOutputFormat,
     human_options: &HumanRenderOptions,
-    report: &PolicyReportDocument,
+    outcome: &PolicyBatchOutcome,
     output: W,
-    max_serialized_bytes: usize,
 ) -> Result<u64, PolicyRenderError> {
+    let max_serialized_bytes = outcome.max_serialized_report_bytes();
     match format {
-        PolicyOutputFormat::Human => {
-            write_policy_human(report, human_options, output, max_serialized_bytes)
-        }
-        PolicyOutputFormat::Json => write_policy_json(report, output, max_serialized_bytes),
-        PolicyOutputFormat::Sarif => write_policy_sarif(
-            report,
-            &SarifToolIdentity::default(),
+        PolicyOutputFormat::Human => write_policy_human(
+            outcome.report(),
+            human_options,
             output,
             max_serialized_bytes,
         ),
+        PolicyOutputFormat::Json => {
+            write_policy_json(outcome.report(), output, max_serialized_bytes)
+        }
+        PolicyOutputFormat::Sarif => {
+            write_policy_sarif_for_outcome(outcome, &SarifToolIdentity::default(), output)
+        }
     }
 }
 

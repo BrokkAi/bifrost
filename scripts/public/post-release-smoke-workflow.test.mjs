@@ -37,6 +37,7 @@ const NPM_PACKAGES = [
   "@brokkai/bifrost-android-arm64",
   "@brokkai/bifrost-win32-x64",
   "@brokkai/bifrost-win32-arm64",
+  "@brokkai/dsh-plugin-bifrost",
 ];
 
 test("is manually resumable and reusable after promotion with an exact tag", () => {
@@ -192,6 +193,14 @@ test("checks PyPI and npm versions, archives, and integrity evidence", () => {
     assert.ok(workflow.includes(`        ${packageName}\n`), `missing npm package ${packageName}`);
   }
   assert.equal(workflow.includes("        @brokk/bifrost-agent\n"), false);
+  assert.match(workflow, /npm pack[\s\S]*@brokkai\/dsh-plugin-bifrost@\$\{RELEASE_VERSION\}/u);
+  assert.match(workflow, /package\/bifrost-release\.json/u);
+  assert.match(workflow, /archiveSha256\["universal-apple-darwin"\]/u);
+  assert.match(
+    workflow,
+    /bifrost-\$\{RELEASE_TAG\}-universal-apple-darwin\.tar\.gz\.sha256/u,
+  );
+  assert.match(workflow, /test "\$expected" = "\$actual"/u);
 });
 
 test("selects and checks the published root binary on supported runner platforms", () => {

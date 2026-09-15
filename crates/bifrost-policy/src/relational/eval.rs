@@ -36,8 +36,8 @@ use crate::definition::{
 use crate::finding::{CertaintyReason, FindingCertainty, PolicyIncompleteReason};
 
 use super::coverage::{
-    MAX_RETAINED_RELATIONAL_OBLIGATIONS, RelationCoverage, RelationalInput, RelationalObligation,
-    RelationalObligationKind,
+    CoveragePartition, MAX_RETAINED_RELATIONAL_OBLIGATIONS, RelationCoverage, RelationalInput,
+    RelationalObligation, RelationalObligationKind,
 };
 use super::ir::{
     DEFAULT_MAX_REPRESENTATIVE_TUPLES, IrAggregate, IrAggregateOp, IrColumn, IrCompareOp,
@@ -206,6 +206,11 @@ struct EvalRelation {
     /// Why rows of this relation may not be witness-sound. Empty when every row
     /// is established.
     witness_reasons: Vec<PolicyIncompleteReason>,
+    /// The analysis partitions behind `witness_reasons`. An anti join over a
+    /// non-exhaustive right relation records the *right* side's partition here,
+    /// because that is the solve a reader has to look at, and the relation's
+    /// own coverage names only the left side (#3205).
+    witness_partition: CoveragePartition,
     /// Typed evidence that one or more input rows were omitted because a
     /// referenced field was unavailable. This is separate from coverage:
     /// filters and joins can still retain sound rows from the known subset,
@@ -264,6 +269,7 @@ pub fn evaluate_plan_ir(
                     RelationalObligationKind::AbsenceRequiresExhaustiveCoverage,
                     assertion.group.clone(),
                     Vec::new(),
+                    CoveragePartition::query_scope(),
                     vec![PolicyIncompleteReason::Cancelled],
                 ));
             }
@@ -355,6 +361,11 @@ fn evaluate_plan(
                 RelationalObligationKind::AbsenceRequiresExhaustiveCoverage,
                 assertion.group.clone(),
                 Vec::new(),
+                relation
+                    .coverage
+                    .partition()
+                    .clone()
+                    .union(relation.witness_partition.clone()),
                 relation.coverage.incomplete_reasons(),
             ));
         }
@@ -378,14 +389,26 @@ fn evaluate_plan(
             if let Some(kind) =
                 verdict_obligation(assertion, aggregates, witnessed, exhaustive, bounded)
             {
-                let reasons = match kind {
-                    RelationalObligationKind::VerdictRequiresWitnessedRows => {
-                        relation.witness_reasons.clone()
-                    }
+                // The partition travels with the evidence that blocked the
+                // verdict: an anti join blocked by its right relation reports
+                // that side's solve, not the left side this relation's own
+                // coverage names.
+                let (reasons, partition) = match kind {
+                    RelationalObligationKind::VerdictRequiresWitnessedRows => (
+                        relation.witness_reasons.clone(),
+                        relation.witness_partition.clone(),
+                    ),
                     RelationalObligationKind::AbsenceRequiresExhaustiveCoverage => {
                         let mut reasons = relation.coverage.incomplete_reasons();
                         reasons.extend(relation.witness_reasons.iter().copied());
-                        reasons
+                        (
+                            reasons,
+                            relation
+                                .coverage
+                                .partition()
+                                .clone()
+                                .union(relation.witness_partition.clone()),
+                        )
                     }
                 };
                 obligations.push(RelationalObligation::new(
@@ -393,6 +416,7 @@ fn evaluate_plan(
                     kind,
                     assertion.group.clone(),
                     key,
+                    partition,
                     reasons,
                 ));
                 continue;
@@ -680,8 +704,9 @@ fn evaluate_relation(
             id,
             binding,
             state.limits.max_source_rows,
-            RelationCoverage::Exhaustive,
+            RelationCoverage::exhaustive(),
             Vec::new(),
+            CoveragePartition::query_scope(),
             UnknownInputEvidence::default(),
             inputs,
             referenced,
@@ -726,6 +751,7 @@ fn evaluate_relation(
                 tuples,
                 coverage: source.coverage.clone(),
                 witness_reasons: source.witness_reasons.clone(),
+                witness_partition: source.witness_partition.clone(),
                 unknown_inputs: source.unknown_inputs.clone(),
             })
         }
@@ -743,6 +769,7 @@ fn evaluate_relation(
                 tuples,
                 coverage: source.coverage.clone(),
                 witness_reasons: source.witness_reasons.clone(),
+                witness_partition: source.witness_partition.clone(),
                 unknown_inputs: source.unknown_inputs.clone(),
             })
         }
@@ -781,6 +808,7 @@ fn load_rows(
     max_rows: usize,
     inherited: RelationCoverage,
     witness_reasons: Vec<PolicyIncompleteReason>,
+    witness_partition: CoveragePartition,
     mut unknown_inputs: UnknownInputEvidence,
     inputs: &HashMap<&str, &RelationalInput<'_>>,
     referenced: &BTreeSet<IrColumn>,
@@ -847,6 +875,7 @@ fn load_rows(
         tuples,
         coverage,
         witness_reasons,
+        witness_partition,
         unknown_inputs,
     })
 }
@@ -882,17 +911,24 @@ fn evaluate_join(
     // held every row that exists.
     let right_is_exhaustive = right.coverage.is_exhaustive();
     let mut witness_reasons = left.witness_reasons.clone();
+    let mut witness_partition = left.witness_partition.clone();
     match kind {
         IrJoinKind::Left => {
             witness_reasons.extend(right.witness_reasons.iter().copied());
+            witness_partition = witness_partition.union(right.witness_partition.clone());
             if !right_is_exhaustive {
                 witness_reasons.extend(right.coverage.incomplete_reasons());
+                witness_partition = witness_partition.union(right.coverage.partition().clone());
             }
         }
         IrJoinKind::Anti if !right_is_exhaustive => {
             witness_reasons.extend(right.coverage.incomplete_reasons());
+            witness_partition = witness_partition.union(right.coverage.partition().clone());
         }
-        _ => witness_reasons.extend(right.witness_reasons.iter().copied()),
+        _ => {
+            witness_reasons.extend(right.witness_reasons.iter().copied());
+            witness_partition = witness_partition.union(right.witness_partition.clone());
+        }
     }
     witness_reasons.sort();
     witness_reasons.dedup();
@@ -1013,6 +1049,7 @@ fn evaluate_join(
         tuples: joined,
         coverage,
         witness_reasons,
+        witness_partition,
         unknown_inputs,
     })
 }
@@ -1126,6 +1163,7 @@ fn evaluate_group(
         tuples,
         coverage,
         witness_reasons,
+        witness_partition: input.witness_partition.clone(),
         unknown_inputs: input.unknown_inputs.clone(),
     })
 }

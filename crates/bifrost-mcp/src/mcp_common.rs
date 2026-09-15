@@ -13,6 +13,16 @@ use std::time::{Duration, Instant};
 const GET_SUMMARIES_RESPONSE_BUDGET_BYTES: usize = 4_096;
 pub const MCP_ANALYZER_REQUEST_BUDGET_SECS_ENV: &str = "BIFROST_MCP_REQUEST_BUDGET_SECS";
 pub(crate) const COLD_WORKSPACE_REQUEST_BUDGET: Duration = Duration::from_millis(4_500);
+/// The budget every interactive request gets when no operator configured one.
+///
+/// Without it a request that waits out cold initialization (#3279: a
+/// `search_symbols` call sat in its workspace-readiness wait past two minutes
+/// with no result and no cancellation state) or a slow scan runs unbounded,
+/// which is indistinguishable from a hung server. Sixty seconds matches the
+/// budget the interactive-latency benchmarks measure against
+/// ([`BENCHMARK_MCP_REQUEST_BUDGET_SECS`]), so the default and the measured
+/// contract agree.
+pub(crate) const DEFAULT_INTERACTIVE_REQUEST_BUDGET: Duration = Duration::from_secs(60);
 #[doc(hidden)]
 pub const BENCHMARK_MCP_REQUEST_BUDGET_SECS: u64 = 60;
 pub(crate) const AGENTS_GUIDANCE_URI: &str = "bifrost://agent-guidance/agents.md";
@@ -57,18 +67,56 @@ pub(crate) fn mcp_analyzer_request_budget() -> Option<Duration> {
         .map(Duration::from_secs)
 }
 
-pub(crate) fn mcp_request_deadline(accepted_at: Instant, cold_workspace: bool) -> Option<Instant> {
-    mcp_request_deadline_with_budget(accepted_at, cold_workspace, mcp_analyzer_request_budget())
+pub(crate) fn mcp_request_deadline(
+    accepted_at: Instant,
+    tool_name: &str,
+    cold_workspace: bool,
+) -> Option<Instant> {
+    mcp_request_deadline_with_budget(
+        accepted_at,
+        tool_name,
+        cold_workspace,
+        mcp_analyzer_request_budget(),
+    )
 }
 
 fn mcp_request_deadline_with_budget(
     accepted_at: Instant,
+    tool_name: &str,
     cold_workspace: bool,
     configured_budget: Option<Duration>,
 ) -> Option<Instant> {
     configured_budget
-        .or(cold_workspace.then_some(COLD_WORKSPACE_REQUEST_BUDGET))
+        .or_else(|| fallback_request_budget(tool_name, cold_workspace))
         .map(|budget| accepted_at + budget)
+}
+
+/// The budget a request falls back to when no operator configured one.
+///
+/// The ladder, and why each rung is where it is:
+///
+/// * A configured `BIFROST_MCP_REQUEST_BUDGET_SECS` always wins, for every
+///   tool, so operators and benchmarks keep one knob.
+/// * `run_policy` and the serial workspace-mutating tools get no fallback.
+///   Their work is batch-shaped (policy evaluation is what MCP Tasks and its
+///   ten-minute TTL exist for) or already serialized by the workspace lock,
+///   and cutting a mutation or a policy run mid-flight on a timer nobody
+///   asked for trades a rare slow call for a broken one.
+/// * A cold workspace fails non-discovery tools fast (4.5 s) with a typed,
+///   retryable not-ready error instead of billing them the whole interactive
+///   budget for a wait they cannot shorten.
+/// * Everything else -- `search_symbols` on a cold workspace included, and
+///   every read on a warm one -- gets the default interactive budget. That
+///   is the #3279 fix: discovery used to wait out cold initialization with
+///   no deadline at all, and warm reads had no deadline either.
+pub(crate) fn fallback_request_budget(tool_name: &str, cold_workspace: bool) -> Option<Duration> {
+    if tool_name == "run_policy" || serial_tool_request(tool_name) {
+        return None;
+    }
+    if cold_workspace && tool_name != "search_symbols" {
+        return Some(COLD_WORKSPACE_REQUEST_BUDGET);
+    }
+    Some(DEFAULT_INTERACTIVE_REQUEST_BUDGET)
 }
 
 fn mcp_analyzer_request_budget_secs(value: Option<String>) -> Option<u64> {
@@ -1100,21 +1148,79 @@ mod shared_tests {
     }
 
     #[test]
-    fn explicit_request_budget_wins_over_the_cold_workspace_fallback() {
+    fn explicit_request_budget_wins_over_every_fallback() {
         let accepted_at = Instant::now();
         let configured_budget = Duration::from_secs(8);
 
-        let configured =
-            mcp_request_deadline_with_budget(accepted_at, true, Some(configured_budget))
-                .expect("configured budget should set a deadline");
-        assert_eq!(configured.duration_since(accepted_at), configured_budget);
+        for (tool_name, cold_workspace) in [
+            ("get_summaries", true),
+            ("search_symbols", true),
+            ("search_symbols", false),
+            ("run_policy", false),
+            ("refresh", true),
+        ] {
+            let configured = mcp_request_deadline_with_budget(
+                accepted_at,
+                tool_name,
+                cold_workspace,
+                Some(configured_budget),
+            )
+            .unwrap_or_else(|| panic!("{tool_name} should honor a configured budget"));
+            assert_eq!(configured.duration_since(accepted_at), configured_budget);
+        }
+    }
 
-        let fallback = mcp_request_deadline_with_budget(accepted_at, true, None)
-            .expect("cold workspace should use its fallback deadline");
-        assert_eq!(
-            fallback.duration_since(accepted_at),
-            COLD_WORKSPACE_REQUEST_BUDGET
-        );
+    #[test]
+    fn interactive_reads_get_the_default_budget_warm_or_cold() {
+        let accepted_at = Instant::now();
+        for (tool_name, cold_workspace) in [
+            ("search_symbols", true),
+            ("search_symbols", false),
+            ("get_summaries", false),
+            ("scan_usages_by_reference", false),
+            ("get_symbol_sources", false),
+        ] {
+            let deadline =
+                mcp_request_deadline_with_budget(accepted_at, tool_name, cold_workspace, None)
+                    .unwrap_or_else(|| panic!("{tool_name} must be bounded by the default budget"));
+            assert_eq!(
+                deadline.duration_since(accepted_at),
+                DEFAULT_INTERACTIVE_REQUEST_BUDGET,
+                "{tool_name} (cold={cold_workspace})"
+            );
+        }
+    }
+
+    #[test]
+    fn cold_non_discovery_reads_keep_the_fail_fast_budget() {
+        let accepted_at = Instant::now();
+        for tool_name in ["get_summaries", "scan_usages_by_reference", "usage_graph"] {
+            let deadline = mcp_request_deadline_with_budget(accepted_at, tool_name, true, None)
+                .unwrap_or_else(|| panic!("{tool_name} must keep its cold fail-fast budget"));
+            assert_eq!(
+                deadline.duration_since(accepted_at),
+                COLD_WORKSPACE_REQUEST_BUDGET
+            );
+        }
+    }
+
+    #[test]
+    fn batch_and_mutation_tools_have_no_fallback_budget() {
+        let accepted_at = Instant::now();
+        for (tool_name, cold_workspace) in [
+            ("run_policy", false),
+            ("run_policy", true),
+            ("refresh", false),
+            ("update_paths", false),
+            ("activate_workspace", false),
+            ("get_active_workspace", false),
+        ] {
+            assert_eq!(
+                mcp_request_deadline_with_budget(accepted_at, tool_name, cold_workspace, None),
+                None,
+                "{tool_name} (cold={cold_workspace}) must stay unbounded without a configured budget"
+            );
+        }
     }
 
     #[test]

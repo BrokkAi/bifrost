@@ -1215,7 +1215,7 @@ mod tests {
                 "format": CodeQueryExplain::FORMAT,
                 "query_schema_version": SCHEMA_VERSION,
                 "parsed_query": {
-                    "schema_version": SCHEMA_VERSION,
+                    "schema_version": SCHEMA_VERSION.to_string(),
                     "union": [
                         { "match": { "name": "Widget" } },
                         { "match": { "name": "Widget" } }

@@ -10,12 +10,12 @@ use super::{
     CaptureBinding, CaptureProjection, CaptureSource, CatalogPackSourceKind, Completeness,
     EmbeddedTypeFact, EmittedDeclaration, ExplicitValueOperation, GeneratorRule, HierarchyFact,
     HierarchyKind, ImplicitOperation, KeyedReadBehavior, KeyedReadObservation, Locator, MemberFact,
-    MemberKind, ReceiverFact, RelationFact, RelationKind, ResolvedActiveSemanticModels,
-    RuleEmission, RuleTrigger, RuntimeGlobalBindingEvidence, RuntimeGlobalExposure,
-    RuntimeValuesPayload, SemanticModelActivationStatus, SemanticModelMatchDisposition, Signature,
-    StructuredTypeExpression, TemplateExpression, TemplateSignature, TemplateTypeRef, TypeFact,
-    TypeKind, TypeParameterConstraint, TypeRef, TypeRefReferenceKind, TypeValueSemantics,
-    Visibility,
+    MemberKind, ParameterPassingMode, ReceiverFact, RelationFact, RelationKind,
+    ResolvedActiveSemanticModels, RuleEmission, RuleTrigger, RuntimeGlobalBindingEvidence,
+    RuntimeGlobalExposure, RuntimeValuesPayload, SemanticModelActivationStatus,
+    SemanticModelMatchDisposition, Signature, StructuredTypeExpression, TemplateExpression,
+    TemplateSignature, TemplateTypeRef, TypeFact, TypeKind, TypeParameterConstraint, TypeRef,
+    TypeRefReferenceKind, TypeValueSemantics, Visibility,
 };
 use crate::analyzer::semantic::LengthDelimitedDigest;
 use crate::analyzer::structural::{FileFacts, NormalizedKind, Role};
@@ -1887,7 +1887,10 @@ impl SemanticModelOverlay {
                     .parameters
                     .iter()
                     .enumerate()
-                    .find(|(_, parameter)| parameter.name.is_none())
+                    .find(|(_, parameter)| {
+                        parameter.name.is_none()
+                            && parameter.passing_mode != ParameterPassingMode::PositionalOnly
+                    })
             }) {
                 SemanticModelCallableDisposition::Incomplete(
                     SemanticModelCallableIncompleteReason::MissingFormalName { ordinal },
@@ -6317,6 +6320,21 @@ mod tests {
             SemanticModelCallableDisposition::Incomplete(
                 SemanticModelCallableIncompleteReason::MissingFormalName { ordinal: 0 }
             )
+        );
+
+        let owner = class("pkg.Owner", "java");
+        let mut positional_signature = signature(&[None], false);
+        positional_signature.parameters[0].passing_mode = ParameterPassingMode::PositionalOnly;
+        let positional = method(
+            &owner,
+            "member.run.positional",
+            "run",
+            Some(positional_signature),
+        );
+        let positional_overlay = overlay(vec![owner, positional], Vec::new());
+        assert_eq!(
+            lookup(&positional_overlay, 1).disposition,
+            SemanticModelCallableDisposition::Unique
         );
     }
 

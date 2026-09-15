@@ -1,12 +1,13 @@
 {
   "schema_version": 1,
   "pack_id": "bifrost.python-stdlib",
-  "pack_version": "2026.9.7",
+  "pack_version": "2026.9.14",
   "ecosystem": "python",
   "kind": {
     "artifact_kind": "python_stub",
     "stubs": [
       "_collections_abc.pyi",
+      "_sitebuiltins.pyi",
       "abc.pyi",
       "builtins.pyi",
       "codecs.pyi",
@@ -62,7 +63,7 @@
   },
   "artifact": {
     "file_name": "typeshed-stdlib-1620e2254765",
-    "sha256": "7c54418f8253daed29dffcf792683204bff441968e00daf95f0421f145a92adb",
+    "sha256": "45154945afdda57a5cd3b90377b7ce649d572dc7296ace4d3fd01099f7cbaa37",
     "url": "https://github.com/python/typeshed/archive/1620e225476597f34177351ef913dc8390dade30.tar.gz",
     "container": null
   },
@@ -133,6 +134,11 @@
       "kind": "member",
       "owner": "subprocess",
       "name": "run"
+    },
+    {
+      "kind": "member",
+      "owner": "builtins",
+      "name": "exit"
     }
   ]
 }

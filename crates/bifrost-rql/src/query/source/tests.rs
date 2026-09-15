@@ -1505,6 +1505,54 @@ fn jsx_attribute_value_source_forms_validate_and_hover_from_schema() {
 }
 
 #[test]
+fn keyed_read_value_family_options_validate_have_range_help() {
+    let source = "(keyed-read-value :runtime node :global process :container argv :key-kind static-index :index-min 1 :index-max 3 (call))";
+    assert!(
+        validate_query_source(source).is_empty(),
+        "{source}: {:#?}",
+        validate_query_source(source)
+    );
+    for token in [":key-kind", ":index-min", ":index-max"] {
+        let help = query_source_help_at(source, source.find(token).unwrap())
+            .unwrap_or_else(|| panic!("no keyed-read help for {token}"));
+        assert_eq!(&source[help.range], token);
+        assert!(!help.description.is_empty());
+    }
+
+    for (source, token) in [
+        (
+            "(keyed-read-value :runtime node :global process :container env :key-kind static-index (call))",
+            "env",
+        ),
+        (
+            "(keyed-read-value :runtime node :global process :container argv :key-kind static-property (call))",
+            "argv",
+        ),
+        (
+            "(keyed-read-value :runtime node :global process :container argv :key-kind static-property :index-min 1 (call))",
+            "static-property",
+        ),
+        (
+            "(keyed-read-value :runtime node :global process :container argv :key-kind static-index :index-min 4 :index-max 2 (call))",
+            "4",
+        ),
+        (
+            "(keyed-read-value :runtime node :global process :container argv :index 4294967295 (call))",
+            "4294967295",
+        ),
+    ] {
+        let diagnostics = validate_query_source(source);
+        assert!(!diagnostics.is_empty(), "{source}");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| &source[diagnostic.range.clone()] == token),
+            "{source}: {diagnostics:#?}"
+        );
+    }
+}
+
+#[test]
 fn generated_json_is_machine_serialization_only() {
     let query = CodeQuery::from_source("(language rust (call :callee (name \"run\")))")
         .expect("authored RQL");

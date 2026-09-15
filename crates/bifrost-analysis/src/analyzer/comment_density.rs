@@ -74,7 +74,19 @@ fn analyze_file(
     let tree = parser.parse(source, None)?;
     let tree = crate::analyzer::repaired_grammar_gap_tree(language, source, tree);
     let mut comments = Vec::new();
+    let mut primary_constructor_ranges = Vec::new();
+    let mut class_parameter_ranges = Vec::new();
     walk_tree_preorder(tree.root_node(), true, |node| {
+        if node.kind() == "primary_constructor" {
+            primary_constructor_ranges.push((node.start_byte(), node.end_byte()));
+        }
+        if node.kind() == "class_parameter"
+            && let Some(primary) = node
+                .parent()
+                .filter(|parent| parent.kind() == "primary_constructor")
+        {
+            class_parameter_ranges.push((node.start_byte(), node.end_byte(), primary.start_byte()));
+        }
         if node.kind().ends_with("comment") {
             comments.push(node);
             WalkControl::SkipChildren
@@ -87,8 +99,26 @@ fn analyze_file(
     // the declaration view once per file instead of repeating those lookups
     // for every comment in the file.
     let declarations = projection.map_or_else(
-        || collect_declarations_from_analyzer(analyzer, language, source, file),
-        |projection| collect_declarations_from_projection(projection, language, source, file),
+        || {
+            collect_declarations_from_analyzer(
+                analyzer,
+                language,
+                source,
+                file,
+                &primary_constructor_ranges,
+                &class_parameter_ranges,
+            )
+        },
+        |projection| {
+            collect_declarations_from_projection(
+                projection,
+                language,
+                source,
+                file,
+                &primary_constructor_ranges,
+                &class_parameter_ranges,
+            )
+        },
     );
     let mut aggregates: HashMap<String, (u32, u32)> = HashMap::default();
     for comment in comments {
@@ -132,6 +162,9 @@ struct DensityRange {
     start: usize,
     declaration_start: usize,
     end: usize,
+    /// The primary constructor's range is also the owning class header. Keep
+    /// it for roll-ups, but attribute its comments to the class scope.
+    exclude_from_attribution: bool,
 }
 
 fn collect_declarations_from_analyzer(
@@ -139,6 +172,8 @@ fn collect_declarations_from_analyzer(
     language: Language,
     source: &str,
     file: &ProjectFile,
+    primary_constructor_ranges: &[(usize, usize)],
+    class_parameter_ranges: &[(usize, usize, usize)],
 ) -> Vec<DensityDeclaration> {
     let mut declarations = Vec::new();
     let mut pending: Vec<(CodeUnit, usize, Option<usize>)> = analyzer
@@ -156,6 +191,8 @@ fn collect_declarations_from_analyzer(
             continue;
         }
         let raw_ranges = analyzer.ranges(&code_unit);
+        let is_constructor =
+            is_kotlin_primary_constructor(&code_unit, &raw_ranges, primary_constructor_ranges);
         let span_lines = raw_ranges
             .iter()
             .map(|range| (range.end_line.saturating_sub(range.start_line) + 1) as u32)
@@ -163,9 +200,21 @@ fn collect_declarations_from_analyzer(
         let ranges = raw_ranges
             .into_iter()
             .map(|range| DensityRange {
-                start: expanded_comment_start(language, source, range.start_byte),
+                start: expanded_density_range_start(
+                    language,
+                    source,
+                    range.start_byte,
+                    range.end_byte,
+                    class_parameter_ranges,
+                ),
                 declaration_start: range.start_byte,
                 end: range.end_byte,
+                exclude_from_attribution: is_constructor
+                    && is_primary_constructor_range(
+                        range.start_byte,
+                        range.end_byte,
+                        primary_constructor_ranges,
+                    ),
             })
             .collect();
         let index = declarations.len();
@@ -194,6 +243,8 @@ fn collect_declarations_from_projection(
     language: Language,
     source: &str,
     file: &ProjectFile,
+    primary_constructor_ranges: &[(usize, usize)],
+    class_parameter_ranges: &[(usize, usize, usize)],
 ) -> Vec<DensityDeclaration> {
     let mut declarations = Vec::new();
     let mut pending: Vec<(CodeUnit, usize, Option<usize>)> = projection
@@ -211,6 +262,8 @@ fn collect_declarations_from_projection(
             .get(&code_unit)
             .cloned()
             .unwrap_or_default();
+        let is_constructor =
+            is_kotlin_primary_constructor(&code_unit, &raw_ranges, primary_constructor_ranges);
         let span_lines = raw_ranges
             .iter()
             .map(|range| (range.end_line.saturating_sub(range.start_line) + 1) as u32)
@@ -218,9 +271,21 @@ fn collect_declarations_from_projection(
         let ranges = raw_ranges
             .into_iter()
             .map(|range| DensityRange {
-                start: expanded_comment_start(language, source, range.start_byte),
+                start: expanded_density_range_start(
+                    language,
+                    source,
+                    range.start_byte,
+                    range.end_byte,
+                    class_parameter_ranges,
+                ),
                 declaration_start: range.start_byte,
                 end: range.end_byte,
+                exclude_from_attribution: is_constructor
+                    && is_primary_constructor_range(
+                        range.start_byte,
+                        range.end_byte,
+                        primary_constructor_ranges,
+                    ),
             })
             .collect();
         let index = declarations.len();
@@ -246,6 +311,23 @@ fn collect_declarations_from_projection(
     declarations
 }
 
+fn expanded_density_range_start(
+    language: Language,
+    source: &str,
+    start_byte: usize,
+    end_byte: usize,
+    class_parameter_ranges: &[(usize, usize, usize)],
+) -> usize {
+    let expanded = expanded_comment_start(language, source, start_byte);
+    class_parameter_ranges
+        .iter()
+        .find_map(|&(parameter_start, parameter_end, primary_start)| {
+            (start_byte == parameter_start && end_byte == parameter_end)
+                .then_some(expanded.max(primary_start))
+        })
+        .unwrap_or(expanded)
+}
+
 fn enclosing_declaration(
     declarations: &[DensityDeclaration],
     start: usize,
@@ -264,6 +346,9 @@ fn enclosing_declaration(
         else {
             continue;
         };
+        if range.exclude_from_attribution {
+            continue;
+        }
         if best.is_none_or(|(best, _)| declaration.depth > best.depth) {
             best = Some((declaration, range));
         }
@@ -313,6 +398,31 @@ fn own_counts(code_unit: &CodeUnit, aggregates: &HashMap<String, (u32, u32)>) ->
         .get(&code_unit.fq_name())
         .copied()
         .unwrap_or_default()
+}
+
+fn is_kotlin_primary_constructor(
+    code_unit: &CodeUnit,
+    ranges: &[crate::analyzer::Range],
+    primary_constructor_ranges: &[(usize, usize)],
+) -> bool {
+    code_unit.is_function()
+        && ranges.iter().any(|range| {
+            is_primary_constructor_range(
+                range.start_byte,
+                range.end_byte,
+                primary_constructor_ranges,
+            )
+        })
+}
+
+fn is_primary_constructor_range(
+    start: usize,
+    end: usize,
+    primary_constructor_ranges: &[(usize, usize)],
+) -> bool {
+    primary_constructor_ranges
+        .iter()
+        .any(|&(primary_start, primary_end)| start == primary_start && end == primary_end)
 }
 
 #[cfg(test)]
@@ -411,8 +521,56 @@ mod tests {
         );
         assert_eq!(
             (stats.header_comment_lines, stats.inline_comment_lines),
-            (0, 0)
+            (1, 0)
         );
         assert!(stats.span_lines > 0);
+    }
+
+    #[test]
+    fn kotlin_primary_constructor_overlap_does_not_capture_secondary_body() {
+        let stats = assert_projection_matches_direct(
+            "Widget.kt",
+            "/** Widget header. */\n\
+             class Widget(\n\
+               val name: String\n\
+             ) {\n\
+               constructor() : this(\"default\") {\n\
+                 // secondary body note\n\
+                 check(name.isNotEmpty())\n\
+               }\n\
+             }\n",
+            "Widget",
+        );
+        // The primary constructor's overlapping range is excluded from the
+        // ownership contest, so its comment belongs to Widget. A secondary
+        // constructor still owns its body comment, rather than dropping it
+        // into the enclosing class after a blanket constructor exclusion.
+        assert_eq!(
+            (stats.header_comment_lines, stats.inline_comment_lines),
+            (1, 0)
+        );
+        assert_eq!(
+            (
+                stats.rolled_up_header_comment_lines,
+                stats.rolled_up_inline_comment_lines,
+            ),
+            (1, 1)
+        );
+    }
+
+    #[test]
+    fn kotlin_constructor_property_keeps_its_attached_documentation() {
+        let source = "/** Class documentation. */\nclass Widget(\n  /** Property documentation. */\n  val name: String\n)\n";
+        let property = assert_projection_matches_direct("Widget.kt", source, "Widget.name");
+        assert_eq!(
+            (property.header_comment_lines, property.inline_comment_lines),
+            (1, 0)
+        );
+        let class = assert_projection_matches_direct("Widget.kt", source, "Widget");
+        assert_eq!(
+            (class.header_comment_lines, class.inline_comment_lines),
+            (1, 0)
+        );
+        assert_eq!(class.rolled_up_header_comment_lines, 2);
     }
 }

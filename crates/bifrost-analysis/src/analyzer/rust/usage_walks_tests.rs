@@ -14,7 +14,10 @@ mod tests {
     use brokk_bifrost_rust::graph_support::{
         rust_module_files_at, rust_module_files_from_path, rust_relative_module_segments,
     };
-    use brokk_bifrost_rust::usage::{Domain, RustSymbolIdentity, RustSymbolNamespace};
+    use brokk_bifrost_rust::usage::{
+        Domain, RustMacroInvocationResolution, RustMacroInvocationRoute, RustSymbolIdentity,
+        RustSymbolNamespace,
+    };
     use brokk_bifrost_rust::usage::{usage_binding_seeds, usage_importers};
     use brokk_bifrost_rust::usage_walks::RustUsageWalks;
     use std::collections::BTreeSet;
@@ -1013,5 +1016,46 @@ mod tests {
             importers.contains(&consumer),
             "raw-module glob importers: {importers:#?}"
         );
+    }
+
+    #[test]
+    fn macro_use_module_route_selects_the_exact_invocation_target() {
+        let (_temp, analyzer) = project(&[
+            (
+                "src/lib.rs",
+                "#[macro_use]\nmod macros;\nfn use_it() { m_macro!(); }\n",
+            ),
+            ("src/macros.rs", "macro_rules! m_macro { () => {} }\n"),
+        ]);
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let walks = RustUsageWalks::new(&analyzer, scope.token());
+        let macro_file = file(&analyzer, "macros.rs");
+        let invocation_file = file(&analyzer, "lib.rs");
+        let target = analyzer
+            .declarations(&macro_file)
+            .into_iter()
+            .find(|declaration| declaration.identifier() == "m_macro")
+            .expect("macro declaration");
+        let seeds =
+            usage_binding_seeds(&analyzer, scope.token(), &BTreeSet::from([target.clone()]));
+        let source = std::fs::read_to_string(invocation_file.abs_path()).expect("fixture source");
+        let byte = source.find("m_macro!()").expect("macro invocation");
+        let candidates = walks.selected_macro_invocation_candidates_named(
+            &seeds,
+            &invocation_file,
+            "m_macro",
+            byte,
+        );
+
+        let RustMacroInvocationResolution::Exact(exact) =
+            seeds.resolve_macro_invocation_targets(&candidates)
+        else {
+            panic!("macro_use route must select exactly: {candidates:#?}");
+        };
+        assert_eq!(exact.identity.file, target.source().clone());
+        assert!(matches!(
+            exact.route,
+            RustMacroInvocationRoute::MacroUseModule { .. }
+        ));
     }
 }

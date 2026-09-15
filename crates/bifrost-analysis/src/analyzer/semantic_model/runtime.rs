@@ -31,7 +31,7 @@ use crate::analyzer::store::{
 use crate::analyzer::{IAnalyzer, Language, LanguageDialect};
 use crate::hash::{HashMap, map_with_capacity};
 
-pub const SEMANTIC_MODEL_RUNTIME_REPRESENTATION_VERSION: u32 = 4;
+pub const SEMANTIC_MODEL_RUNTIME_REPRESENTATION_VERSION: u32 = 5;
 
 type DependencyEvidencePublication = (Box<[Language]>, super::DependencyDiscoveryEvidence);
 
@@ -288,6 +288,20 @@ impl ResolvedActiveSemanticModels {
         self.shards
             .iter()
             .filter_map(|shard| shard.shard.runtime_values().map(|payload| (payload, shard)))
+    }
+
+    /// Portable records retain their catalog shard and provenance. Catalog
+    /// activation alone does not authorize their target-scoped runtime claims;
+    /// consumers must also evaluate the portable activation and producer evidence.
+    pub fn runtime_contracts(
+        &self,
+    ) -> impl Iterator<Item = (&super::RuntimeContractsPayload, &ActiveSemanticModelShard)> {
+        self.shards.iter().filter_map(|shard| {
+            shard
+                .shard
+                .runtime_contracts()
+                .map(|payload| (payload, shard))
+        })
     }
 
     /// Collection-flow contracts are carried by the same activated shard as
@@ -3769,7 +3783,7 @@ mod active_model_set_identity_tests {
 
     #[test]
     fn value_semantics_schema_rotates_active_set_identity() {
-        assert_eq!(SEMANTIC_MODEL_RUNTIME_REPRESENTATION_VERSION, 4);
+        assert_eq!(SEMANTIC_MODEL_RUNTIME_REPRESENTATION_VERSION, 5);
         let mut previous = Sha256::new();
         previous.update(b"bifrost.semantic-model.active-set.v2\0");
         previous.update(2u32.to_be_bytes());

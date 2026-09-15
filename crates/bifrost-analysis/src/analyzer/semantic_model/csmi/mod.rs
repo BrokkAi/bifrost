@@ -11,6 +11,7 @@ mod import;
 mod model;
 mod pack;
 pub(crate) mod python;
+mod runtime_contract_validation;
 mod validate;
 
 #[cfg(test)]
@@ -22,4 +23,5 @@ pub use identity::*;
 pub use import::*;
 pub use model::*;
 pub use pack::*;
+pub(crate) use runtime_contract_validation::validate_runtime_contract_semantics;
 pub use validate::*;

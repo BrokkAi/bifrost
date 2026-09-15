@@ -420,7 +420,11 @@ async function runScenario(job, binary, runDir) {
     };
   } finally {
     if (bridge) await stopBridge(bridge);
-    fs.rmSync(workspaceRoot, { recursive: true, force: true });
+    // The server owns a background filesystem watcher. On macOS it may race a
+    // final cache-directory event after the bridge has exited, briefly making
+    // recursive removal report ENOTEMPTY. Retry that transient teardown race;
+    // a conformance verdict must not depend on temp-directory cleanup timing.
+    fs.rmSync(workspaceRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 }
 
@@ -510,7 +514,9 @@ async function main(argv) {
       console.error('  fix: node extract-schemas.mjs --write (only if the pin bump is deliberate)');
       failed = true;
     } else {
-      console.log(`schema drift check: 4 schemas match the pinned conformance bundle`);
+      console.log(
+        `schema drift check: 4 schemas match the pinned conformance sources and published corrections`,
+      );
     }
 
     if (problems.length > 0) {

@@ -21,7 +21,7 @@ pub use human::{
     EscapedTerminalText, HumanRenderColor, HumanRenderDetail, HumanRenderOptions,
     escape_terminal_text, write_policy_human,
 };
-pub use sarif::{SarifToolIdentity, write_policy_sarif};
+pub use sarif::{SarifToolIdentity, write_policy_sarif, write_policy_sarif_for_outcome};
 
 /// A policy report could not be rendered or written.
 #[derive(Debug)]

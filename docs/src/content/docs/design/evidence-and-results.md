@@ -96,6 +96,41 @@ value dependence even when the conversion annotation is unknown. That does not
 establish reference identity. Unknown conversions cannot transport heap aliases,
 and proven unboxing retains its possible exceptional boundary.
 
+## Coverage and its partition
+
+Evidence answers whether a returned row is real. It says nothing about the rows
+that are absent, and every absence claim -- an anti join, a zero count, a
+`none` assertion -- reads exactly that second question. Coverage is the separate
+axis that answers it, and it is always relative to a partition.
+
+A query's own completion states coverage for the row set it returned. An
+analysis that runs a solver states coverage for the partition that solver
+enumerated: the value-flow plan, the typestate protocol, the taint sink, the
+member-access class set, or the call site. The two are independent. A flow query
+can return every endpoint it found while the solve behind them stopped against a
+budget, so the returned set is whole and the partition is not.
+
+Rows of those families therefore carry a coverage value beside their evidence
+object:
+
+| Extent | Meaning |
+| --- | --- |
+| `exhaustive` | Every row of the stated partition that exists was returned |
+| `incomplete` | Rows of the partition may be missing, with the typed causes |
+| `unsupported` | The producer cannot describe this partition at all |
+
+Policy evaluation folds a relation's coverage by a meet: a derivation is exactly
+as trustworthy as its weakest input, `exhaustive` adds no restriction, and
+`unsupported` dominates. The folded value keeps the partition of whichever input
+made it weaker, so an absence verdict that cannot be published names the solve
+that left it open rather than reporting an unattributed incompleteness. Those
+unmet obligations are canonical report data, not prose.
+
+Coverage never invalidates a positive row. A count above an upper bound is
+evidence the returned rows established, and unread rows could only raise it, so
+that verdict publishes from a partition the solver did not finish. Only the
+claim about rows nobody read requires an enumerated partition.
+
 ## Positive evidence and authoritative absence
 
 A partial result supports only a narrow positive claim: Bifrost returned this

@@ -992,19 +992,12 @@ mod tests {
         ");\n",
     );
 
-    /// `class=` is outside the JavaScript grammar's JSX attribute rule, so a
-    /// `.js` file carrying JSX still derails: the element names and expression
-    /// reads that follow survive only as terminals below ERROR. Membership must
-    /// back an inverse hit on them (#3215) while the forward census keeps
-    /// refusing to propose a site it cannot grade.
-    ///
-    /// This is the residual #3322 left. `.jsx` moved to the TSX grammar, which
-    /// parses the attribute; a `.js` file cannot, because the TSX grammar is
-    /// not a superset of JavaScript -- it reads `await using x = ...` as an
-    /// assignment and `a < unique` as the start of a type -- so the JavaScript
-    /// grammar stays the one that reads `.js`.
+    /// Brokk's JavaScript grammar accepts `class=` without recovery, so a `.js`
+    /// file carrying JSX grades the later element names and expression reads
+    /// on both reference frontiers (#3342). This preserves the JavaScript
+    /// grammar's ordinary-language behavior instead of parsing `.js` as TSX.
     #[test]
-    fn js_census_membership_backs_recovered_jsx_references_without_proposing_them() {
+    fn js_census_grades_references_after_reserved_jsx_attributes() {
         let source = RESERVED_JSX_ATTRIBUTE;
         let census = census_offsets(Language::JavaScript, "app.js", source);
         let membership = census_membership_offsets(Language::JavaScript, "app.js", source);
@@ -1012,20 +1005,12 @@ mod tests {
         let read = source.find("{settings.reset}").expect("JSX attribute read") + 1;
         let intact = source.find("(settings)").expect("parameter binder") + 1;
 
-        for offset in [element, read] {
+        for offset in [element, read, intact] {
             assert!(
-                !census.contains(&offset),
-                "recovery fallout must stay out of the graded census at {offset}: {census:?}"
-            );
-            assert!(
-                membership.contains(&offset),
-                "the recovered reference at {offset} must back an inverse hit: {membership:?}"
+                census.contains(&offset) && membership.contains(&offset),
+                "the repaired JavaScript grammar grades {offset} on both frontiers: {census:?} {membership:?}"
             );
         }
-        assert!(
-            census.contains(&intact) && membership.contains(&intact),
-            "the intact part of the file keeps both frontiers: {census:?} {membership:?}"
-        );
     }
 
     /// The same source as a `.jsx` file has no recovery fallout at all: #3322

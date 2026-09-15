@@ -1,0 +1,57 @@
+(policy
+  :schema-version 1
+  :id "bifrost.security.java.system-getenv-to-runtime-exec"
+  :name "Environment variable reaches Runtime.exec"
+  :message "An environment variable reached the command argument of Runtime.exec(String)"
+  :severity error
+  :description "Reports values returned by the exact System.getenv(String) overload that reach the command argument of the exact Runtime.exec(String) overload. The rule excludes Runtime.exec(String[]) and unrelated same-named APIs."
+  :help-uri "https://bifrost.brokk.ai/static-analysis-policies/#built-in-security-pack"
+  :tags ["security" "java" "command-injection" "cwe-78"]
+  :analysis
+    (analysis
+      :type taint
+      :mode may
+      :call-modeling (call-modeling :unmodeled require-model)
+      :sources
+        (endpoint-set
+          :entries [
+            (source
+              :id environment-variable
+              :display-name "System.getenv(String)"
+              :categories [input.environment io.external]
+              :selector
+                (rql
+                  :schema-version 1
+                  (language java
+                    (call-argument :formal-index 0
+                      (resolved-call
+                        :resolves-to member.system.getenv-string
+                        :proof exact
+                        (call-bindings
+                          (call-shape
+                            (call :callee (name "getenv") (arity 1))))))))
+              :bind return-value
+              :labels [attacker-controlled])])
+      :sinks
+        (endpoint-set
+          :entries [
+            (sink
+              :id runtime-exec-command
+              :display-name "Runtime.exec(String) command"
+              :categories [process.external]
+              :selector
+                (rql
+                  :schema-version 1
+                  (language java
+                    (call-argument :formal-index 0
+                      (resolved-call
+                        :resolves-to member.runtime.exec-string
+                        :proof declared
+                        (call-bindings
+                          (call-shape
+                            (call :callee (name "exec") (arity 1))))))))
+              :dangerous-operand (argument :index 0)
+              :accepts [attacker-controlled])]))
+  :classification
+    (classification
+      :fallback (classification-id :taxonomy "CWE" :id "78")))

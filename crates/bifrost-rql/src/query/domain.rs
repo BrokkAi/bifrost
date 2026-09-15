@@ -7,6 +7,7 @@
 //! accidentally presented as a clean result.
 
 use brokk_bifrost_core::analyzer::Language;
+use brokk_bifrost_core::analyzer::configuration::ConfigurationFormat as CoreConfigurationFormat;
 use serde::de::Error as DeError;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::cmp::Ordering;
@@ -64,32 +65,39 @@ impl ConfigurationFormat {
         }
     }
 
-    /// Extensions used by a future source-discovery adapter.
-    pub const fn discovery_extensions(self) -> &'static [&'static str] {
-        match self {
-            Self::Yaml => &["yaml", "yml"],
-            Self::Toml => &["toml"],
-            Self::Json => &["json"],
-            Self::Xml => &["xml"],
-            Self::Properties => &["properties", "props"],
-        }
-    }
-
     pub fn from_label(label: &str) -> Option<Self> {
         let normalized = label.trim().trim_start_matches('.').to_ascii_lowercase();
         Self::ALL.into_iter().find(|format| {
             format.label() == normalized || format.aliases().contains(&normalized.as_str())
         })
     }
+}
 
-    pub fn from_discovery_extension(extension: &str) -> Option<Self> {
-        let normalized = extension
-            .trim()
-            .trim_start_matches('.')
-            .to_ascii_lowercase();
-        Self::ALL
-            .into_iter()
-            .find(|format| format.discovery_extensions().contains(&normalized.as_str()))
+/// The query-domain registry names the same formats as the canonical core
+/// registry, which owns path discovery and ingestion classification. These
+/// conversions are the only bridge, so a format cannot be discoverable under
+/// one registry and unknown to the other.
+impl From<CoreConfigurationFormat> for ConfigurationFormat {
+    fn from(format: CoreConfigurationFormat) -> Self {
+        match format {
+            CoreConfigurationFormat::Yaml => Self::Yaml,
+            CoreConfigurationFormat::Toml => Self::Toml,
+            CoreConfigurationFormat::Json => Self::Json,
+            CoreConfigurationFormat::Xml => Self::Xml,
+            CoreConfigurationFormat::Properties => Self::Properties,
+        }
+    }
+}
+
+impl From<ConfigurationFormat> for CoreConfigurationFormat {
+    fn from(format: ConfigurationFormat) -> Self {
+        match format {
+            ConfigurationFormat::Yaml => Self::Yaml,
+            ConfigurationFormat::Toml => Self::Toml,
+            ConfigurationFormat::Json => Self::Json,
+            ConfigurationFormat::Xml => Self::Xml,
+            ConfigurationFormat::Properties => Self::Properties,
+        }
     }
 }
 
@@ -1284,23 +1292,50 @@ mod tests {
                 ConfigurationFormat::from_label(format.label()),
                 Some(format)
             );
-            assert_eq!(
-                ConfigurationFormat::from_discovery_extension(format.label()),
-                Some(format)
-            );
             for alias in format.aliases() {
                 assert_eq!(ConfigurationFormat::from_label(alias), Some(format));
-            }
-            for extension in format.discovery_extensions() {
-                assert_eq!(
-                    ConfigurationFormat::from_discovery_extension(extension),
-                    Some(format)
-                );
             }
             let json = serde_json::to_string(&format).expect("serialize format");
             let decoded: ConfigurationFormat = serde_json::from_str(&json).expect("decode format");
             assert_eq!(decoded, format);
         }
+    }
+
+    #[test]
+    fn configuration_registry_agrees_with_canonical_discovery_and_ingestion() {
+        use brokk_bifrost_core::analyzer::configuration::{
+            ConfigurationPathClassification, classify_configuration_path,
+        };
+        use std::path::{Path, PathBuf};
+
+        // Every format is one format in both registries, under one label.
+        let mut seen = Vec::new();
+        for core in CoreConfigurationFormat::ALL {
+            let format = ConfigurationFormat::from(core);
+            assert_eq!(CoreConfigurationFormat::from(format), core);
+            assert_eq!(format.label(), core.label());
+            assert_eq!(ConfigurationFormat::from_label(core.label()), Some(format));
+            seen.push(format);
+            // Every extension the canonical registry discovers classifies to
+            // the same format that the query domain selects.
+            for extension in core.discovery_extensions() {
+                let path = PathBuf::from("conf").join(format!("candidate.{extension}"));
+                assert_eq!(
+                    classify_configuration_path(&path),
+                    ConfigurationPathClassification::Supported(core),
+                    "{path:?}"
+                );
+                assert_eq!(ConfigurationFormat::from_label(extension), Some(format));
+            }
+        }
+        seen.sort();
+        assert_eq!(seen, ConfigurationFormat::ALL);
+        // A label alias is a query spelling, not a discovered extension:
+        // `.props` is an MSBuild XML project file.
+        assert_eq!(
+            classify_configuration_path(Path::new("Directory.Build.props")),
+            ConfigurationPathClassification::Unsupported
+        );
     }
 
     #[test]

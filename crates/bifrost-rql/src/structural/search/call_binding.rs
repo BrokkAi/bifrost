@@ -94,6 +94,9 @@ pub(super) struct CallBindingSiteValue {
     /// the activated semantic-model overlay.
     pub(super) target_origin: Option<&'static str>,
     pub(super) model_id: Option<String>,
+    /// Exact aliases declared by the selected semantic-model member. These
+    /// are identity locators, not display-name fallbacks.
+    pub(super) model_aliases: Vec<String>,
     pub(super) pack_id: Option<String>,
     pub(super) semantic_model_provenance: Option<Arc<SemanticModelProvenance>>,
     /// Stable identity of the type that owns this callable's receiver, when
@@ -239,6 +242,7 @@ enum ModelCallBinding {
         signature_id: String,
         signature: Box<crate::analyzer::semantic_model::Signature>,
         semantic_model_provenance: Arc<SemanticModelProvenance>,
+        model_aliases: Vec<String>,
     },
     CompatibleLayout {
         layout: FormalParameterLayout,
@@ -274,10 +278,7 @@ fn model_formal_layout(
         .parameters
         .iter()
         .map(|parameter| {
-            let name = parameter
-                .name
-                .clone()
-                .expect("an applicable model layout has every formal name");
+            let names = parameter.name.clone().into_iter().collect();
             let passing_mode = match parameter.passing_mode {
                 ParameterPassingMode::PositionalOnly => FormalParameterPassingMode::PositionalOnly,
                 ParameterPassingMode::PositionalOrNamed => {
@@ -292,7 +293,7 @@ fn model_formal_layout(
                 }
             });
             FormalParameterSlot {
-                names: vec![name],
+                names,
                 // Model records have no source parameter range. The call
                 // range is the only source-backed location available; it is
                 // used only to keep default rows addressable.
@@ -440,6 +441,7 @@ fn model_call_binding(
                 signature_id,
                 signature: Box::new(signature.clone()),
                 semantic_model_provenance: model_provenance,
+                model_aliases: symbol.aliases.clone(),
             }
         }
         SemanticModelCallableDisposition::CompatibleLayout => {
@@ -522,6 +524,7 @@ fn model_call_binding(
                         signature_id,
                         signature: Box::new(selected_signature),
                         semantic_model_provenance: Arc::new(selected_symbol.provenance.clone()),
+                        model_aliases: selected_symbol.aliases.clone(),
                     }
                 }
                 Ok(None) => ModelCallBinding::ConversionUnavailable {
@@ -553,6 +556,7 @@ enum SourceTargetModelProvenance {
     Absent,
     Exact {
         model_id: String,
+        model_aliases: Vec<String>,
         model_callable_id: String,
         receiver_type_id: Option<String>,
         provenance: Arc<SemanticModelProvenance>,
@@ -619,6 +623,7 @@ fn model_provenance_for_source_target(
     debug_assert!(!symbol.provenance.ambiguous);
     SourceTargetModelProvenance::Exact {
         model_id: symbol.id.clone(),
+        model_aliases: symbol.aliases.clone(),
         model_callable_id: model_callable_id
             .expect("an exact source model target must retain its callable family identity"),
         receiver_type_id: key.has_receiver.then(|| symbol.owner_id.clone()).flatten(),
@@ -926,6 +931,7 @@ pub(super) fn call_binding_expansions(
             CallBindingDispatch::from_answer(answer, source_target.as_ref(), None)
         });
     let mut model_id = None;
+    let mut model_aliases = Vec::new();
     let mut model_callable_id = None;
     let mut formal_layout_id = None;
     let mut pack_id = None;
@@ -951,12 +957,14 @@ pub(super) fn call_binding_expansions(
             SourceTargetModelProvenance::Absent => {}
             SourceTargetModelProvenance::Exact {
                 model_id: resolved_model_id,
+                model_aliases: resolved_model_aliases,
                 model_callable_id: resolved_model_callable_id,
                 receiver_type_id: resolved_receiver_type_id,
                 provenance,
                 key,
             } => {
                 model_id = Some(resolved_model_id);
+                model_aliases = resolved_model_aliases;
                 model_callable_id = Some(resolved_model_callable_id);
                 pack_id = Some(provenance.pack_id.clone());
                 receiver_type_id = resolved_receiver_type_id;
@@ -1002,6 +1010,7 @@ pub(super) fn call_binding_expansions(
                 signature_id: resolved_signature_id,
                 signature: resolved_signature,
                 semantic_model_provenance: resolved_provenance,
+                model_aliases: resolved_model_aliases,
             } => {
                 model_static_selector_proven = dispatch_answer
                     .as_ref()
@@ -1015,6 +1024,7 @@ pub(super) fn call_binding_expansions(
                     *resolved_signature,
                 ));
                 model_id = Some(resolved_model_id);
+                model_aliases = resolved_model_aliases;
                 signature_id = Some(resolved_signature_id);
                 pack_id = Some(resolved_pack_id);
                 receiver_type_id = resolved_receiver_type_id;
@@ -1219,6 +1229,7 @@ pub(super) fn call_binding_expansions(
         semantic_target_id,
         target_origin,
         model_id,
+        model_aliases,
         pack_id,
         semantic_model_provenance,
         receiver_type_id,

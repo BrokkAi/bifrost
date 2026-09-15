@@ -6,7 +6,7 @@ use crate::analyzer::semantic::{
     ValueFlowKind,
 };
 use crate::analyzer::semantic_model::{
-    CatalogOptions, CompilerOptions, SemanticModelActivationEvidence,
+    ActiveSemanticModelSnapshot, CatalogOptions, CompilerOptions, SemanticModelActivationEvidence,
     SemanticModelActivationRequest, SemanticModelRuntimeLimits, SemanticModelRuntimeOutcome,
     SemanticPackCatalog, SessionPackSource, SessionPackSourceKind, SourceFormat,
     acquire_active_semantic_models, compile_source,
@@ -7437,7 +7437,15 @@ func oneSidedLock() int {
     return value
 }
 
-func unsupportedOnce() int {
+func oncePublishesCallback() int {
+    once := &sync.Once{}
+    value := 0
+    go func() { once.Do(func() { value = 1 }) }()
+    once.Do(func() {})
+    return value
+}
+
+func onceBeforeDoStaysUnordered() int {
     once := &sync.Once{}
     value := 0
     go func() {
@@ -7445,6 +7453,94 @@ func unsupportedOnce() int {
         once.Do(func() {})
     }()
     once.Do(func() {})
+    return value
+}
+
+func onceSingleExecution() {
+    once := &sync.Once{}
+    value := 0
+    go func() { once.Do(func() { value = 1 }) }()
+    go func() { once.Do(func() { value = 2 }) }()
+}
+
+func onceLoopSingleExecution() {
+    once := &sync.Once{}
+    value := 0
+    for i := 0; i < 3; i++ {
+        go func() { once.Do(func() { value = 1 }) }()
+    }
+}
+
+func onceLoopFreshObjects() {
+    value := 0
+    for i := 0; i < 3; i++ {
+        once := &sync.Once{}
+        go func() { once.Do(func() { value = 1 }) }()
+    }
+}
+
+func onceConditionalDo(flag bool) int {
+    once := &sync.Once{}
+    value := 0
+    go func() {
+        if flag {
+            once.Do(func() { value = 1 })
+        }
+    }()
+    once.Do(func() {})
+    return value
+}
+
+type doer interface{ Do(func()) }
+
+func onceInterfaceReceiver(d doer) int {
+    value := 0
+    go func() { d.Do(func() { value = 1 }) }()
+    d.Do(func() {})
+    return value
+}
+
+func onceNonParticipant() int {
+    once := &sync.Once{}
+    value := 0
+    go func() { once.Do(func() { value = 1 }) }()
+    go func() { value = 2 }()
+    return value
+}
+
+func onceDistinctObjects() int {
+    first := &sync.Once{}
+    second := &sync.Once{}
+    value := 0
+    go func() { first.Do(func() { value = 1 }) }()
+    second.Do(func() {})
+    return value
+}
+
+type onceLike struct{}
+
+func (*onceLike) Do(f func()) {}
+
+func onceSameNameOtherType() int {
+    other := &onceLike{}
+    value := 0
+    go func() {
+        value = 1
+        other.Do(func() {})
+    }()
+    other.Do(func() {})
+    return value
+}
+
+func onceUnknownCallable(once *sync.Once, f func()) int {
+    value := 0
+    once.Do(f)
+    return value
+}
+
+func onceProjected(once *sync.Once) int {
+    value := 0
+    once.Do(func() { value = 1 })
     return value
 }
 "#,
@@ -7707,7 +7803,7 @@ func unsupportedOnce() int {
                   "target": { "path": "src/sync/once.go", "symbol": "sync.Once.Do(func())", "has_receiver": true, "parameter_count": 1 },
                   "completeness": "complete",
                   "transfers": [],
-                  "concurrency_effects": [{ "kind": "unsupported", "protocol": "sync.Once" }]
+                  "concurrency_effects": [{ "kind": "once_do", "once": { "kind": "receiver" }, "callable": { "kind": "parameter", "ordinal": 0 } }]
                 },
                 {
                   "id": "waitgroup.go",
@@ -7847,6 +7943,109 @@ func unsupportedOnce() int {
             &workspace,
             Some(snapshot.clone()),
         );
+    // A source wrapper that owns the call but not the object keeps the
+    // reviewed Once contract at its boundary: the projected summary names the
+    // object port and the callable argument, and the direct, freshly
+    // projected, and retained reports agree.
+    let once_root = procedure("onceProjected");
+    let once_summaries =
+        brokk_bifrost_flow::typestate::project_production_semantic_summaries_with_concurrency(
+            std::slice::from_ref(&once_root),
+            &icfg,
+            &direct_provider,
+            &mut crate::analyzer::semantic::SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("Once wrapper summaries project");
+    let once_summary = once_summaries
+        .summary_for(&once_root)
+        .expect("the Once wrapper has a projected summary");
+    assert!(
+        once_summary.effects().iter().any(|effect| matches!(
+            effect.key(),
+            brokk_bifrost_flow::dataflow::SummaryEffectKey::Concurrency(effect)
+                if matches!(
+                    effect.kind(),
+                    brokk_bifrost_flow::dataflow::SummaryConcurrencyEffectKind::OnceDo {
+                        once,
+                        identity:
+                            brokk_bifrost_flow::dataflow::SummaryConcurrencySubjectIdentity::Backing,
+                        callable:
+                            brokk_bifrost_flow::dataflow::SummaryConcurrencyCallable::SourceArgument(0),
+                        ..
+                    } if once.root() == &brokk_bifrost_flow::dataflow::SummaryPort::Parameter(0)
+                )
+        )),
+        "the wrapper summary keeps the Once object port and callable argument: {once_summary:#?}"
+    );
+    let fresh_provider = super::super::concurrency::WorkspaceConcurrencyProvider::new(
+        &workspace,
+        Some(snapshot.clone()),
+        Some(once_summaries),
+    );
+    let mut direct_once_budget = crate::analyzer::semantic::SemanticBudget::default();
+    let direct_once_report = brokk_bifrost_flow::concurrency::concurrent_access_conflicts(
+        &direct_provider,
+        &once_root,
+        &mut crate::analyzer::semantic::SemanticRequest::new(
+            &mut direct_once_budget,
+            &cancellation,
+        ),
+    )
+    .expect("direct Once wrapper report computes");
+    assert!(
+        direct_once_report.conflicts.iter().any(|conflict| {
+            conflict.proven
+                && conflict.exhaustive
+                && conflict.ordering
+                    == brokk_bifrost_flow::concurrency::ConcurrentOrdering::HappensBefore
+        }) && direct_once_report.reasons.is_empty(),
+        "the wrapper's own Do publishes its callback: {direct_once_report:#?}"
+    );
+    let once_repository = brokk_bifrost_flow::dataflow::ProductionSemanticSummaryRepository::new();
+    let once_summaries =
+        brokk_bifrost_flow::typestate::project_production_semantic_summaries_with_concurrency(
+            std::slice::from_ref(&once_root),
+            &icfg,
+            &direct_provider,
+            &mut crate::analyzer::semantic::SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("Once wrapper summaries project again");
+    once_repository
+        .publish_components(once_summaries.summaries(), once_summaries.components())
+        .expect("Once wrapper component publishes");
+    let retained_once =
+        brokk_bifrost_flow::typestate::acquire_production_semantic_summaries_with_concurrency(
+            std::slice::from_ref(&once_root),
+            &icfg,
+            &direct_provider,
+            &once_repository,
+            &brokk_bifrost_flow::dataflow::NoSummaryReadObserver,
+            &mut crate::analyzer::semantic::SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("Once wrapper component reacquires");
+    assert_eq!(
+        retained_once.kind(),
+        brokk_bifrost_flow::typestate::ProductionSemanticSummaryAcquisitionKind::Retained
+    );
+    let retained_once_provider = super::super::concurrency::WorkspaceConcurrencyProvider::new(
+        &workspace,
+        Some(snapshot.clone()),
+        Some(retained_once.into_summaries()),
+    );
+    for provider in [&fresh_provider, &retained_once_provider] {
+        let mut once_budget = crate::analyzer::semantic::SemanticBudget::default();
+        let report = brokk_bifrost_flow::concurrency::concurrent_access_conflicts(
+            provider,
+            &once_root,
+            &mut crate::analyzer::semantic::SemanticRequest::new(&mut once_budget, &cancellation),
+        )
+        .expect("projected Once wrapper report computes");
+        assert_eq!(
+            report, direct_once_report,
+            "projected and retained Once wrappers preserve the direct report"
+        );
+    }
+
     let summaries =
         brokk_bifrost_flow::typestate::project_production_semantic_summaries_with_concurrency(
             &roots,
@@ -8866,16 +9065,228 @@ func unsupportedOnce() int {
         "{result:#?}"
     );
 
-    let query = CodeQuery::from_json(&json!({
-        "languages": ["go"],
-        "match": { "kind": "function", "name": "unsupportedOnce" },
-        "steps": [
-            { "op": "procedure_of" },
-            { "op": "concurrent_access_conflicts" }
-        ],
-        "result_detail": "full"
-    }))
-    .expect("unsupported Once synchronization query");
+    let once_query = |name: &str| {
+        CodeQuery::from_json(&json!({
+            "languages": ["go"],
+            "match": { "kind": "function", "name": name },
+            "steps": [
+                { "op": "procedure_of" },
+                { "op": "concurrent_access_conflicts" }
+            ],
+            "result_detail": "full"
+        }))
+        .unwrap_or_else(|error| panic!("{name} concurrent access query: {error}"))
+    };
+
+    // A completed Do call publishes its callback: the write inside the one
+    // execution is synchronized before the return of every Do on that object,
+    // so the read after the caller's own Do is ordered rather than racy.
+    let query = once_query("oncePublishesCallback");
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    assert_eq!(
+        result.completion(),
+        CodeQueryCompletion::Complete,
+        "{result:#?}"
+    );
+    let ordered = find_concurrent_relation(&result, |value| value.ordering == "happens_before");
+    assert_eq!(
+        (ordered.verdict, ordered.proof, ordered.coverage),
+        ("ordered", "proven", "exhaustive"),
+        "{result:#?}"
+    );
+    assert!(
+        result.results.iter().all(|item| {
+            !matches!(
+                &item.value,
+                CodeQueryResultValue::ConcurrentAccessConflict { value }
+                    if value.verdict == "conflict"
+            )
+        }),
+        "the published callback leaves no unordered pair: {result:#?}"
+    );
+
+    // A write made before the Do is not part of the single execution, so the
+    // return of the callback does not publish it: the pair stays a race.
+    let query = once_query("onceBeforeDoStaysUnordered");
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    let value = find_concurrent_relation(&result, |value| value.verdict == "conflict");
+    assert_eq!(
+        (
+            value.ordering,
+            value.protection,
+            value.proof,
+            value.coverage
+        ),
+        ("unordered", "unprotected", "proven", "exhaustive"),
+        "{result:#?}"
+    );
+    assert!(value.reasons.is_empty(), "{result:#?}");
+
+    // A Do that only some paths reach still publishes whichever callback ran:
+    // the completion belongs to the object, not to the branch that made the
+    // call.
+    let query = once_query("onceConditionalDo");
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    assert_eq!(
+        result.completion(),
+        CodeQueryCompletion::Complete,
+        "{result:#?}"
+    );
+    assert!(
+        result.results.iter().all(|item| {
+            !matches!(
+                &item.value,
+                CodeQueryResultValue::ConcurrentAccessConflict { value }
+                    if value.verdict == "conflict"
+            )
+        }),
+        "a conditional Do publishes the callback it ran: {result:#?}"
+    );
+
+    // An interface receiver is not the reviewed declaration, so nothing here
+    // publishes the write on the strength of a matching method name.
+    let query = once_query("onceInterfaceReceiver");
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    assert!(
+        result.results.iter().all(|item| !matches!(
+            &item.value,
+            CodeQueryResultValue::ConcurrentAccessConflict { value }
+                if value.verdict == "ordered"
+        )),
+        "an interface Do never publishes on the strength of a method name: {result:#?}"
+    );
+    assert_eq!(
+        result.completion(),
+        CodeQueryCompletion::Incomplete {
+            codes: vec![CodeQueryDiagnosticCode::SemanticAnalysisPartial]
+        },
+        "an unresolved interface Do remains an explicit boundary: {result:#?}"
+    );
+
+    // Single execution: two callbacks bound to one object never run together,
+    // so their writes are mutually exclusive rather than concurrent.
+    let query = once_query("onceSingleExecution");
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    assert_eq!(
+        result.completion(),
+        CodeQueryCompletion::Complete,
+        "{result:#?}"
+    );
+    assert!(
+        result.results.iter().all(|item| {
+            !matches!(
+                &item.value,
+                CodeQueryResultValue::ConcurrentAccessConflict { value }
+                    if value.verdict == "conflict"
+            )
+        }),
+        "one object runs one callback: {result:#?}"
+    );
+
+    // A callback inside a loop still runs at most once while every activation
+    // observes the same object.
+    let query = once_query("onceLoopSingleExecution");
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    assert!(
+        result.results.iter().all(|item| {
+            !matches!(
+                &item.value,
+                CodeQueryResultValue::ConcurrentAccessConflict { value }
+                    if value.verdict == "conflict"
+            )
+        }),
+        "one object across loop activations runs one callback: {result:#?}"
+    );
+
+    // An object created inside the repeated scope is a new object for each
+    // activation, so its callbacks may all run.
+    let query = once_query("onceLoopFreshObjects");
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    assert!(
+        result.results.iter().any(|item| matches!(
+            &item.value,
+            CodeQueryResultValue::ConcurrentAccessConflict { value }
+                if value.verdict == "conflict"
+        )),
+        "an object recreated by each activation does not serialize its callbacks: {result:#?}"
+    );
+
+    // A goroutine that never calls Do is not ordered by another goroutine's
+    // completed Do.
+    let query = once_query("onceNonParticipant");
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    let value = find_concurrent_relation(&result, |value| value.verdict == "conflict");
+    assert_eq!(
+        (value.ordering, value.proof, value.coverage),
+        ("unordered", "proven", "exhaustive"),
+        "{result:#?}"
+    );
+
+    // Distinct Once objects share no completion state, so a callback bound to
+    // one object never publishes an access after a Do on another.
+    let query = once_query("onceDistinctObjects");
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    let value = find_concurrent_relation(&result, |value| value.verdict == "conflict");
+    assert_eq!(
+        (value.ordering, value.protection),
+        ("unordered", "unprotected"),
+        "{result:#?}"
+    );
+
+    // A same-named method on another type is not the reviewed protocol: its
+    // own body runs and publishes nothing.
+    let query = once_query("onceSameNameOtherType");
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    let value = find_concurrent_relation(&result, |value| value.verdict == "conflict");
+    assert_eq!(
+        (value.ordering, value.protection, value.proof),
+        ("unordered", "unprotected", "proven"),
+        "{result:#?}"
+    );
+
+    // A Do whose callable cannot be resolved keeps the boundary open instead
+    // of claiming the synchronous execution that follows it.
+    let query = once_query("onceUnknownCallable");
     let result = execute_workspace(
         &workspace,
         &brokk_bifrost_flow::FlowWorkspaceState::new(),
@@ -8886,30 +9297,6 @@ func unsupportedOnce() int {
         CodeQueryCompletion::Incomplete {
             codes: vec![CodeQueryDiagnosticCode::SemanticAnalysisPartial]
         },
-        "{result:#?}"
-    );
-    let item = result
-        .results
-        .iter()
-        .find(|item| {
-            matches!(
-                &item.value,
-                CodeQueryResultValue::ConcurrentAccessConflict { value }
-                    if value.verdict == "conflict" && value.proof == "open"
-            )
-        })
-        .unwrap_or_else(|| panic!("one binding-scoped unsupported Once row: {result:#?}"));
-    let CodeQueryResultValue::ConcurrentAccessConflict { value } = &item.value else {
-        panic!("unsupported Once retains its typed row: {item:#?}");
-    };
-    assert_eq!(
-        (value.ordering, value.proof, value.coverage),
-        ("unordered", "open", "open"),
-        "{result:#?}"
-    );
-    assert_eq!(
-        value.reasons,
-        ["unsupported_synchronization:sync.Once"],
         "{result:#?}"
     );
 
@@ -19255,6 +19642,661 @@ fn an_exhausted_root_is_attributed_by_path_name_lane_and_charge() {
         assert!(
             diagnostic.message.contains(expected),
             "the message renders `{expected}`: {diagnostic:#?}"
+        );
+    }
+}
+/// The reviewed try-acquire protocol pack shared by the TryLock guard tests:
+/// sync.Mutex and sync.RWMutex with the call-result-true acquisition condition
+/// on TryLock and TryRLock (issue #3369).
+const TRY_LOCK_GUARD_PACK: &[u8] = br#"{
+  "schema_version": 2,
+  "pack_id": "test.go.trylock-guard",
+  "version": "1.0.0",
+  "producer": { "name": "test", "version": "1.0.0" },
+  "language": "go",
+  "ecosystem": "go",
+  "compatibility": { "bifrost": ">=0.10.7, <1.0.0", "toolchains": [] },
+  "provenance": { "source": "test", "revision": "1" },
+  "license": "MIT",
+  "completeness": "complete",
+  "safety": { "generated_code_only": false, "review_required": false },
+  "shards": [{
+    "id": "declarations",
+    "activation": [{}],
+    "payload": {
+      "kind": "declaration_facts",
+      "types": [
+        {
+          "id": "type.1111111111111111111111111111111111111111111111111111111111111111",
+          "name": "sync", "type_kind": "module", "visibility": "package",
+          "is_abstract": false, "is_sealed": false, "has_explicit_type_terms": false,
+          "type_parameters": [], "type_parameter_constraints": [], "embedded_types": [],
+          "hierarchy": [], "aliases": ["sync"], "extension_surfaces": [],
+          "locator": { "kind": "artifact", "path": "src/sync/mutex.go", "symbol": "sync" }
+        },
+        {
+          "id": "type.2222222222222222222222222222222222222222222222222222222222222222",
+          "name": "sync.Mutex", "type_kind": "struct", "visibility": "public",
+          "is_abstract": false, "is_sealed": false, "has_explicit_type_terms": false,
+          "type_parameters": [], "type_parameter_constraints": [], "embedded_types": [],
+          "hierarchy": [], "aliases": [], "extension_surfaces": [],
+          "locator": { "kind": "artifact", "path": "src/sync/mutex.go", "symbol": "sync.Mutex" }
+        },
+        {
+          "id": "type.3333333333333333333333333333333333333333333333333333333333333333",
+          "name": "sync.RWMutex", "type_kind": "struct", "visibility": "public",
+          "is_abstract": false, "is_sealed": false, "has_explicit_type_terms": false,
+          "type_parameters": [], "type_parameter_constraints": [], "embedded_types": [],
+          "hierarchy": [], "aliases": [], "extension_surfaces": [],
+          "locator": { "kind": "artifact", "path": "src/sync/rwmutex.go", "symbol": "sync.RWMutex" }
+        }
+      ],
+      "members": [
+        {
+          "id": "member.1111111111111111111111111111111111111111111111111111111111111111",
+          "owner": "type.2222222222222222222222222222222222222222222222222222222222222222",
+          "name": "Lock", "member_kind": "method", "visibility": "public", "is_static": false,
+          "is_abstract": false, "is_virtual": false, "signature": { "type_parameters": [], "parameters": [] },
+          "receiver": { "pointer": true }, "aliases": [],
+          "locator": { "kind": "artifact", "path": "src/sync/mutex.go", "symbol": "sync.Mutex.Lock" }
+        },
+        {
+          "id": "member.2222222222222222222222222222222222222222222222222222222222222222",
+          "owner": "type.2222222222222222222222222222222222222222222222222222222222222222",
+          "name": "Unlock", "member_kind": "method", "visibility": "public", "is_static": false,
+          "is_abstract": false, "is_virtual": false, "signature": { "type_parameters": [], "parameters": [] },
+          "receiver": { "pointer": true }, "aliases": [],
+          "locator": { "kind": "artifact", "path": "src/sync/mutex.go", "symbol": "sync.Mutex.Unlock" }
+        },
+        {
+          "id": "member.3333333333333333333333333333333333333333333333333333333333333333",
+          "owner": "type.2222222222222222222222222222222222222222222222222222222222222222",
+          "name": "TryLock", "member_kind": "method", "visibility": "public", "is_static": false,
+          "is_abstract": false, "is_virtual": false, "signature": { "type_parameters": [], "parameters": [], "returns": { "kind": "named", "name": "bool", "arguments": [], "nullable": false } },
+          "receiver": { "pointer": true }, "aliases": [],
+          "locator": { "kind": "artifact", "path": "src/sync/mutex.go", "symbol": "sync.Mutex.TryLock" }
+        },
+        {
+          "id": "member.4444444444444444444444444444444444444444444444444444444444444444",
+          "owner": "type.3333333333333333333333333333333333333333333333333333333333333333",
+          "name": "Lock", "member_kind": "method", "visibility": "public", "is_static": false,
+          "is_abstract": false, "is_virtual": false, "signature": { "type_parameters": [], "parameters": [] },
+          "receiver": { "pointer": true }, "aliases": [],
+          "locator": { "kind": "artifact", "path": "src/sync/rwmutex.go", "symbol": "sync.RWMutex.Lock" }
+        },
+        {
+          "id": "member.5555555555555555555555555555555555555555555555555555555555555555",
+          "owner": "type.3333333333333333333333333333333333333333333333333333333333333333",
+          "name": "Unlock", "member_kind": "method", "visibility": "public", "is_static": false,
+          "is_abstract": false, "is_virtual": false, "signature": { "type_parameters": [], "parameters": [] },
+          "receiver": { "pointer": true }, "aliases": [],
+          "locator": { "kind": "artifact", "path": "src/sync/rwmutex.go", "symbol": "sync.RWMutex.Unlock" }
+        },
+        {
+          "id": "member.6666666666666666666666666666666666666666666666666666666666666666",
+          "owner": "type.3333333333333333333333333333333333333333333333333333333333333333",
+          "name": "RLock", "member_kind": "method", "visibility": "public", "is_static": false,
+          "is_abstract": false, "is_virtual": false, "signature": { "type_parameters": [], "parameters": [] },
+          "receiver": { "pointer": true }, "aliases": [],
+          "locator": { "kind": "artifact", "path": "src/sync/rwmutex.go", "symbol": "sync.RWMutex.RLock" }
+        },
+        {
+          "id": "member.7777777777777777777777777777777777777777777777777777777777777777",
+          "owner": "type.3333333333333333333333333333333333333333333333333333333333333333",
+          "name": "RUnlock", "member_kind": "method", "visibility": "public", "is_static": false,
+          "is_abstract": false, "is_virtual": false, "signature": { "type_parameters": [], "parameters": [] },
+          "receiver": { "pointer": true }, "aliases": [],
+          "locator": { "kind": "artifact", "path": "src/sync/rwmutex.go", "symbol": "sync.RWMutex.RUnlock" }
+        },
+        {
+          "id": "member.8888888888888888888888888888888888888888888888888888888888888888",
+          "owner": "type.3333333333333333333333333333333333333333333333333333333333333333",
+          "name": "TryLock", "member_kind": "method", "visibility": "public", "is_static": false,
+          "is_abstract": false, "is_virtual": false, "signature": { "type_parameters": [], "parameters": [], "returns": { "kind": "named", "name": "bool", "arguments": [], "nullable": false } },
+          "receiver": { "pointer": true }, "aliases": [],
+          "locator": { "kind": "artifact", "path": "src/sync/rwmutex.go", "symbol": "sync.RWMutex.TryLock" }
+        },
+        {
+          "id": "member.9999999999999999999999999999999999999999999999999999999999999999",
+          "owner": "type.3333333333333333333333333333333333333333333333333333333333333333",
+          "name": "TryRLock", "member_kind": "method", "visibility": "public", "is_static": false,
+          "is_abstract": false, "is_virtual": false, "signature": { "type_parameters": [], "parameters": [], "returns": { "kind": "named", "name": "bool", "arguments": [], "nullable": false } },
+          "receiver": { "pointer": true }, "aliases": [],
+          "locator": { "kind": "artifact", "path": "src/sync/rwmutex.go", "symbol": "sync.RWMutex.TryRLock" }
+        }
+      ],
+      "relations": []
+    }
+  }, {
+    "id": "behavior",
+    "activation": [{}],
+    "payload": {
+      "kind": "procedure_summaries",
+      "summaries": [
+        {
+          "id": "mu.lock", "target": { "path": "src/sync/mutex.go", "symbol": "sync.Mutex.Lock()", "has_receiver": true, "parameter_count": 0 },
+          "completeness": "complete", "ordinary_heap_unchanged": true, "transfers": [],
+          "concurrency_effects": [{ "kind": "lock_acquire", "lock": { "kind": "receiver" }, "mode": "exclusive" }]
+        },
+        {
+          "id": "mu.unlock", "target": { "path": "src/sync/mutex.go", "symbol": "sync.Mutex.Unlock()", "has_receiver": true, "parameter_count": 0 },
+          "completeness": "complete", "ordinary_heap_unchanged": true, "transfers": [],
+          "concurrency_effects": [{ "kind": "lock_release", "lock": { "kind": "receiver" }, "mode": "exclusive" }]
+        },
+        {
+          "id": "mu.try-lock", "target": { "path": "src/sync/mutex.go", "symbol": "sync.Mutex.TryLock()", "has_receiver": true, "parameter_count": 0 },
+          "completeness": "complete", "ordinary_heap_unchanged": true, "transfers": [],
+          "concurrency_effects": [{ "kind": "lock_acquire", "lock": { "kind": "receiver" }, "mode": "exclusive", "condition": "call_result_true" }]
+        },
+        {
+          "id": "rw.lock", "target": { "path": "src/sync/rwmutex.go", "symbol": "sync.RWMutex.Lock()", "has_receiver": true, "parameter_count": 0 },
+          "completeness": "complete", "ordinary_heap_unchanged": true, "transfers": [],
+          "concurrency_effects": [{ "kind": "lock_acquire", "lock": { "kind": "receiver" }, "mode": "exclusive" }]
+        },
+        {
+          "id": "rw.unlock", "target": { "path": "src/sync/rwmutex.go", "symbol": "sync.RWMutex.Unlock()", "has_receiver": true, "parameter_count": 0 },
+          "completeness": "complete", "ordinary_heap_unchanged": true, "transfers": [],
+          "concurrency_effects": [{ "kind": "lock_release", "lock": { "kind": "receiver" }, "mode": "exclusive" }]
+        },
+        {
+          "id": "rw.rlock", "target": { "path": "src/sync/rwmutex.go", "symbol": "sync.RWMutex.RLock()", "has_receiver": true, "parameter_count": 0 },
+          "completeness": "complete", "ordinary_heap_unchanged": true, "transfers": [],
+          "concurrency_effects": [{ "kind": "lock_acquire", "lock": { "kind": "receiver" }, "mode": "shared" }]
+        },
+        {
+          "id": "rw.runlock", "target": { "path": "src/sync/rwmutex.go", "symbol": "sync.RWMutex.RUnlock()", "has_receiver": true, "parameter_count": 0 },
+          "completeness": "complete", "ordinary_heap_unchanged": true, "transfers": [],
+          "concurrency_effects": [{ "kind": "lock_release", "lock": { "kind": "receiver" }, "mode": "shared" }]
+        },
+        {
+          "id": "rw.try-lock", "target": { "path": "src/sync/rwmutex.go", "symbol": "sync.RWMutex.TryLock()", "has_receiver": true, "parameter_count": 0 },
+          "completeness": "complete", "ordinary_heap_unchanged": true, "transfers": [],
+          "concurrency_effects": [{ "kind": "lock_acquire", "lock": { "kind": "receiver" }, "mode": "exclusive", "condition": "call_result_true" }]
+        },
+        {
+          "id": "rw.try-rlock", "target": { "path": "src/sync/rwmutex.go", "symbol": "sync.RWMutex.TryRLock()", "has_receiver": true, "parameter_count": 0 },
+          "completeness": "complete", "ordinary_heap_unchanged": true, "transfers": [],
+          "concurrency_effects": [{ "kind": "lock_acquire", "lock": { "kind": "receiver" }, "mode": "shared", "condition": "call_result_true" }]
+        }
+      ]
+    }
+  }]
+}"#;
+
+fn try_lock_guard_snapshot(
+    workspace: &WorkspaceAnalyzer,
+) -> std::sync::Arc<ActiveSemanticModelSnapshot> {
+    let pack = compile_source(
+        SourceFormat::Json,
+        TRY_LOCK_GUARD_PACK,
+        &CompilerOptions::default(),
+    )
+    .unwrap_or_else(|diagnostics| panic!("TryLock guard pack compiles: {diagnostics:#?}"));
+    let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default())
+        .expect("ephemeral semantic-pack catalog");
+    catalog
+        .register_session_pack(
+            &pack,
+            &SessionPackSource {
+                kind: SessionPackSourceKind::Embedded,
+                source_id: "test:go-trylock-guard".to_owned(),
+            },
+        )
+        .expect("register TryLock guard model pack");
+    let activation = acquire_active_semantic_models(
+        workspace.analyzer(),
+        &catalog,
+        None,
+        &SemanticModelActivationRequest {
+            bifrost_version: Version::parse(env!("CARGO_PKG_VERSION")).expect("crate version"),
+            evidence: vec![SemanticModelActivationEvidence {
+                language: "go".to_owned(),
+                ecosystem: "go".to_owned(),
+                package: None,
+                module: None,
+                toolchain: None,
+                target: None,
+                configuration: None,
+                artifact_sha256: None,
+            }],
+            controls: Vec::new(),
+            limits: SemanticModelRuntimeLimits::default(),
+        },
+        &CancellationToken::default(),
+    );
+    match activation {
+        SemanticModelRuntimeOutcome::Ready { snapshot, .. } => snapshot,
+        other => panic!("TryLock guard models activate: {other:#?}"),
+    }
+}
+
+#[test]
+fn go_concurrent_access_conflicts_bind_try_lock_results() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file(
+            "main.go",
+            r#"package main
+
+import "sync"
+
+func tryLockRoot() int {
+	mu := &sync.Mutex{}
+	guarded := 0
+	go func() {
+		mu.Lock()
+		guarded++
+		mu.Unlock()
+	}()
+	if mu.TryLock() {
+		guarded++
+		mu.Unlock()
+	}
+	return 0
+}
+
+func falseBranchRoot() int {
+	mu := &sync.Mutex{}
+	branched := 0
+	go func() {
+		mu.Lock()
+		branched++
+		mu.Unlock()
+	}()
+	if mu.TryLock() {
+		mu.Unlock()
+	} else {
+		branched++
+	}
+	return 0
+}
+
+func displacedRoot() int {
+	mu := &sync.Mutex{}
+	other := &sync.Mutex{}
+	displaced := 0
+	go func() {
+		mu.Lock()
+		displaced++
+		mu.Unlock()
+	}()
+	if other.TryLock() {
+		displaced++
+		other.Unlock()
+	}
+	return 0
+}
+
+func unestablishedRoot() int {
+	mu := &sync.Mutex{}
+	unestablished := 0
+	go func() {
+		mu.Lock()
+		unestablished++
+		mu.Unlock()
+	}()
+	locked := mu.TryLock()
+	unestablished++
+	if locked {
+		mu.Unlock()
+	}
+	return 0
+}
+
+func tryRLockRoot() int {
+	rw := &sync.RWMutex{}
+	rwwritten := 0
+	go func() {
+		rw.Lock()
+		rwwritten++
+		rw.Unlock()
+	}()
+	if rw.TryRLock() {
+		rwwritten++
+		rw.RUnlock()
+	}
+	return 0
+}
+
+type spinner struct{ n int }
+
+func (s *spinner) TryLock() bool {
+	s.n++
+	return s.n%2 == 0
+}
+
+func sameNameRoot() int {
+	sp := &sync.Mutex{}
+	spun := 0
+	go func() {
+		sp.Lock()
+		spun++
+		sp.Unlock()
+	}()
+	s := &spinner{}
+	if s.TryLock() {
+		spun++
+	}
+	return 0
+}
+"#,
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let snapshot = try_lock_guard_snapshot(&workspace);
+
+    let cancellation = CancellationToken::default();
+    let mut budget = SemanticBudget::default();
+    let artifact = workspace
+        .materialize_program_semantics(
+            &project.file("main.go"),
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("TryLock guard semantics materialize")
+        .available_value()
+        .cloned()
+        .expect("TryLock guard semantics are available");
+    let procedure = |name: &str| {
+        artifact
+            .procedures()
+            .iter()
+            .find(|candidate| {
+                candidate
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|segment| segment.name())
+                    == Some(name)
+            })
+            .and_then(|row| artifact.procedure_handle(row.id()))
+            .unwrap_or_else(|| panic!("missing {name}"))
+    };
+    let provider = super::super::concurrency::WorkspaceConcurrencyProvider::new(
+        &workspace,
+        Some(snapshot),
+        None,
+    );
+    let report = |name: &str| {
+        let mut budget = SemanticBudget::default();
+        brokk_bifrost_flow::concurrency::concurrent_access_conflicts(
+            &provider,
+            &procedure(name),
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .unwrap_or_else(|error| panic!("{name} report computes: {error}"))
+    };
+
+    // Positive: both conflicting accesses hold the receiver lock exclusively on
+    // the paths that reach them, so the guarded pair is compatible-lock
+    // protected and the model reports no open boundary.
+    let positive = report("tryLockRoot");
+    assert!(
+        !positive
+            .reasons
+            .iter()
+            .any(|reason| matches!(reason, brokk_bifrost_flow::concurrency::ConcurrencyOpenReason::UnsupportedSynchronization(protocol) if protocol.contains("TryLock")))
+    );
+    assert!(
+        positive.conflicts.iter().any(|conflict| {
+            conflict.proven
+                && conflict.exhaustive
+                && conflict.protection
+                    == brokk_bifrost_flow::concurrency::ConcurrentProtection::CompatibleLock
+        }),
+        "the TryLock success branch must protect the guarded accesses: {positive:#?}"
+    );
+
+    // Wrong branch: the false arm holds nothing, so the write inside it stays
+    // unprotected and the conflict stays a proven race.
+    let wrong_branch = report("falseBranchRoot");
+    assert!(
+        wrong_branch.conflicts.iter().any(|conflict| {
+            conflict.proven
+                && conflict.exhaustive
+                && conflict.ordering
+                    == brokk_bifrost_flow::concurrency::ConcurrentOrdering::Unordered
+                && conflict.protection
+                    == brokk_bifrost_flow::concurrency::ConcurrentProtection::Unprotected
+        }),
+        "the false-branch write must remain an unprotected proven race: {wrong_branch:#?}"
+    );
+    assert!(
+        !wrong_branch.conflicts.iter().any(|conflict| {
+            conflict.protection
+                == brokk_bifrost_flow::concurrency::ConcurrentProtection::CompatibleLock
+        }),
+        "no pair may claim receiver protection from the failed branch: {wrong_branch:#?}"
+    );
+
+    // Wrong object: a TryLock on one receiver cannot protect data guarded by
+    // another mutex.
+    let wrong_object = report("displacedRoot");
+    assert!(
+        wrong_object.conflicts.iter().any(|conflict| {
+            conflict.proven
+                && conflict.protection
+                    == brokk_bifrost_flow::concurrency::ConcurrentProtection::Unprotected
+        }),
+        "the distinct-receiver guard must not protect the shared write: {wrong_object:#?}"
+    );
+    assert!(
+        !wrong_object.conflicts.iter().any(|conflict| {
+            conflict.protection
+                == brokk_bifrost_flow::concurrency::ConcurrentProtection::CompatibleLock
+        }),
+        "no pair may claim protection across distinct receivers: {wrong_object:#?}"
+    );
+
+    // Incomplete: a result no structured guard tests establishes no lock on
+    // any path, and the typed boundary keeps the answer open.
+    let incomplete = report("unestablishedRoot");
+    assert!(
+        incomplete.reasons.iter().any(|reason| matches!(reason,
+            brokk_bifrost_flow::concurrency::ConcurrencyOpenReason::UnsupportedSynchronization(protocol)
+            if protocol.contains("try-acquire result is not established")),
+        ),
+        "the unbound try-acquire result must keep its typed boundary: {incomplete:#?}"
+    );
+    assert!(
+        incomplete.conflicts.iter().all(|conflict| {
+            conflict.protection
+                != brokk_bifrost_flow::concurrency::ConcurrentProtection::CompatibleLock
+        }),
+        "no pair may gain protection from an unestablished result: {incomplete:#?}"
+    );
+
+    // Reader mode: a proven TryRLock success protects against a blocking
+    // exclusive writer exactly like RLock does.
+    let reader = report("tryRLockRoot");
+    assert!(
+        reader.conflicts.iter().any(|conflict| {
+            conflict.proven
+                && conflict.protection
+                    == brokk_bifrost_flow::concurrency::ConcurrentProtection::CompatibleLock
+        }),
+        "the TryRLock success branch protects in shared mode: {reader:#?}"
+    );
+
+    // Same name, wrong type: an unrelated TryLock method never binds the
+    // reviewed sync.Mutex protocol.
+    let same_name = report("sameNameRoot");
+    assert!(
+        !same_name.conflicts.iter().any(|conflict| {
+            conflict.protection
+                == brokk_bifrost_flow::concurrency::ConcurrentProtection::CompatibleLock
+        }),
+        "an unrelated same-name method must not grant lock protection: {same_name:#?}"
+    );
+}
+
+#[test]
+fn go_projected_summaries_retain_try_lock_conditions() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file(
+            "main.go",
+            r#"package main
+
+import "sync"
+
+type guardedCell struct {
+	mu  sync.Mutex
+	sum int
+}
+
+func (c *guardedCell) tryLockSum() bool {
+	return c.mu.TryLock()
+}
+
+func (c *guardedCell) guardedWriter() {
+	if c.tryLockSum() {
+		c.sum++
+		c.mu.Unlock()
+	}
+}
+
+func (c *guardedCell) blockingWriter() {
+	c.mu.Lock()
+	c.sum++
+	c.mu.Unlock()
+}
+
+func wrappedRoot(cell *guardedCell) {
+	go cell.guardedWriter()
+	cell.blockingWriter()
+}
+"#,
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let snapshot = try_lock_guard_snapshot(&workspace);
+
+    let cancellation = CancellationToken::default();
+    let mut budget = SemanticBudget::default();
+    let artifact = workspace
+        .materialize_program_semantics(
+            &project.file("main.go"),
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("wrapper semantics materialize")
+        .available_value()
+        .cloned()
+        .expect("wrapper semantics are available");
+    let procedure = |name: &str| {
+        artifact
+            .procedures()
+            .iter()
+            .find(|candidate| {
+                candidate
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|segment| segment.name())
+                    == Some(name)
+            })
+            .and_then(|row| artifact.procedure_handle(row.id()))
+            .unwrap_or_else(|| panic!("missing {name}"))
+    };
+    let try_lock_sum = procedure("tryLockSum");
+    let wrapped_root = procedure("wrappedRoot");
+
+    // Project production summaries for the wrapper closure and prove that the
+    // projected try-acquire keeps its call-result-true acquisition.
+    let icfg =
+        crate::analyzer::semantic::WorkspaceIcfgProvider::with_active_semantic_model_snapshot(
+            &workspace,
+            Some(snapshot.clone()),
+        );
+    let projection_provider = super::super::concurrency::WorkspaceConcurrencyProvider::new(
+        &workspace,
+        Some(snapshot.clone()),
+        None,
+    );
+    let roots = [
+        wrapped_root.clone(),
+        procedure("guardedWriter"),
+        procedure("blockingWriter"),
+        try_lock_sum.clone(),
+    ];
+    let mut projection_budget = SemanticBudget::default();
+    let summaries =
+        brokk_bifrost_flow::typestate::project_production_semantic_summaries_with_concurrency(
+            &roots,
+            &icfg,
+            &projection_provider,
+            &mut SemanticRequest::new(&mut projection_budget, &cancellation),
+        )
+        .expect("wrapper summaries project");
+    let summary = summaries
+        .summary_for(&try_lock_sum)
+        .expect("the wrapper has a production summary");
+    assert!(
+        summary.effects().iter().any(|effect| matches!(
+            effect.key(),
+            brokk_bifrost_flow::dataflow::SummaryEffectKey::Concurrency(effect)
+                if matches!(
+                    effect.kind(),
+                    brokk_bifrost_flow::dataflow::SummaryConcurrencyEffectKind::Lock {
+                        acquisition: brokk_bifrost_flow::dataflow::SummaryLockAcquisition::CallResultTrue,
+                        ..
+                    }
+                )
+        )),
+        "the wrapper summary must carry the call-result-true acquisition: {summary:#?}"
+    );
+
+    // Direct expansion cannot see the caller's guard from inside the wrapper,
+    // so the unbound result keeps its typed boundary and grants no protection.
+    let direct_provider = super::super::concurrency::WorkspaceConcurrencyProvider::new(
+        &workspace,
+        Some(snapshot.clone()),
+        None,
+    );
+    let mut direct_budget = SemanticBudget::default();
+    let direct = brokk_bifrost_flow::concurrency::concurrent_access_conflicts(
+        &direct_provider,
+        &wrapped_root,
+        &mut SemanticRequest::new(&mut direct_budget, &cancellation),
+    )
+    .expect("direct wrapper report computes");
+    assert!(
+        !direct.conflicts.iter().any(|conflict| {
+            conflict.protection
+                == brokk_bifrost_flow::concurrency::ConcurrentProtection::CompatibleLock
+        }),
+        "direct expansion must not grant protection across the wrapper: {direct:#?}"
+    );
+
+    // The projected summary retains the condition, but applying a callee's
+    // conditional acquisition inside the caller's guard context is the
+    // remaining exact-wrapper-protection work: the solve must keep the typed
+    // boundary open in both modes and must not grant protection.
+    let projected_provider = super::super::concurrency::WorkspaceConcurrencyProvider::new(
+        &workspace,
+        Some(snapshot.clone()),
+        Some(summaries),
+    );
+    let mut projected_budget = SemanticBudget::default();
+    let projected = brokk_bifrost_flow::concurrency::concurrent_access_conflicts(
+        &projected_provider,
+        &wrapped_root,
+        &mut SemanticRequest::new(&mut projected_budget, &cancellation),
+    )
+    .expect("projected wrapper report computes");
+    for report in [(&direct, "direct"), (&projected, "projected")] {
+        let (report, mode) = report;
+        assert!(
+            report.reasons.iter().any(|reason| matches!(reason,
+                brokk_bifrost_flow::concurrency::ConcurrencyOpenReason::UnsupportedSynchronization(protocol)
+                if protocol.as_ref() == "try-acquire result is returned untested; its guard lives in a caller")),
+            "the {mode} run must name the wrapper boundary: {report:#?}"
+        );
+        assert!(
+            !report.conflicts.iter().any(|conflict| {
+                conflict.protection
+                    == brokk_bifrost_flow::concurrency::ConcurrentProtection::CompatibleLock
+            }),
+            "the {mode} run must not grant protection across the wrapper: {report:#?}"
         );
     }
 }

@@ -301,6 +301,16 @@ fn cache_hints_2026_07_28_session_emits_schema_valid_wire() {
     assert_eq!(resource["result"]["ttlMs"], 3_600_000, "{resource}");
     assert_eq!(resource["result"]["cacheScope"], "public", "{resource}");
 
+    for (id, method) in [(5, "prompts/list"), (6, "resources/templates/list")] {
+        let unsupported = session.round_trip(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": { "_meta": stateless_meta() }
+        }));
+        assert_eq!(unsupported["error"]["code"], -32601, "{unsupported}");
+    }
+
     session.finish();
 }
 

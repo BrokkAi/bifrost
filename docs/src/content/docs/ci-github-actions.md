@@ -45,6 +45,46 @@ The gate distinguishes three results:
 - `1` - findings at or above the `fail-on` threshold. The job fails and the findings appear as code-scanning alerts.
 - `2` - unreliable. The run could not prove its own completeness, for example after a budget or capability limit. The job fails with a distinct message. Do not treat an unreliable run as clean, and do not lower `fail-on` to hide it. Read the report diagnostics instead.
 
+## Scan error diagnostics
+
+CLI-generated SARIF records the policy status in
+`runs[].invocations[].exitCode`, with an `exitCodeDescription`. Status `1`
+means the finding gate fired; it does not by itself mean the analyzer failed.
+Unreliable analysis keeps `executionSuccessful: false`, including when an
+explicit policy setting changes how an unknown verdict gates CI.
+
+Detailed diagnostic identifiers live in
+`runs[].invocations[].toolExecutionNotifications[].descriptor.id`. Use these
+stable identifiers for automation; message wording can change. Report-level
+identifiers match the canonical JSON diagnostic `code`:
+
+| Identifier | Meaning and next step |
+| --- | --- |
+| `policy-load-failed` | A policy could not be read. Check the path and permissions in the diagnostic. |
+| `policy-parse-failed` / `policy-validation-failed` | Fix the policy syntax or invalid declaration at the reported source range. |
+| `diff-base-unreliable` | The base revision could not establish a reliable comparison. Inspect its policy completion reasons; full gating applies. |
+| `pack-activation-failed` | Inspect the named pack and its activation diagnostic. |
+| `workspace-snapshot-deadline-exceeded` | Workspace preparation exceeded its deadline. Inspect the workspace and preparation budget. |
+| `BIFROST_POLICY_INCONCLUSIVE` | Inspect `bifrost.completion` for the typed reasons the evaluation could not finish reliably. |
+| `BIFROST_POLICY_UNSUPPORTED` | The policy requires unavailable analysis support. Inspect the completion reason. |
+| `BIFROST_POLICY_FAILED` | Evaluation failed. Inspect the retained completion diagnostic. |
+| `BIFROST_REPORT_DIAGNOSTICS_TRUNCATED` | Some diagnostics did not fit in the report. Inspect the omission count and reporting limits. |
+
+Notifications also retain policy identity, completion reasons, and diagnostic
+source details in `properties`. A notification can be advisory: its identifier
+alone is not a failure verdict. An empty findings list under incomplete
+coverage does not establish that the code is clean.
+
+To inspect a downloaded report:
+
+```bash
+jq '.runs[].invocations[] | {exitCode, exitCodeDescription, executionSuccessful, toolExecutionNotifications}' bifrost-policy.sarif
+```
+
+The report-only library renderer omits process status because a report alone
+does not contain the CLI threshold decision. Library callers with a
+`PolicyBatchOutcome` can use `write_policy_sarif_for_outcome` to include it.
+
 ## Inputs
 
 | Input | Default | Meaning |

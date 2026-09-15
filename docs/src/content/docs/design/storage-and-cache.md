@@ -213,6 +213,9 @@ no committed revision represents. Retained revision roots are read inside the
 deletion transaction so revisions published during the repository walk remain
 protected. Collection is best effort and throttled. Failure to reclaim space
 must preserve every live fact set and leave incomplete candidates unpublished.
+A collection a workspace build has scheduled belongs to that workspace: it
+runs to completion, and closing the workspace waits for it, so no maintenance
+write follows a close and a short-lived session still advances the cadence.
 
 ## Current decisions and trade-offs
 

@@ -2,12 +2,12 @@
 // @modelcontextprotocol/conformance dist bundle, and check the extraction
 // against the files committed in schemas/.
 //
-// The 2026-07-28 revision was still the spec repository's moving `draft/`
-// directory when the pinned conformance version was published, so the only
-// stable definition of "the official schema the gate judges against" is the
-// snapshot the pinned runner itself validates with. Extracting from that exact
-// artifact keeps the Rust wire-schema gate and the official runner in agreement
-// and gives one thing to bump.
+// The pinned runner supplies the base schemas. The published 2026-07-28 schema
+// then receives the one correction made after the runner's final prerelease:
+// modelcontextprotocol/modelcontextprotocol@271ecc9accaf added the missing
+// subscriptions/listen response envelope and aligned its metadata type name.
+// Keeping that small correction explicit lets the Rust gate judge the current
+// stable schema without downloading moving input in CI.
 //
 // Usage:
 //   node extract-schemas.mjs            compare schemas/ with a fresh
@@ -215,6 +215,38 @@ function parseDataLiteral(source, start) {
   return object();
 }
 
+function applyPublishedSchemaCorrections(revision, schema) {
+  if (revision !== '2026-07-28') return schema;
+  const defs = schema.$defs ?? schema.definitions;
+  if (!defs) throw new Error('2026-07-28 schema has no definitions map');
+
+  if (defs.SubscriptionsListenResultMeta && !defs.SubscriptionsListenResultMetaObject) {
+    defs.SubscriptionsListenResultMetaObject = defs.SubscriptionsListenResultMeta;
+    delete defs.SubscriptionsListenResultMeta;
+  }
+  const metaRef = defs.SubscriptionsListenResult?.properties?._meta?.$ref;
+  if (metaRef === '#/$defs/SubscriptionsListenResultMeta') {
+    defs.SubscriptionsListenResult.properties._meta.$ref =
+      '#/$defs/SubscriptionsListenResultMetaObject';
+  }
+  if (!defs.SubscriptionsListenResultMetaObject) {
+    throw new Error('2026-07-28 schema lacks SubscriptionsListenResultMetaObject');
+  }
+
+  defs.SubscriptionsListenResultResponse ??= {
+    description:
+      'A successful response from the server for a {@link SubscriptionsListenRequestsubscriptions/listen}\nrequest, sent when the server tears the subscription down gracefully.',
+    properties: {
+      id: { $ref: '#/$defs/RequestId' },
+      jsonrpc: { const: '2.0', type: 'string' },
+      result: { $ref: '#/$defs/SubscriptionsListenResult' },
+    },
+    required: ['id', 'jsonrpc', 'result'],
+    type: 'object',
+  };
+  return schema;
+}
+
 // Returns a Map of revision -> file text (pretty-printed JSON with a trailing
 // newline), in the order the bundle's version map declares them.
 export function extractSchemas(bundlePath = DEFAULT_BUNDLE) {
@@ -239,7 +271,8 @@ export function extractSchemas(bundlePath = DEFAULT_BUNDLE) {
 
   const out = new Map();
   for (const [revision, variable] of variables) {
-    const schema = extractObjectLiteral(source, variable);
+    const extracted = extractObjectLiteral(source, variable);
+    const schema = extracted && applyPublishedSchemaCorrections(revision, extracted);
     if (!schema) {
       throw new Error(`extraction failed for ${revision} (bundle variable ${variable})`);
     }
@@ -301,12 +334,12 @@ function main() {
   }
   const problems = compareSchemas();
   if (problems.length > 0) {
-    console.error('schema drift against the pinned conformance bundle:');
+    console.error('schema drift against the pinned conformance sources and published corrections:');
     for (const p of problems) console.error(`  ${p}`);
     console.error('run `node extract-schemas.mjs --write` if the pin bump is deliberate');
     return 1;
   }
-  console.log('schemas match the pinned conformance bundle');
+  console.log('schemas match the pinned conformance sources and published corrections');
   return 0;
 }
 

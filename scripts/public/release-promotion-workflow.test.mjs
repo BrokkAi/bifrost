@@ -304,6 +304,7 @@ readinessTest("semantic-pack source caches are keyed to exact published checksum
       "utf8",
     );
     const cacheSteps = stepBlocks(job).filter((step) =>
+      /uses: actions\/cache@[0-9a-f]{40}/u.test(step) &&
       step.includes("semantic-pack-source-cache"),
     );
     assert.equal(cacheSteps.length, 1, `${jobName} must have one source-input cache step`);
@@ -538,6 +539,8 @@ test("publishers preserve their platform, environment, and OIDC protections", ()
   assert.match(publishNpm, /--manifest-sha256/u);
   assert.match(publishNpm, /actions\/download-artifact@[0-9a-f]{40}/u);
   assert.match(publishNpm, /--dist "\$RUNNER_TEMP\/npm-qualified"/u);
+  assert.match(publishNpm, /brokkai-dsh-plugin-bifrost-/u);
+  assert.match(publishNpm, /test "\$\{#files\[@\]\}" -eq 8/u);
   assert.doesNotMatch(publishNpm, /^\s*npm\s+pack\b/mu);
 });
 

@@ -11,16 +11,18 @@ use super::{
     map_io_error, map_json_error,
 };
 use crate::display_path::{TaintDisplayPath, TaintDisplayStep, TaintDisplayStepKind};
+use crate::is_false;
 use crate::{
     FindingCertainty, FindingCompleteness, FindingDiffDisposition, FindingIdentityStability,
-    FindingSeverity, OrganizationalRiskAssessment, PolicyAnalysisType, PolicyBaselineReview,
+    FindingSeverity, OrganizationalRiskAssessment, POLICY_EXIT_CLEAN, POLICY_EXIT_FINDING,
+    POLICY_EXIT_UNRELIABLE, PolicyAnalysisType, PolicyBaselineReview, PolicyBatchOutcome,
     PolicyDiagnostic, PolicyDiagnosticSeverity, PolicyDiffReview, PolicyDisplayRegion,
     PolicyEvaluationDate, PolicyFinding, PolicyFindingBaseline, PolicyFindingEvidence,
     PolicyFindingSuppression, PolicyLevel, PolicyObligationKind, PolicyPackActivationReview,
-    PolicyReportDiagnostic, PolicyReportDocument, PolicyReportEvaluationContext,
-    PolicyRuleDescriptor, PolicyRun, PolicyRunCompletion, PolicySemanticHash, PolicySeveritySpec,
-    PolicySourceLocation, PolicySuppressionPolicyHashState, PolicySuppressionReview,
-    PolicyWorkReport, ProofMetadata, RelatedPolicyLocation,
+    PolicyReportDiagnostic, PolicyReportDiagnosticCode, PolicyReportDocument,
+    PolicyReportEvaluationContext, PolicyRuleDescriptor, PolicyRun, PolicyRunCompletion,
+    PolicySemanticHash, PolicySeveritySpec, PolicySourceLocation, PolicySuppressionPolicyHashState,
+    PolicySuppressionReview, PolicyWorkReport, ProofMetadata, RelatedPolicyLocation,
 };
 
 const SARIF_SCHEMA_URI: &str =
@@ -104,15 +106,44 @@ impl Default for SarifToolIdentity {
 }
 
 /// Serialize one canonical policy report as a single bounded SARIF run.
+///
+/// A report alone has no resolved gate status, so invocation exit fields are
+/// omitted. Use [`write_policy_sarif_for_outcome`] when a batch outcome is available.
 pub fn write_policy_sarif<W: Write>(
     report: &PolicyReportDocument,
     tool: &SarifToolIdentity,
     output: W,
     max_serialized_bytes: usize,
 ) -> Result<u64, PolicyRenderError> {
+    write_policy_sarif_internal(report, tool, output, max_serialized_bytes, None)
+}
+
+/// Serialize one canonical policy report and its resolved batch status as a
+/// single bounded SARIF run.
+pub fn write_policy_sarif_for_outcome<W: Write>(
+    outcome: &PolicyBatchOutcome,
+    tool: &SarifToolIdentity,
+    output: W,
+) -> Result<u64, PolicyRenderError> {
+    write_policy_sarif_internal(
+        outcome.report(),
+        tool,
+        output,
+        outcome.max_serialized_report_bytes(),
+        Some(outcome.exit_status()),
+    )
+}
+
+fn write_policy_sarif_internal<W: Write>(
+    report: &PolicyReportDocument,
+    tool: &SarifToolIdentity,
+    output: W,
+    max_serialized_bytes: usize,
+    exit_status: Option<u8>,
+) -> Result<u64, PolicyRenderError> {
     ensure_supported_schema(report)?;
     tool.validate()?;
-    let log = SarifLog::try_from_report(report, tool)?;
+    let log = SarifLog::try_from_report(report, tool, exit_status)?;
     let mut output = BoundedWriter::new(output, max_serialized_bytes);
     let serialized = {
         let mut serializer =
@@ -143,11 +174,12 @@ impl<'a> SarifLog<'a> {
     fn try_from_report(
         report: &'a PolicyReportDocument,
         tool: &'a SarifToolIdentity,
+        exit_status: Option<u8>,
     ) -> Result<Self, PolicyRenderError> {
         Ok(Self {
             schema: SARIF_SCHEMA_URI,
             version: SARIF_VERSION,
-            runs: [SarifRun::try_from_report(report, tool)?],
+            runs: [SarifRun::try_from_report(report, tool, exit_status)?],
         })
     }
 }
@@ -166,6 +198,7 @@ impl<'a> SarifRun<'a> {
     fn try_from_report(
         report: &'a PolicyReportDocument,
         tool: &'a SarifToolIdentity,
+        exit_status: Option<u8>,
     ) -> Result<Self, PolicyRenderError> {
         // Validate every join before the serializer can touch the destination,
         // but retain only borrowed views. Sequence serializers below visit the
@@ -195,7 +228,7 @@ impl<'a> SarifRun<'a> {
             },
             column_kind: "unicodeCodePoints",
             results: SarifResults { report },
-            invocations: [SarifInvocation::from_report(report)],
+            invocations: [SarifInvocation::from_report(report, exit_status)],
             properties: SarifRunProperties::from_report(report),
         })
     }
@@ -819,27 +852,36 @@ struct SarifDisplayStepProperties {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SarifInvocation<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exit_code: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exit_code_description: Option<&'static str>,
     execution_successful: bool,
     tool_execution_notifications: SarifNotifications<'a>,
 }
 
 impl<'a> SarifInvocation<'a> {
-    fn from_report(report: &'a PolicyReportDocument) -> Self {
-        // The same rule the exit status uses: an error report diagnostic means
-        // the run cannot be trusted, an advisory one states a fact the reader
-        // needs. Both are still published as notifications; only the verdict
-        // differs, so `executionSuccessful` and the process exit code agree.
-        let execution_successful = report
+    fn from_report(report: &'a PolicyReportDocument, exit_status: Option<u8>) -> Self {
+        // An error report diagnostic means the run cannot be trusted, while an
+        // advisory one states a fact the reader needs. Completion and execution
+        // termination are independent reliability signals; an outcome's status
+        // additionally records the resolved threshold/unreliable decision.
+        let report_execution_successful = report
             .diagnostics()
             .iter()
             .all(|diagnostic| diagnostic.severity() != PolicyDiagnosticSeverity::Error)
             && !report.diagnostics_truncated()
+            && report.execution().termination().is_none()
             && report
                 .runs()
                 .iter()
                 .all(|run| run.completion().is_reliable());
+        let execution_successful =
+            report_execution_successful && exit_status != Some(POLICY_EXIT_UNRELIABLE);
 
         Self {
+            exit_code: exit_status,
+            exit_code_description: exit_status.map(policy_exit_description),
             execution_successful,
             tool_execution_notifications: SarifNotifications(report),
         }
@@ -893,7 +935,7 @@ impl<'a> SarifNotification<'a> {
     fn report_diagnostic(diagnostic: &'a PolicyReportDiagnostic) -> Self {
         Self {
             descriptor: SarifDescriptorReference {
-                id: "BIFROST_REPORT_DIAGNOSTIC",
+                id: SarifDescriptorId::Report(diagnostic.code()),
             },
             message: SarifMessage {
                 text: diagnostic.message(),
@@ -915,7 +957,7 @@ impl<'a> SarifNotification<'a> {
     fn truncated_report_diagnostics(report: &'a PolicyReportDocument) -> Self {
         Self {
             descriptor: SarifDescriptorReference {
-                id: "BIFROST_REPORT_DIAGNOSTICS_TRUNCATED",
+                id: SarifDescriptorId::Static("BIFROST_REPORT_DIAGNOSTICS_TRUNCATED"),
             },
             message: SarifMessage {
                 text: "Bifrost report diagnostics were truncated",
@@ -967,7 +1009,9 @@ impl<'a> SarifNotification<'a> {
             ),
         };
         Some(Self {
-            descriptor: SarifDescriptorReference { id: descriptor_id },
+            descriptor: SarifDescriptorReference {
+                id: SarifDescriptorId::Static(descriptor_id),
+            },
             message: SarifMessage { text },
             level,
             properties: SarifNotificationProperties {
@@ -986,7 +1030,14 @@ impl<'a> SarifNotification<'a> {
 
 #[derive(Serialize)]
 struct SarifDescriptorReference {
-    id: &'static str,
+    id: SarifDescriptorId,
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum SarifDescriptorId {
+    Static(&'static str),
+    Report(PolicyReportDiagnosticCode),
 }
 
 #[derive(Serialize)]
@@ -1203,6 +1254,17 @@ fn notification_level(severity: PolicyDiagnosticSeverity) -> SarifNotificationLe
     }
 }
 
+fn policy_exit_description(status: u8) -> &'static str {
+    match status {
+        POLICY_EXIT_CLEAN => "Policy gate passed: no gated findings",
+        POLICY_EXIT_FINDING => {
+            "Policy gate failed: findings or policy obligations met the failure threshold"
+        }
+        POLICY_EXIT_UNRELIABLE => "Policy analysis was incomplete or invalid and is unreliable",
+        _ => unreachable!("unknown policy exit status: {status}"),
+    }
+}
+
 fn relationship_label(related: &RelatedPolicyLocation) -> &'static str {
     use crate::PolicyLocationRelationship;
 
@@ -1297,10 +1359,6 @@ const fn slice_is_empty<T>(value: &[T]) -> bool {
     value.is_empty()
 }
 
-const fn is_false(value: &bool) -> bool {
-    !*value
-}
-
 const fn is_zero(value: &u64) -> bool {
     *value == 0
 }
@@ -1330,6 +1388,85 @@ mod tests {
         assert_eq!(tool.version(), Some(env!("CARGO_PKG_VERSION")));
         assert_eq!(tool.information_uri(), Some(env!("CARGO_PKG_HOMEPAGE")));
         tool.validate().unwrap();
+    }
+
+    #[test]
+    fn invocation_preserves_exit_status_without_promoting_incomplete_analysis() {
+        let mut report =
+            PolicyReportDocument::try_new(Vec::new(), Vec::new(), Vec::new(), false, 0, None)
+                .unwrap();
+        for status in [
+            POLICY_EXIT_CLEAN,
+            POLICY_EXIT_FINDING,
+            POLICY_EXIT_UNRELIABLE,
+        ] {
+            let value =
+                serde_json::to_value(SarifInvocation::from_report(&report, Some(status))).unwrap();
+            assert_eq!(value["exitCode"], status);
+            assert_eq!(
+                value["executionSuccessful"],
+                status != POLICY_EXIT_UNRELIABLE
+            );
+        }
+        report.replace_execution(
+            crate::PolicyExecutionMetadata::try_new(
+                1,
+                Vec::new(),
+                Some(crate::PolicyExecutionTermination::DeadlineExceeded),
+                Some(crate::PolicyExecutionStage::WorkspaceSnapshot),
+                None,
+                Vec::new(),
+                Vec::new(),
+            )
+            .unwrap(),
+        );
+        for status in [
+            None,
+            Some(POLICY_EXIT_CLEAN),
+            Some(POLICY_EXIT_FINDING),
+            Some(POLICY_EXIT_UNRELIABLE),
+        ] {
+            let value =
+                serde_json::to_value(SarifInvocation::from_report(&report, status)).unwrap();
+            assert_eq!(value["executionSuccessful"], false);
+            if let Some(status) = status {
+                assert_eq!(value["exitCode"], status);
+            } else {
+                assert!(value.get("exitCode").is_none());
+                assert!(value.get("exitCodeDescription").is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn report_diagnostic_notifications_use_their_typed_stable_descriptor_ids() {
+        for (code, expected_id) in [
+            (
+                PolicyReportDiagnosticCode::PolicyParseFailed,
+                "policy-parse-failed",
+            ),
+            (
+                PolicyReportDiagnosticCode::PolicyLoadFailed,
+                "policy-load-failed",
+            ),
+        ] {
+            let diagnostic = PolicyReportDiagnostic::try_new(
+                code,
+                PolicyDiagnosticSeverity::Error,
+                "diagnostic",
+                None,
+                None,
+                Vec::new(),
+            )
+            .expect("valid report diagnostic");
+            let value = serde_json::to_value(SarifNotification::report_diagnostic(&diagnostic))
+                .expect("serialize report diagnostic notification");
+            assert_eq!(value["descriptor"]["id"], expected_id, "{value}");
+            assert_eq!(
+                value["properties"]["bifrost.reportDiagnostic"]["code"], expected_id,
+                "{value}"
+            );
+        }
     }
 
     #[test]

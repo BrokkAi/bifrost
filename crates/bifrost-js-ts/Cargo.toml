@@ -16,7 +16,7 @@ publish = true
 name = "brokk_bifrost_js_ts"
 
 [dependencies]
-brokk-bifrost-core = { path = "../bifrost-core", version = "=0.11.3" }
+brokk-bifrost-core = { path = "../bifrost-core", version = "=0.11.4" }
 # `scan_files_for_seeds` and the usage-index builder walk the workspace file set
 # in parallel; these are the seam's only two rayon sites and both moved here.
 rayon = "1.10.0"
@@ -26,16 +26,17 @@ regex = "1.12.2"
 # strips and then parses for its `paths` map.
 serde_json = "1.0.145"
 tree-sitter = "0.25.10"
-tree-sitter-javascript = "0.25.0"
+tree-sitter-javascript = { package = "brokk-tree-sitter-javascript", version = "=0.25.1" }
 # tree-sitter-typescript is a grammar generation behind the fleet's 0.25 line,
 # in the same class as tree-sitter-c-sharp 0.23.1, tree-sitter-cpp 0.23.4 and
 # tree-sitter-ruby 0.23.1. It is versioned independently of
 # tree-sitter-javascript even though one module drives both dialects, and it is
 # the only fleet grammar exporting a second parser constant (`LANGUAGE_TSX`),
 # which is why `ParserFlavor` exists on the analysis side. `LANGUAGE_TSX` also
-# reads `.jsx`: tree-sitter-javascript cannot parse a reserved word as a JSX
-# attribute name, so this crate is a hard dependency of JavaScript support and
-# not only of TypeScript's (#3322).
+# continues to read `.jsx` under its established dialect/storage identity.
+# Standard `.js` uses Brokk's JavaScript grammar, whose 0.25.1 repair accepts
+# reserved words in JSX name positions without TSX's ordinary-JS drift
+# (#3322, #3342).
 tree-sitter-typescript = "0.23.2"
 
 [features]
@@ -47,7 +48,7 @@ default = []
 test-support = ["brokk-bifrost-core/test-support"]
 
 [dev-dependencies]
-brokk-bifrost-core = { path = "../bifrost-core", version = "=0.11.3", features = ["test-support"] }
+brokk-bifrost-core = { path = "../bifrost-core", version = "=0.11.4", features = ["test-support"] }
 tempfile = "3.23.0"
 
 [lints]

@@ -66,7 +66,7 @@
     },
     {
       "name": "variable.parameter.role.bifrost-rql",
-      "match": ":(?:args|arity|attributes|boolean[-_]value|callee|capture|children|class(?:es)?|columns|completen(?:ess|esses)|config[-_]gated|consumers?|declaration[-_]only|decorators|depth|domains?|element[-_]name|elements|fact[-_](?:ordinal|ordinals)|field|formats?|formal[-_](?:index|name)|forms?|has|global|identity|index|inputs?|iterable|keys?|kwargs|left|boundar(?:y|ies)|hoisting|include[-_]shadowed|min[-_]segments|node[-_](?:kind|kinds)|scalar[-_](?:kind|kinds)|origins?|resolved|resolves[-_]to|routes?|max-(?:bytes|steps)|max|min|member[-_]target[-_]id|module|name(?:/regex)?|namespaces?|outcomes?|not[-_]has|not[-_]kind|object|parameter-(?:index|name|type(?:/regex)?)|plan-ref|proof|property|property[-_]name|provenances?|protocol-ref|receiver(?:[-_](?:identity[-_]id|type))?|reference-kinds|relation(?:s)?|right|roles?|runtime|site[-_]class|source[-_]origin|subjects?|tag|value|certaint(?:y|ies)|surface|tiers?|taint[-_]ref|text/regex|transitive|usage|visibility|where)(?=$|[\\s()\\[\\]])"
+      "match": ":(?:args|arity|attributes|boolean[-_]value|callee|capture|children|class(?:es)?|columns|completen(?:ess|esses)|config[-_]gated|consumers?|declaration[-_]only|decorators|depth|domains?|element[-_]name|elements|fact[-_](?:ordinal|ordinals)|field|formats?|formal[-_](?:index|name)|forms?|has|global|identity|index(?:[-_](?:min|max))?|inputs?|iterable|key[-_]kind|keys?|kwargs|left|boundar(?:y|ies)|hoisting|include[-_]shadowed|min[-_]segments|node[-_](?:kind|kinds)|scalar[-_](?:kind|kinds)|origins?|resolved|resolves[-_]to|routes?|max-(?:bytes|steps)|max|min|member[-_]target[-_]id|module|name(?:/regex)?|namespaces?|outcomes?|not[-_]has|not[-_]kind|object|parameter-(?:index|name|type(?:/regex)?)|plan-ref|proof|property|property[-_]name|provenances?|protocol-ref|receiver(?:[-_](?:identity[-_]id|type))?|reference-kinds|relation(?:s)?|right|roles?|runtime|site[-_]class|source[-_]origin|subjects?|tag|value|certaint(?:y|ies)|surface|tiers?|taint[-_]ref|text/regex|transitive|usage|visibility|where)(?=$|[\\s()\\[\\]])"
     },
     {
       "name": "support.function.wrapper.bifrost-rql",
@@ -107,6 +107,10 @@
     {
       "name": "constant.language.configuration-completeness.bifrost-rql",
       "match": "(?<![A-Za-z0-9_-])(?:complete|incomplete)(?=[\\s)\\]])"
+    },
+    {
+      "name": "constant.language.runtime-key-kind.bifrost-rql",
+      "match": "(?<![A-Za-z0-9_-])(?:static[-_]property|static[-_]index)(?=[\\s)\\]])"
     },
     {
       "name": "constant.language.boolean.bifrost-rql",

@@ -44,6 +44,12 @@ mod unit_execution;
 mod units;
 mod witness_projection;
 
+/// Whether a serialized boolean is at its default, for the `skip_serializing_if`
+/// of every optional flag in this crate's report model.
+const fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[cfg(test)]
 mod adapter_seam_tests;
 #[cfg(test)]

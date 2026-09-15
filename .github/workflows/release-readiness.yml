@@ -263,8 +263,6 @@ jobs:
     timeout-minutes: 60
     permissions:
       contents: read
-    env:
-      SEMANTIC_PACK_SOURCE_CACHE: ${{ runner.temp }}/semantic-pack-source-cache/jvm
     steps:
       - name: Checkout qualified source
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
@@ -289,6 +287,8 @@ jobs:
           path: ${{ runner.temp }}/semantic-pack-source-cache/jvm
           key: semantic-pack-source-jvm-${{ runner.os }}-kotlin-27b9b8672ef33ae9c345b3e57d39b705560e7eca9ca2bf6485f323f612276c26-scala-c02edc324e7db59c52115214a6ef36e2d78d0a50dff635eda4dcee5502b1dea5-jdk-59422c2292ae4e76b87e00d8808dbe49cffa39af731e08bb0292ddb0af4e0261
       - name: Generate JVM partial bundle
+        env:
+          SEMANTIC_PACK_SOURCE_CACHE: ${{ runner.temp }}/semantic-pack-source-cache/jvm
         run: bash scripts/public/build-pinned-jvm-semantic-packs.sh "${RUNNER_TEMP}/bifrost-semantic-packs-jvm" "${RUNNER_TEMP}"
       - name: Verify JVM partial bundle
         run: >-
@@ -309,8 +309,6 @@ jobs:
     timeout-minutes: 60
     permissions:
       contents: read
-    env:
-      SEMANTIC_PACK_SOURCE_CACHE: ${{ runner.temp }}/semantic-pack-source-cache/python
     steps:
       - name: Checkout qualified source
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
@@ -335,6 +333,8 @@ jobs:
           path: ${{ runner.temp }}/semantic-pack-source-cache/python
           key: semantic-pack-source-python-${{ runner.os }}-typeshed-e4faf1d0ebbbc22a4932f56af7c3067f21334cd88146bd23deec41d529220626
       - name: Generate Python partial bundle
+        env:
+          SEMANTIC_PACK_SOURCE_CACHE: ${{ runner.temp }}/semantic-pack-source-cache/python
         run: bash scripts/public/build-pinned-python-semantic-packs.sh "${RUNNER_TEMP}/bifrost-semantic-packs-python" "${RUNNER_TEMP}"
       - name: Verify Python partial bundle
         run: >-
@@ -355,8 +355,6 @@ jobs:
     timeout-minutes: 60
     permissions:
       contents: read
-    env:
-      SEMANTIC_PACK_SOURCE_CACHE: ${{ runner.temp }}/semantic-pack-source-cache/typescript
     steps:
       - name: Checkout qualified source
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
@@ -381,6 +379,8 @@ jobs:
           path: ${{ runner.temp }}/semantic-pack-source-cache/typescript
           key: semantic-pack-source-typescript-${{ runner.os }}-compiler-da2513f4b95176d6dde8b51aab7afe8a927656c9d277369793f77f7e59371c08-library-7ecad6f67377e831856367ab062ef394f21506a611405bf8ac0ff039348637d3
       - name: Generate TypeScript partial bundle
+        env:
+          SEMANTIC_PACK_SOURCE_CACHE: ${{ runner.temp }}/semantic-pack-source-cache/typescript
         run: bash scripts/public/build-pinned-typescript-semantic-packs.sh "${RUNNER_TEMP}/bifrost-semantic-packs-typescript" "${RUNNER_TEMP}"
       - name: Verify TypeScript partial bundle
         run: >-
@@ -401,8 +401,6 @@ jobs:
     timeout-minutes: 60
     permissions:
       contents: read
-    env:
-      SEMANTIC_PACK_SOURCE_CACHE: ${{ runner.temp }}/semantic-pack-source-cache/rust
     steps:
       - name: Checkout qualified source
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
@@ -427,6 +425,8 @@ jobs:
           path: ${{ runner.temp }}/semantic-pack-source-cache/rust
           key: semantic-pack-source-rust-${{ runner.os }}-rust-docs-json-nightly-x86_64-unknown-linux-gnu-0b18d55b97cee6756745744c0c169402ab6d3d506bb30267067b2438b3b5e000
       - name: Generate Rust partial bundle
+        env:
+          SEMANTIC_PACK_SOURCE_CACHE: ${{ runner.temp }}/semantic-pack-source-cache/rust
         run: bash scripts/public/build-pinned-rust-semantic-packs.sh "${RUNNER_TEMP}/bifrost-semantic-packs-rust" "${RUNNER_TEMP}"
       - name: Verify Rust partial bundle
         run: >-
@@ -991,6 +991,11 @@ jobs:
         run: node --test plugins/bifrost-agent/test/launcher.test.mjs
       - name: Validate agent plugin manifests
         run: node scripts/public/check-codex-plugin-manifest.mjs
+      - name: Test and package the DSH plugin
+        run: |
+          npm test
+          npm pack --pack-destination ../../dist
+        working-directory: plugins/bifrost-dsh
       - name: Package exact agent plugin archive
         shell: bash
         env:
@@ -1010,6 +1015,7 @@ jobs:
           path: |
             dist/bifrost-agent-*.tar.gz
             dist/bifrost-agent-*.sha256
+            dist/brokkai-dsh-plugin-bifrost-*.tgz
           if-no-files-found: error
           retention-days: 14
 

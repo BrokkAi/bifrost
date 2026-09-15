@@ -41,8 +41,8 @@ small Rust file, and a README, so search and resource tools have real content.
 
 | file | purpose |
 | --- | --- |
-| `package.json`, `package-lock.json` | pin `@modelcontextprotocol/conformance` at exactly `0.2.0-alpha.11` |
-| `extract-schemas.mjs` | extracts the four official spec schemas from the pinned bundle; default mode compares, `--write` regenerates. `run.mjs` imports the same functions, so the gate performs the identical comparison |
+| `package.json`, `package-lock.json` | pin `@modelcontextprotocol/conformance` at exactly `0.2.0-alpha.11`, the newest published prerelease covering `2026-07-28` |
+| `extract-schemas.mjs` | extracts the four official spec schemas from the pinned bundle, applies the published `2026-07-28` subscriptions/listen envelope correction from specification commit `271ecc9accaf`, and byte-compares the result; `--write` regenerates. `run.mjs` imports the same functions, so the gate performs the identical comparison |
 | `schemas/mcp-schema-<revision>.json` | the extracted schemas, checked in. The Rust `mcp_wire_schema` gate loads the two Bifrost supports from here |
 | `bridge.mjs` | raw Streamable-HTTP-to-stdio relay (see honesty model below) |
 | `run.mjs` | the gate orchestrator |

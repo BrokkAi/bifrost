@@ -11357,7 +11357,10 @@ where
         patterns: &SearchSymbolPatternBatch,
         cancellation: Option<&CancellationToken>,
     ) -> Option<SearchSymbolCandidates> {
-        if patterns.patterns().is_empty() {
+        if patterns.patterns().is_empty() || !patterns.has_compiled_patterns() {
+            // An all-invalid batch can only match nothing; skipping the blob
+            // enumeration keeps such a request from scanning the workspace to
+            // prove it (#3279).
             return Some(SearchSymbolCandidates::complete(Vec::new(), 0));
         }
         if !patterns.complete() || cancellation.is_some_and(CancellationToken::is_cancelled) {

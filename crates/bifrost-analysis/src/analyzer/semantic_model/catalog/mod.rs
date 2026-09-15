@@ -70,7 +70,20 @@ pub const CATALOG_SCHEMA_VERSION: i64 = db::CURRENT_CATALOG_VERSION;
 /// 24: the C++ header producer publishes namespace owners and the exact
 /// explicit value operations of std::basic_string. Warm generated packs
 /// predate those owner and operation facts.
-pub const GENERATED_PRODUCTION_CACHE_VERSION: u32 = 24;
+/// 25: producers write native schema four, which admits the portable runtime
+/// contract companion. Rebuild generated packs under the new wire contract.
+/// 26: Java source and binary producers mark formals as positional-only and
+/// publish reviewed stable identities and formal names for selected JDK
+/// security endpoints. Warm generated JDK packs predate those facts.
+/// 27: the Rust declaration producer unwraps grammar-owned attributes in
+/// impl bodies so attributed methods, associated constants, and associated
+/// types are retained. Warm generated packs may omit those declarations.
+/// 28: the Python stub producer projects the `__call__` signature of a
+/// module-level value's class onto the value's name, so `builtins.exit` and
+/// `builtins.quit` carry the `_sitebuiltins.Quitter.__call__` contract
+/// (#3135). Warm generated packs publish those names as signature-less
+/// constants.
+pub const GENERATED_PRODUCTION_CACHE_VERSION: u32 = 28;
 pub const SEMANTIC_PACK_CACHE_ROOT_ENV: &str = "BIFROST_SEMANTIC_PACK_CACHE_ROOT";
 
 /// Resolve the generated catalog used when no explicit catalog is configured.
@@ -369,6 +382,163 @@ pub fn pack_rejects_are_warning_only(extraction: &PackExtractionAccounting) -> b
 }
 
 const GENERATED_PRODUCTION_DOMAIN: &[u8] = b"bifrost.semantic-pack.generated-production.v1";
+const ACQUISITION_REQUEST_DOMAIN: &[u8] = b"bifrost.semantic-pack.acquisition-request.v1";
+const ACQUISITION_RELEASE_DOMAIN: &[u8] = b"bifrost.semantic-pack.acquisition-release.v1";
+const ACQUISITION_SOURCE_STATE_DOMAIN: &[u8] = b"bifrost.semantic-pack.acquisition-sources.v1";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AcquisitionReceiptRequest {
+    GeneratedProduction(GeneratedProductionKey),
+    DeclaredPack(Box<SemanticPackSelectorQuery>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcquisitionReceiptRelease {
+    pub repository: String,
+    pub tag: String,
+    pub archive_name: String,
+    pub archive_digest: String,
+    pub bundle_schema_version: u32,
+    pub bundle_generator_name: String,
+    pub bundle_generator_version: String,
+    pub semantic_schema_version: u32,
+    pub generated_cache_version: u32,
+    pub client_epoch: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcquisitionReceiptSource {
+    release_digest: String,
+    manifest_digest: String,
+    source: DurablePackSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcquisitionReceiptLookup {
+    Satisfied,
+    KnownVerifiedAbsence,
+    ReceiptMiss,
+}
+
+impl AcquisitionReceiptRequest {
+    pub fn generated(key: &GeneratedProductionKey) -> Self {
+        Self::GeneratedProduction(key.clone())
+    }
+
+    pub fn declared(query: &SemanticPackSelectorQuery) -> Self {
+        Self::DeclaredPack(Box::new(query.clone()))
+    }
+
+    pub fn digest(&self) -> String {
+        let mut hasher = CanonicalHasher::new(ACQUISITION_REQUEST_DOMAIN);
+        match self {
+            Self::GeneratedProduction(key) => {
+                hasher.field("kind", b"generated_production");
+                hasher.field("production_digest", key.production_digest().as_bytes());
+                hasher.field("input_digest", key.input_digest().as_bytes());
+                hasher.field("producer_name", key.producer_name().as_bytes());
+                hasher.field("producer_version", key.producer_version().as_bytes());
+                hasher.field("schema_version", &key.schema_version().to_be_bytes());
+                hasher.field(
+                    "generated_cache_version",
+                    &GENERATED_PRODUCTION_CACHE_VERSION.to_be_bytes(),
+                );
+            }
+            Self::DeclaredPack(query) => {
+                hasher.field("kind", b"declared_pack");
+                hasher.field("language", query.language.as_bytes());
+                hasher.field("ecosystem", query.ecosystem.as_bytes());
+                hash_coordinate(&mut hasher, "package", query.package.as_ref());
+                hash_coordinate(&mut hasher, "module", query.module.as_ref());
+                hash_coordinate(&mut hasher, "toolchain", query.toolchain.as_ref());
+                hash_optional(&mut hasher, "target", query.target.as_deref());
+                hash_optional(&mut hasher, "configuration", query.configuration.as_deref());
+                hash_optional(
+                    &mut hasher,
+                    "artifact_sha256",
+                    query.artifact_sha256.as_deref(),
+                );
+                hasher.field(
+                    "bifrost_version",
+                    query.bifrost_version.to_string().as_bytes(),
+                );
+            }
+        }
+        lower_hex_string(&hasher.finish())
+    }
+}
+
+impl AcquisitionReceiptRelease {
+    pub fn digest(&self) -> Result<String, CatalogError> {
+        if self.repository.is_empty()
+            || self.tag.is_empty()
+            || self.archive_name.is_empty()
+            || !is_lower_sha256(&self.archive_digest)
+            || self.bundle_schema_version == 0
+            || self.bundle_generator_name.is_empty()
+            || self.bundle_generator_version.is_empty()
+            || self.semantic_schema_version == 0
+            || self.generated_cache_version == 0
+            || self.client_epoch == 0
+        {
+            return Err(CatalogError::Integrity(
+                "acquisition release identity must be complete".to_owned(),
+            ));
+        }
+        let mut hasher = CanonicalHasher::new(ACQUISITION_RELEASE_DOMAIN);
+        hasher.field("repository", self.repository.as_bytes());
+        hasher.field("tag", self.tag.as_bytes());
+        hasher.field("archive_name", self.archive_name.as_bytes());
+        hasher.field("archive_digest", self.archive_digest.as_bytes());
+        hasher.field(
+            "bundle_schema_version",
+            &self.bundle_schema_version.to_be_bytes(),
+        );
+        hasher.field(
+            "bundle_generator_name",
+            self.bundle_generator_name.as_bytes(),
+        );
+        hasher.field(
+            "bundle_generator_version",
+            self.bundle_generator_version.as_bytes(),
+        );
+        hasher.field(
+            "semantic_schema_version",
+            &self.semantic_schema_version.to_be_bytes(),
+        );
+        hasher.field(
+            "generated_cache_version",
+            &self.generated_cache_version.to_be_bytes(),
+        );
+        hasher.field("client_epoch", &self.client_epoch.to_be_bytes());
+        hasher.field(
+            "catalog_schema_version",
+            &CATALOG_SCHEMA_VERSION.to_be_bytes(),
+        );
+        Ok(lower_hex_string(&hasher.finish()))
+    }
+}
+
+fn hash_optional(hasher: &mut CanonicalHasher, name: &str, value: Option<&str>) {
+    hasher.field(name, value.unwrap_or_default().as_bytes());
+    hasher.field(&format!("{name}_present"), &[u8::from(value.is_some())]);
+}
+
+fn hash_coordinate(
+    hasher: &mut CanonicalHasher,
+    name: &str,
+    coordinate: Option<&CatalogCoordinate>,
+) {
+    hash_optional(
+        hasher,
+        &format!("{name}_name"),
+        coordinate.map(|coordinate| coordinate.name.as_str()),
+    );
+    let version = coordinate
+        .and_then(|coordinate| coordinate.version.as_ref())
+        .map(ToString::to_string);
+    hash_optional(hasher, &format!("{name}_version"), version.as_deref());
+}
 
 /// Exact semantic inputs that identify one generated semantic-pack production.
 ///
@@ -444,6 +614,42 @@ impl GeneratedProductionKey {
     pub fn source_id(&self) -> String {
         format!("production:{}", self.production_digest)
     }
+}
+
+/// Verify a release-recorded generated-production digest with its recorded
+/// cache epoch. This checks the immutable identity without constructing a key
+/// under the current cache epoch.
+pub fn verify_recorded_generated_production_digest(
+    production_digest: &str,
+    input_digest: &str,
+    producer_name: &str,
+    producer_version: &str,
+    schema_version: u32,
+    cache_version: u32,
+) -> Result<bool, CatalogError> {
+    if !is_lower_sha256(production_digest) || !is_lower_sha256(input_digest) {
+        return Err(CatalogError::Integrity(
+            "generated-production digests must be lowercase SHA-256".to_owned(),
+        ));
+    }
+    if producer_name.is_empty()
+        || producer_version.is_empty()
+        || schema_version == 0
+        || cache_version == 0
+    {
+        return Err(CatalogError::Integrity(
+            "generated-production producer identity, schema version, and cache version must be non-empty"
+                .to_owned(),
+        ));
+    }
+    Ok(production_digest
+        == generated_production_digest_for_cache_version(
+            input_digest,
+            producer_name,
+            producer_version,
+            schema_version,
+            cache_version,
+        ))
 }
 
 /// An acquired operating-system lock for one exact generated production.
@@ -1121,6 +1327,41 @@ impl SemanticPackCatalog {
         })
     }
 
+    /// Install a release pack and return an opaque proof of the exact source
+    /// row committed by the catalog. Callers cannot construct this proof from
+    /// asserted release metadata.
+    pub fn install_release_for_receipt(
+        &self,
+        release: &AcquisitionReceiptRelease,
+        pack: &CompiledSemanticModelPack,
+        source: &DurablePackSource,
+        extraction: &PackExtractionAccounting,
+    ) -> Result<(InstallOutcome, AcquisitionReceiptSource), CatalogError> {
+        let release_digest = release.digest()?;
+        validate_extraction_accounting(extraction)?;
+        let validated = validate_pack(pack, &self.options.decode_limits)?;
+        let install = if self.unchanged_release_install(
+            &validated,
+            &pack.manifest_bytes,
+            source,
+            extraction,
+        )? {
+            InstallOutcome {
+                manifest_digest: validated.manifest.content_sha256,
+                inserted_manifest: false,
+                inserted_objects: 0,
+            }
+        } else {
+            self.install_release(pack, source, extraction)?
+        };
+        let proof = AcquisitionReceiptSource {
+            release_digest,
+            manifest_digest: install.manifest_digest.clone(),
+            source: source.clone(),
+        };
+        Ok((install, proof))
+    }
+
     /// Install a release-provided production as an exact generated entry.
     ///
     /// The release source, extraction accounting, generated mapping, manifest,
@@ -1159,6 +1400,71 @@ impl SemanticPackCatalog {
             },
             install,
         })
+    }
+
+    /// Install a release-generated pack and return opaque proofs for both the
+    /// release provenance and canonical generated-production source rows.
+    pub fn install_release_generated_for_receipt(
+        &self,
+        release: &AcquisitionReceiptRelease,
+        key: &GeneratedProductionKey,
+        pack: &CompiledSemanticModelPack,
+        source: &DurablePackSource,
+        extraction: &PackExtractionAccounting,
+    ) -> Result<(GeneratedInstallOutcome, Vec<AcquisitionReceiptSource>), CatalogError> {
+        let release_digest = release.digest()?;
+        validate_generated_pack_identity(key, &pack.manifest)?;
+        validate_extraction_accounting(extraction)?;
+        let validated = validate_pack(pack, &self.options.decode_limits)?;
+        let generated_source = DurablePackSource {
+            kind: DurablePackSourceKind::Generated,
+            source_id: key.source_id(),
+        };
+        let unchanged =
+            self.unchanged_release_install(&validated, &pack.manifest_bytes, source, extraction)?
+                && self.exact_verified_install_present(
+                    &validated,
+                    &pack.manifest_bytes,
+                    &generated_source,
+                )?
+                && self.generated_production(key)?.is_some_and(|production| {
+                    production.manifest_digest == validated.manifest.content_sha256
+                });
+        let installation = if unchanged {
+            GeneratedInstallOutcome {
+                production: GeneratedProduction {
+                    key: key.clone(),
+                    manifest_digest: validated.manifest.content_sha256.clone(),
+                    completeness: validated.manifest.completeness,
+                },
+                install: InstallOutcome {
+                    manifest_digest: validated.manifest.content_sha256,
+                    inserted_manifest: false,
+                    inserted_objects: 0,
+                },
+            }
+        } else {
+            self.install_release_generated(key, pack, source, extraction)?
+        };
+        let manifest_digest = installation.install.manifest_digest.clone();
+        Ok((
+            installation,
+            vec![
+                AcquisitionReceiptSource {
+                    release_digest: release_digest.clone(),
+                    manifest_digest: manifest_digest.clone(),
+                    source: source.clone(),
+                },
+                AcquisitionReceiptSource {
+                    release_digest,
+                    manifest_digest,
+                    source: DurablePackSource {
+                        kind: DurablePackSourceKind::Generated,
+                        source_id: key.source_id(),
+                    },
+                },
+            ],
+        ))
     }
 
     /// Whether a verified durable pack carries exactly this source identity.
@@ -1492,6 +1798,369 @@ impl SemanticPackCatalog {
             }
             Err(error) => Err(self.release_after_install_failure(&installation_id, error)),
         }
+    }
+
+    fn exact_verified_install_present(
+        &self,
+        validated: &ValidatedPack,
+        manifest_bytes: &[u8],
+        source: &DurablePackSource,
+    ) -> Result<bool, CatalogError> {
+        let connection = self
+            .connection
+            .lock()
+            .expect("semantic-pack catalog connection mutex poisoned");
+        let provenance_json = serde_json::to_vec(&validated.manifest.provenance)
+            .map_err(|error| CatalogError::Integrity(error.to_string()))?;
+        let pack = connection
+            .query_row(
+                "SELECT pack.semantic_digest, pack.manifest_bytes, pack.schema_version,
+                        pack.pack_id, pack.pack_version, pack.producer_name,
+                        pack.producer_version, pack.language, pack.ecosystem,
+                        pack.bifrost_compatibility, pack.provenance_json, pack.license,
+                        pack.completeness
+                 FROM catalog_packs AS pack
+                 JOIN catalog_sources AS source
+                   ON source.manifest_digest = pack.manifest_digest
+                 WHERE pack.manifest_digest = ?1 AND pack.state = 'verified'
+                   AND source.source_kind = ?2 AND source.source_id = ?3",
+                params![
+                    validated.manifest.content_sha256,
+                    source.kind.as_str(),
+                    source.source_id,
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, u32>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, String>(8)?,
+                        row.get::<_, String>(9)?,
+                        row.get::<_, Vec<u8>>(10)?,
+                        row.get::<_, String>(11)?,
+                        row.get::<_, String>(12)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| CatalogError::sqlite("read exact verified manifest", error))?;
+        let Some((
+            semantic_digest,
+            stored_manifest_bytes,
+            schema_version,
+            pack_id,
+            pack_version,
+            producer_name,
+            producer_version,
+            language,
+            ecosystem,
+            bifrost_compatibility,
+            stored_provenance_json,
+            license,
+            completeness,
+        )) = pack
+        else {
+            return Ok(false);
+        };
+        if semantic_digest != validated.manifest.semantic_sha256
+            || stored_manifest_bytes != manifest_bytes
+            || schema_version != validated.manifest.schema_version
+            || pack_id != validated.manifest.pack_id
+            || pack_version != validated.manifest.version
+            || producer_name != validated.manifest.producer.name
+            || producer_version != validated.manifest.producer.version
+            || language != validated.manifest.language
+            || ecosystem != validated.manifest.ecosystem
+            || bifrost_compatibility != validated.manifest.compatibility.bifrost
+            || stored_provenance_json != provenance_json
+            || license != validated.manifest.license
+            || completeness != completeness_name(&validated.manifest.completeness)
+        {
+            return Ok(false);
+        }
+
+        let mut statement = connection
+            .prepare(
+                "SELECT shard.ordinal, shard.shard_id, shard.payload_kind,
+                        shard.stored_digest, shard.content_digest, shard.semantic_digest,
+                        shard.record_count, shard.descriptor_json,
+                        object.relative_path, object.stored_size, object.raw_size,
+                        object.encoding
+                 FROM catalog_packs AS pack
+                 JOIN catalog_sources AS source ON source.manifest_digest = pack.manifest_digest
+                 JOIN catalog_pack_shards AS shard ON shard.manifest_digest = pack.manifest_digest
+                 JOIN catalog_objects AS object ON object.stored_digest = shard.stored_digest
+                 WHERE pack.manifest_digest = ?1 AND pack.state = 'verified'
+                   AND source.source_kind = ?2 AND source.source_id = ?3
+                 ORDER BY shard.ordinal",
+            )
+            .map_err(|error| {
+                CatalogError::sqlite("prepare exact verified installation check", error)
+            })?;
+        let rows = statement
+            .query_map(
+                params![
+                    validated.manifest.content_sha256,
+                    source.kind.as_str(),
+                    source.source_id,
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, u64>(6)?,
+                        row.get::<_, Vec<u8>>(7)?,
+                        row.get::<_, String>(8)?,
+                        row.get::<_, u64>(9)?,
+                        row.get::<_, u64>(10)?,
+                        row.get::<_, String>(11)?,
+                    ))
+                },
+            )
+            .map_err(|error| CatalogError::sqlite("check exact verified installation", error))?;
+        let mut stored_shards = Vec::with_capacity(validated.shards.len());
+        for row in rows {
+            stored_shards.push(row.map_err(|error| {
+                CatalogError::sqlite("read exact verified installation", error)
+            })?);
+        }
+        if stored_shards.len() != validated.shards.len() {
+            return Ok(false);
+        }
+        for (ordinal, (shard, row)) in validated.shards.iter().zip(stored_shards).enumerate() {
+            let (
+                stored_ordinal,
+                shard_id,
+                payload_kind,
+                stored_digest,
+                content_digest,
+                semantic_digest,
+                record_count,
+                descriptor_json,
+                relative_path,
+                stored_size,
+                raw_size,
+                encoding,
+            ) = row;
+            let expected_ordinal = i64::try_from(ordinal).map_err(|_| {
+                CatalogError::Integrity("catalog shard ordinal exceeds i64".to_owned())
+            })?;
+            let expected_descriptor_json = serde_json::to_vec(&shard.descriptor)
+                .map_err(|error| CatalogError::Integrity(error.to_string()))?;
+            if stored_ordinal != expected_ordinal
+                || shard_id != shard.descriptor.shard_id
+                || payload_kind != payload_kind_name(shard.descriptor.payload_kind)
+                || stored_digest != shard.descriptor.stored_sha256
+                || content_digest != shard.descriptor.content_sha256
+                || semantic_digest != shard.descriptor.semantic_sha256
+                || record_count != shard.descriptor.record_count
+                || descriptor_json != expected_descriptor_json
+                || stored_size != shard.descriptor.stored_size
+                || raw_size != shard.descriptor.raw_size
+                || encoding != encoding_name(shard.descriptor.encoding)
+            {
+                return Ok(false);
+            }
+            if !receipt_object_is_valid(
+                &self.root,
+                Path::new(&relative_path),
+                &stored_digest,
+                stored_size,
+            )? {
+                return Ok(false);
+            }
+        }
+
+        let mut expected_selectors = Vec::new();
+        for shard in &validated.shards {
+            for (ordinal, selector) in shard.selectors.iter().enumerate() {
+                expected_selectors.push((
+                    shard.descriptor.shard_id.clone(),
+                    i64::try_from(ordinal).map_err(|_| {
+                        CatalogError::Integrity("selector ordinal exceeds i64".to_owned())
+                    })?,
+                    selector.package.as_ref().map(|value| value.name.clone()),
+                    selector
+                        .package
+                        .as_ref()
+                        .and_then(|value| value.version.clone()),
+                    selector.module.as_ref().map(|value| value.name.clone()),
+                    selector
+                        .module
+                        .as_ref()
+                        .and_then(|value| value.version.clone()),
+                    selector.toolchain.as_ref().map(|value| value.name.clone()),
+                    selector
+                        .toolchain
+                        .as_ref()
+                        .and_then(|value| value.version.clone()),
+                    selector.artifact_sha256.clone(),
+                    serde_json::to_vec(selector)
+                        .map_err(|error| CatalogError::Integrity(error.to_string()))?,
+                ));
+            }
+        }
+        expected_selectors.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
+        let mut statement = connection
+            .prepare(
+                "SELECT shard_id, selector_ordinal, package_name, package_version,
+                        module_name, module_version, toolchain_name, toolchain_version,
+                        artifact_sha256, selector_json
+                 FROM catalog_selectors
+                 WHERE manifest_digest = ?1
+                 ORDER BY shard_id, selector_ordinal",
+            )
+            .map_err(|error| CatalogError::sqlite("prepare exact selector check", error))?;
+        let rows = statement
+            .query_map([&validated.manifest.content_sha256], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Vec<u8>>(9)?,
+                ))
+            })
+            .map_err(|error| CatalogError::sqlite("query exact selector check", error))?;
+        let mut stored_selectors = Vec::with_capacity(expected_selectors.len());
+        for row in rows {
+            stored_selectors.push(
+                row.map_err(|error| CatalogError::sqlite("read exact selector check", error))?,
+            );
+        }
+        if stored_selectors != expected_selectors {
+            return Ok(false);
+        }
+
+        let mut expected_targets = Vec::new();
+        let mut expected_configurations = Vec::new();
+        for shard in &validated.shards {
+            for (ordinal, selector) in shard.selectors.iter().enumerate() {
+                let ordinal = i64::try_from(ordinal).map_err(|_| {
+                    CatalogError::Integrity("selector ordinal exceeds i64".to_owned())
+                })?;
+                expected_targets.extend(
+                    selector
+                        .targets
+                        .iter()
+                        .map(|target| (shard.descriptor.shard_id.clone(), ordinal, target.clone())),
+                );
+                expected_configurations.extend(selector.configurations.iter().map(
+                    |configuration| {
+                        (
+                            shard.descriptor.shard_id.clone(),
+                            ordinal,
+                            configuration.clone(),
+                        )
+                    },
+                ));
+            }
+        }
+        expected_targets.sort();
+        expected_configurations.sort();
+        let mut statement = connection
+            .prepare(
+                "SELECT shard_id, selector_ordinal, target
+                 FROM catalog_selector_targets
+                 WHERE manifest_digest = ?1
+                 ORDER BY shard_id, selector_ordinal, target",
+            )
+            .map_err(|error| CatalogError::sqlite("prepare exact selector target check", error))?;
+        let rows = statement
+            .query_map([&validated.manifest.content_sha256], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .map_err(|error| CatalogError::sqlite("query exact selector target check", error))?;
+        let stored_targets = rows
+            .collect::<Result<Vec<(String, i64, String)>, _>>()
+            .map_err(|error| CatalogError::sqlite("read exact selector target check", error))?;
+        if stored_targets != expected_targets {
+            return Ok(false);
+        }
+        let mut statement = connection
+            .prepare(
+                "SELECT shard_id, selector_ordinal, configuration
+                 FROM catalog_selector_configurations
+                 WHERE manifest_digest = ?1
+                 ORDER BY shard_id, selector_ordinal, configuration",
+            )
+            .map_err(|error| {
+                CatalogError::sqlite("prepare exact selector configuration check", error)
+            })?;
+        let rows = statement
+            .query_map([&validated.manifest.content_sha256], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .map_err(|error| {
+                CatalogError::sqlite("query exact selector configuration check", error)
+            })?;
+        let stored_configurations = rows
+            .collect::<Result<Vec<(String, i64, String)>, _>>()
+            .map_err(|error| {
+                CatalogError::sqlite("read exact selector configuration check", error)
+            })?;
+        if stored_configurations != expected_configurations {
+            return Ok(false);
+        }
+
+        let mut expected_routing_keys = Vec::new();
+        for shard in &validated.shards {
+            expected_routing_keys.extend(
+                shard
+                    .descriptor
+                    .routing_keys
+                    .iter()
+                    .map(|routing_key| (shard.descriptor.shard_id.clone(), routing_key.clone())),
+            );
+        }
+        expected_routing_keys.sort();
+        let mut statement = connection
+            .prepare(
+                "SELECT shard_id, routing_key
+                 FROM catalog_routing_keys
+                 WHERE manifest_digest = ?1
+                 ORDER BY shard_id, routing_key",
+            )
+            .map_err(|error| CatalogError::sqlite("prepare exact routing-key check", error))?;
+        let rows = statement
+            .query_map([&validated.manifest.content_sha256], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .map_err(|error| CatalogError::sqlite("query exact routing-key check", error))?;
+        let stored_routing_keys = rows
+            .collect::<Result<Vec<(String, String)>, _>>()
+            .map_err(|error| CatalogError::sqlite("read exact routing-key check", error))?;
+        Ok(stored_routing_keys == expected_routing_keys)
+    }
+
+    fn unchanged_release_install(
+        &self,
+        validated: &ValidatedPack,
+        manifest_bytes: &[u8],
+        source: &DurablePackSource,
+        extraction: &PackExtractionAccounting,
+    ) -> Result<bool, CatalogError> {
+        Ok(
+            self.exact_verified_install_present(validated, manifest_bytes, source)?
+                && self
+                    .extraction_accounting(&validated.manifest.content_sha256)?
+                    .as_ref()
+                    == Some(extraction),
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2103,6 +2772,272 @@ impl SemanticPackCatalog {
         self.candidates_bounded_inner(query, usize::MAX, true)
     }
 
+    /// Check an exact acquisition under a transaction that gives a satisfying
+    /// candidate precedence over an absence receipt.
+    pub fn acquisition_receipt_lookup(
+        &self,
+        request: &AcquisitionReceiptRequest,
+        release: &AcquisitionReceiptRelease,
+    ) -> Result<AcquisitionReceiptLookup, CatalogError> {
+        self.require_writable()?;
+        validate_acquisition_receipt_request(request)?;
+        let request_digest = request.digest();
+        let release_digest = release.digest()?;
+        let mut connection = self
+            .connection
+            .lock()
+            .expect("semantic-pack catalog connection mutex poisoned");
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| CatalogError::sqlite("begin acquisition receipt lookup", error))?;
+        if acquisition_request_satisfied(
+            &self.root,
+            &transaction,
+            &self.options.decode_limits,
+            request,
+        )? {
+            transaction
+                .commit()
+                .map_err(|error| CatalogError::sqlite("commit satisfied receipt lookup", error))?;
+            return Ok(AcquisitionReceiptLookup::Satisfied);
+        }
+        let mutation_epoch = semantic_mutation_epoch(&transaction)?;
+        let receipt = transaction
+            .query_row(
+                "SELECT catalog_mutation_epoch, source_state_digest, source_count
+                 FROM catalog_acquisition_absence_receipts
+                 WHERE request_digest = ?1 AND release_digest = ?2
+                   AND release_repository = ?3 AND release_tag = ?4
+                   AND archive_name = ?5 AND archive_digest = ?6
+                   AND bundle_schema_version = ?7
+                   AND bundle_generator_name = ?8
+                   AND bundle_generator_version = ?9
+                   AND semantic_schema_version = ?10
+                   AND generated_cache_version = ?11
+                   AND client_epoch = ?12
+                   AND catalog_schema_version = ?13",
+                params![
+                    request_digest,
+                    release_digest,
+                    release.repository,
+                    release.tag,
+                    release.archive_name,
+                    release.archive_digest,
+                    release.bundle_schema_version,
+                    release.bundle_generator_name,
+                    release.bundle_generator_version,
+                    release.semantic_schema_version,
+                    release.generated_cache_version,
+                    release.client_epoch,
+                    CATALOG_SCHEMA_VERSION,
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, u64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, u64>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| CatalogError::sqlite("read acquisition absence receipt", error))?;
+        let valid = if let Some((receipt_epoch, source_state_digest, source_count)) = receipt {
+            receipt_epoch == mutation_epoch
+                && receipt_source_state_digest(
+                    &self.root,
+                    &transaction,
+                    &self.options.decode_limits,
+                    &request_digest,
+                    &release_digest,
+                    source_count,
+                )?
+                .is_some_and(|digest| digest == source_state_digest)
+        } else {
+            false
+        };
+        transaction
+            .commit()
+            .map_err(|error| CatalogError::sqlite("commit acquisition receipt lookup", error))?;
+        Ok(if valid {
+            AcquisitionReceiptLookup::KnownVerifiedAbsence
+        } else {
+            AcquisitionReceiptLookup::ReceiptMiss
+        })
+    }
+
+    /// Record verified absence only after the caller has completely verified
+    /// and installed the selected release. Every source proof is revalidated
+    /// against the same catalog transaction before persistence.
+    pub fn record_acquisition_absence(
+        &self,
+        request: &AcquisitionReceiptRequest,
+        release: &AcquisitionReceiptRelease,
+        sources: &[AcquisitionReceiptSource],
+    ) -> Result<AcquisitionReceiptLookup, CatalogError> {
+        self.require_writable()?;
+        validate_acquisition_receipt_request(request)?;
+        if sources.is_empty() {
+            return Err(CatalogError::Integrity(
+                "acquisition absence requires at least one verified installed source".to_owned(),
+            ));
+        }
+        let mut sources = sources.to_vec();
+        sources.sort_by(|left, right| {
+            left.release_digest
+                .cmp(&right.release_digest)
+                .then_with(|| left.manifest_digest.cmp(&right.manifest_digest))
+                .then_with(|| left.source.kind.as_str().cmp(right.source.kind.as_str()))
+                .then_with(|| left.source.source_id.cmp(&right.source.source_id))
+        });
+        sources.dedup();
+        let request_digest = request.digest();
+        let release_digest = release.digest()?;
+        let mut connection = self
+            .connection
+            .lock()
+            .expect("semantic-pack catalog connection mutex poisoned");
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| CatalogError::sqlite("begin acquisition absence record", error))?;
+        if acquisition_request_satisfied(
+            &self.root,
+            &transaction,
+            &self.options.decode_limits,
+            request,
+        )? {
+            transaction
+                .commit()
+                .map_err(|error| CatalogError::sqlite("commit satisfied absence record", error))?;
+            return Ok(AcquisitionReceiptLookup::Satisfied);
+        }
+        for source in &sources {
+            if source.release_digest != release_digest {
+                return Err(CatalogError::Integrity(
+                    "acquisition receipt source belongs to a different release".to_owned(),
+                ));
+            }
+            let source_state = transaction
+                .query_row(
+                    "SELECT pack.state, pack.manifest_bytes
+                     FROM catalog_sources AS source
+                     JOIN catalog_packs AS pack
+                       ON pack.manifest_digest = source.manifest_digest
+                     WHERE source.manifest_digest = ?1
+                       AND source.source_kind = ?2
+                       AND source.source_id = ?3",
+                    params![
+                        source.manifest_digest,
+                        source.source.kind.as_str(),
+                        source.source.source_id,
+                    ],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
+                )
+                .optional()
+                .map_err(|error| {
+                    CatalogError::sqlite("verify acquisition receipt source", error)
+                })?;
+            let Some((state, manifest_bytes)) = source_state else {
+                return Err(CatalogError::Integrity(format!(
+                    "acquisition receipt source is not verified: {:?}",
+                    source
+                )));
+            };
+            let manifest = decode_manifest(&manifest_bytes, &self.options.decode_limits)
+                .map_err(|error| CatalogError::Artifact(error.to_string()))?;
+            if state != "verified"
+                || manifest.content_sha256 != source.manifest_digest
+                || !manifest_shard_rows_present(
+                    &self.root,
+                    &transaction,
+                    &source.manifest_digest,
+                    &manifest,
+                )?
+            {
+                return Err(CatalogError::Integrity(format!(
+                    "acquisition receipt source is not fully verified: {:?}",
+                    source
+                )));
+            }
+        }
+        let mutation_epoch = semantic_mutation_epoch(&transaction)?;
+        let source_state_digest = acquisition_source_state_digest(&sources);
+        let now = crate::cache_db::now_unix_seconds();
+        transaction
+            .execute(
+                "INSERT INTO catalog_acquisition_absence_receipts(
+                   request_digest, release_digest, release_repository, release_tag,
+                   archive_name, archive_digest, bundle_schema_version,
+                   bundle_generator_name, bundle_generator_version,
+                   semantic_schema_version, generated_cache_version, client_epoch,
+                   catalog_schema_version, catalog_mutation_epoch, source_state_digest,
+                   source_count, created_at
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+                 ON CONFLICT(request_digest, release_digest) DO UPDATE SET
+                   release_repository = excluded.release_repository,
+                   release_tag = excluded.release_tag,
+                   archive_name = excluded.archive_name,
+                   archive_digest = excluded.archive_digest,
+                   bundle_schema_version = excluded.bundle_schema_version,
+                   bundle_generator_name = excluded.bundle_generator_name,
+                   bundle_generator_version = excluded.bundle_generator_version,
+                   semantic_schema_version = excluded.semantic_schema_version,
+                   generated_cache_version = excluded.generated_cache_version,
+                   client_epoch = excluded.client_epoch,
+                   catalog_schema_version = excluded.catalog_schema_version,
+                   catalog_mutation_epoch = excluded.catalog_mutation_epoch,
+                   source_state_digest = excluded.source_state_digest,
+                   source_count = excluded.source_count,
+                   created_at = excluded.created_at",
+                params![
+                    request_digest,
+                    release_digest,
+                    release.repository,
+                    release.tag,
+                    release.archive_name,
+                    release.archive_digest,
+                    release.bundle_schema_version,
+                    release.bundle_generator_name,
+                    release.bundle_generator_version,
+                    release.semantic_schema_version,
+                    release.generated_cache_version,
+                    release.client_epoch,
+                    CATALOG_SCHEMA_VERSION,
+                    mutation_epoch,
+                    source_state_digest,
+                    u64::try_from(sources.len()).unwrap_or(u64::MAX),
+                    now,
+                ],
+            )
+            .map_err(|error| CatalogError::sqlite("write acquisition absence receipt", error))?;
+        transaction
+            .execute(
+                "DELETE FROM catalog_acquisition_absence_receipt_sources
+                 WHERE request_digest = ?1 AND release_digest = ?2",
+                params![request_digest, release_digest],
+            )
+            .map_err(|error| CatalogError::sqlite("replace acquisition receipt sources", error))?;
+        for source in sources {
+            transaction
+                .execute(
+                    "INSERT INTO catalog_acquisition_absence_receipt_sources(
+                       request_digest, release_digest, manifest_digest, source_kind, source_id
+                     ) VALUES(?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        request_digest,
+                        release_digest,
+                        source.manifest_digest,
+                        source.source.kind.as_str(),
+                        source.source.source_id,
+                    ],
+                )
+                .map_err(|error| CatalogError::sqlite("write acquisition receipt source", error))?;
+        }
+        transaction
+            .commit()
+            .map_err(|error| CatalogError::sqlite("commit acquisition absence receipt", error))?;
+        Ok(AcquisitionReceiptLookup::KnownVerifiedAbsence)
+    }
+
     pub fn candidates_bounded(
         &self,
         query: &SemanticPackSelectorQuery,
@@ -2336,139 +3271,12 @@ impl SemanticPackCatalog {
         query: &SemanticPackSelectorQuery,
         max_rows: usize,
     ) -> Result<Vec<DurableSelectorRow>, CatalogError> {
-        let selector_source = if query.package.is_some() {
-            "SELECT * FROM catalog_selectors INDEXED BY catalog_selectors_package
-             WHERE package_name IS NULL
-             UNION ALL
-             SELECT * FROM catalog_selectors INDEXED BY catalog_selectors_package
-             WHERE package_name = ?3"
-        } else if query.module.is_some() {
-            "SELECT * FROM catalog_selectors INDEXED BY catalog_selectors_module
-             WHERE module_name IS NULL
-             UNION ALL
-             SELECT * FROM catalog_selectors INDEXED BY catalog_selectors_module
-             WHERE module_name = ?4"
-        } else if query.toolchain.is_some() {
-            "SELECT * FROM catalog_selectors INDEXED BY catalog_selectors_toolchain
-             WHERE toolchain_name IS NULL
-             UNION ALL
-             SELECT * FROM catalog_selectors INDEXED BY catalog_selectors_toolchain
-             WHERE toolchain_name = ?5"
-        } else if query.artifact_sha256.is_some() {
-            "SELECT * FROM catalog_selectors INDEXED BY catalog_selectors_artifact
-             WHERE artifact_sha256 IS NULL
-             UNION ALL
-             SELECT * FROM catalog_selectors INDEXED BY catalog_selectors_artifact
-             WHERE artifact_sha256 = ?8"
-        } else {
-            "SELECT * FROM catalog_selectors"
-        };
-        let candidate_sql = format!(
-            "SELECT p.manifest_digest, p.manifest_bytes, ps.shard_id,
-                    ps.descriptor_json, s.selector_json,
-                    source.source_kind, source.source_id
-             FROM catalog_packs AS p
-             JOIN catalog_pack_shards AS ps
-               ON ps.manifest_digest = p.manifest_digest
-             JOIN ({selector_source}) AS s
-               ON s.manifest_digest = ps.manifest_digest
-              AND s.shard_id = ps.shard_id
-             JOIN catalog_sources AS source
-               ON source.manifest_digest = p.manifest_digest
-             WHERE p.state = 'verified'
-               AND p.language = ?1
-               AND p.ecosystem = ?2
-               AND (?3 IS NULL OR s.package_name IS NULL OR s.package_name = ?3)
-               AND (?4 IS NULL OR s.module_name IS NULL OR s.module_name = ?4)
-               AND (?5 IS NULL OR s.toolchain_name IS NULL OR s.toolchain_name = ?5)
-               AND (
-                 ?6 IS NULL
-                 OR NOT EXISTS(
-                   SELECT 1 FROM catalog_selector_targets AS targets
-                   WHERE targets.manifest_digest = s.manifest_digest
-                     AND targets.shard_id = s.shard_id
-                     AND targets.selector_ordinal = s.selector_ordinal
-                 )
-                 OR EXISTS(
-                   SELECT 1 FROM catalog_selector_targets AS targets
-                   WHERE targets.manifest_digest = s.manifest_digest
-                     AND targets.shard_id = s.shard_id
-                     AND targets.selector_ordinal = s.selector_ordinal
-                     AND targets.target = ?6
-                 )
-               )
-               AND (
-                 ?7 IS NULL
-                 OR NOT EXISTS(
-                   SELECT 1 FROM catalog_selector_configurations AS configurations
-                   WHERE configurations.manifest_digest = s.manifest_digest
-                     AND configurations.shard_id = s.shard_id
-                     AND configurations.selector_ordinal = s.selector_ordinal
-                 )
-                 OR EXISTS(
-                   SELECT 1 FROM catalog_selector_configurations AS configurations
-                   WHERE configurations.manifest_digest = s.manifest_digest
-                     AND configurations.shard_id = s.shard_id
-                     AND configurations.selector_ordinal = s.selector_ordinal
-                     AND configurations.configuration = ?7
-                 )
-               )
-               AND (
-                 ?8 IS NULL OR s.artifact_sha256 IS NULL OR s.artifact_sha256 = ?8
-               )
-             ORDER BY p.manifest_digest, ps.shard_id,
-                      source.source_kind, source.source_id, s.selector_ordinal
-             LIMIT ?9"
-        );
         let connection = self
             .connection
             .lock()
             .expect("semantic-pack catalog connection mutex poisoned");
         self.sql_statements.fetch_add(1, Ordering::Relaxed);
-        let mut statement = connection
-            .prepare(&candidate_sql)
-            .map_err(|error| CatalogError::sqlite("prepare candidate lookup", error))?;
-        let rows = statement
-            .query_map(
-                params![
-                    &query.language,
-                    &query.ecosystem,
-                    query
-                        .package
-                        .as_ref()
-                        .map(|coordinate| coordinate.name.as_str()),
-                    query
-                        .module
-                        .as_ref()
-                        .map(|coordinate| coordinate.name.as_str()),
-                    query
-                        .toolchain
-                        .as_ref()
-                        .map(|coordinate| coordinate.name.as_str()),
-                    query.target.as_deref(),
-                    query.configuration.as_deref(),
-                    query.artifact_sha256.as_deref(),
-                    i64::try_from(max_rows).unwrap_or(i64::MAX)
-                ],
-                |row| {
-                    Ok(DurableSelectorRow {
-                        manifest_digest: row.get::<_, String>(0)?,
-                        manifest_bytes: row.get::<_, Vec<u8>>(1)?,
-                        shard_id: row.get::<_, String>(2)?,
-                        descriptor_json: row.get::<_, Vec<u8>>(3)?,
-                        selector_json: row.get::<_, Vec<u8>>(4)?,
-                        source_kind: row.get::<_, String>(5)?,
-                        source_id: row.get::<_, String>(6)?,
-                    })
-                },
-            )
-            .map_err(|error| CatalogError::sqlite("query candidates", error))?;
-        let mut durable_rows = Vec::new();
-        for row in rows {
-            durable_rows
-                .push(row.map_err(|error| CatalogError::sqlite("read candidate row", error))?);
-        }
-        Ok(durable_rows)
+        durable_selector_rows_on(&connection, query, max_rows)
     }
 
     pub fn load(&self, candidate: &CatalogCandidate) -> Result<LoadedCatalogShard, CatalogMiss> {
@@ -3066,6 +3874,140 @@ impl SemanticPackCatalog {
     }
 }
 
+fn durable_selector_rows_on(
+    connection: &Connection,
+    query: &SemanticPackSelectorQuery,
+    max_rows: usize,
+) -> Result<Vec<DurableSelectorRow>, CatalogError> {
+    let selector_source = if query.package.is_some() {
+        "SELECT * FROM catalog_selectors INDEXED BY catalog_selectors_package
+         WHERE package_name IS NULL
+         UNION ALL
+         SELECT * FROM catalog_selectors INDEXED BY catalog_selectors_package
+         WHERE package_name = ?3"
+    } else if query.module.is_some() {
+        "SELECT * FROM catalog_selectors INDEXED BY catalog_selectors_module
+         WHERE module_name IS NULL
+         UNION ALL
+         SELECT * FROM catalog_selectors INDEXED BY catalog_selectors_module
+         WHERE module_name = ?4"
+    } else if query.toolchain.is_some() {
+        "SELECT * FROM catalog_selectors INDEXED BY catalog_selectors_toolchain
+         WHERE toolchain_name IS NULL
+         UNION ALL
+         SELECT * FROM catalog_selectors INDEXED BY catalog_selectors_toolchain
+         WHERE toolchain_name = ?5"
+    } else if query.artifact_sha256.is_some() {
+        "SELECT * FROM catalog_selectors INDEXED BY catalog_selectors_artifact
+         WHERE artifact_sha256 IS NULL
+         UNION ALL
+         SELECT * FROM catalog_selectors INDEXED BY catalog_selectors_artifact
+         WHERE artifact_sha256 = ?8"
+    } else {
+        "SELECT * FROM catalog_selectors"
+    };
+    let candidate_sql = format!(
+        "SELECT p.manifest_digest, p.manifest_bytes, ps.shard_id,
+                ps.descriptor_json, s.selector_json,
+                source.source_kind, source.source_id
+         FROM catalog_packs AS p
+         JOIN catalog_pack_shards AS ps
+           ON ps.manifest_digest = p.manifest_digest
+         JOIN ({selector_source}) AS s
+           ON s.manifest_digest = ps.manifest_digest
+          AND s.shard_id = ps.shard_id
+         JOIN catalog_sources AS source
+           ON source.manifest_digest = p.manifest_digest
+         WHERE p.state = 'verified'
+           AND p.language = ?1
+           AND p.ecosystem = ?2
+           AND (?3 IS NULL OR s.package_name IS NULL OR s.package_name = ?3)
+           AND (?4 IS NULL OR s.module_name IS NULL OR s.module_name = ?4)
+           AND (?5 IS NULL OR s.toolchain_name IS NULL OR s.toolchain_name = ?5)
+           AND (
+             ?6 IS NULL
+             OR NOT EXISTS(
+               SELECT 1 FROM catalog_selector_targets AS targets
+               WHERE targets.manifest_digest = s.manifest_digest
+                 AND targets.shard_id = s.shard_id
+                 AND targets.selector_ordinal = s.selector_ordinal
+             )
+             OR EXISTS(
+               SELECT 1 FROM catalog_selector_targets AS targets
+               WHERE targets.manifest_digest = s.manifest_digest
+                 AND targets.shard_id = s.shard_id
+                 AND targets.selector_ordinal = s.selector_ordinal
+                 AND targets.target = ?6
+             )
+           )
+           AND (
+             ?7 IS NULL
+             OR NOT EXISTS(
+               SELECT 1 FROM catalog_selector_configurations AS configurations
+               WHERE configurations.manifest_digest = s.manifest_digest
+                 AND configurations.shard_id = s.shard_id
+                 AND configurations.selector_ordinal = s.selector_ordinal
+             )
+             OR EXISTS(
+               SELECT 1 FROM catalog_selector_configurations AS configurations
+               WHERE configurations.manifest_digest = s.manifest_digest
+                 AND configurations.shard_id = s.shard_id
+                 AND configurations.selector_ordinal = s.selector_ordinal
+                 AND configurations.configuration = ?7
+             )
+           )
+           AND (
+             ?8 IS NULL OR s.artifact_sha256 IS NULL OR s.artifact_sha256 = ?8
+           )
+         ORDER BY p.manifest_digest, ps.shard_id,
+                  source.source_kind, source.source_id, s.selector_ordinal
+         LIMIT ?9"
+    );
+    let mut statement = connection
+        .prepare(&candidate_sql)
+        .map_err(|error| CatalogError::sqlite("prepare candidate lookup", error))?;
+    let rows = statement
+        .query_map(
+            params![
+                &query.language,
+                &query.ecosystem,
+                query
+                    .package
+                    .as_ref()
+                    .map(|coordinate| coordinate.name.as_str()),
+                query
+                    .module
+                    .as_ref()
+                    .map(|coordinate| coordinate.name.as_str()),
+                query
+                    .toolchain
+                    .as_ref()
+                    .map(|coordinate| coordinate.name.as_str()),
+                query.target.as_deref(),
+                query.configuration.as_deref(),
+                query.artifact_sha256.as_deref(),
+                i64::try_from(max_rows).unwrap_or(i64::MAX)
+            ],
+            |row| {
+                Ok(DurableSelectorRow {
+                    manifest_digest: row.get::<_, String>(0)?,
+                    manifest_bytes: row.get::<_, Vec<u8>>(1)?,
+                    shard_id: row.get::<_, String>(2)?,
+                    descriptor_json: row.get::<_, Vec<u8>>(3)?,
+                    selector_json: row.get::<_, Vec<u8>>(4)?,
+                    source_kind: row.get::<_, String>(5)?,
+                    source_id: row.get::<_, String>(6)?,
+                })
+            },
+        )
+        .map_err(|error| CatalogError::sqlite("query candidates", error))?;
+    let mut durable_rows = Vec::new();
+    for row in rows {
+        durable_rows.push(row.map_err(|error| CatalogError::sqlite("read candidate row", error))?);
+    }
+    Ok(durable_rows)
+}
+
 fn validate_pack(
     pack: &CompiledSemanticModelPack,
     limits: &DecodeLimits,
@@ -3111,6 +4053,256 @@ fn validate_pack(
         });
     }
     Ok(ValidatedPack { manifest, shards })
+}
+
+fn semantic_mutation_epoch(connection: &Connection) -> Result<u64, CatalogError> {
+    connection
+        .query_row(
+            "SELECT mutation_epoch FROM catalog_semantic_state WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| CatalogError::sqlite("read semantic catalog mutation epoch", error))
+}
+
+fn acquisition_request_satisfied(
+    root: &Path,
+    connection: &Connection,
+    limits: &DecodeLimits,
+    request: &AcquisitionReceiptRequest,
+) -> Result<bool, CatalogError> {
+    match request {
+        AcquisitionReceiptRequest::GeneratedProduction(key) => {
+            let row = connection
+                .query_row(
+                    "SELECT gp.input_digest, gp.producer_name, gp.producer_version,
+                            gp.schema_version, gp.manifest_digest, p.manifest_bytes
+                     FROM catalog_generated_productions AS gp
+                     JOIN catalog_packs AS p ON p.manifest_digest = gp.manifest_digest
+                     JOIN catalog_sources AS source
+                       ON source.manifest_digest = gp.manifest_digest
+                      AND source.source_kind = 'generated'
+                      AND source.source_id = 'production:' || gp.production_digest
+                     WHERE gp.production_digest = ?1 AND p.state = 'verified'",
+                    [key.production_digest()],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, u32>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, Vec<u8>>(5)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(|error| {
+                    CatalogError::sqlite("lookup receipt generated production", error)
+                })?;
+            let Some((input, producer, producer_version, schema, digest, manifest_bytes)) = row
+            else {
+                return Ok(false);
+            };
+            let stored_key =
+                match GeneratedProductionKey::new(input, producer, producer_version, schema) {
+                    Ok(key) => key,
+                    Err(CatalogError::Integrity(_)) => return Ok(false),
+                    Err(error) => return Err(error),
+                };
+            let manifest = match decode_manifest(&manifest_bytes, limits) {
+                Ok(manifest) => manifest,
+                Err(_) => return Ok(false),
+            };
+            Ok(stored_key == *key
+                && manifest.content_sha256 == digest
+                && manifest_shard_rows_present(root, connection, &digest, &manifest)?
+                && validate_generated_pack_identity(key, &manifest).is_ok())
+        }
+        AcquisitionReceiptRequest::DeclaredPack(query) => {
+            assert!(query_has_exact_coordinate(query));
+            for row in durable_selector_rows_on(connection, query, usize::MAX)? {
+                let manifest = match decode_manifest(&row.manifest_bytes, limits) {
+                    Ok(manifest) => manifest,
+                    Err(_) => continue,
+                };
+                if manifest.content_sha256 != row.manifest_digest {
+                    continue;
+                }
+                let selector: ActivationSelector = match serde_json::from_slice(&row.selector_json)
+                {
+                    Ok(selector) => selector,
+                    Err(_) => continue,
+                };
+                let descriptor: CompiledShardDescriptor =
+                    match serde_json::from_slice(&row.descriptor_json) {
+                        Ok(descriptor) => descriptor,
+                        Err(_) => continue,
+                    };
+                if manifest_shard_rows_present(root, connection, &row.manifest_digest, &manifest)?
+                    && matches!(manifest_compatible(&manifest, query), Ok(true))
+                    && matches!(selector_matches(&selector, query), Ok(true))
+                    && selector_binds_exact_coordinate(&selector, query)
+                    && manifest.shards.iter().any(|expected| {
+                        expected.shard_id == row.shard_id && *expected == descriptor
+                    })
+                {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+    }
+}
+
+fn manifest_shard_rows_present(
+    root: &Path,
+    connection: &Connection,
+    manifest_digest: &str,
+    manifest: &CompiledPackManifest,
+) -> Result<bool, CatalogError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT shard.shard_id, shard.stored_digest,
+                    object.relative_path, object.stored_size
+             FROM catalog_pack_shards AS shard
+             JOIN catalog_objects AS object ON object.stored_digest = shard.stored_digest
+             WHERE shard.manifest_digest = ?1",
+        )
+        .map_err(|error| CatalogError::sqlite("prepare receipt shard proof", error))?;
+    let rows = statement
+        .query_map([manifest_digest], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, u64>(3)?,
+            ))
+        })
+        .map_err(|error| CatalogError::sqlite("query receipt shard proof", error))?;
+    let mut stored = HashMap::with_capacity(manifest.shards.len());
+    for row in rows {
+        let (shard_id, stored_digest, relative_path, stored_size) =
+            row.map_err(|error| CatalogError::sqlite("read receipt shard proof", error))?;
+        if !receipt_object_is_valid(root, Path::new(&relative_path), &stored_digest, stored_size)? {
+            return Ok(false);
+        }
+        stored.insert(shard_id, stored_digest);
+    }
+    Ok(stored.len() == manifest.shards.len()
+        && manifest
+            .shards
+            .iter()
+            .all(|descriptor| stored.get(&descriptor.shard_id) == Some(&descriptor.stored_sha256)))
+}
+
+fn validate_acquisition_receipt_request(
+    request: &AcquisitionReceiptRequest,
+) -> Result<(), CatalogError> {
+    if let AcquisitionReceiptRequest::DeclaredPack(query) = request
+        && !query_has_exact_coordinate(query)
+    {
+        return Err(CatalogError::Integrity(
+            "declared-pack acquisition receipts require an exact dependency coordinate".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn acquisition_source_state_digest(sources: &[AcquisitionReceiptSource]) -> String {
+    let mut hasher = CanonicalHasher::new(ACQUISITION_SOURCE_STATE_DOMAIN);
+    hasher.sequence("sources", sources, |hasher, source| {
+        hasher.field("release_digest", source.release_digest.as_bytes());
+        hasher.field("manifest_digest", source.manifest_digest.as_bytes());
+        hasher.field("source_kind", source.source.kind.as_str().as_bytes());
+        hasher.field("source_id", source.source.source_id.as_bytes());
+    });
+    lower_hex_string(&hasher.finish())
+}
+
+fn receipt_source_state_digest(
+    root: &Path,
+    connection: &Connection,
+    limits: &DecodeLimits,
+    request_digest: &str,
+    release_digest: &str,
+    expected_count: u64,
+) -> Result<Option<String>, CatalogError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT receipt.manifest_digest, receipt.source_kind, receipt.source_id,
+                    pack.state, pack.manifest_bytes
+             FROM catalog_acquisition_absence_receipt_sources AS receipt
+             LEFT JOIN catalog_sources AS source
+               ON source.manifest_digest = receipt.manifest_digest
+              AND source.source_kind = receipt.source_kind
+              AND source.source_id = receipt.source_id
+             LEFT JOIN catalog_packs AS pack ON pack.manifest_digest = source.manifest_digest
+             WHERE receipt.request_digest = ?1 AND receipt.release_digest = ?2
+             ORDER BY receipt.manifest_digest, receipt.source_kind, receipt.source_id",
+        )
+        .map_err(|error| CatalogError::sqlite("prepare acquisition receipt source proof", error))?;
+    let rows = statement
+        .query_map(params![request_digest, release_digest], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<Vec<u8>>>(4)?,
+            ))
+        })
+        .map_err(|error| CatalogError::sqlite("query acquisition receipt source proof", error))?;
+    let mut sources = Vec::new();
+    for row in rows {
+        let (manifest_digest, source_kind, source_id, state, manifest_bytes) =
+            row.map_err(|error| {
+                CatalogError::sqlite("read acquisition receipt source proof", error)
+            })?;
+        if state.as_deref() != Some("verified") {
+            return Ok(None);
+        }
+        let Some(manifest_bytes) = manifest_bytes else {
+            return Ok(None);
+        };
+        let manifest = match decode_manifest(&manifest_bytes, limits) {
+            Ok(manifest) => manifest,
+            Err(_) => return Ok(None),
+        };
+        if manifest.content_sha256 != manifest_digest
+            || !manifest_shard_rows_present(root, connection, &manifest_digest, &manifest)?
+        {
+            return Ok(None);
+        }
+        sources.push(AcquisitionReceiptSource {
+            release_digest: release_digest.to_owned(),
+            manifest_digest,
+            source: DurablePackSource {
+                kind: DurablePackSourceKind::parse(&source_kind)?,
+                source_id,
+            },
+        });
+    }
+    if u64::try_from(sources.len()).unwrap_or(u64::MAX) != expected_count {
+        return Ok(None);
+    }
+    Ok(Some(acquisition_source_state_digest(&sources)))
+}
+
+fn receipt_object_is_valid(
+    root: &Path,
+    relative_path: &Path,
+    digest: &str,
+    stored_size: u64,
+) -> Result<bool, CatalogError> {
+    match storage::verify_existing(root, relative_path, digest, stored_size) {
+        Ok(()) => Ok(true),
+        Err(CatalogError::Integrity(_)) => Ok(false),
+        Err(CatalogError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn validate_extraction_accounting(
@@ -3931,7 +5123,7 @@ mod generated_production_cache_version_tests {
 
     use super::{
         CATALOG_SCHEMA_VERSION, default_semantic_pack_catalog_root_with_override,
-        generated_production_digest_for_cache_version,
+        generated_production_digest_for_cache_version, verify_recorded_generated_production_digest,
     };
 
     #[test]
@@ -3956,6 +5148,40 @@ mod generated_production_cache_version_tests {
     }
 
     #[test]
+    fn recorded_cache_version_verifies_identity_without_current_cache_epoch() {
+        let input = "a".repeat(64);
+        let recorded = generated_production_digest_for_cache_version(
+            &input,
+            "fixture-producer",
+            "1.0.0",
+            1,
+            8,
+        );
+        assert!(
+            verify_recorded_generated_production_digest(
+                &recorded,
+                &input,
+                "fixture-producer",
+                "1.0.0",
+                1,
+                8,
+            )
+            .unwrap()
+        );
+        assert!(
+            !verify_recorded_generated_production_digest(
+                &recorded,
+                &input,
+                "fixture-producer",
+                "1.0.0",
+                1,
+                9,
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
     fn explicit_cache_root_shares_generated_productions_across_workspaces() {
         let cache_root = OsString::from("shared-semantic-packs");
         let first = default_semantic_pack_catalog_root_with_override(
@@ -3972,6 +5198,90 @@ mod generated_production_cache_version_tests {
             first,
             Path::new("shared-semantic-packs")
                 .join(format!("semantic-pack-catalog.v{CATALOG_SCHEMA_VERSION}"))
+        );
+    }
+}
+
+#[cfg(test)]
+mod acquisition_receipt_tests {
+    use std::fs;
+
+    use semver::Version;
+    use tempfile::TempDir;
+
+    use super::{
+        AcquisitionReceiptRequest, CatalogCoordinate, GeneratedProductionKey,
+        SemanticPackSelectorQuery, lower_hex_string, receipt_object_is_valid,
+    };
+
+    fn generated_key() -> GeneratedProductionKey {
+        GeneratedProductionKey::new(
+            "a".repeat(64),
+            "fixture-producer".to_owned(),
+            "1.0.0".to_owned(),
+            3,
+        )
+        .unwrap()
+    }
+
+    fn declared_query() -> SemanticPackSelectorQuery {
+        SemanticPackSelectorQuery {
+            language: "java".to_owned(),
+            ecosystem: "maven".to_owned(),
+            package: Some(CatalogCoordinate {
+                name: "com.acme:widget".to_owned(),
+                version: Some(Version::parse("1.0.0").unwrap()),
+            }),
+            module: None,
+            toolchain: None,
+            target: None,
+            configuration: None,
+            artifact_sha256: None,
+            bifrost_version: Version::parse("0.8.17").unwrap(),
+        }
+    }
+
+    #[test]
+    fn receipt_request_digest_binds_kind_coordinate_and_version() {
+        let generated = AcquisitionReceiptRequest::generated(&generated_key()).digest();
+        let declared = AcquisitionReceiptRequest::declared(&declared_query()).digest();
+        assert_ne!(generated, declared);
+
+        let mut changed = declared_query();
+        changed.package.as_mut().unwrap().version = Some(Version::parse("1.1.0").unwrap());
+        assert_ne!(
+            declared,
+            AcquisitionReceiptRequest::declared(&changed).digest()
+        );
+        let mut changed_flags = declared_query();
+        changed_flags.target = Some("jvm".to_owned());
+        assert_ne!(
+            AcquisitionReceiptRequest::declared(&declared_query()).digest(),
+            AcquisitionReceiptRequest::declared(&changed_flags).digest()
+        );
+    }
+
+    #[test]
+    fn receipt_object_validation_rejects_corruption_and_missing_files() {
+        let root = TempDir::new().unwrap();
+        let bytes = b"receipt-object";
+        let digest = lower_hex_string(&crate::analyzer::canonical_hash::sha256_bytes(bytes));
+        let relative = std::path::Path::new("objects/sha256")
+            .join(&digest[..2])
+            .join(&digest[2..]);
+        fs::create_dir_all(root.path().join("objects/sha256").join(&digest[..2])).unwrap();
+        fs::write(root.path().join(&relative), bytes).unwrap();
+        assert!(
+            receipt_object_is_valid(root.path(), &relative, &digest, bytes.len() as u64).unwrap()
+        );
+
+        fs::write(root.path().join(&relative), b"corrupt").unwrap();
+        assert!(
+            !receipt_object_is_valid(root.path(), &relative, &digest, bytes.len() as u64).unwrap()
+        );
+        fs::remove_file(root.path().join(&relative)).unwrap();
+        assert!(
+            !receipt_object_is_valid(root.path(), &relative, &digest, bytes.len() as u64).unwrap()
         );
     }
 }

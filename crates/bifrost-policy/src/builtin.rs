@@ -95,10 +95,20 @@ const CODE_SMELLS_POLICY_SOURCES: &[(&str, &str)] = &[
     ),
 ];
 
-const SECURITY_POLICY_SOURCES: &[(&str, &str)] = &[(
-    "policies/jvm/servlet-parameter-to-jdbc.rqlp",
-    include_str!("../policy-packs/bifrost.security/policies/jvm/servlet-parameter-to-jdbc.rqlp"),
-)];
+const SECURITY_POLICY_SOURCES: &[(&str, &str)] = &[
+    (
+        "policies/jvm/servlet-parameter-to-jdbc.rqlp",
+        include_str!(
+            "../policy-packs/bifrost.security/policies/jvm/servlet-parameter-to-jdbc.rqlp"
+        ),
+    ),
+    (
+        "policies/jvm/system-getenv-to-runtime-exec.rqlp",
+        include_str!(
+            "../policy-packs/bifrost.security/policies/jvm/system-getenv-to-runtime-exec.rqlp"
+        ),
+    ),
+];
 
 const EMBEDDED_POLICY_PACK_SOURCES: &[(&str, &str)] = &[
     ("bifrost.code-smells", CODE_SMELLS_MANIFEST_SOURCE),
@@ -598,7 +608,7 @@ mod tests {
                 .expect("security pack")
                 .policies
                 .len(),
-            1
+            2
         );
         assert_eq!(
             catalog
@@ -616,7 +626,7 @@ mod tests {
                 ..BuiltInPolicySelection::default()
             })
             .expect("select security pack");
-        assert_eq!(security.len(), 1);
+        assert_eq!(security.len(), 2);
         assert_eq!(security[0].pack_id(), SECURITY_PACK_ID);
         assert_eq!(
             security[0].source_identity().as_str(),
@@ -680,7 +690,8 @@ mod tests {
                 ..BuiltInPolicySelection::default()
             }),
             Ok(vec![
-                "bifrost.security.java.servlet-parameter-to-jdbc".to_owned()
+                "bifrost.security.java.servlet-parameter-to-jdbc".to_owned(),
+                "bifrost.security.java.system-getenv-to-runtime-exec".to_owned(),
             ])
         );
     }

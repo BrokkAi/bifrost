@@ -26,7 +26,9 @@ use crate::analyzer::{
 };
 use crate::hash::HashSet;
 use brokk_bifrost_python::graph::PythonGraphSource;
-use brokk_bifrost_python::graph::extractor::{build_python_graph, scan_files_for_seeds};
+use brokk_bifrost_python::graph::extractor::{
+    PythonScanTarget, build_python_graph, scan_file_for_seeds,
+};
 use brokk_bifrost_python::graph::inverted::PythonEdgeScan;
 use brokk_bifrost_python::graph::resolver::{infer_export_names, infer_usage_seeds};
 use brokk_bifrost_python::usage_index::usage_importer_files;
@@ -236,18 +238,26 @@ impl<'a> UsageQueryResolver<'a> for PythonQueryResolver<'a> {
         // seeded from the candidate's own file, so each candidate gets its own
         // scan and the group answers with their union.
         union_candidate_usages(overloads, max_usages, |target| {
-            let graph =
-                build_python_graph(candidate_files, target.source(), scan_scope.cancellation());
+            let graph = {
+                let _scope = crate::profiling::scope("python_graph::build_syntax");
+                build_python_graph(candidate_files, target.source(), scan_scope.cancellation())
+            };
             if scan_scope.is_cancelled() {
                 return Ok(CandidateUsageHits::default());
             }
-            let seed_names = infer_export_names(py, target);
+            let seed_names = {
+                let _scope = crate::profiling::scope("python_graph::infer_export_names");
+                infer_export_names(py, target)
+            };
             if seed_names.is_empty() {
                 return Err(GraphFailureReason::NoGraphSeed("no export seed resolved")
                     .diagnostic(target.fq_name(), PYTHON_STRATEGY));
             }
 
-            let seeds = infer_usage_seeds(py, target, seed_names);
+            let seeds = {
+                let _scope = crate::profiling::scope("python_graph::infer_usage_seeds");
+                infer_usage_seeds(py, target, seed_names)
+            };
             if seeds.is_empty() {
                 return Err(
                     GraphFailureReason::NoGraphSeed("export graph produced no seeds")
@@ -258,40 +268,55 @@ impl<'a> UsageQueryResolver<'a> for PythonQueryResolver<'a> {
             let mut scan_files = graph.scan_files(candidate_files, target.source());
             scan_files.retain(|file| scan_scope.allows(file));
 
-            let scan_result =
-                match crate::analyzer::relational_frontier::resolve_relational_frontier(
-                    analyzer,
-                    cancellation,
-                    |frontier| {
-                        let source = PythonGraphSource {
-                            token: scope.token(),
-                            index: analyzer,
-                            hierarchy: analyzer.type_hierarchy_provider(),
-                            imports: analyzer.import_analysis_provider(),
-                            definitions: frontier,
-                        };
-                        scan_files_for_seeds(
-                            &source,
-                            py,
-                            &graph,
-                            &scan_files,
-                            target,
-                            &seeds,
-                            scan_scope.cancellation(),
-                        )
+            let session = crate::analyzer::relational_frontier::RelationalFrontierSession::new(
+                analyzer,
+                cancellation,
+            );
+            let mut scan_files = scan_files.into_iter().collect::<Vec<_>>();
+            scan_files.sort();
+            let scan_target = PythonScanTarget::new(analyzer, target);
+            let scan_result = match session.resolve_owned_items(
+                "python_file_scan",
+                &scan_files,
+                |file, frontier| {
+                    let source = PythonGraphSource {
+                        token: scope.token(),
+                        index: analyzer,
+                        hierarchy: analyzer.type_hierarchy_provider(),
+                        imports: analyzer.import_analysis_provider(),
+                        definitions: frontier.as_ref(),
+                    };
+                    scan_file_for_seeds(
+                        &source,
+                        py,
+                        &graph,
+                        file,
+                        &scan_target,
+                        &seeds,
+                        scan_scope.cancellation(),
+                    )
+                },
+            ) {
+                crate::analyzer::relational_frontier::RelationalItemFrontierOutcome::Complete(
+                    results,
+                ) => results.into_iter().fold(
+                    brokk_bifrost_python::graph::extractor::ScanResult::default(),
+                    |mut result, file_result| {
+                        result.hits.extend(file_result.hits);
+                        result.unproven_hits.extend(file_result.unproven_hits);
+                        result
                     },
-                ) {
-                    crate::analyzer::RelationalFrontierOutcome::Complete(result) => result,
-                    crate::analyzer::RelationalFrontierOutcome::Cancelled => {
-                        return Ok(CandidateUsageHits::default());
-                    }
-                    crate::analyzer::RelationalFrontierOutcome::Failed(_) => {
-                        return Err(GraphFailureReason::UnsupportedTargetShape(
-                            "the relational Python scan frontier failed",
-                        )
-                        .diagnostic(target.fq_name(), PYTHON_STRATEGY));
-                    }
-                };
+                ),
+                crate::analyzer::relational_frontier::RelationalItemFrontierOutcome::Cancelled(
+                    _,
+                ) => return Ok(CandidateUsageHits::default()),
+                crate::analyzer::relational_frontier::RelationalItemFrontierOutcome::Failed(_) => {
+                    return Err(GraphFailureReason::UnsupportedTargetShape(
+                        "the relational Python scan frontier failed",
+                    )
+                    .diagnostic(target.fq_name(), PYTHON_STRATEGY));
+                }
+            };
             // A proven hit inside the target itself is a recursive call (#1638):
             // kept, classified `SelfReceiver`. The unproven channel still drops
             // them -- an unproven recursive call is not evidence of anything.

@@ -10,10 +10,18 @@
 use std::str::FromStr;
 
 use brokk_bifrost_rql::structural::search::{
-    CodeQueryCallShapeArgument, CodeQueryResultItem, CodeQueryRowFieldUnknownReason,
-    DetailedCodeQueryDomain, UnitRowField, UnitRowItem, UnitRowScalar, UnitRowUnknownField,
+    CodeQueryCallShapeArgument, CodeQueryClassSetRow, CodeQueryFlowCarrierSymbol,
+    CodeQueryFlowCertainty, CodeQueryFlowEndpoint, CodeQueryFlowEvent, CodeQueryFlowReachability,
+    CodeQueryFlowStatus, CodeQueryFlowSymbolSite, CodeQueryResultItem,
+    CodeQueryRowFieldUnknownReason, CodeQuerySemanticCompleteness, CodeQuerySemanticEvidence,
+    CodeQuerySemanticProof, CodeQuerySourceSite, CodeQueryTaintFinding,
+    CodeQueryTypestateCertainty, CodeQueryTypestateFinding, CodeQueryTypestateFindingKind,
+    CodeQueryTypestateSubject, DetailedCodeQueryDomain, UnitRowField, UnitRowItem, UnitRowScalar,
+    UnitRowUnknownField,
 };
-use brokk_bifrost_rql::structural::{CodeQueryRange, CodeQueryResultValue};
+use brokk_bifrost_rql::structural::{CodeQueryCompletion, CodeQueryRange, CodeQueryResultValue};
+
+use brokk_bifrost_flow::type_flow::ClassSetStatus;
 
 use brokk_bifrost_analysis::analyzer::usages::call_conversion::ConversionUnknown;
 
@@ -125,6 +133,7 @@ fn call_binding(
         path: "app.ts".into(),
         range: None,
         evidence: None,
+        coverage: None,
         fields,
         unknown_fields,
         projected_field_names: Vec::new(),
@@ -320,8 +329,8 @@ fn an_exceeded_upper_bound_is_published_from_a_proven_subset() {
     let plan = counting_plan(AssertCardinality::AtMost(1));
     let rows = two_rows_at_one_site();
     for coverage in [
-        RelationCoverage::Exhaustive,
-        RelationCoverage::ProvenSubset,
+        RelationCoverage::exhaustive(),
+        RelationCoverage::proven_subset(),
         RelationCoverage::incomplete(vec![PolicyIncompleteReason::Cancelled]),
     ] {
         let evaluation = evaluate(&plan, &[("arg", &rows, coverage.clone())]);
@@ -340,7 +349,7 @@ fn an_exceeded_upper_bound_is_published_from_a_proven_subset() {
 fn an_exceeded_exact_bound_is_published_from_a_proven_subset() {
     let plan = counting_plan(AssertCardinality::Exactly(1));
     let rows = two_rows_at_one_site();
-    let evaluation = evaluate(&plan, &[("arg", &rows, RelationCoverage::ProvenSubset)]);
+    let evaluation = evaluate(&plan, &[("arg", &rows, RelationCoverage::proven_subset())]);
     assert_eq!(verdicts(&evaluation), vec![("site".to_string(), 2)]);
     assert!(evaluation.unmet_obligations.is_empty());
 }
@@ -352,11 +361,11 @@ fn a_clean_upper_bound_needs_exhaustive_coverage() {
     let plan = counting_plan(AssertCardinality::AtMost(2));
     let rows = two_rows_at_one_site();
 
-    let exhaustive = evaluate(&plan, &[("arg", &rows, RelationCoverage::Exhaustive)]);
+    let exhaustive = evaluate(&plan, &[("arg", &rows, RelationCoverage::exhaustive())]);
     assert!(exhaustive.violations.is_empty());
     assert!(exhaustive.unmet_obligations.is_empty());
 
-    let subset = evaluate(&plan, &[("arg", &rows, RelationCoverage::ProvenSubset)]);
+    let subset = evaluate(&plan, &[("arg", &rows, RelationCoverage::proven_subset())]);
     assert!(subset.violations.is_empty());
     assert_eq!(subset.unmet_obligations.len(), 1);
     assert_eq!(
@@ -375,12 +384,12 @@ fn a_clean_zero_verdict_needs_exhaustive_coverage() {
     let plan = counting_plan(AssertCardinality::Exactly(0));
     let rows: Vec<UnitRowItem> = Vec::new();
 
-    let exhaustive = evaluate(&plan, &[("arg", &rows, RelationCoverage::Exhaustive)]);
+    let exhaustive = evaluate(&plan, &[("arg", &rows, RelationCoverage::exhaustive())]);
     assert!(exhaustive.unmet_obligations.is_empty());
 
     // No group exists at all, so the clean verdict is a claim about rows nobody
     // read.
-    let subset = evaluate(&plan, &[("arg", &rows, RelationCoverage::ProvenSubset)]);
+    let subset = evaluate(&plan, &[("arg", &rows, RelationCoverage::proven_subset())]);
     assert_eq!(subset.violations.len(), 0);
     assert_eq!(subset.unmet_obligations.len(), 1);
     assert!(subset.unmet_obligations[0].key.is_empty());
@@ -394,11 +403,11 @@ fn a_lower_bound_violation_needs_exhaustive_coverage() {
         let plan = counting_plan(cardinality);
         let rows = two_rows_at_one_site();
 
-        let exhaustive = evaluate(&plan, &[("arg", &rows, RelationCoverage::Exhaustive)]);
+        let exhaustive = evaluate(&plan, &[("arg", &rows, RelationCoverage::exhaustive())]);
         assert_eq!(verdicts(&exhaustive), vec![("site".to_string(), 2)]);
         assert!(exhaustive.unmet_obligations.is_empty());
 
-        let subset = evaluate(&plan, &[("arg", &rows, RelationCoverage::ProvenSubset)]);
+        let subset = evaluate(&plan, &[("arg", &rows, RelationCoverage::proven_subset())]);
         assert!(subset.violations.is_empty(), "{cardinality:?}");
         assert_eq!(
             subset.unmet_obligations[0].kind,
@@ -413,7 +422,7 @@ fn a_lower_bound_violation_needs_exhaustive_coverage() {
 fn a_clean_lower_bound_is_conclusive_from_a_proven_subset() {
     let plan = counting_plan(AssertCardinality::AtLeast(2));
     let rows = two_rows_at_one_site();
-    let subset = evaluate(&plan, &[("arg", &rows, RelationCoverage::ProvenSubset)]);
+    let subset = evaluate(&plan, &[("arg", &rows, RelationCoverage::proven_subset())]);
     assert!(subset.violations.is_empty());
     assert!(
         subset.unmet_obligations.is_empty(),
@@ -557,7 +566,7 @@ fn an_unrelated_unknown_conversion_does_not_degrade_mapping_or_count() {
             None,
         ),
     ];
-    let evaluation = evaluate(&plan, &[("calls", &rows, RelationCoverage::Exhaustive)]);
+    let evaluation = evaluate(&plan, &[("calls", &rows, RelationCoverage::exhaustive())]);
     assert_eq!(verdicts(&evaluation), vec![("site".to_string(), 2)]);
     assert!(evaluation.unmet_obligations.is_empty());
     assert!(evaluation.exhaustive);
@@ -584,7 +593,7 @@ fn mapping_only_filter_remains_exhaustive_with_unknown_conversion() {
             None,
         ),
     ];
-    let evaluation = evaluate(&plan, &[("calls", &rows, RelationCoverage::Exhaustive)]);
+    let evaluation = evaluate(&plan, &[("calls", &rows, RelationCoverage::exhaustive())]);
     assert_eq!(verdicts(&evaluation), vec![("site".to_string(), 2)]);
     assert!(evaluation.unmet_obligations.is_empty());
     assert!(evaluation.exhaustive);
@@ -620,7 +629,7 @@ fn conversion_equality_does_not_treat_unknown_as_a_known_value() {
             None,
         ),
     ];
-    let evaluation = evaluate(&plan, &[("calls", &rows, RelationCoverage::Exhaustive)]);
+    let evaluation = evaluate(&plan, &[("calls", &rows, RelationCoverage::exhaustive())]);
     assert!(evaluation.violations.is_empty());
     assert_eq!(evaluation.unmet_obligations.len(), 1);
     assert_eq!(
@@ -650,7 +659,10 @@ fn conversion_null_tests_do_not_treat_unknown_as_absent() {
         },
         AssertCardinality::AtMost(0),
     );
-    let evaluation = evaluate(&is_null, &[("calls", &rows, RelationCoverage::Exhaustive)]);
+    let evaluation = evaluate(
+        &is_null,
+        &[("calls", &rows, RelationCoverage::exhaustive())],
+    );
     assert!(evaluation.violations.is_empty());
     assert_eq!(evaluation.unmet_obligations.len(), 1);
     assert_eq!(
@@ -668,7 +680,7 @@ fn conversion_null_tests_do_not_treat_unknown_as_absent() {
     );
     let evaluation = evaluate(
         &is_not_null,
-        &[("calls", &rows, RelationCoverage::Exhaustive)],
+        &[("calls", &rows, RelationCoverage::exhaustive())],
     );
     assert!(evaluation.violations.is_empty());
     assert_eq!(evaluation.unmet_obligations.len(), 1);
@@ -701,8 +713,8 @@ fn conversion_join_drops_unknown_keys_without_matching_nulls() {
     let evaluation = evaluate(
         &plan,
         &[
-            ("left", &left, RelationCoverage::Exhaustive),
-            ("right", &right, RelationCoverage::Exhaustive),
+            ("left", &left, RelationCoverage::exhaustive()),
+            ("right", &right, RelationCoverage::exhaustive()),
         ],
     );
     assert!(evaluation.violations.is_empty());
@@ -736,8 +748,8 @@ fn conversion_anti_join_does_not_publish_unwitnessed_unmatched_rows() {
     let evaluation = evaluate(
         &plan,
         &[
-            ("left", &left, RelationCoverage::Exhaustive),
-            ("right", &right, RelationCoverage::Exhaustive),
+            ("left", &left, RelationCoverage::exhaustive()),
+            ("right", &right, RelationCoverage::exhaustive()),
         ],
     );
     assert!(evaluation.violations.is_empty());
@@ -757,7 +769,10 @@ fn unknown_value_blocks_all_min_max_and_all_aggregate_witnesses() {
         call_binding("site", "known", Some(0), Some(true), None, None),
         call_binding("site", "unknown", None, None, None, Some("terminal")),
     ];
-    let all_evaluation = evaluate(&all, &[("calls", &all_rows, RelationCoverage::Exhaustive)]);
+    let all_evaluation = evaluate(
+        &all,
+        &[("calls", &all_rows, RelationCoverage::exhaustive())],
+    );
     assert!(all_evaluation.violations.is_empty());
     assert_eq!(all_evaluation.unmet_obligations.len(), 1);
     assert_eq!(
@@ -778,7 +793,7 @@ fn unknown_value_blocks_all_min_max_and_all_aggregate_witnesses() {
                 Some("actual_index"),
             ),
         ];
-        let evaluation = evaluate(&plan, &[("calls", &rows, RelationCoverage::Exhaustive)]);
+        let evaluation = evaluate(&plan, &[("calls", &rows, RelationCoverage::exhaustive())]);
         assert!(evaluation.violations.is_empty(), "{op:?}");
         assert_eq!(evaluation.unmet_obligations.len(), 1, "{op:?}");
         assert_eq!(
@@ -819,7 +834,7 @@ fn unknown_conversion_count_clean_upper_bound_is_inconclusive() {
             None,
         ),
     ];
-    let evaluation = evaluate(&plan, &[("calls", &rows, RelationCoverage::Exhaustive)]);
+    let evaluation = evaluate(&plan, &[("calls", &rows, RelationCoverage::exhaustive())]);
     assert!(evaluation.violations.is_empty());
     assert_eq!(evaluation.unmet_obligations.len(), 1);
     assert_eq!(
@@ -875,8 +890,8 @@ fn a_semi_join_keeps_each_left_row_once() {
     let semi = evaluate(
         &join_plan(IrJoinKind::Semi, AssertCardinality::AtMost(0)),
         &[
-            ("arg", &left, RelationCoverage::Exhaustive),
-            ("other", &right, RelationCoverage::Exhaustive),
+            ("arg", &left, RelationCoverage::exhaustive()),
+            ("other", &right, RelationCoverage::exhaustive()),
         ],
     );
     assert_eq!(verdicts(&semi), vec![("site".to_string(), 1)]);
@@ -884,8 +899,8 @@ fn a_semi_join_keeps_each_left_row_once() {
     let inner = evaluate(
         &join_plan(IrJoinKind::Inner, AssertCardinality::AtMost(0)),
         &[
-            ("arg", &left, RelationCoverage::Exhaustive),
-            ("other", &right, RelationCoverage::Exhaustive),
+            ("arg", &left, RelationCoverage::exhaustive()),
+            ("other", &right, RelationCoverage::exhaustive()),
         ],
     );
     assert_eq!(verdicts(&inner), vec![("site".to_string(), 2)]);
@@ -949,8 +964,8 @@ fn a_left_join_keeps_an_unmatched_left_row_with_null_right_fields() {
     let evaluation = evaluate(
         &plan,
         &[
-            ("arg", &left_rows, RelationCoverage::Exhaustive),
-            ("other", &right_rows, RelationCoverage::Exhaustive),
+            ("arg", &left_rows, RelationCoverage::exhaustive()),
+            ("other", &right_rows, RelationCoverage::exhaustive()),
         ],
     );
     assert_eq!(verdicts(&evaluation), vec![("site".to_string(), 1)]);
@@ -970,8 +985,8 @@ fn a_left_join_matches_inner_join_for_matching_pairs() {
     let left = [argument("site", "arg-0", 0, None, false)];
     let right = [argument("site", "other-0", 0, None, false)];
     let inputs = [
-        ("arg", &left[..], RelationCoverage::Exhaustive),
-        ("other", &right[..], RelationCoverage::Exhaustive),
+        ("arg", &left[..], RelationCoverage::exhaustive()),
+        ("other", &right[..], RelationCoverage::exhaustive()),
     ];
     let left_join = evaluate(
         &join_plan(IrJoinKind::Left, AssertCardinality::AtMost(0)),
@@ -1010,8 +1025,8 @@ fn a_left_join_retains_each_matching_right_duplicate() {
     let evaluation = evaluate(
         &join_plan(IrJoinKind::Left, AssertCardinality::AtMost(0)),
         &[
-            ("arg", &left, RelationCoverage::Exhaustive),
-            ("other", &right, RelationCoverage::Exhaustive),
+            ("arg", &left, RelationCoverage::exhaustive()),
+            ("other", &right, RelationCoverage::exhaustive()),
         ],
     );
     assert_eq!(verdicts(&evaluation), vec![("site".to_string(), 2)]);
@@ -1027,8 +1042,8 @@ fn an_unmatched_left_join_row_is_witness_unsound_over_a_partial_right_relation()
     let evaluation = evaluate(
         &join_plan(IrJoinKind::Left, AssertCardinality::AtMost(0)),
         &[
-            ("arg", &left, RelationCoverage::Exhaustive),
-            ("other", &right, RelationCoverage::ProvenSubset),
+            ("arg", &left, RelationCoverage::exhaustive()),
+            ("other", &right, RelationCoverage::proven_subset()),
         ],
     );
     assert!(evaluation.violations.is_empty());
@@ -1095,8 +1110,8 @@ fn a_left_join_retains_right_witness_and_coverage_reasons() {
     let evaluation = evaluate(
         &plan,
         &[
-            ("arg", &arg_rows, RelationCoverage::Exhaustive),
-            ("other", &other_rows, RelationCoverage::ProvenSubset),
+            ("arg", &arg_rows, RelationCoverage::exhaustive()),
+            ("other", &other_rows, RelationCoverage::proven_subset()),
             (
                 "blocker",
                 &blocker_rows,
@@ -1134,8 +1149,8 @@ fn an_inner_join_preserves_duplicate_order_and_contributors() {
     let evaluation = evaluate(
         &join_plan(IrJoinKind::Inner, AssertCardinality::AtMost(0)),
         &[
-            ("arg", &left, RelationCoverage::Exhaustive),
-            ("other", &right, RelationCoverage::Exhaustive),
+            ("arg", &left, RelationCoverage::exhaustive()),
+            ("other", &right, RelationCoverage::exhaustive()),
         ],
     );
     assert_eq!(verdicts(&evaluation), vec![("site".to_string(), 4)]);
@@ -1214,8 +1229,8 @@ fn a_composite_key_rejects_a_partial_match() {
             ],
         ),
         &[
-            ("arg", &left, RelationCoverage::Exhaustive),
-            ("other", &right, RelationCoverage::Exhaustive),
+            ("arg", &left, RelationCoverage::exhaustive()),
+            ("other", &right, RelationCoverage::exhaustive()),
         ],
     );
     assert_eq!(verdicts(&evaluation), vec![("site".to_string(), 1)]);
@@ -1236,8 +1251,8 @@ fn nullable_join_keys_use_option_equality() {
             }],
         ),
         &[
-            ("arg", &left, RelationCoverage::Exhaustive),
-            ("other", &right, RelationCoverage::Exhaustive),
+            ("arg", &left, RelationCoverage::exhaustive()),
+            ("other", &right, RelationCoverage::exhaustive()),
         ],
     );
     assert_eq!(verdicts(&evaluation), vec![("site".to_string(), 1)]);
@@ -1250,8 +1265,8 @@ fn semi_and_anti_joins_select_opposite_row_sets() {
     let left = vec![argument("site", "arg-0", 0, None, false)];
     let right = vec![argument("elsewhere", "other-0", 0, None, false)];
     let inputs: &[(&str, &[UnitRowItem], RelationCoverage)] = &[
-        ("arg", &left, RelationCoverage::Exhaustive),
-        ("other", &right, RelationCoverage::Exhaustive),
+        ("arg", &left, RelationCoverage::exhaustive()),
+        ("other", &right, RelationCoverage::exhaustive()),
     ];
     let semi = evaluate(
         &join_plan(IrJoinKind::Semi, AssertCardinality::AtMost(0)),
@@ -1274,8 +1289,8 @@ fn anti_join_output_is_witness_unsound_over_a_partial_right_relation() {
     let evaluation = evaluate(
         &join_plan(IrJoinKind::Anti, AssertCardinality::AtMost(0)),
         &[
-            ("arg", &left, RelationCoverage::Exhaustive),
-            ("other", &right, RelationCoverage::ProvenSubset),
+            ("arg", &left, RelationCoverage::exhaustive()),
+            ("other", &right, RelationCoverage::proven_subset()),
         ],
     );
     assert!(
@@ -1302,8 +1317,8 @@ fn an_anti_join_that_removed_every_row_still_concludes() {
     let evaluation = evaluate(
         &join_plan(IrJoinKind::Anti, AssertCardinality::AtMost(0)),
         &[
-            ("arg", &left, RelationCoverage::Exhaustive),
-            ("other", &right, RelationCoverage::Exhaustive),
+            ("arg", &left, RelationCoverage::exhaustive()),
+            ("other", &right, RelationCoverage::exhaustive()),
         ],
     );
     assert!(evaluation.violations.is_empty());
@@ -1318,8 +1333,8 @@ fn an_inner_join_meets_both_coverages() {
     let evaluation = evaluate(
         &join_plan(IrJoinKind::Inner, AssertCardinality::AtMost(1)),
         &[
-            ("arg", &rows, RelationCoverage::Exhaustive),
-            ("other", &rows, RelationCoverage::ProvenSubset),
+            ("arg", &rows, RelationCoverage::exhaustive()),
+            ("other", &rows, RelationCoverage::proven_subset()),
         ],
     );
     assert!(evaluation.violations.is_empty());
@@ -1339,7 +1354,7 @@ fn the_source_bound_truncates_and_degrades_coverage() {
     let mut plan = counting_plan(AssertCardinality::AtMost(2));
     plan.limits.max_source_rows = 1;
     let rows = two_rows_at_one_site();
-    let evaluation = evaluate(&plan, &[("arg", &rows, RelationCoverage::Exhaustive)]);
+    let evaluation = evaluate(&plan, &[("arg", &rows, RelationCoverage::exhaustive())]);
     assert!(evaluation.limit_exceeded);
     assert!(!evaluation.exhaustive);
     assert_eq!(
@@ -1360,8 +1375,8 @@ fn the_comparison_and_joined_row_bounds_truncate() {
         let evaluation = evaluate(
             &plan,
             &[
-                ("arg", &rows, RelationCoverage::Exhaustive),
-                ("other", &rows, RelationCoverage::Exhaustive),
+                ("arg", &rows, RelationCoverage::exhaustive()),
+                ("other", &rows, RelationCoverage::exhaustive()),
             ],
         );
         assert!(evaluation.limit_exceeded);
@@ -1386,8 +1401,8 @@ fn the_probe_budget_allows_a_large_duplicate_cartesian_output() {
     let evaluation = evaluate(
         &plan,
         &[
-            ("arg", &left, RelationCoverage::Exhaustive),
-            ("other", &right, RelationCoverage::Exhaustive),
+            ("arg", &left, RelationCoverage::exhaustive()),
+            ("other", &right, RelationCoverage::exhaustive()),
         ],
     );
     assert_eq!(verdicts(&evaluation), vec![("site".to_string(), 4)]);
@@ -1410,8 +1425,8 @@ fn too_many_left_probes_still_truncate_the_join() {
     let evaluation = evaluate(
         &plan,
         &[
-            ("arg", &left, RelationCoverage::Exhaustive),
-            ("other", &right, RelationCoverage::Exhaustive),
+            ("arg", &left, RelationCoverage::exhaustive()),
+            ("other", &right, RelationCoverage::exhaustive()),
         ],
     );
     assert!(evaluation.limit_exceeded);
@@ -1426,7 +1441,7 @@ fn the_group_bound_truncates_the_group_relation() {
         argument("site-a", "arg-0", 0, None, false),
         argument("site-b", "arg-1", 0, None, false),
     ];
-    let evaluation = evaluate(&plan, &[("arg", &rows, RelationCoverage::Exhaustive)]);
+    let evaluation = evaluate(&plan, &[("arg", &rows, RelationCoverage::exhaustive())]);
     assert!(evaluation.limit_exceeded);
     assert_eq!(
         evaluation.violations.len(),
@@ -1447,7 +1462,7 @@ fn a_truncated_group_loses_its_verdict_and_no_other_group_does() {
         argument("site-a", "arg-1", 1, None, false),
         argument("site-b", "arg-2", 0, None, false),
     ];
-    let evaluation = evaluate(&plan, &[("arg", &rows, RelationCoverage::Exhaustive)]);
+    let evaluation = evaluate(&plan, &[("arg", &rows, RelationCoverage::exhaustive())]);
     assert_eq!(verdicts(&evaluation), vec![("site-b".to_string(), 1)]);
     assert_eq!(evaluation.unmet_obligations.len(), 1);
     assert_eq!(
@@ -1478,8 +1493,8 @@ fn representative_tuple_retention_defaults_to_eight() {
     let evaluation = evaluate(
         &join_plan(IrJoinKind::Inner, AssertCardinality::AtMost(0)),
         &[
-            ("arg", &left, RelationCoverage::Exhaustive),
-            ("other", &right, RelationCoverage::Exhaustive),
+            ("arg", &left, RelationCoverage::exhaustive()),
+            ("other", &right, RelationCoverage::exhaustive()),
         ],
     );
     assert_eq!(verdicts(&evaluation), vec![("site".to_string(), 10)]);
@@ -1494,8 +1509,8 @@ fn representative_tuple_retention_accepts_a_bound_above_eight() {
     let evaluation = evaluate(
         &plan,
         &[
-            ("arg", &left, RelationCoverage::Exhaustive),
-            ("other", &right, RelationCoverage::Exhaustive),
+            ("arg", &left, RelationCoverage::exhaustive()),
+            ("other", &right, RelationCoverage::exhaustive()),
         ],
     );
     assert_eq!(verdicts(&evaluation), vec![("site".to_string(), 10)]);
@@ -1528,7 +1543,7 @@ fn published_verdicts_do_not_depend_on_input_row_order() {
     let ordered = build(0);
     let expected = verdicts(&evaluate(
         &plan,
-        &[("arg", &ordered, RelationCoverage::Exhaustive)],
+        &[("arg", &ordered, RelationCoverage::exhaustive())],
     ));
     assert_eq!(
         expected,
@@ -1543,7 +1558,7 @@ fn published_verdicts_do_not_depend_on_input_row_order() {
         assert_eq!(
             verdicts(&evaluate(
                 &plan,
-                &[("arg", &shuffled, RelationCoverage::Exhaustive)]
+                &[("arg", &shuffled, RelationCoverage::exhaustive())]
             )),
             expected,
             "rotation {rotation}"
@@ -1568,7 +1583,7 @@ fn filtered_count(predicates: Vec<IrPredicate>, rows: &[UnitRowItem]) -> u64 {
     );
     let assert = assertion("kept", &grouped, "calls", AssertCardinality::AtMost(0));
     let plan = plan(vec![arg, filtered, grouped], vec![assert]);
-    let evaluation = evaluate(&plan, &[("arg", rows, RelationCoverage::Exhaustive)]);
+    let evaluation = evaluate(&plan, &[("arg", rows, RelationCoverage::exhaustive())]);
     evaluation
         .violations
         .first()
@@ -1715,8 +1730,8 @@ fn a_field_to_field_comparison_reads_both_sides() {
     let evaluation = evaluate(
         &plan,
         &[
-            ("arg", &rows, RelationCoverage::Exhaustive),
-            ("other", &rows, RelationCoverage::Exhaustive),
+            ("arg", &rows, RelationCoverage::exhaustive()),
+            ("other", &rows, RelationCoverage::exhaustive()),
         ],
     );
     assert_eq!(
@@ -1742,7 +1757,7 @@ fn folded(op: IrAggregateOp, value: &str, rows: &[UnitRowItem]) -> u64 {
     // `at-most 0` publishes the fold's exact value as the violation's actual.
     let assert = assertion("value", &grouped, "value", AssertCardinality::AtMost(0));
     let plan = plan(vec![arg, grouped], vec![assert]);
-    let evaluation = evaluate(&plan, &[("arg", rows, RelationCoverage::Exhaustive)]);
+    let evaluation = evaluate(&plan, &[("arg", rows, RelationCoverage::exhaustive())]);
     evaluation
         .violations
         .first()
@@ -2101,7 +2116,7 @@ fn cancellation_during_source_discards_partial_rows() {
     let inputs = [RelationalInput {
         binding: &name,
         rows: &rows,
-        coverage: RelationCoverage::Exhaustive,
+        coverage: RelationCoverage::exhaustive(),
     }];
     cancellation_witness(&plan, &inputs, |work| {
         work.input_rows == 1 && work.materialized_rows == 0
@@ -2135,7 +2150,7 @@ fn cancellation_during_filter_discards_partial_rows() {
     let inputs = [RelationalInput {
         binding: &name,
         rows: &rows,
-        coverage: RelationCoverage::Exhaustive,
+        coverage: RelationCoverage::exhaustive(),
     }];
     let checkpoints = cancellation_witness(&plan, &inputs, |work| {
         work.input_rows == 2 && work.materialized_rows == 2
@@ -2173,12 +2188,12 @@ fn cancellation_during_join_discards_partial_matches() {
         RelationalInput {
             binding: &left,
             rows: &rows,
-            coverage: RelationCoverage::Exhaustive,
+            coverage: RelationCoverage::exhaustive(),
         },
         RelationalInput {
             binding: &right,
             rows: &rows,
-            coverage: RelationCoverage::Exhaustive,
+            coverage: RelationCoverage::exhaustive(),
         },
     ];
     let checkpoints = cancellation_witness(&plan, &inputs, |work| {
@@ -2198,7 +2213,7 @@ fn cancellation_during_group_discards_partial_groups() {
     let inputs = [RelationalInput {
         binding: &name,
         rows: &rows,
-        coverage: RelationCoverage::Exhaustive,
+        coverage: RelationCoverage::exhaustive(),
     }];
     cancellation_witness(&plan, &inputs, |work| {
         work.produced_groups == 1 && work.materialized_rows == 2
@@ -2216,7 +2231,7 @@ fn cancellation_during_assertion_discards_already_computed_violations() {
     let inputs = [RelationalInput {
         binding: &name,
         rows: &rows,
-        coverage: RelationCoverage::Exhaustive,
+        coverage: RelationCoverage::exhaustive(),
     }];
     cancellation_witness(&plan, &inputs, |work| work.assertion_checks == 1);
 }
@@ -2251,7 +2266,7 @@ fn may_evidence_survives_grouping_beyond_retained_representatives() {
     });
     let mut plan = counting_plan(AssertCardinality::AtMost(0));
     plan.limits.max_representative_tuples = 1;
-    let result = evaluate(&plan, &[("arg", &rows, RelationCoverage::Exhaustive)]);
+    let result = evaluate(&plan, &[("arg", &rows, RelationCoverage::exhaustive())]);
     assert_eq!(result.violations.len(), 1);
     assert_eq!(result.violations[0].representatives.len(), 1);
     assert_eq!(
@@ -2266,8 +2281,580 @@ fn may_evidence_survives_grouping_beyond_retained_representatives() {
     assert!(result.exhaustive);
 
     plan.limits.max_values_per_group = 1;
-    let truncated = evaluate(&plan, &[("arg", &rows, RelationCoverage::Exhaustive)]);
+    let truncated = evaluate(&plan, &[("arg", &rows, RelationCoverage::exhaustive())]);
     assert!(truncated.violations.is_empty());
     assert!(!truncated.unmet_obligations.is_empty());
     assert!(!truncated.exhaustive);
+}
+
+// ---------------------------------------------------------------------------
+// Flow, taint, typestate and type-flow rows in the coverage envelope (#3205).
+//
+// These families run a solver, and the solver's outcome is a statement about
+// the partition it enumerated, not about the row set the query returned. A
+// query can therefore complete cleanly over rows whose solve abstained, ran out
+// of budget, or retained only part of a finding's evidence. Before #3205 the
+// envelope was derived from `CodeQueryCompletion` alone, so exactly those runs
+// read as exhaustive and an absence verdict over them passed clean.
+// ---------------------------------------------------------------------------
+
+fn range() -> CodeQueryRange {
+    CodeQueryRange {
+        start_line: 1,
+        start_column: 1,
+        end_line: 1,
+        end_column: 2,
+    }
+}
+
+fn flow_symbol_site(id: &str) -> CodeQueryFlowSymbolSite {
+    CodeQueryFlowSymbolSite {
+        id: id.to_string(),
+        path: "app.py".to_string(),
+        language: "python",
+        declaration: Vec::new(),
+        role: "value",
+        start_byte: 0,
+        end_byte: 1,
+        occurrence: 0,
+        range: range(),
+    }
+}
+
+fn flow_event(id: &str, phase: &'static str) -> CodeQueryFlowEvent {
+    CodeQueryFlowEvent {
+        id: id.to_string(),
+        site: flow_symbol_site(id),
+        path: "app.py".to_string(),
+        range: range(),
+        phase,
+        ordinal: 0,
+        carrier: CodeQueryFlowCarrierSymbol::Value {
+            id: format!("{id}-carrier"),
+            site: flow_symbol_site(id),
+            role: "value".to_string(),
+            ordinal: None,
+        },
+    }
+}
+
+/// One value-flow endpoint row exactly as the projector publishes it, so the
+/// coverage under test is derived from the real row, not from a hand-written
+/// envelope.
+fn flow_endpoint(id: &str, plan_ref: &str, status: CodeQueryFlowStatus) -> UnitRowItem {
+    UnitRowItem::project(&CodeQueryResultItem {
+        value: CodeQueryResultValue::FlowEndpoint {
+            value: Box::new(CodeQueryFlowEndpoint {
+                id: id.to_string(),
+                plan_ref: plan_ref.to_string(),
+                source: Some(flow_event(&format!("{id}-source"), "source")),
+                sink: flow_event(&format!("{id}-sink"), "sink"),
+                reachability: CodeQueryFlowReachability::Reached,
+                certainty: Some(CodeQueryFlowCertainty::Exact),
+                ambiguous: false,
+                status,
+                reason: None,
+                path: "app.py".to_string(),
+                language: "python",
+                range: range(),
+                path_qualities: Vec::new(),
+                retained_witnesses: 0,
+                omitted_witnesses: 0,
+            }),
+        },
+        provenance: Vec::new(),
+        provenance_truncated: false,
+        row_projection: Vec::new(),
+    })
+}
+
+fn typestate_finding(
+    id: &str,
+    protocol_ref: &str,
+    analysis_complete: bool,
+    abstained: bool,
+) -> UnitRowItem {
+    UnitRowItem::project(&CodeQueryResultItem {
+        value: CodeQueryResultValue::TypestateFinding {
+            value: Box::new(CodeQueryTypestateFinding {
+                id: id.to_string(),
+                protocol_ref: protocol_ref.to_string(),
+                protocol_hash: "protocol-hash".to_string(),
+                binding_plan_hash: "binding-hash".to_string(),
+                subject: CodeQueryTypestateSubject {
+                    class: "Resource".to_string(),
+                    identity: "app.Resource".to_string(),
+                },
+                finding_kind: CodeQueryTypestateFindingKind::TerminalExpectation {
+                    expectation: "closed".to_string(),
+                    actual_states: vec!["open".to_string()],
+                },
+                certainty: CodeQueryTypestateCertainty::May,
+                path: "app.py".to_string(),
+                language: "python",
+                range: range(),
+                path_proven: true,
+                path_complete: true,
+                analysis_complete,
+                uncertainty: Vec::new(),
+                abstained,
+                retained_witnesses: 0,
+                omitted_witnesses: 0,
+            }),
+        },
+        provenance: Vec::new(),
+        provenance_truncated: false,
+        row_projection: Vec::new(),
+    })
+}
+
+fn taint_finding(id: &str, sink_event_id: &str, origins_truncated: bool) -> UnitRowItem {
+    let complete = !origins_truncated;
+    UnitRowItem::project(&CodeQueryResultItem {
+        value: CodeQueryResultValue::TaintFinding {
+            value: Box::new(CodeQueryTaintFinding {
+                id: id.to_string(),
+                path: "app.py".to_string(),
+                language: "python",
+                range: range(),
+                sink_event_id: sink_event_id.to_string(),
+                sink: CodeQuerySourceSite {
+                    path: "app.py".to_string(),
+                    range: range(),
+                },
+                reached_labels: vec!["tainted".to_string()],
+                origins: Vec::new(),
+                origins_truncated,
+                witnesses: Vec::new(),
+                witnesses_truncated: false,
+                evidence: CodeQuerySemanticEvidence::new(
+                    CodeQuerySemanticProof::Proven,
+                    if complete {
+                        CodeQuerySemanticCompleteness::Complete
+                    } else {
+                        CodeQuerySemanticCompleteness::Partial
+                    },
+                    None,
+                ),
+                ambiguous: false,
+            }),
+        },
+        provenance: Vec::new(),
+        provenance_truncated: false,
+        row_projection: Vec::new(),
+    })
+}
+
+fn class_set_row(id: &str, status: ClassSetStatus) -> UnitRowItem {
+    UnitRowItem::project(&CodeQueryResultItem {
+        value: CodeQueryResultValue::ClassSetRow {
+            value: Box::new(CodeQueryClassSetRow {
+                id: id.to_string(),
+                file: "app.py".to_string(),
+                range: range(),
+                member: "close".to_string(),
+                class: Some("app.Resource".to_string()),
+                origin: "workspace".to_string(),
+                status: status.label(),
+                guard_only: Some(false),
+            }),
+        },
+        provenance: Vec::new(),
+        provenance_truncated: false,
+        row_projection: Vec::new(),
+    })
+}
+
+/// The envelope the relational seam builds for one executed binding, with the
+/// query envelope a clean run hands it.
+fn envelope_of_complete_query(rows: &[UnitRowItem]) -> RelationCoverage {
+    RelationCoverage::from_query(rows, &CodeQueryCompletion::Complete, false)
+}
+
+/// The regression. A value-flow binding whose solve stopped against the solver
+/// budget publishes rows the query returned in full; the envelope must still
+/// refuse to call the relation exhaustive, and must name the plan it is about.
+#[test]
+fn a_flow_solve_that_stopped_against_a_budget_is_not_an_exhaustive_relation() {
+    let rows = vec![
+        flow_endpoint("endpoint-0", "plan-a", CodeQueryFlowStatus::Complete),
+        flow_endpoint(
+            "endpoint-1",
+            "plan-b",
+            CodeQueryFlowStatus::SolverBudgetExhausted,
+        ),
+    ];
+    let coverage = envelope_of_complete_query(&rows);
+    assert!(
+        !coverage.is_exhaustive(),
+        "a complete query over an unfinished solve is not an exhaustive relation"
+    );
+    assert_eq!(
+        coverage.incomplete_reasons(),
+        vec![PolicyIncompleteReason::PartialDiscovery]
+    );
+    let named = coverage
+        .partition()
+        .roots()
+        .iter()
+        .map(|root| (root.family.label(), root.root.as_ref()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        named,
+        vec![("flow_endpoint", "plan-b")],
+        "the envelope names the plan whose solve did not finish, not the one that did"
+    );
+}
+
+/// Every other flow status that is not `complete` is a frontier, a limit or a
+/// stop, and none of them establishes the endpoint set.
+#[test]
+fn only_a_complete_flow_status_establishes_the_endpoint_set() {
+    for status in [
+        CodeQueryFlowStatus::Partial,
+        CodeQueryFlowStatus::Ambiguous,
+        CodeQueryFlowStatus::Unknown,
+        CodeQueryFlowStatus::Unproven,
+        CodeQueryFlowStatus::Unsupported,
+        CodeQueryFlowStatus::SemanticBudgetExhausted,
+        CodeQueryFlowStatus::SolverBudgetExhausted,
+        CodeQueryFlowStatus::SemanticCancelled,
+        CodeQueryFlowStatus::SolverCancelled,
+        CodeQueryFlowStatus::QueryCancelled,
+    ] {
+        let rows = vec![flow_endpoint("endpoint", "plan-a", status)];
+        assert!(
+            !envelope_of_complete_query(&rows).is_exhaustive(),
+            "{}",
+            status.label()
+        );
+    }
+    let complete = vec![flow_endpoint(
+        "endpoint",
+        "plan-a",
+        CodeQueryFlowStatus::Complete,
+    )];
+    assert!(
+        envelope_of_complete_query(&complete).is_exhaustive(),
+        "a finished solve over a complete query is exhaustive"
+    );
+}
+
+/// An unsupported capability is not a partial result: nothing the family
+/// produced describes the partition at all.
+#[test]
+fn an_unsupported_flow_capability_dominates_the_relation_envelope() {
+    let rows = vec![
+        flow_endpoint("endpoint-0", "plan-a", CodeQueryFlowStatus::Complete),
+        flow_endpoint("endpoint-1", "plan-b", CodeQueryFlowStatus::Unsupported),
+    ];
+    let coverage = envelope_of_complete_query(&rows);
+    assert_eq!(
+        coverage.incomplete_reasons(),
+        vec![PolicyIncompleteReason::CapabilityIncomplete]
+    );
+    assert!(matches!(
+        coverage.extent(),
+        super::coverage::CoverageExtent::Unsupported { .. }
+    ));
+}
+
+/// The typestate report's completeness and a finding's own abstention are both
+/// per-partition facts that a clean query envelope does not carry.
+#[test]
+fn an_abstained_or_incomplete_typestate_finding_is_not_an_exhaustive_relation() {
+    let complete = vec![typestate_finding("finding", "protocol-a", true, false)];
+    assert!(envelope_of_complete_query(&complete).is_exhaustive());
+
+    for (analysis_complete, abstained) in [(false, false), (true, true), (false, true)] {
+        let rows = vec![typestate_finding(
+            "finding",
+            "protocol-a",
+            analysis_complete,
+            abstained,
+        )];
+        let coverage = envelope_of_complete_query(&rows);
+        assert!(
+            !coverage.is_exhaustive(),
+            "analysis_complete={analysis_complete} abstained={abstained}"
+        );
+        assert_eq!(
+            coverage
+                .partition()
+                .roots()
+                .iter()
+                .map(|root| (root.family.label(), root.root.as_ref()))
+                .collect::<Vec<_>>(),
+            vec![("typestate_finding", "protocol-a")]
+        );
+    }
+}
+
+/// A taint finding's retained origins are bounded per finding, so a projection
+/// that dropped some of them leaves the query envelope complete while this
+/// sink's evidence set is not.
+#[test]
+fn a_taint_finding_with_truncated_origins_is_not_an_exhaustive_relation() {
+    let complete = vec![taint_finding("finding", "sink-a", false)];
+    assert!(envelope_of_complete_query(&complete).is_exhaustive());
+
+    let truncated = vec![taint_finding("finding", "sink-a", true)];
+    let coverage = envelope_of_complete_query(&truncated);
+    assert!(!coverage.is_exhaustive());
+    assert_eq!(
+        coverage
+            .partition()
+            .roots()
+            .iter()
+            .map(|root| (root.family.label(), root.root.as_ref()))
+            .collect::<Vec<_>>(),
+        vec![("taint_finding", "sink-a")]
+    );
+}
+
+/// A class set that is anything but fully known is missing atoms, so the member
+/// access it describes cannot support an absence claim.
+#[test]
+fn only_a_known_class_set_establishes_the_receiver_atoms() {
+    let known = vec![class_set_row("row", ClassSetStatus::Known)];
+    assert!(envelope_of_complete_query(&known).is_exhaustive());
+
+    for status in [
+        ClassSetStatus::Partial,
+        ClassSetStatus::NoInformation,
+        ClassSetStatus::Inconclusive,
+    ] {
+        let rows = vec![class_set_row("row", status)];
+        assert!(
+            !envelope_of_complete_query(&rows).is_exhaustive(),
+            "{}",
+            status.label()
+        );
+    }
+}
+
+/// The verdict truth table over flow-backed rows. A count above an upper bound
+/// is positive evidence whatever the solve did; the clean verdict is the one
+/// that needs the partition to have been enumerated.
+#[test]
+fn the_flow_backed_truth_table_matches_the_row_set_table() {
+    let plan_exceeded = flow_counting_plan(AssertCardinality::AtMost(1));
+    let plan_clean = flow_counting_plan(AssertCardinality::AtMost(5));
+    for status in [
+        CodeQueryFlowStatus::Complete,
+        CodeQueryFlowStatus::SolverBudgetExhausted,
+    ] {
+        let rows = vec![
+            flow_endpoint("endpoint-0", "plan-a", status),
+            flow_endpoint("endpoint-1", "plan-a", status),
+        ];
+        let coverage = envelope_of_complete_query(&rows);
+
+        let exceeded = evaluate(&plan_exceeded, &[("flow", &rows, coverage.clone())]);
+        assert_eq!(
+            verdicts(&exceeded),
+            vec![("plan-a".to_string(), 2)],
+            "{}",
+            status.label()
+        );
+        assert!(exceeded.unmet_obligations.is_empty(), "{}", status.label());
+
+        let clean = evaluate(&plan_clean, &[("flow", &rows, coverage)]);
+        assert!(clean.violations.is_empty(), "{}", status.label());
+        match status {
+            CodeQueryFlowStatus::Complete => {
+                assert!(clean.unmet_obligations.is_empty(), "{}", status.label());
+                assert!(clean.exhaustive);
+            }
+            _ => {
+                let obligation = clean
+                    .unmet_obligations
+                    .first()
+                    .expect("an unenumerated partition blocks the clean upper bound");
+                assert_eq!(
+                    obligation.kind,
+                    RelationalObligationKind::AbsenceRequiresExhaustiveCoverage
+                );
+                assert_eq!(
+                    obligation
+                        .partition
+                        .roots()
+                        .iter()
+                        .map(|root| (root.family.label(), root.root.as_ref()))
+                        .collect::<Vec<_>>(),
+                    vec![("flow_endpoint", "plan-a")],
+                    "the blocked verdict names the flow partition that blocked it"
+                );
+                assert!(!clean.exhaustive);
+            }
+        }
+    }
+}
+
+/// Group flow endpoint rows by their plan and count them.
+fn flow_counting_plan(cardinality: AssertCardinality) -> RelationalPlanIr {
+    let flow = IrRelation {
+        id: IrRelationId(0),
+        name: "flow".to_string(),
+        op: IrRelationOp::Source {
+            binding: binding("flow"),
+            schema: domain_schema("flow", DetailedCodeQueryDomain::FlowEndpoint),
+        },
+        schema: domain_schema("flow", DetailedCodeQueryDomain::FlowEndpoint),
+    };
+    let grouped = group(
+        1,
+        "by-plan",
+        &flow,
+        vec![column("flow", "plan_ref")],
+        vec![fold("by-plan", "endpoints", IrAggregateOp::Count, None)],
+    );
+    let assert = assertion("flow-endpoints", &grouped, "endpoints", cardinality);
+    plan(vec![flow, grouped], vec![assert])
+}
+
+/// Anti join one call-site relation against the flow endpoints reaching it, and
+/// assert that no site is left unmatched. `(at-most 0)` over the anti join is
+/// the shape a "no unguarded sink" policy takes.
+fn flow_anti_join_plan() -> RelationalPlanIr {
+    let sites = IrRelation {
+        id: IrRelationId(0),
+        name: "sites".to_string(),
+        op: IrRelationOp::Source {
+            binding: binding("sites"),
+            schema: domain_schema("sites", DOMAIN),
+        },
+        schema: domain_schema("sites", DOMAIN),
+    };
+    let flow = IrRelation {
+        id: IrRelationId(1),
+        name: "flow".to_string(),
+        op: IrRelationOp::Source {
+            binding: binding("flow"),
+            schema: domain_schema("flow", DetailedCodeQueryDomain::FlowEndpoint),
+        },
+        schema: domain_schema("flow", DetailedCodeQueryDomain::FlowEndpoint),
+    };
+    let joined = join(
+        2,
+        &sites,
+        &flow,
+        IrJoinKind::Anti,
+        vec![IrEquiKey {
+            left: column("sites", "id"),
+            right: column("flow", "id"),
+        }],
+    );
+    let grouped = group(
+        3,
+        "by-site",
+        &joined,
+        vec![column("sites", "site_id")],
+        vec![fold("by-site", "unmatched", IrAggregateOp::Count, None)],
+    );
+    let assert = assertion(
+        "no-unmatched-site",
+        &grouped,
+        "unmatched",
+        AssertCardinality::AtMost(0),
+    );
+    plan(vec![sites, flow, joined, grouped], vec![assert])
+}
+
+/// An anti join is a claim about the right relation's absent rows, so an
+/// unfinished flow solve on that side blocks the verdict -- and the obligation
+/// names the flow partition, not the exhaustive left side it was joined from.
+#[test]
+fn an_anti_join_over_an_unfinished_flow_solve_names_the_flow_partition() {
+    let plan = flow_anti_join_plan();
+    let sites = vec![argument("site", "arg-0", 0, Some("name"), false)];
+
+    let complete = vec![flow_endpoint(
+        "other-endpoint",
+        "plan-a",
+        CodeQueryFlowStatus::Complete,
+    )];
+    let clean = evaluate(
+        &plan,
+        &[
+            ("sites", &sites, RelationCoverage::exhaustive()),
+            ("flow", &complete, envelope_of_complete_query(&complete)),
+        ],
+    );
+    assert_eq!(
+        verdicts(&clean),
+        vec![("site".to_string(), 1)],
+        "a finished solve establishes the unmatched row, which is the violation"
+    );
+    assert!(clean.unmet_obligations.is_empty());
+
+    let stopped = vec![flow_endpoint(
+        "other-endpoint",
+        "plan-a",
+        CodeQueryFlowStatus::SolverBudgetExhausted,
+    )];
+    let blocked = evaluate(
+        &plan,
+        &[
+            ("sites", &sites, RelationCoverage::exhaustive()),
+            ("flow", &stopped, envelope_of_complete_query(&stopped)),
+        ],
+    );
+    assert!(
+        blocked.violations.is_empty(),
+        "an unmatched row over an unfinished right relation is not a witness"
+    );
+    let obligation = blocked
+        .unmet_obligations
+        .first()
+        .expect("the blocked verdict is reported as an obligation");
+    assert_eq!(
+        obligation.kind,
+        RelationalObligationKind::VerdictRequiresWitnessedRows
+    );
+    assert_eq!(
+        obligation
+            .partition
+            .roots()
+            .iter()
+            .map(|root| (root.family.label(), root.root.as_ref()))
+            .collect::<Vec<_>>(),
+        vec![("flow_endpoint", "plan-a")],
+        "the anti join names the right relation's solve, not the left relation's scope"
+    );
+}
+
+/// A published unit carries its rows as JSON, and a later run evaluates from
+/// that copy. A coverage that did not survive the round trip would let a
+/// replayed relation read as exhaustive where the live one did not, which is
+/// exactly the false green the envelope exists to prevent.
+#[test]
+fn a_persisted_row_replays_the_coverage_the_live_row_published() {
+    let rows = vec![
+        flow_endpoint("endpoint-0", "plan-a", CodeQueryFlowStatus::Complete),
+        flow_endpoint(
+            "endpoint-1",
+            "plan-b",
+            CodeQueryFlowStatus::SolverBudgetExhausted,
+        ),
+        typestate_finding("finding", "protocol-a", true, true),
+        taint_finding("taint", "sink-a", true),
+        class_set_row("class-set", ClassSetStatus::Partial),
+    ];
+    let encoded = serde_json::to_string(&rows).expect("a unit product serializes");
+    let replayed: Vec<UnitRowItem> =
+        serde_json::from_str(&encoded).expect("a published unit product is readable");
+    assert_eq!(
+        replayed
+            .iter()
+            .map(|row| row.coverage.clone())
+            .collect::<Vec<_>>(),
+        rows.iter()
+            .map(|row| row.coverage.clone())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        envelope_of_complete_query(&replayed),
+        envelope_of_complete_query(&rows)
+    );
 }

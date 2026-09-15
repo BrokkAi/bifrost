@@ -447,6 +447,21 @@ pub fn validate_prepared_syntax_for_procedure(
     file: &ProjectFile,
     prepared: Arc<PreparedSyntaxTree>,
 ) -> Result<Arc<PreparedSyntaxTree>, UnknownReason> {
+    if !matches!(prepared.backing(), PreparedSyntaxSource::Indexed(_)) {
+        return Err(UnknownReason::UncertainFlow);
+    }
+    validate_prepared_syntax_source_for_procedure(workspace, procedure, file, prepared)
+}
+
+/// Validate source identity without requiring indexed declaration access.
+/// Bounded structural queries retain exact-source trees; their bytes, dialect,
+/// mount, revision and current indexed snapshot must still match the artifact.
+pub(crate) fn validate_prepared_syntax_source_for_procedure(
+    workspace: &WorkspaceAnalyzer,
+    procedure: &ProcedureHandle,
+    file: &ProjectFile,
+    prepared: Arc<PreparedSyntaxTree>,
+) -> Result<Arc<PreparedSyntaxTree>, UnknownReason> {
     let key = procedure.artifact().key();
     let path_matches =
         WorkspaceRelativePath::try_from_path(file.rel_path()).is_ok_and(|path| &path == key.path());
@@ -473,7 +488,6 @@ pub fn validate_prepared_syntax_for_procedure(
         && key.mount() == WorkspaceMountId::from_root(file.root())
         && key.language() == prepared.dialect()
         && revision_matches
-        && matches!(prepared.backing(), PreparedSyntaxSource::Indexed(_))
         && workspace
             .analyzer()
             .indexed_source_matches(file, prepared.source());

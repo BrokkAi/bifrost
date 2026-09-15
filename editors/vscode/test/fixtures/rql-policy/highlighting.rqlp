@@ -115,3 +115,12 @@
                 (resolved-call :resolves-to "Widget.send" :proof exact
                   :receiver-type (assignable-to "Widget")
                   (call-bindings (call-shape (call :callee "send")))))))))))
+
+; Standalone typed endpoint-set documents use the policy grammar.
+(endpoint-set-document
+  :schema-version 1
+  :kind sources
+  :set (endpoint-set
+    :include-files [(endpoint-set-file
+      :path "sets/common.rqlp"
+      :sha256 "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")]))

@@ -45,8 +45,7 @@ impl ConfigurationFactValue {
     }
 
     pub(super) fn format(&self) -> crate::query::domain::ConfigurationFormat {
-        crate::query::domain::ConfigurationFormat::from_label(self.document.format().label())
-            .expect("core configuration formats round-trip through the query-domain registry")
+        self.document.format().into()
     }
 
     /// The document-scoped stable id the core model derives from format, node
@@ -232,7 +231,7 @@ impl ConfigurationFactsTraversalCache {
         let document = match outcome {
             ConfigurationIngestionOutcome::Facts(facts) => {
                 if facts.completeness().is_complete() {
-                    Some((Arc::new(facts), Arc::clone(&source)))
+                    Some((Arc::new(*facts), Arc::clone(&source)))
                 } else {
                     self.report_file_incomplete(
                         file,
@@ -244,7 +243,7 @@ impl ConfigurationFactsTraversalCache {
                         ),
                         diagnostics,
                     );
-                    Some((Arc::new(facts), Arc::clone(&source)))
+                    Some((Arc::new(*facts), Arc::clone(&source)))
                 }
             }
             ConfigurationIngestionOutcome::Unsupported { format } => {
@@ -323,6 +322,9 @@ fn recovery_labels(facts: &ConfigurationDocumentFacts) -> String {
                 }
                 brokk_bifrost_core::analyzer::configuration::ConfigurationRecoveryReason::UnsupportedScalar => {
                     "unsupported scalar"
+                }
+                brokk_bifrost_core::analyzer::configuration::ConfigurationRecoveryReason::UnsupportedConstruct => {
+                    "unsupported construct"
                 }
             })
             .collect::<Vec<_>>()
@@ -502,9 +504,7 @@ pub(super) fn format_for_path(
         ConfigurationPathClassification, classify_configuration_path,
     };
     match classify_configuration_path(file.rel_path()) {
-        ConfigurationPathClassification::Supported(format) => {
-            crate::query::domain::ConfigurationFormat::from_label(format.label())
-        }
+        ConfigurationPathClassification::Supported(format) => Some(format.into()),
         ConfigurationPathClassification::Unsupported => None,
     }
 }

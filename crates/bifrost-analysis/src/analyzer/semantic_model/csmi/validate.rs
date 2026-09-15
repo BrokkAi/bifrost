@@ -34,6 +34,7 @@ const JVM_BINARY_IDENTITY_SCHEMA_JSON: &str =
 const JAVA_JVM_MAPPING_SCHEMA_JSON: &str = include_str!("profiles/java-jvm-mapping.schema.json");
 const JVM_COMPATIBILITY_SCHEMA_JSON: &str = include_str!("profiles/jvm-compatibility.schema.json");
 const RUNTIME_VALUES_SCHEMA_JSON: &str = include_str!("profiles/runtime-values.schema.json");
+const RUNTIME_VALUES_V2_SCHEMA_JSON: &str = include_str!("profiles/runtime-values-v2.schema.json");
 const COLLECTION_FLOW_SCHEMA_JSON: &str = include_str!("profiles/collection-flow.schema.json");
 const CONDITIONAL_TYPE_REFINEMENT_SCHEMA_JSON: &str =
     include_str!("profiles/conditional-type-refinement.schema.json");
@@ -405,6 +406,13 @@ const KNOWN_PROFILES: &[KnownProfile] = &[
         ],
     },
     KnownProfile {
+        identifier: CSMI_RUNTIME_VALUES_PROFILE_ID,
+        version: "0.2.0",
+        schema: "https://csmi.brokk.ai/schema/profiles/runtime-values/0.2/schema.json",
+        schema_json: RUNTIME_VALUES_V2_SCHEMA_JSON,
+        payload_definitions: &["contract", "target", "activation", "binding", "observation"],
+    },
+    KnownProfile {
         identifier: CSMI_DEFERRED_YIELD_PROFILE_ID,
         version: CSMI_DEFERRED_YIELD_PROFILE_VERSION,
         schema: CSMI_DEFERRED_YIELD_PROFILE_SCHEMA,
@@ -513,18 +521,15 @@ const KNOWN_PROFILES: &[KnownProfile] = &[
     },
 ];
 
-fn known_profile(identifier: &str, schema: &str) -> Option<(usize, KnownProfile)> {
+fn known_profile(identifier: &str, version: &str, schema: &str) -> Option<(usize, KnownProfile)> {
     KNOWN_PROFILES
         .iter()
         .copied()
         .enumerate()
-        .find(|(_, profile)| profile.identifier == identifier)
-        .or_else(|| {
-            KNOWN_PROFILES
-                .iter()
-                .copied()
-                .enumerate()
-                .find(|(_, profile)| profile.schema == schema)
+        .find(|(_, profile)| {
+            profile.identifier == identifier
+                && profile.version == version
+                && profile.schema == schema
         })
 }
 
@@ -571,8 +576,61 @@ fn validate_profile_schemas(
         let model_value = serde_json::to_value(model).expect("CSMI semantic model serializes");
         for (use_index, use_) in model.vocabulary_uses.iter().enumerate() {
             let path = format!("$.semanticModels[{model_index}].vocabularyUses[{use_index}]");
-            let Some((profile_index, profile)) = known_profile(&use_.identifier, &use_.schema)
+            let Some((profile_index, profile)) =
+                known_profile(&use_.identifier, &use_.version, &use_.schema)
             else {
+                // An unregistered vocabulary is an opaque extension and can
+                // remain structurally valid.  A registered identifier with
+                // an unknown version or schema is different: accepting it
+                // would silently validate the payload against another
+                // contract (for example runtime-values 0.2 against 0.1).
+                let expected_for_identifier: Vec<String> = KNOWN_PROFILES
+                    .iter()
+                    .filter(|profile| profile.identifier == use_.identifier)
+                    .map(|profile| {
+                        format!("version {} with schema {}", profile.version, profile.schema)
+                    })
+                    .collect();
+                let expected_for_schema: Vec<String> = KNOWN_PROFILES
+                    .iter()
+                    .filter(|profile| profile.schema == use_.schema)
+                    .map(|profile| {
+                        format!(
+                            "identifier {} with version {}",
+                            profile.identifier, profile.version
+                        )
+                    })
+                    .collect();
+                if !expected_for_identifier.is_empty() || !expected_for_schema.is_empty() {
+                    let message = if !expected_for_identifier.is_empty() {
+                        format!(
+                            "known profile {} supports only: {}",
+                            use_.identifier,
+                            expected_for_identifier.join(", ")
+                        )
+                    } else {
+                        format!(
+                            "schema {} is registered only for: {}",
+                            use_.schema,
+                            expected_for_schema.join(", ")
+                        )
+                    };
+                    error(
+                        diagnostics,
+                        "structural.profile_schema_mismatch",
+                        &path,
+                        message,
+                    );
+                    outcomes.push(CsmiProfileValidation {
+                        identifier: use_.identifier.clone(),
+                        version: use_.version.clone(),
+                        schema: use_.schema.clone(),
+                        recognized: false,
+                        structural_valid: false,
+                        semantically_supported: false,
+                    });
+                    continue;
+                }
                 outcomes.push(CsmiProfileValidation {
                     identifier: use_.identifier.clone(),
                     version: use_.version.clone(),
@@ -2447,6 +2505,9 @@ fn validate_model(
     if !validate_runtime_values_semantics(model, &prefix, diagnostics) {
         valid = false;
     }
+    if !super::validate_runtime_contract_semantics(model, Some(document), &prefix, diagnostics) {
+        valid = false;
+    }
     if !validate_collection_flow_semantics(
         model,
         &prefix,
@@ -2772,6 +2833,7 @@ pub(crate) fn validate_native_deferred_yield_model(
     let mut diagnostics = Vec::new();
     let (profile_index, _) = known_profile(
         CSMI_DEFERRED_YIELD_PROFILE_ID,
+        CSMI_DEFERRED_YIELD_PROFILE_VERSION,
         CSMI_DEFERRED_YIELD_PROFILE_SCHEMA,
     )
     .expect("deferred-yield profile is registered");
@@ -6031,6 +6093,7 @@ pub(crate) fn validate_native_conditional_type_payloads(
     let mut diagnostics = Vec::new();
     let (index, _) = known_profile(
         CSMI_CONDITIONAL_TYPE_REFINEMENT_PROFILE_ID,
+        CSMI_CONDITIONAL_TYPE_REFINEMENT_PROFILE_VERSION,
         CSMI_CONDITIONAL_TYPE_REFINEMENT_PROFILE_SCHEMA,
     )
     .expect("conditional refinement profile is registered");

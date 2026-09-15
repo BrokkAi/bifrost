@@ -5,14 +5,14 @@ description: Use the canonical JSON representation for Bifrost's query_code engi
 
 JSON `CodeQuery` is the canonical machine-facing representation accepted by Bifrost's `query_code` tool. MCP hosts and the Python client send this shape directly. Author queries in RQL, then generate this serialization from the decoded `CodeQuery`; the RQL REPL prints it with `:json`. JSON examples on this page describe the machine wire contract, not a second authoring syntax. Generated `.json` query files remain supported; JSON text in `.rql` files or editor buffers is not supported.
 
-The single supported schema version is 1; it carries the complete vocabulary below. A taint query names only a registered immutable result; it cannot load a policy, compile selectors, run propagation, reconstruct witnesses, or perform policy classification.
+The single supported schema version is `"1"`; it carries the complete vocabulary below. A taint query names only a registered immutable result; it cannot load a policy, compile selectors, run propagation, reconstruct witnesses, or perform policy classification.
 
 ## Minimal Query
 
 <!-- code-query-test:json:minimal-call -->
 ```json
 {
-  "schema_version": 1,
+  "schema_version": "1",
   "match": {
     "kind": "call",
     "callee": {
@@ -28,7 +28,7 @@ The `match` object is the root pattern. It must constrain at least one of `kind`
 
 | Field | Shape | Meaning |
 | --- | --- | --- |
-| `schema_version` | integer | Optional. Version `1` is the only supported version; omit it or pin it explicitly. Other versions are rejected. |
+| `schema_version` | string | Optional. Version `"1"` is the only supported version; omit it or pin it explicitly. Other versions are rejected. Legacy numeric `1` input is accepted and canonicalized to `"1"`. |
 | `match` | pattern | Required root pattern. |
 | `where` | string array or array of non-empty string arrays | Optional project-relative globs. A flat list uses OR; nested lists use AND between groups and OR within each group. Absolute paths or globs inside the active workspace are normalized by MCP and CLI entrypoints. |
 | `languages` | string array | Optional language labels such as `python` or `cpp`, or fixed families `jvm` (`java`, `kotlin`, `scala`) and `js-ts` (`javascript`, `typescript`). Empty means every structural adapter. |
@@ -287,7 +287,7 @@ be confused with an arbitrary string:
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": "1",
   "occurrences": { "class": "reference" },
   "steps": [
     {
@@ -328,7 +328,7 @@ This query starts from a structural function match, resolves its executable proc
 <!-- code-query-test:json:cfg-entry-successor -->
 ```json
 {
-  "schema_version": 1,
+  "schema_version": "1",
   "languages": ["typescript"],
   "match": {"kind": "function", "name": "run"},
   "steps": [
@@ -353,7 +353,7 @@ An embedding first registers an in-memory compiled protocol and its pre-resolved
 <!-- code-query-test:json:typestate-witness -->
 ```json
 {
-  "schema_version": 1,
+  "schema_version": "1",
   "match": {"kind": "function", "name": "lifecycle"},
   "steps": [
     {"op": "procedure_of"},
@@ -374,7 +374,7 @@ The host registers an already-built `ValueFlowPlan` under a namespaced reference
 <!-- code-query-test:json:value-flow-witness -->
 ```json
 {
-  "schema_version": 1,
+  "schema_version": "1",
   "match": {"kind": "method", "name": "run"},
   "steps": [
     {"op": "procedure_of"},
@@ -413,7 +413,7 @@ receiver was classified.
 <!-- code-query-test:json:absent-member-witness -->
 ```json
 {
-  "schema_version": 1,
+  "schema_version": "1",
   "languages": ["python"],
   "match": {"kind": "function", "name": "read_config"},
   "steps": [
@@ -443,7 +443,7 @@ The host registers immutable results produced by the production taint policy com
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": "1",
   "match": {"kind": "method", "name": "run"},
   "steps": [
     {"op": "procedure_of"},

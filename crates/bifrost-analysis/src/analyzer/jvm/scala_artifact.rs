@@ -1227,6 +1227,7 @@ fn finish_production(
             relations: Vec::new(),
         },
         runtime_values: None,
+        runtime_contracts: None,
         collection_flows: (!collection_flows.is_empty()).then_some(CollectionFlowsPayload {
             flows: collection_flows,
         }),

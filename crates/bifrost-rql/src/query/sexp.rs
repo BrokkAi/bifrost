@@ -1126,6 +1126,20 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
                 let field = option.field().label();
                 let value = match option.field() {
                     QueryStepField::Index => number_value(&pair[1], head)?,
+                    QueryStepField::IndexMin | QueryStepField::IndexMax => {
+                        number_value(&pair[1], head)?
+                    }
+                    QueryStepField::KeyKind => {
+                        let label = symbol_or_string(&pair[1])?;
+                        let kind =
+                            super::schema::RuntimeKeyKind::from_label(&label).ok_or_else(|| {
+                                lower_error(
+                                    &pair[1],
+                                    "key-kind must be static-property or static-index",
+                                )
+                            })?;
+                        Value::String(kind.label().to_string())
+                    }
                     QueryStepField::Runtime
                     | QueryStepField::Global
                     | QueryStepField::Container
@@ -2988,7 +3002,7 @@ mod tests {
     /// steps are bare ops.
     #[test]
     fn materialization_forms_lower_to_canonical_json() {
-        let version = rql_schema_resolution().version;
+        let version = rql_schema_resolution().version.to_string();
         assert_eq!(
             canonical(
                 "(generated-by (generates (generation-sites :kind accessor_macro :input literal)))"
@@ -3343,7 +3357,7 @@ mod tests {
 
     #[test]
     fn call_binding_selectors_lower_to_typed_pipeline_steps() {
-        let version = rql_schema_resolution().version;
+        let version = rql_schema_resolution().version.to_string();
         assert_eq!(
             canonical(
                 r#"(call-argument :formal-name "sql"

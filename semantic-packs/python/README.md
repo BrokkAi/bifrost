@@ -12,12 +12,13 @@ typeshed revision.
 ## The pinned slice
 
 `typeshed-stdlib-2026.8.31.json` pins typeshed revision
-`1620e225476597f34177351ef913dc8390dade30` and lists 52 stub files. The
+`1620e225476597f34177351ef913dc8390dade30` and lists 53 stub files. The
 slice is deliberately bounded to common runtime and standard-library surfaces:
 
 | Module | Pinned stub files |
 | --- | --- |
 | `builtins` | `builtins.pyi` |
+| `_sitebuiltins` | `_sitebuiltins.pyi` |
 | `typing` | `typing.pyi` |
 | `re` | `re.pyi` |
 | `subprocess` | `subprocess.pyi` |
@@ -95,6 +96,18 @@ name. The semantic-model overlay treats such records as one present member
 only when the active pack proves the complete callable family. Competing
 fields, partial families, ambiguous records, and records from different packs
 remain incomplete.
+
+`builtins.pyi` declares `exit` and `quit` as values of the class
+`_sitebuiltins.Quitter`, not as functions, and calling such a value invokes
+its class's `__call__`. The producer projects that signature onto the value's
+name: the generated pack publishes `builtins.exit` with the
+`Quitter.__call__` contract, whose return annotation is `typing.Never`. A
+guard whose arm calls `sys.exit`, `exit`, or `quit` therefore ends the arm,
+and the class the guard excluded no longer reaches the code after the `if`
+(#3135). The same projection publishes `copyright`, `credits`, `help`, and
+`license` from their `_sitebuiltins` classes. A value annotation that names
+no class this production declares, and a class without a declared
+`__call__`, keeps the plain value binding without a callable record.
 
 The producer omits `Protocol` and `Generic` class bases only when structured
 import bindings resolve them to `typing` or `typing_extensions`. These are

@@ -133,6 +133,22 @@
             "locator": { "kind": "artifact", "path": "src/sync/cond.go", "symbol": "sync.Cond" }
           },
           {
+            "id": "type.6158a1dbe8aaba39c59b91f615159e0e1102cf9293e2c03ca4190635bf37473a",
+            "name": "sync.Locker",
+            "type_kind": "interface",
+            "visibility": "public",
+            "is_abstract": true,
+            "is_sealed": false,
+            "has_explicit_type_terms": false,
+            "type_parameters": [],
+            "type_parameter_constraints": [],
+            "embedded_types": [],
+            "hierarchy": [],
+            "aliases": [],
+            "extension_surfaces": [],
+            "locator": { "kind": "artifact", "path": "src/sync/mutex.go", "symbol": "sync.Locker" }
+          },
+          {
             "id": "type.538649cc81748836c55f68c423109c1a9e1d0f0b59bc27f12a9bda095f904951",
             "name": "sync.Once",
             "type_kind": "struct",
@@ -285,6 +301,14 @@
             "locator": { "kind": "artifact", "path": "src/sync/rwmutex.go", "symbol": "sync.RWMutex.TryRLock" }
           },
           {
+            "id": "member.cafb75dfc7c6dd7a03b8bb8b5cc10e20c20febfaee44812c14fa643c59f379b6",
+            "owner": "type.9c6857469485ea47ece477c4c1da488b2171f18ffa4241346447bdf62ba993db",
+            "name": "NewCond", "member_kind": "function", "visibility": "public", "is_static": true, "is_abstract": false, "is_virtual": false,
+            "signature": { "type_parameters": [], "parameters": [{ "name": "l", "type": { "kind": "named", "name": "sync.Locker", "arguments": [], "nullable": false }, "optional": false, "variadic": false }], "returns": { "kind": "pointer", "element": { "kind": "declared", "id": "type.6055305a597d0b5012873c6d68180256bacc20af37150077b7950c162c91cde1", "arguments": [], "nullable": false } } },
+            "aliases": [],
+            "locator": { "kind": "artifact", "path": "src/sync/cond.go", "symbol": "sync.NewCond" }
+          },
+          {
             "id": "member.f8e51f5a5a19f9976d9400c46616b830a2dff7c9511c3a8bb25cc7c3ec1bf2d8",
             "owner": "type.6055305a597d0b5012873c6d68180256bacc20af37150077b7950c162c91cde1",
             "name": "Wait", "member_kind": "method", "visibility": "public", "is_static": false, "is_abstract": false, "is_virtual": false,
@@ -304,6 +328,14 @@
             "name": "Broadcast", "member_kind": "method", "visibility": "public", "is_static": false, "is_abstract": false, "is_virtual": false,
             "signature": { "type_parameters": [], "parameters": [] }, "receiver": { "pointer": true }, "aliases": [],
             "locator": { "kind": "artifact", "path": "src/sync/cond.go", "symbol": "sync.Cond.Broadcast" }
+          },
+          {
+            "id": "member.41e1057612d61c9da35d6b3bf8466a3eef6a26717f0eab60349b259a9c40a9cf",
+            "owner": "type.6055305a597d0b5012873c6d68180256bacc20af37150077b7950c162c91cde1",
+            "name": "L", "member_kind": "field", "visibility": "public", "is_static": false, "is_abstract": false, "is_virtual": false,
+            "signature": { "type_parameters": [], "parameters": [], "returns": { "kind": "named", "name": "sync.Locker", "arguments": [], "nullable": false } },
+            "aliases": [],
+            "locator": { "kind": "artifact", "path": "src/sync/cond.go", "symbol": "sync.Cond.L" }
           },
           {
             "id": "member.a548a6de13ba2d47d106ea40b201de2d8b52041d635edb32e04a65efc9fe9808",

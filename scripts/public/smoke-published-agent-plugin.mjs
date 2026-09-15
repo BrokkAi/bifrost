@@ -162,6 +162,15 @@ export function assertPolicyCatalog(response, host) {
     Array.isArray(security.policies) && security.policies.length > 0,
     `${host} returned no security policies`,
   );
+  for (const policyId of [
+    "bifrost.security.java.servlet-parameter-to-jdbc",
+    "bifrost.security.java.system-getenv-to-runtime-exec",
+  ]) {
+    assert.ok(
+      security.policies.some((policy) => policy.id === policyId),
+      `${host} omitted shipped policy ${policyId}`,
+    );
+  }
   return codeSmells;
 }
 

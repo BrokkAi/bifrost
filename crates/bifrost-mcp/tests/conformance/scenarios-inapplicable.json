@@ -30,7 +30,7 @@
     "rationale": "Same missing resources.subscribe capability; the scenario fails while establishing the subscription it then removes. Becomes applicable if Bifrost ever advertises resources.subscribe."
   },
   "prompts-list": {
-    "rationale": "Bifrost does not advertise the prompts capability, so a prompts inventory is not part of its surface. It passes at 2025-11-25 only because rmcp answers prompts/list with an empty list anyway; at 2026-07-28 that same answer omits the required cacheScope and ttlMs. That wire defect is real and is gated as an expected failure under `caching` and `input-required-result-unsupported-methods` instead of here, because whole-scenario triage cannot record 'passes at one revision, fails at the other'. Becomes applicable if Bifrost ever advertises prompts."
+    "rationale": "Bifrost does not advertise the prompts capability, so a prompts inventory is not part of its surface and prompts/list returns MethodNotFound at both supported revisions. Becomes applicable if Bifrost ever advertises prompts."
   },
   "prompts-get-simple": {
     "rationale": "Requires a prompt named test_simple_prompt; Bifrost advertises no prompts capability and prompts/get errors. Becomes applicable if Bifrost ever advertises prompts and ships named prompts."

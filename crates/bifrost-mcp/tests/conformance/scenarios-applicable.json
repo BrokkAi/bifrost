@@ -31,5 +31,8 @@
   },
   "input-required-result-validate-input": {
     "proves": "Malformed inputResponses values (a number, then null) do not break Bifrost's tools/call handling; the responses stay schema-valid at 2026-07-28. The SHOULD-level validation expectations are reported as warnings."
+  },
+  "input-required-result-unsupported-methods": {
+    "proves": "Bifrost rejects unadvertised prompts/list and resources/templates/list methods with schema-valid MethodNotFound errors rather than returning InputRequiredResult or invalid cacheable list results."
   }
 }

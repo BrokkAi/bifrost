@@ -999,11 +999,13 @@ mod tests {
             sources: TaintEndpointSet {
                 include_sets: vec![],
                 include_matches: vec![],
+                include_files: vec![],
                 entries: std::mem::take(&mut sources),
             },
             sinks: TaintEndpointSet {
                 include_sets: vec![],
                 include_matches: vec![],
+                include_files: vec![],
                 entries: std::mem::take(&mut sinks),
             },
             sanitizers: empty_set(),
@@ -1012,6 +1014,7 @@ mod tests {
             external_models: empty_set(),
             store_writes: vec![],
             store_reads: vec![],
+            store_include_files: vec![],
             finding_combinations: vec![],
         };
         let catalogs = TaintCatalogRegistry::new_without_workspace(Default::default());
@@ -1081,16 +1084,19 @@ mod tests {
             sources: TaintEndpointSet {
                 include_sets: vec![],
                 include_matches: vec![],
+                include_files: vec![],
                 entries: vec![source],
             },
             sinks: TaintEndpointSet {
                 include_sets: vec![],
                 include_matches: vec![],
+                include_files: vec![],
                 entries: vec![sink],
             },
             sanitizers: TaintEndpointSet {
                 include_sets: vec![reference.clone(), reference],
                 include_matches: vec![],
+                include_files: vec![],
                 entries: vec![],
             },
             entry_points: empty_set(),
@@ -1098,6 +1104,7 @@ mod tests {
             external_models: empty_set(),
             store_writes: vec![],
             store_reads: vec![],
+            store_include_files: vec![],
             finding_combinations: vec![],
         };
 
@@ -1152,11 +1159,13 @@ mod tests {
             sources: TaintEndpointSet {
                 include_sets: vec![],
                 include_matches: vec![],
+                include_files: vec![],
                 entries: vec![source.clone()],
             },
             sinks: TaintEndpointSet {
                 include_sets: vec![],
                 include_matches: vec![],
+                include_files: vec![],
                 entries: vec![sink.clone()],
             },
             sanitizers: empty_set(),
@@ -1165,6 +1174,7 @@ mod tests {
             external_models: empty_set(),
             store_writes: vec![],
             store_reads: vec![],
+            store_include_files: vec![],
             finding_combinations: combinations,
         };
         let catalogs = TaintCatalogRegistry::new_without_workspace(Default::default());

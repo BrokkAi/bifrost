@@ -30,6 +30,7 @@ use super::identity::PolicySemanticHash;
 use super::retained::{RetainedSize, retained_extra};
 use super::scope::PolicyFindingScope;
 use super::suppression::PolicyFindingSuppression;
+use crate::is_false;
 
 const MAX_REPORT_PROSE_BYTES: usize = 4_096;
 const MAX_REPORT_IDENTIFIER_BYTES: usize = 128;
@@ -3467,7 +3468,56 @@ pub struct PolicyObligation {
     /// diagnostic renders it. Absent when the obligation is about the group
     /// relation as a whole rather than one observed group.
     group_key: Option<String>,
+    /// The analysis partitions the blocked claim is about: the value-flow
+    /// plans, typestate protocols, taint sinks, class sets or call sites whose
+    /// coverage did not support the verdict (#3205). Empty when the blocked
+    /// claim is about the executed query's own scope rather than about one
+    /// solver root, which is the case for a row set that was simply short.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    partitions: Vec<PolicyCoveragePartition>,
+    /// Whether the partition list dropped a name against its bound. The extent
+    /// and the reasons are complete either way; only the attribution is
+    /// shortened.
+    #[serde(skip_serializing_if = "is_false")]
+    partitions_truncated: bool,
     reasons: Vec<PolicyIncompleteReason>,
+}
+
+/// One analysis partition named on an unmet obligation.
+///
+/// `family` is the published row-domain label of the analysis that enumerated
+/// the partition; `root` is that family's own published identity for it. Both
+/// are display and correlation text for a blocked verdict, not an identity that
+/// anything joins on.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub struct PolicyCoveragePartition {
+    family: String,
+    root: String,
+}
+
+impl PolicyCoveragePartition {
+    pub(crate) fn new(family: &str, root: &str) -> Self {
+        Self {
+            family: family.to_owned(),
+            root: bound_obligation_group_key(root),
+        }
+    }
+
+    pub fn family(&self) -> &str {
+        &self.family
+    }
+
+    pub fn root(&self) -> &str {
+        &self.root
+    }
+}
+
+impl RetainedSize for PolicyCoveragePartition {
+    fn retained_size(&self) -> usize {
+        size_of::<Self>()
+            .saturating_add(self.family.capacity())
+            .saturating_add(self.root.capacity())
+    }
 }
 
 impl PolicyObligation {
@@ -3476,6 +3526,8 @@ impl PolicyObligation {
         kind: PolicyObligationKind,
         group: &str,
         group_key: Option<&str>,
+        partitions: Vec<PolicyCoveragePartition>,
+        partitions_truncated: bool,
         mut reasons: Vec<PolicyIncompleteReason>,
     ) -> Result<Self, ReportValueError> {
         validate_report_identifier(assertion)?;
@@ -3496,11 +3548,17 @@ impl PolicyObligation {
             });
         }
         tighten_vec(&mut reasons);
+        let mut partitions = partitions;
+        partitions.sort();
+        partitions.dedup();
+        tighten_vec(&mut partitions);
         Ok(Self {
             assertion: assertion.to_owned(),
             kind,
             group: group.to_owned(),
             group_key: group_key.map(bound_obligation_group_key),
+            partitions,
+            partitions_truncated,
             reasons,
         })
     }
@@ -3517,6 +3575,13 @@ impl PolicyObligation {
     pub fn group_key(&self) -> Option<&str> {
         self.group_key.as_deref()
     }
+    /// The analysis partitions the blocked claim is about.
+    pub fn partitions(&self) -> &[PolicyCoveragePartition] {
+        &self.partitions
+    }
+    pub const fn partitions_truncated(&self) -> bool {
+        self.partitions_truncated
+    }
     pub fn reasons(&self) -> &[PolicyIncompleteReason] {
         &self.reasons
     }
@@ -3528,6 +3593,7 @@ impl RetainedSize for PolicyObligation {
             .saturating_add(self.assertion.capacity())
             .saturating_add(self.group.capacity())
             .saturating_add(self.group_key.as_ref().map_or(0, String::capacity))
+            .saturating_add(retained_extra(&self.partitions))
             .saturating_add(retained_extra(&self.reasons))
     }
 }
@@ -5596,6 +5662,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(),
             PolicyPrecedenceManifest::default(),
             None,
             None,
@@ -6495,6 +6562,8 @@ mod tests {
             PolicyObligationKind::AbsenceRequiresExhaustiveCoverage,
             "by-site",
             None,
+            Vec::new(),
+            false,
             vec![PolicyIncompleteReason::PipelineRowBudget],
         )
         .unwrap()
@@ -6608,6 +6677,8 @@ mod tests {
                 "by-site",
                 None,
                 Vec::new(),
+                false,
+                Vec::new(),
             )
             .unwrap_err(),
             ReportValueError::EmptyCollection {
@@ -6620,6 +6691,8 @@ mod tests {
                 PolicyObligationKind::VerdictRequiresWitnessedRows,
                 "by-site",
                 None,
+                Vec::new(),
+                false,
                 vec![PolicyIncompleteReason::Cancelled],
             )
             .is_err()
@@ -6631,6 +6704,8 @@ mod tests {
             PolicyObligationKind::VerdictRequiresWitnessedRows,
             "by-site",
             Some(&key),
+            Vec::new(),
+            false,
             vec![
                 PolicyIncompleteReason::Cancelled,
                 PolicyIncompleteReason::Cancelled,
@@ -6695,6 +6770,65 @@ mod tests {
                 "group_key": null,
                 "reasons": ["pipeline_row_budget"],
             }])
+        );
+    }
+
+    /// The partition an analysis-backed obligation is about is report data, not
+    /// prose: a reader joins the blocked verdict to the solve that left it open
+    /// without parsing a diagnostic message. A query-scope obligation publishes
+    /// no partition at all, so an absent list reads as "the row set was short",
+    /// not as "this producer does not report partitions".
+    #[test]
+    fn an_obligation_publishes_the_analysis_partitions_that_blocked_it() {
+        let mut run = run_at(
+            PolicyRunCompletion::inconclusive(vec![PolicyIncompleteReason::PartialDiscovery])
+                .unwrap(),
+        );
+        let blocked = PolicyObligation::try_new(
+            "no-tainted-sink",
+            PolicyObligationKind::AbsenceRequiresExhaustiveCoverage,
+            "by-sink",
+            None,
+            vec![
+                PolicyCoveragePartition::new("taint_finding", "sink-b"),
+                PolicyCoveragePartition::new("flow_endpoint", "plan-a"),
+            ],
+            true,
+            vec![PolicyIncompleteReason::PartialDiscovery],
+        )
+        .unwrap();
+        run.set_obligations(&[blocked], false, 0, &PolicyBudget::default())
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&run).unwrap()["obligations"],
+            json!([{
+                "assertion": "no-tainted-sink",
+                "kind": "absence_requires_exhaustive_coverage",
+                "group": "by-sink",
+                "group_key": null,
+                "partitions": [
+                    { "family": "flow_endpoint", "root": "plan-a" },
+                    { "family": "taint_finding", "root": "sink-b" },
+                ],
+                "partitions_truncated": true,
+                "reasons": ["partial_discovery"],
+            }]),
+            "partitions are canonical and the truncation flag travels with them"
+        );
+
+        let mut unpartitioned = run_at(
+            PolicyRunCompletion::inconclusive(vec![PolicyIncompleteReason::PipelineRowBudget])
+                .unwrap(),
+        );
+        unpartitioned
+            .set_obligations(&[obligation()], false, 0, &PolicyBudget::default())
+            .unwrap();
+        let value = serde_json::to_value(&unpartitioned).unwrap();
+        assert!(value["obligations"][0].get("partitions").is_none());
+        assert!(
+            value["obligations"][0]
+                .get("partitions_truncated")
+                .is_none()
         );
     }
 

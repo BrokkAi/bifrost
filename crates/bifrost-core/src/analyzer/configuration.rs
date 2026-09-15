@@ -507,6 +507,11 @@ impl ConfigurationFeatureState {
     }
 }
 
+/// Per-document state of every indirection or typing construct a format can
+/// author. Each axis is `NotApplicable` when the document authors none of it,
+/// `Authored` when the fact arena represents every occurrence exactly, and
+/// `Unresolved` when the construct's effect on the effective value is left to
+/// the later precedence/evidence layer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConfigurationFeatureSemantics {
     anchors: ConfigurationFeatureState,
@@ -514,6 +519,8 @@ pub struct ConfigurationFeatureSemantics {
     includes: ConfigurationFeatureState,
     interpolation: ConfigurationFeatureState,
     format_merge: ConfigurationFeatureState,
+    /// Explicit node type annotations such as YAML's `!!int` or `!Ref`.
+    tags: ConfigurationFeatureState,
 }
 
 impl ConfigurationFeatureSemantics {
@@ -523,6 +530,7 @@ impl ConfigurationFeatureSemantics {
         includes: ConfigurationFeatureState,
         interpolation: ConfigurationFeatureState,
         format_merge: ConfigurationFeatureState,
+        tags: ConfigurationFeatureState,
     ) -> Self {
         Self {
             anchors,
@@ -530,12 +538,14 @@ impl ConfigurationFeatureSemantics {
             includes,
             interpolation,
             format_merge,
+            tags,
         }
     }
 
     /// States for a format in which the feature is absent by definition.
     pub const fn not_applicable() -> Self {
         Self::new(
+            ConfigurationFeatureState::NotApplicable,
             ConfigurationFeatureState::NotApplicable,
             ConfigurationFeatureState::NotApplicable,
             ConfigurationFeatureState::NotApplicable,
@@ -563,6 +573,10 @@ impl ConfigurationFeatureSemantics {
     pub const fn format_merge(&self) -> &ConfigurationFeatureState {
         &self.format_merge
     }
+
+    pub const fn tags(&self) -> &ConfigurationFeatureState {
+        &self.tags
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -572,6 +586,10 @@ pub enum ConfigurationRecoveryReason {
     BudgetExhausted,
     ParserLimit,
     UnsupportedScalar,
+    /// A well-formed construct the single-root fact model cannot represent,
+    /// such as a second document in a YAML stream or a collection used as a
+    /// mapping key.
+    UnsupportedConstruct,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1666,6 +1684,10 @@ mod tests {
         );
         assert_eq!(
             features.format_merge(),
+            &super::ConfigurationFeatureState::NotApplicable
+        );
+        assert_eq!(
+            features.tags(),
             &super::ConfigurationFeatureState::NotApplicable
         );
     }

@@ -215,16 +215,13 @@ impl Language {
 ///
 /// - TypeScript, because `.ts` and `.tsx` files use distinct tree-sitter
 ///   grammars while sharing the same normalized language adapter.
-/// - JavaScript, because tree-sitter-javascript cannot parse a reserved word
-///   as a JSX attribute name -- `_jsx_attribute_name` admits only `identifier`
-///   and `jsx_identifier`, and every one of the grammar's 32 global reserved
-///   words plus `null`/`true`/`false` is therefore outside it. `class=`,
-///   `for=`, `in=` and friends are ordinary in JSX that targets web
-///   components, Preact or Vue, and error recovery does not fail locally: one
-///   `<div class="x">` folds the rest of the expression into `ERROR` and
-///   `regex_pattern` soup, losing every declaration and usage below it
-///   (#3322). The TSX grammar has no reserved words in that position and
-///   accepts the same source, so `.jsx` is parsed with it.
+/// - JavaScript, because `.jsx` keeps the TSX grammar and distinct storage
+///   identity introduced by #3322, while `.js` uses Brokk's repaired
+///   tree-sitter-javascript grammar. The upstream grammar could not parse
+///   reserved words as JSX attribute names, and recovery from one `<div
+///   class="x">` could lose every declaration and usage below it. The Brokk
+///   grammar repairs `.js` without switching ordinary JavaScript to TSX
+///   (#3342).
 /// - C++, because `Language::Cpp` also claims C. A `.c` file is parsed with the
 ///   same tree-sitter-cpp grammar but obeys C scoping rules, most visibly that
 ///   a struct/union/enum tag declared inside another aggregate's member list
@@ -243,8 +240,8 @@ impl Language {
 pub enum LanguageDialect {
     Standard(Language),
     TypeScriptTsx,
-    /// A JavaScript file parsed with the TSX grammar, which accepts the JSX
-    /// attribute names tree-sitter-javascript rejects.
+    /// A `.jsx` JavaScript file parsed with the TSX grammar under the distinct
+    /// dialect and storage identity introduced by #3322.
     JavaScriptJsx,
     /// A translation unit compiled as C rather than C++.
     CppC,

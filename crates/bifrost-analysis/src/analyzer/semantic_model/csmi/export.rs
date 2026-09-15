@@ -119,6 +119,15 @@ pub fn export_csmi_pack(
         .map(|shard| decode_shard(&shard.descriptor, &shard.bytes, &DecodeLimits::default()))
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| CsmiExportError::Canonical(error.to_string()))?;
+    if decoded
+        .iter()
+        .any(|shard| shard.runtime_contracts().is_some())
+    {
+        return Err(CsmiExportError::Unsupported {
+            path: "shards.runtime_contracts".to_owned(),
+            semantic: "portable runtime-contracts require export_runtime_contracts_csmi_pack so the retained CSMI document envelope and its PURL/VERS applicability are preserved".to_owned(),
+        });
+    }
     if pack.manifest.language == "python" && decoded.iter().any(|shard| matches!(shard.payload(), CompiledPayload::DeclarationFacts { types, members, .. } if !types.is_empty() || !members.is_empty())) {
         let (semantic, provenance) = super::python::export_document(&pack.manifest, &decoded, artifact, options)?;
         return logical_pack(semantic, provenance, &pack.manifest.license, options);
@@ -133,6 +142,112 @@ pub fn export_csmi_pack(
         options,
     )?;
     logical_pack(semantic, provenance, &pack.manifest.license, options)
+}
+
+/// Export a compiled portable runtime-contract pack without requiring an
+/// artifact digest. Runtime-values 0.2 is intentionally portable: its target
+/// range and complete semantic-document envelope are the applicability claim.
+/// The native companion retains that envelope so this operation does not
+/// project a PURL/VERS range into a language wildcard or synthesize bytes.
+pub fn export_runtime_contracts_csmi_pack(
+    pack: &CompiledSemanticModelPack,
+    options: &CsmiExportOptions,
+) -> Result<CsmiLogicalPack, CsmiExportReport> {
+    let decoded = pack
+        .shards
+        .iter()
+        .map(|shard| decode_shard(&shard.descriptor, &shard.bytes, &DecodeLimits::default()))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| CsmiExportError::Canonical(error.to_string()))?;
+    let mut retained: Option<serde_json::Value> = None;
+    for shard in &decoded {
+        let Some(carrier) = shard.runtime_contracts() else {
+            if shard.runtime_values().is_some()
+                || shard.collection_flows().is_some()
+                || shard.deferred_yields().is_some()
+                || shard.conditional_type_refinements().is_some()
+                || shard.payload().record_count() > 0
+            {
+                return Err(CsmiExportError::Unsupported {
+                    path: format!("shards.{}", shard.shard_id()),
+                    semantic: "portable runtime-contract export cannot drop non-runtime-contract shard facts".to_owned(),
+                });
+            }
+            continue;
+        };
+        if shard.runtime_values().is_some()
+            || shard.collection_flows().is_some()
+            || shard.deferred_yields().is_some()
+            || shard.conditional_type_refinements().is_some()
+            || shard.cpp_portability().is_some()
+            || shard.payload().record_count() > 0
+        {
+            return Err(CsmiExportError::Unsupported {
+                path: format!("shards.{}", shard.shard_id()),
+                semantic: "portable runtime-contract export cannot drop extra facts carried by a runtime-contract shard".to_owned(),
+            });
+        }
+        let Some(envelope) = &carrier.envelope else {
+            return Err(CsmiExportError::Unsupported {
+                path: format!("shards.{}.runtime_contracts", shard.shard_id()),
+                semantic:
+                    "runtime-contracts export requires the retained CSMI semantic-document envelope"
+                        .to_owned(),
+            });
+        };
+        if !crate::analyzer::semantic_model::runtime_contract_envelope_matches(
+            &carrier.payload,
+            envelope,
+        )
+        .map_err(|error| CsmiExportError::Canonical(error.to_string()))?
+        {
+            return Err(CsmiExportError::Canonical(
+                "native runtime-contract payload conflicts with its retained CSMI envelope"
+                    .to_owned(),
+            ));
+        }
+        if let Some(previous) = &retained {
+            let previous = super::canonical::canonical_json_value(previous)
+                .map_err(|error| CsmiExportError::Canonical(error.to_string()))?;
+            let current = super::canonical::canonical_json_value(envelope)
+                .map_err(|error| CsmiExportError::Canonical(error.to_string()))?;
+            if previous != current {
+                return Err(CsmiExportError::Canonical(
+                    "runtime-contract shards retain different CSMI envelopes".to_owned(),
+                ));
+            }
+        } else {
+            retained = Some(envelope.clone());
+        }
+    }
+    let Some(envelope) = retained else {
+        return Err(CsmiExportError::Unsupported {
+            path: "shards.runtime_contracts".to_owned(),
+            semantic: "compiled pack has no runtime-contracts payload".to_owned(),
+        });
+    };
+    let document: CsmiSemanticDocument = serde_json::from_value(envelope)
+        .map_err(|error| CsmiExportError::Canonical(error.to_string()))?;
+    let provenance = document
+        .provenance_records
+        .first()
+        .cloned()
+        .ok_or_else(|| {
+            CsmiExportError::Canonical("retained CSMI document has no provenance record".to_owned())
+        })?;
+    logical_pack(document, provenance, &pack.manifest.license, options)
+}
+
+/// Author and export a portable runtime-contract pack while preserving its
+/// retained CSMI semantic-document envelope.
+pub fn export_authored_runtime_contracts_csmi_pack(
+    pack: &AuthoredSemanticModelPack,
+    options: &CsmiExportOptions,
+) -> Result<CsmiLogicalPack, CsmiExportReport> {
+    let compiled = compile_pack(pack, &CompilerOptions::default()).map_err(|diagnostics| {
+        CsmiExportError::Canonical(format!("Bifrost pack did not compile: {diagnostics:?}"))
+    })?;
+    export_runtime_contracts_csmi_pack(&compiled, options)
 }
 
 pub fn export_authored_csmi_pack(
@@ -1055,11 +1170,18 @@ fn export_semantic_document<'a>(
 }
 
 fn logical_pack(
-    document: CsmiSemanticDocument,
+    mut document: CsmiSemanticDocument,
     provenance: CsmiProvenanceRecord,
     license: &str,
     options: &CsmiExportOptions,
 ) -> Result<CsmiLogicalPack, CsmiExportError> {
+    // Reconstructed documents from native export have no source default, so
+    // keep the historical exporter identity for them. A retained portable
+    // envelope already has an authoritative default provenance reference;
+    // preserving it is required for a lossless runtime-contract round trip.
+    if document.default_provenance.is_none() {
+        document.default_provenance = Some(options.provenance_id.clone());
+    }
     let semantic_bytes =
         canonical_json(&document).map_err(|error| CsmiExportError::Canonical(error.to_string()))?;
     let digest = sha256_hex(&semantic_bytes);
@@ -1110,6 +1232,11 @@ fn logical_pack(
         CSMI_RUNTIME_VALUES_PROFILE_ID,
         CSMI_RUNTIME_VALUES_PROFILE_VERSION,
         CSMI_RUNTIME_VALUES_PROFILE_SCHEMA,
+    );
+    support.add(
+        CSMI_RUNTIME_VALUES_PROFILE_ID,
+        CSMI_RUNTIME_CONTRACTS_PROFILE_VERSION,
+        CSMI_RUNTIME_CONTRACTS_PROFILE_SCHEMA,
     );
     support.add(
         CSMI_COLLECTION_FLOW_PROFILE_ID,

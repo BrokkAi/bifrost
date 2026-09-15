@@ -205,6 +205,31 @@ impl RuntimeSourceOrigin {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeKeyKind {
+    StaticProperty,
+    StaticIndex,
+}
+
+impl RuntimeKeyKind {
+    pub const ALL: [Self; 2] = [Self::StaticProperty, Self::StaticIndex];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::StaticProperty => "static-property",
+            Self::StaticIndex => "static-index",
+        }
+    }
+
+    pub fn from_label(label: &str) -> Option<Self> {
+        match label {
+            "static-property" | "static_property" => Some(Self::StaticProperty),
+            "static-index" | "static_index" => Some(Self::StaticIndex),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReceiverTypeConstraintForm {
     AssignableTo,
 }
@@ -317,6 +342,7 @@ pub enum ValueShape {
     RuntimeGlobal,
     RuntimeContainer,
     RuntimeSourceOrigin,
+    RuntimeKeyKind,
     CallIdentity,
     ReceiverTypeConstraint,
     CallProof,
@@ -419,6 +445,7 @@ impl ValueShape {
             Self::RuntimeGlobal => "a supported runtime global binding",
             Self::RuntimeContainer => "a supported runtime container member",
             Self::RuntimeSourceOrigin => "a supported runtime source-origin contract",
+            Self::RuntimeKeyKind => "static-property or static-index",
             Self::CallIdentity => "a stable, qualified, or resolved typed call identity",
             Self::ReceiverTypeConstraint => {
                 "an exact call identity or an assignable-to workspace receiver family"
@@ -1456,7 +1483,7 @@ rql_forms! {
         labels: ["keyed-read-value", "keyed_read_value"],
         class: Wrapper,
         shape: Query,
-        signature: "(keyed-read-value :runtime node :global process :container env|argv [:property name | :index number] [:source-origin pristine_input] query)",
+        signature: "(keyed-read-value :runtime node :global process :container env|argv [:property name | :index number | :key-kind static-property | :key-kind static-index [:index-min number] [:index-max number]] [:source-origin pristine_input] query)",
         description: (QueryStepOp::KeyedReadValue),
         step: KeyedReadValue,
     }
@@ -2290,7 +2317,7 @@ json_fields! {
     Limit { label: "limit", shape: PositiveInteger, signature: "\"limit\": positive integer", description: "Set the maximum number of matches returned." }
     ResultDetail { label: "result_detail", shape: ResultDetail, signature: "\"result_detail\": \"compact\" | \"full\"", description: "Choose compact output or full capture and source details." }
     ExecutionMode { label: "execution_mode", shape: ExecutionMode, signature: "\"execution_mode\": \"results\" | \"explain\" | \"profile\"", description: "Return ordinary results, explain the selected plan without execution, or execute with an operator profile." }
-    SchemaVersion { label: "schema_version", shape: SchemaVersion, signature: "\"schema_version\": supported positive integer", description: "Pin one exact CodeQuery schema version; omission selects the compatible lineage head." }
+    SchemaVersion { label: "schema_version", shape: SchemaVersion, signature: "\"schema_version\": supported version string", description: "Pin one exact CodeQuery schema version; omission selects the compatible lineage head." }
     Occurrences { label: "occurrences", shape: OccurrenceFilter, signature: "\"occurrences\": { \"class\": [...], \"role\": [...], \"namespace\": [...] }", description: "Seed classified identifier occurrences directly from workspace facts." }
     Scopes { label: "scopes", shape: ScopeFilter, signature: "\"scopes\": { \"kind\": [...] }", description: "Seed lexical scope rows directly from workspace facts." }
     Bindings { label: "bindings", shape: BindingFilter, signature: "\"bindings\": { \"kind\": [...], \"name\": [...], \"hoisting\": [...] }", description: "Seed lexical binding rows directly from workspace facts." }
@@ -2321,6 +2348,9 @@ json_fields! {
     Container { label: "container", shape: RuntimeContainer, signature: "\"container\": \"env\" | \"argv\"", description: "Select the modeled container member." }
     Property { label: "property", shape: String, signature: "\"property\": \"name\"", description: "Select one exact static property key." }
     Index { label: "index", shape: NonNegativeInteger, signature: "\"index\": non-negative integer", description: "Select one exact non-negative array index." }
+    KeyKind { label: "key_kind", shape: RuntimeKeyKind, signature: "\"key_kind\": \"static-property\" | \"static-index\"", description: "Select a family of static property or index keys without naming one exact key." }
+    IndexMin { label: "index_min", shape: NonNegativeInteger, signature: "\"index_min\": non-negative integer", description: "Set the inclusive minimum index accepted by a static-index key family." }
+    IndexMax { label: "index_max", shape: NonNegativeInteger, signature: "\"index_max\": non-negative integer", description: "Set the inclusive maximum index accepted by a static-index key family." }
     SourceOrigin { label: "source_origin", shape: RuntimeSourceOrigin, signature: "\"source_origin\": \"pristine_input\"", description: "Require the modeled pristine runtime-input origin." }
     Capture { label: "capture", shape: CaptureName, signature: "\"capture\": \"declared_name\"", description: "Analyze every unique range bound to a declared positive structural capture." }
     ReceiverIdentityId { label: "receiver_identity_id", shape: String, signature: "\"receiver_identity_id\": \"stable-id\"", description: "Retain field-write rows whose already-proven receiver identity equals this exact analyzer or semantic-model identity." }
@@ -2493,6 +2523,9 @@ const KEYED_READ_VALUE_STEP_OPTIONS: &[QueryStepOption] = &[
     QueryStepOption::required(QueryStepField::Container, &[":container"]),
     QueryStepOption::optional(QueryStepField::Property, &[":property"]),
     QueryStepOption::optional(QueryStepField::Index, &[":index"]),
+    QueryStepOption::optional(QueryStepField::KeyKind, &[":key-kind", ":key_kind"]),
+    QueryStepOption::optional(QueryStepField::IndexMin, &[":index-min", ":index_min"]),
+    QueryStepOption::optional(QueryStepField::IndexMax, &[":index-max", ":index_max"]),
     QueryStepOption::optional(
         QueryStepField::SourceOrigin,
         &[":source-origin", ":source_origin"],
@@ -2951,6 +2984,12 @@ pub fn flow_state_filter_labels(field: QueryStepField) -> Vec<&'static str> {
 /// row family owns it. Parser, validator, hover and completion all read this
 /// one entry point, so a new constrained axis is spelled once (#1480).
 pub fn constrained_step_option_labels(field: QueryStepField) -> Vec<&'static str> {
+    if field == QueryStepField::KeyKind {
+        return RuntimeKeyKind::ALL
+            .iter()
+            .map(|kind| kind.label())
+            .collect();
+    }
     let failure_use = failure_use_filter_labels(field);
     if !failure_use.is_empty() {
         return failure_use;

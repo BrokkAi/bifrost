@@ -3,7 +3,7 @@ title: Code Querying
 description: Understand Bifrost's structural code-querying model and its query representations.
 ---
 
-Bifrost's composable code-query engine is `query_code`. The single supported schema version is 1; it carries the complete query vocabulary, including host-registered retained production taint findings. It answers questions such as “find calls to this callee,” “which exact control edge leaves this entry?”, “does this registered resource protocol reach an error transition?”, and “which retained production taint findings belong to this procedure?” across the active workspace.
+Bifrost's composable code-query engine is `query_code`. The single supported schema version is `"1"`; it carries the complete query vocabulary, including host-registered retained production taint findings. It answers questions such as “find calls to this callee,” “which exact control edge leaves this entry?”, “does this registered resource protocol reach an error transition?”, and “which retained production taint findings belong to this procedure?” across the active workspace.
 
 The CFG surface remains deliberately procedure-local. A narrow registered typestate adapter, declaration-bounded containment, and registered value flow are part of the same vocabulary. The `taint` step resolves an exact procedure within an immutable retained production result and invokes only the existing public projector. It never loads or compiles a policy, runs propagation, reconstructs witnesses, or performs policy classification.
 

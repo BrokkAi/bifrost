@@ -40,21 +40,22 @@ use std::time::Instant;
 
 use brokk_bifrost_analysis::CancellationToken;
 use brokk_bifrost_analysis::analyzer::semantic_model::{
-    ActivationSelector, ArtifactEncoding, ArtifactProducerLimits, ArtifactProduction,
-    ArtifactProductionRequest, AuthoredSemanticModelPack, CatalogCoordinate, CatalogOptions,
-    Compatibility, CompiledSemanticModelPack, CompilerOptions, Completeness, DecodeLimits,
-    DependencyArtifactRole, DependencyPackLimits, DurablePackSource, DurablePackSourceKind,
-    ExactArtifact, ExactDependencyArtifact, ExternalArtifactKind,
-    GENERATED_PRODUCTION_CACHE_VERSION, GeneratedProductionKey, PackExtractionAccounting,
-    PackExtractionGap, PackExtractionSourceEntry, ProcedureSummaryMemberKey, ProducerDiagnostic,
-    ProducerDiagnosticSeverity, Provenance, ResolvedActiveSemanticModels,
-    SEMANTIC_MODEL_SCHEMA_VERSION, Safety, SemanticModelActivationControl,
+    AcquisitionReceiptRelease, AcquisitionReceiptSource, ActivationSelector, ArtifactEncoding,
+    ArtifactProducerLimits, ArtifactProduction, ArtifactProductionRequest,
+    AuthoredSemanticModelPack, CatalogCoordinate, CatalogOptions, Compatibility,
+    CompiledSemanticModelPack, CompilerOptions, Completeness, DecodeLimits, DependencyArtifactRole,
+    DependencyPackLimits, DurablePackSource, DurablePackSourceKind, ExactArtifact,
+    ExactDependencyArtifact, ExternalArtifactKind, GENERATED_PRODUCTION_CACHE_VERSION,
+    GeneratedProductionKey, PackExtractionAccounting, PackExtractionGap, PackExtractionSourceEntry,
+    ProcedureSummaryMemberKey, ProducerDiagnostic, ProducerDiagnosticSeverity, Provenance,
+    ResolvedActiveSemanticModels, SEMANTIC_MODEL_SCHEMA_VERSION,
+    SEMANTIC_MODEL_SUPPORTED_SCHEMA_VERSIONS, Safety, SemanticModelActivationControl,
     SemanticModelActivationEvidence, SemanticModelActivationRequest, SemanticModelControlAction,
     SemanticModelControlScope, SemanticModelPackSelector, SemanticModelResolutionOutcome,
     SemanticModelRuntimeOutcome, SemanticPackCatalog, acquire_active_semantic_models,
     compile_exact_dependency_production, compile_pack, decode_manifest, decode_shard_for_manifest,
     pack_rejects_are_warning_only, read_exact_artifact, read_exact_source_set,
-    resolve_active_semantic_models,
+    resolve_active_semantic_models, verify_recorded_generated_production_digest,
 };
 use brokk_bifrost_analysis::analyzer::{
     AnalyzerConfig, CSharpAssemblyPackProducer, ComposerPackagePackProducer,
@@ -479,6 +480,24 @@ pub struct ReleaseBundle {
     pub rejects: ReleaseBundleRejects,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GeneratedProductionReuse {
+    Eligible,
+    StaleCache { recorded: u32, current: u32 },
+    StaleSchema { recorded: u32, current: u32 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VerifiedReleaseBundle {
+    bundle: ReleaseBundle,
+    generated_reuse: Vec<GeneratedProductionReuse>,
+    curated_packs: Vec<CompiledSemanticModelPack>,
+    /// One entry per indexed generated production. `Some` exactly where the
+    /// matching `generated_reuse` entry is `Eligible`: a production this build
+    /// will not install is verified from the index and never decoded.
+    generated_packs: Vec<Option<CompiledSemanticModelPack>>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReleaseBundleMeasurements {
@@ -547,6 +566,12 @@ pub struct ReleasePackInstallation {
     pub pack_id: String,
     pub pack_version: String,
     pub manifest_digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BundleInstallationProof {
+    pub installations: Vec<ReleasePackInstallation>,
+    pub sources: Vec<AcquisitionReceiptSource>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -643,7 +668,7 @@ pub fn generate_release_bundle(
         &json_bytes(&measurements)?,
     )?;
     write_checksums(output_root, &index)?;
-    verify_release_bundle(output_root)
+    verify_current_release_bundle(output_root)
 }
 
 fn read_and_validate_spec(spec_path: &Path) -> Result<PinnedPackSpec, BundleError> {
@@ -1956,6 +1981,92 @@ fn lookup_record_count(active: &ResolvedActiveSemanticModels, query: &PinnedLook
 }
 
 pub fn verify_release_bundle(output_root: &Path) -> Result<ReleaseBundle, BundleError> {
+    verify_current_release_bundle(output_root)
+}
+
+#[cfg(any(test, feature = "download"))]
+pub(crate) fn verify_release_bundle_for_install(
+    output_root: &Path,
+) -> Result<VerifiedReleaseBundle, BundleError> {
+    verify_release_bundle_for_cache_version(output_root, GENERATED_PRODUCTION_CACHE_VERSION)
+}
+
+fn verify_release_bundle_for_cache_version(
+    output_root: &Path,
+    current_cache_version: u32,
+) -> Result<VerifiedReleaseBundle, BundleError> {
+    assert!(
+        current_cache_version > 0,
+        "generated cache version is nonzero"
+    );
+    let index = read_release_bundle_index(output_root)?;
+    // The compatibility decision is index-level and runs beside the gates
+    // above, before any asset is read: a bundle whose generated schema this
+    // build cannot decode fails here, without the whole-bundle checksum pass
+    // or any manifest and shard decode (#3364).
+    let generated_reuse =
+        generated_production_reuse(&index.generated_productions, current_cache_version)?;
+    verify_checksums(output_root, &index)?;
+    let rejects = verify_rejects(output_root, &index)?;
+    let measurements_path = safe_asset_path(output_root, Path::new("measurements.json"))?;
+    verify_measurements(&measurements_path, &index)?;
+    let mut curated_packs = Vec::with_capacity(index.packs.len());
+    for pack in &index.packs {
+        let compiled =
+            read_compiled_pack(output_root, &pack.pack_id, &pack.manifest, &pack.shards)?;
+        let manifest = &compiled.manifest;
+        if manifest.pack_id != pack.pack_id
+            || manifest.version != pack.pack_version
+            || manifest.semantic_sha256 != pack.manifest_semantic_sha256
+            || manifest.content_sha256 != pack.manifest_content_sha256
+            || manifest.shards.len() != pack.shards.len()
+            || manifest.language != pack.language
+            || manifest.ecosystem != pack.ecosystem
+            || manifest.completeness != pack.completeness
+            || manifest.compatibility != pack.compatibility
+            || manifest.provenance != pack.provenance
+            || manifest.license != pack.license
+        {
+            return Err(BundleError::new(format!(
+                "release index metadata does not match manifest for {}@{}",
+                pack.pack_id, pack.pack_version
+            )));
+        }
+        if pack.notices.is_empty() {
+            return Err(BundleError::new(format!(
+                "release pack {}@{} must include at least one license or notice asset",
+                pack.pack_id, pack.pack_version
+            )));
+        }
+        validate_release_notices(&pack.notices)?;
+        for notice in &pack.notices {
+            verify_asset(output_root, &notice.asset)?;
+        }
+        curated_packs.push(compiled);
+    }
+    let mut generated_packs = Vec::with_capacity(index.generated_productions.len());
+    for (generated, reuse) in index.generated_productions.iter().zip(&generated_reuse) {
+        verify_generated_production_identity(&index, generated)?;
+        // A production this build will not install is never decoded. Its bytes
+        // keep their whole-bundle checksum coverage, and the decode cost
+        // leaves the first request's critical path (#3364).
+        generated_packs.push(if *reuse == GeneratedProductionReuse::Eligible {
+            Some(verify_generated_production_pack(output_root, generated)?)
+        } else {
+            None
+        });
+    }
+    Ok(VerifiedReleaseBundle {
+        bundle: ReleaseBundle { index, rejects },
+        generated_reuse,
+        curated_packs,
+        generated_packs,
+    })
+}
+
+/// Read `index.json` and run the index-level gates: bundle schema, generator
+/// identity, and pack and generated-production uniqueness.
+fn read_release_bundle_index(output_root: &Path) -> Result<ReleaseBundleIndex, BundleError> {
     let index_path = safe_asset_path(output_root, Path::new("index.json"))?;
     let index_bytes = fs::read(&index_path)
         .map_err(|error| BundleError::new(format!("read {}: {error}", index_path.display())))?;
@@ -1976,74 +2087,83 @@ pub fn verify_release_bundle(output_root: &Path) -> Result<ReleaseBundle, Bundle
     }
     ensure_unique_pack_identities(&index.packs)?;
     ensure_unique_generated_productions(&index.generated_productions)?;
-    verify_checksums(output_root, &index)?;
-    let rejects = verify_rejects(output_root, &index)?;
-    let measurements_path = safe_asset_path(output_root, Path::new("measurements.json"))?;
-    verify_measurements(&measurements_path, &index)?;
-    let limits = DecodeLimits::default();
-    for pack in &index.packs {
-        let manifest_bytes = verify_asset(output_root, &pack.manifest)?;
-        let manifest = decode_manifest(&manifest_bytes, &limits).map_err(|error| {
-            BundleError::new(format!("decode manifest for {}: {error}", pack.pack_id))
-        })?;
-        if manifest.pack_id != pack.pack_id
-            || manifest.version != pack.pack_version
-            || manifest.semantic_sha256 != pack.manifest_semantic_sha256
-            || manifest.content_sha256 != pack.manifest_content_sha256
-            || manifest.shards.len() != pack.shards.len()
-            || manifest.language != pack.language
-            || manifest.ecosystem != pack.ecosystem
-            || manifest.completeness != pack.completeness
-            || manifest.compatibility != pack.compatibility
-            || manifest.provenance != pack.provenance
-            || manifest.license != pack.license
-        {
-            return Err(BundleError::new(format!(
-                "release index metadata does not match manifest for {}@{}",
-                pack.pack_id, pack.pack_version
-            )));
-        }
-        for descriptor in &manifest.shards {
-            let indexed = pack
-                .shards
-                .iter()
-                .find(|shard| shard.shard_id == descriptor.shard_id)
-                .ok_or_else(|| {
-                    BundleError::new(format!("missing indexed shard {}", descriptor.shard_id))
-                })?;
-            if indexed.encoding != descriptor.encoding
-                || indexed.raw_bytes != descriptor.raw_size
-                || indexed.records != descriptor.record_count
-                || indexed.semantic_sha256 != descriptor.semantic_sha256
-                || indexed.content_sha256 != descriptor.content_sha256
-                || indexed.asset.sha256 != descriptor.stored_sha256
-                || indexed.asset.bytes != descriptor.stored_size
-            {
+    Ok(index)
+}
+
+/// Decide from the index alone whether each generated production can be
+/// installed by this build. A schema this build cannot decode is a hard
+/// error; a decodable but stale entry is reported for the caller to skip.
+fn generated_production_reuse(
+    generated_productions: &[ReleaseGeneratedProduction],
+    current_cache_version: u32,
+) -> Result<Vec<GeneratedProductionReuse>, BundleError> {
+    generated_productions
+        .iter()
+        .map(|generated| {
+            if !SEMANTIC_MODEL_SUPPORTED_SCHEMA_VERSIONS.contains(&generated.schema_version) {
                 return Err(BundleError::new(format!(
-                    "release index metadata does not match shard {}",
-                    descriptor.shard_id
+                    "unsupported generated production semantic schema {}",
+                    generated.schema_version
                 )));
             }
-            let bytes = verify_asset(output_root, &indexed.asset)?;
-            decode_shard_for_manifest(&manifest, descriptor, &bytes, &limits).map_err(|error| {
-                BundleError::new(format!("decode shard {}: {error}", descriptor.shard_id))
-            })?;
-        }
-        if pack.notices.is_empty() {
-            return Err(BundleError::new(format!(
-                "release pack {}@{} must include at least one license or notice asset",
-                pack.pack_id, pack.pack_version
-            )));
-        }
-        validate_release_notices(&pack.notices)?;
-        for notice in &pack.notices {
-            verify_asset(output_root, &notice.asset)?;
+            Ok(
+                if generated.schema_version != SEMANTIC_MODEL_SCHEMA_VERSION {
+                    GeneratedProductionReuse::StaleSchema {
+                        recorded: generated.schema_version,
+                        current: SEMANTIC_MODEL_SCHEMA_VERSION,
+                    }
+                } else if generated.cache_version == current_cache_version {
+                    GeneratedProductionReuse::Eligible
+                } else {
+                    GeneratedProductionReuse::StaleCache {
+                        recorded: generated.cache_version,
+                        current: current_cache_version,
+                    }
+                },
+            )
+        })
+        .collect()
+}
+
+fn verify_current_release_bundle(output_root: &Path) -> Result<ReleaseBundle, BundleError> {
+    verify_release_bundle_for_generation(output_root, GENERATED_PRODUCTION_CACHE_VERSION)
+}
+
+fn verify_release_bundle_for_generation(
+    output_root: &Path,
+    current_cache_version: u32,
+) -> Result<ReleaseBundle, BundleError> {
+    // Generation and merge consume only bundles whose generated productions
+    // are current for this build. The gate reads the index alone and runs
+    // before any asset, so an incompatible bundle is rejected without the
+    // checksum pass or any manifest and shard decode (#3364).
+    ensure_generated_productions_are_current(output_root, current_cache_version)?;
+    Ok(verify_release_bundle_for_cache_version(output_root, current_cache_version)?.bundle)
+}
+
+/// Reject a bundle whose generated productions are not current for this
+/// build, reading only `index.json`.
+fn ensure_generated_productions_are_current(
+    output_root: &Path,
+    current_cache_version: u32,
+) -> Result<(), BundleError> {
+    let index = read_release_bundle_index(output_root)?;
+    for reuse in generated_production_reuse(&index.generated_productions, current_cache_version)? {
+        match reuse {
+            GeneratedProductionReuse::Eligible => {}
+            GeneratedProductionReuse::StaleCache { recorded, current } => {
+                return Err(BundleError::new(format!(
+                    "generated production cache version {recorded} is not current {current}"
+                )));
+            }
+            GeneratedProductionReuse::StaleSchema { recorded, current } => {
+                return Err(BundleError::new(format!(
+                    "generated production schema version {recorded} is not current {current}"
+                )));
+            }
         }
     }
-    for generated in &index.generated_productions {
-        verify_generated_production(output_root, &index, generated)?;
-    }
-    Ok(ReleaseBundle { index, rejects })
+    Ok(())
 }
 
 /// Merge independently generated, fully verified release bundles into one
@@ -2053,6 +2173,18 @@ pub fn verify_release_bundle(output_root: &Path) -> Result<ReleaseBundle, Bundle
 pub fn merge_release_bundles(
     output_root: &Path,
     input_roots: &[PathBuf],
+) -> Result<ReleaseBundle, BundleError> {
+    merge_release_bundles_for_cache_version(
+        output_root,
+        input_roots,
+        GENERATED_PRODUCTION_CACHE_VERSION,
+    )
+}
+
+fn merge_release_bundles_for_cache_version(
+    output_root: &Path,
+    input_roots: &[PathBuf],
+    current_cache_version: u32,
 ) -> Result<ReleaseBundle, BundleError> {
     if input_roots.is_empty() {
         return Err(BundleError::new(
@@ -2068,12 +2200,15 @@ pub fn merge_release_bundles(
     let mut identities = BTreeSet::new();
     let mut generated_identities = BTreeSet::new();
 
-    // Verify every input and retain all source bytes before touching the
-    // output. The output must be a new or empty directory, so a stale or
-    // source bundle file can never be retained accidentally.
+    // Verify every input before touching the output. The output must be a new
+    // or empty directory, so a stale or source bundle file can never be
+    // retained accidentally.
+    let bundles = input_roots
+        .iter()
+        .map(|input_root| verify_release_bundle_for_generation(input_root, current_cache_version))
+        .collect::<Result<Vec<_>, _>>()?;
     prepare_merge_output(output_root, input_roots)?;
-    for input_root in input_roots {
-        let bundle = verify_release_bundle(input_root)?;
+    for (input_root, bundle) in input_roots.iter().zip(bundles) {
         if bundle.index.generator != generator {
             return Err(BundleError::new(format!(
                 "input bundle {} uses incompatible generator {:?}",
@@ -2173,7 +2308,7 @@ pub fn merge_release_bundles(
         &json_bytes(&measurements)?,
     )?;
     write_checksums(output_root, &index)?;
-    verify_release_bundle(output_root)
+    verify_release_bundle_for_generation(output_root, current_cache_version)
 }
 
 fn collect_asset(
@@ -2290,8 +2425,10 @@ fn ensure_unique_generated_productions(
     Ok(())
 }
 
-fn verify_generated_production(
-    output_root: &Path,
+/// Verify a generated production from the index alone: identity fields,
+/// digest binding to the production key, curated-source binding, and the
+/// extraction accounting gates. Reads no bundle asset.
+fn verify_generated_production_identity(
     index: &ReleaseBundleIndex,
     generated: &ReleaseGeneratedProduction,
 ) -> Result<(), BundleError> {
@@ -2307,26 +2444,16 @@ fn verify_generated_production(
             "generated production identity metadata must be non-empty",
         ));
     }
-    if generated.schema_version != SEMANTIC_MODEL_SCHEMA_VERSION {
-        return Err(BundleError::new(format!(
-            "unsupported generated production semantic schema {}",
-            generated.schema_version
-        )));
-    }
-    if generated.cache_version != GENERATED_PRODUCTION_CACHE_VERSION {
-        return Err(BundleError::new(format!(
-            "generated production cache version {} is not current {}",
-            generated.cache_version, GENERATED_PRODUCTION_CACHE_VERSION
-        )));
-    }
-    let key = GeneratedProductionKey::new(
-        generated.input_digest.clone(),
-        generated.producer_name.clone(),
-        generated.producer_version.clone(),
+    if !verify_recorded_generated_production_digest(
+        &generated.production_digest,
+        &generated.input_digest,
+        &generated.producer_name,
+        &generated.producer_version,
         generated.schema_version,
+        generated.cache_version,
     )
-    .map_err(|error| BundleError::new(format!("invalid generated production key: {error}")))?;
-    if key.production_digest() != generated.production_digest {
+    .map_err(|error| BundleError::new(format!("invalid generated production identity: {error}")))?
+    {
         return Err(BundleError::new(
             "generated production digest does not match its key fields",
         ));
@@ -2350,27 +2477,6 @@ fn verify_generated_production(
     {
         return Err(BundleError::new(
             "generated production does not bind the curated JDK artifact",
-        ));
-    }
-    let compiled = read_compiled_pack(
-        output_root,
-        &generated.pack_id,
-        &generated.manifest,
-        &generated.shards,
-    )?;
-    if compiled.manifest.pack_id != generated.pack_id
-        || compiled.manifest.version != generated.pack_version
-        || compiled.manifest.language != generated.language
-        || compiled.manifest.ecosystem != generated.ecosystem
-        || compiled.manifest.semantic_sha256 != generated.manifest_semantic_sha256
-        || compiled.manifest.content_sha256 != generated.manifest_content_sha256
-        || compiled.manifest.completeness != generated.completeness
-        || compiled.manifest.producer.name != generated.producer_name
-        || compiled.manifest.producer.version != generated.producer_version
-        || compiled.manifest.schema_version != generated.schema_version
-    {
-        return Err(BundleError::new(
-            "generated production index metadata does not match its manifest",
         ));
     }
     validate_release_reject_subjects(
@@ -2413,8 +2519,37 @@ fn verify_generated_production(
             "generated production extraction accounting is inconsistent",
         ));
     }
-    let _ = key;
     Ok(())
+}
+
+/// Decode a generated production's compiled pack and cross-check it against
+/// its index entry.
+fn verify_generated_production_pack(
+    output_root: &Path,
+    generated: &ReleaseGeneratedProduction,
+) -> Result<CompiledSemanticModelPack, BundleError> {
+    let compiled = read_compiled_pack(
+        output_root,
+        &generated.pack_id,
+        &generated.manifest,
+        &generated.shards,
+    )?;
+    if compiled.manifest.pack_id != generated.pack_id
+        || compiled.manifest.version != generated.pack_version
+        || compiled.manifest.language != generated.language
+        || compiled.manifest.ecosystem != generated.ecosystem
+        || compiled.manifest.semantic_sha256 != generated.manifest_semantic_sha256
+        || compiled.manifest.content_sha256 != generated.manifest_content_sha256
+        || compiled.manifest.completeness != generated.completeness
+        || compiled.manifest.producer.name != generated.producer_name
+        || compiled.manifest.producer.version != generated.producer_version
+        || compiled.manifest.schema_version != generated.schema_version
+    {
+        return Err(BundleError::new(
+            "generated production index metadata does not match its manifest",
+        ));
+    }
+    Ok(compiled)
 }
 
 /// Read and cross-check the structured extraction burn-down report.
@@ -2563,7 +2698,8 @@ fn extraction_accounting(
     }
 }
 
-/// Verify and install every compiled pack in a downloaded release bundle.
+/// Verify a downloaded release bundle, install every curated pack, and install
+/// only generated productions that match the current runtime cache identity.
 ///
 /// Download policy remains outside ordinary analysis. Once a caller has
 /// selected and unpacked a bundle, this provides the explicit bridge into the
@@ -2572,42 +2708,127 @@ pub fn install_release_bundle(
     bundle_root: &Path,
     catalog: &SemanticPackCatalog,
 ) -> Result<Vec<ReleasePackInstallation>, BundleError> {
-    let bundle = verify_release_bundle(bundle_root)?;
-    let mut installed = bundle
+    install_release_bundle_for_cache_version(
+        bundle_root,
+        catalog,
+        GENERATED_PRODUCTION_CACHE_VERSION,
+        None,
+    )
+    .map(|proof| proof.installations)
+}
+
+#[cfg(feature = "download")]
+pub(crate) fn install_release_bundle_with_proof(
+    bundle_root: &Path,
+    catalog: &SemanticPackCatalog,
+    release: &AcquisitionReceiptRelease,
+) -> Result<BundleInstallationProof, BundleError> {
+    install_release_bundle_for_cache_version(
+        bundle_root,
+        catalog,
+        GENERATED_PRODUCTION_CACHE_VERSION,
+        Some(release),
+    )
+}
+
+fn install_release_bundle_for_cache_version(
+    bundle_root: &Path,
+    catalog: &SemanticPackCatalog,
+    current_cache_version: u32,
+    receipt_release: Option<&AcquisitionReceiptRelease>,
+) -> Result<BundleInstallationProof, BundleError> {
+    let verified = {
+        let _scope = brokk_bifrost_analysis::profiling::scope(
+            "semantic_pack.release_bundle.verify_for_install",
+        );
+        verify_release_bundle_for_cache_version(bundle_root, current_cache_version)?
+    };
+    install_verified_release_bundle(verified, catalog, receipt_release)
+}
+
+#[cfg(feature = "download")]
+pub(crate) fn install_verified_release_bundle_with_proof(
+    verified: VerifiedReleaseBundle,
+    catalog: &SemanticPackCatalog,
+    release: &AcquisitionReceiptRelease,
+) -> Result<BundleInstallationProof, BundleError> {
+    install_verified_release_bundle(verified, catalog, Some(release))
+}
+
+fn install_verified_release_bundle(
+    verified: VerifiedReleaseBundle,
+    catalog: &SemanticPackCatalog,
+    receipt_release: Option<&AcquisitionReceiptRelease>,
+) -> Result<BundleInstallationProof, BundleError> {
+    let VerifiedReleaseBundle {
+        bundle,
+        generated_reuse,
+        curated_packs,
+        generated_packs,
+    } = verified;
+    let _install_scope =
+        brokk_bifrost_analysis::profiling::scope("semantic_pack.release_bundle.decode_and_install");
+    let installed = bundle
         .index
         .packs
         .iter()
         .zip(&bundle.rejects.packs)
-        .map(|(pack, rejects)| {
-            let compiled =
-                read_compiled_pack(bundle_root, &pack.pack_id, &pack.manifest, &pack.shards)?;
+        .zip(curated_packs)
+        .map(|((pack, rejects), compiled)| {
             let extraction = release_extraction_accounting(rejects);
-            let installed = catalog
-                .install_release(
-                    &compiled,
-                    &DurablePackSource {
-                        kind: DurablePackSourceKind::PreShipped,
-                        source_id: format!(
-                            "release:{}@{}:{}",
-                            pack.pack_id, pack.pack_version, pack.manifest.sha256
-                        ),
-                    },
-                    &extraction,
-                )
-                .map_err(|error| {
-                    BundleError::new(format!(
-                        "install {}@{}: {error}",
-                        pack.pack_id, pack.pack_version
-                    ))
-                })?;
-            Ok(ReleasePackInstallation {
-                pack_id: pack.pack_id.clone(),
-                pack_version: pack.pack_version.clone(),
-                manifest_digest: installed.manifest_digest,
-            })
+            let source = DurablePackSource {
+                kind: DurablePackSourceKind::PreShipped,
+                source_id: format!(
+                    "release:{}@{}:{}",
+                    pack.pack_id, pack.pack_version, pack.manifest.sha256
+                ),
+            };
+            let (installed, proof) = if let Some(release) = receipt_release {
+                let (installed, proof) = catalog
+                    .install_release_for_receipt(release, &compiled, &source, &extraction)
+                    .map_err(|error| {
+                        BundleError::new(format!(
+                            "install {}@{}: {error}",
+                            pack.pack_id, pack.pack_version
+                        ))
+                    })?;
+                (installed, Some(proof))
+            } else {
+                let installed = catalog
+                    .install_release(&compiled, &source, &extraction)
+                    .map_err(|error| {
+                        BundleError::new(format!(
+                            "install {}@{}: {error}",
+                            pack.pack_id, pack.pack_version
+                        ))
+                    })?;
+                (installed, None)
+            };
+            Ok((
+                ReleasePackInstallation {
+                    pack_id: pack.pack_id.clone(),
+                    pack_version: pack.pack_version.clone(),
+                    manifest_digest: installed.manifest_digest,
+                },
+                proof,
+            ))
         })
         .collect::<Result<Vec<_>, BundleError>>()?;
-    for generated in &bundle.index.generated_productions {
+    let (mut installed, sources): (Vec<_>, Vec<_>) = installed.into_iter().unzip();
+    let mut sources = sources.into_iter().flatten().collect::<Vec<_>>();
+    for ((generated, reuse), compiled) in bundle
+        .index
+        .generated_productions
+        .iter()
+        .zip(generated_reuse)
+        .zip(generated_packs)
+    {
+        if reuse != GeneratedProductionReuse::Eligible {
+            continue;
+        }
+        let Some(compiled) = compiled else {
+            unreachable!("an eligible generated production is always decoded");
+        };
         let key = GeneratedProductionKey::new(
             generated.input_digest.clone(),
             generated.producer_name.clone(),
@@ -2615,12 +2836,6 @@ pub fn install_release_bundle(
             generated.schema_version,
         )
         .map_err(|error| BundleError::new(format!("invalid generated production key: {error}")))?;
-        let compiled = read_compiled_pack(
-            bundle_root,
-            &generated.pack_id,
-            &generated.manifest,
-            &generated.shards,
-        )?;
         let source = DurablePackSource {
             kind: DurablePackSourceKind::PreShipped,
             source_id: format!(
@@ -2630,26 +2845,46 @@ pub fn install_release_bundle(
                 generated.production_digest
             ),
         };
-        let installation = catalog
-            .install_release_generated(
-                &key,
-                &compiled,
-                &source,
-                &generated_extraction_accounting(generated),
-            )
-            .map_err(|error| {
-                BundleError::new(format!(
-                    "install generated {}@{}: {error}",
-                    generated.pack_id, generated.pack_version
-                ))
-            })?;
+        let extraction = generated_extraction_accounting(generated);
+        let (installation, generated_sources) = if let Some(release) = receipt_release {
+            let (installation, sources) = catalog
+                .install_release_generated_for_receipt(
+                    release,
+                    &key,
+                    &compiled,
+                    &source,
+                    &extraction,
+                )
+                .map_err(|error| {
+                    BundleError::new(format!(
+                        "install generated {}@{}: {error}",
+                        generated.pack_id, generated.pack_version
+                    ))
+                })?;
+            (installation, sources)
+        } else {
+            let installation = catalog
+                .install_release_generated(&key, &compiled, &source, &extraction)
+                .map_err(|error| {
+                    BundleError::new(format!(
+                        "install generated {}@{}: {error}",
+                        generated.pack_id, generated.pack_version
+                    ))
+                })?;
+            (installation, Vec::new())
+        };
+        let manifest_digest = installation.install.manifest_digest;
         installed.push(ReleasePackInstallation {
             pack_id: generated.pack_id.clone(),
             pack_version: generated.pack_version.clone(),
-            manifest_digest: installation.install.manifest_digest,
+            manifest_digest: manifest_digest.clone(),
         });
+        sources.extend(generated_sources);
     }
-    Ok(installed)
+    Ok(BundleInstallationProof {
+        installations: installed,
+        sources,
+    })
 }
 
 fn read_compiled_pack(
@@ -2698,6 +2933,9 @@ fn read_compiled_pack(
                 )));
             }
             let bytes = verify_asset(bundle_root, &indexed.asset)?;
+            decode_shard_for_manifest(&manifest, descriptor, &bytes, &limits).map_err(|error| {
+                BundleError::new(format!("decode shard {}: {error}", descriptor.shard_id))
+            })?;
             Ok(
                 brokk_bifrost_analysis::analyzer::semantic_model::CompiledShardArtifact {
                     descriptor: descriptor.clone(),
@@ -3476,13 +3714,503 @@ mod tests {
         );
         assert!(catalog.generated_production(&key).unwrap().is_some());
 
+        // Model this honestly generated bundle as a prior release relative to
+        // a subsequent runtime cache epoch. Its recorded digest remains bound
+        // to the epoch that generated it; only reuse eligibility changes. The
+        // curated pack remains installable, while the stale generated
+        // acceleration must create no catalog, source, candidate, or active
+        // shard.
+        let future_cache_version = GENERATED_PRODUCTION_CACHE_VERSION + 1;
+        let verified =
+            verify_release_bundle_for_cache_version(&first, future_cache_version).unwrap();
+        assert_eq!(
+            verified.generated_reuse,
+            vec![GeneratedProductionReuse::StaleCache {
+                recorded: GENERATED_PRODUCTION_CACHE_VERSION,
+                current: future_cache_version,
+            }]
+        );
+        assert!(
+            verify_release_bundle_for_generation(&first, future_cache_version)
+                .unwrap_err()
+                .to_string()
+                .contains("is not current")
+        );
+        let stale_catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        let installed = install_release_bundle_for_cache_version(
+            &first,
+            &stale_catalog,
+            future_cache_version,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            installed.installations.len(),
+            1,
+            "only the curated JDK pack installs"
+        );
+        assert!(stale_catalog.generated_production(&key).unwrap().is_none());
+        let generated_manifest_digest = generated.manifest_content_sha256.clone();
+        assert!(
+            stale_catalog
+                .inventory_bounded(usize::MAX)
+                .unwrap()
+                .packs
+                .iter()
+                .all(|pack| pack.manifest_content_sha256 != generated_manifest_digest),
+            "stale generated pack must not have a catalog row"
+        );
+        assert!(
+            !stale_catalog
+                .durable_source_present(&DurablePackSource {
+                    kind: DurablePackSourceKind::PreShipped,
+                    source_id: format!(
+                        "release-generated:{}@{}:{}",
+                        generated.source_pack_id,
+                        generated.source_pack_version,
+                        generated.production_digest
+                    ),
+                })
+                .unwrap()
+        );
+        let query = brokk_bifrost_analysis::analyzer::semantic_model::SemanticPackSelectorQuery {
+            language: "java".to_owned(),
+            ecosystem: "jdk".to_owned(),
+            package: None,
+            module: Some(CatalogCoordinate {
+                name: "java.base".to_owned(),
+                version: None,
+            }),
+            toolchain: Some(CatalogCoordinate {
+                name: "jdk".to_owned(),
+                version: Some(Version::parse(version).unwrap()),
+            }),
+            target: None,
+            configuration: None,
+            artifact_sha256: Some(artifact_sha256.clone()),
+            bifrost_version: env!("CARGO_PKG_VERSION").parse().unwrap(),
+        };
+        assert!(
+            stale_catalog
+                .candidates(&query)
+                .unwrap()
+                .iter()
+                .all(|candidate| candidate.manifest_digest() != generated_manifest_digest),
+            "ordinary candidates must not contain the stale generated pack"
+        );
+        let SemanticModelResolutionOutcome::Ready(active) = resolve_active_semantic_models(
+            &stale_catalog,
+            &SemanticModelActivationRequest {
+                bifrost_version: env!("CARGO_PKG_VERSION").parse().unwrap(),
+                evidence: vec![SemanticModelActivationEvidence {
+                    language: query.language.clone(),
+                    ecosystem: query.ecosystem.clone(),
+                    package: query.package.clone(),
+                    module: query.module.clone(),
+                    toolchain: query.toolchain.clone(),
+                    target: query.target.clone(),
+                    configuration: query.configuration.clone(),
+                    artifact_sha256: query.artifact_sha256.clone(),
+                }],
+                controls: Vec::new(),
+                limits: Default::default(),
+            },
+            &CancellationToken::default(),
+        ) else {
+            panic!("the curated JDK pack must remain activation-ready");
+        };
+        assert!(
+            active
+                .shards()
+                .iter()
+                .all(|shard| shard.manifest.content_sha256 != generated_manifest_digest),
+            "activation must not select the stale generated pack"
+        );
+
+        let stale_merge = fixture.path().join("stale-merge");
+        let error = merge_release_bundles_for_cache_version(
+            &stale_merge,
+            std::slice::from_ref(&first),
+            future_cache_version,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("is not current"), "{error}");
+        assert!(
+            !stale_merge.exists(),
+            "strict merge must reject stale input before creating output"
+        );
+
+        let mut incompatible_schema = first_bundle.index.clone();
+        incompatible_schema.generated_productions[0].schema_version += 1;
+        fs::write(
+            first.join("index.json"),
+            json_bytes(&incompatible_schema).unwrap(),
+        )
+        .unwrap();
+        fs::remove_file(first.join("SHA256SUMS")).unwrap();
+        write_checksums(&first, &incompatible_schema).unwrap();
+        let error = verify_release_bundle_for_cache_version(&first, future_cache_version)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("unsupported generated production semantic schema"),
+            "{error}"
+        );
+        fs::write(
+            first.join("index.json"),
+            json_bytes(&first_bundle.index).unwrap(),
+        )
+        .unwrap();
+        fs::remove_file(first.join("SHA256SUMS")).unwrap();
+        write_checksums(&first, &first_bundle.index).unwrap();
+
+        // Compile an actually readable schema-2 pack, rather than changing an
+        // index field without updating its bytes. It is trustworthy input but
+        // cannot serve as current generated output, even at the same epoch.
+        let request = ArtifactProductionRequest {
+            path: artifact_path.clone(),
+            artifact_kind: ExternalArtifactKind::JdkSourceZip,
+            pack_id: generated.pack_id.clone(),
+            pack_version: generated.pack_version.clone(),
+            ecosystem: generated.ecosystem.clone(),
+            compatibility: pinned.compatibility.clone(),
+            activation: pinned.activation.clone(),
+            provenance: pinned.provenance.clone(),
+            license: pinned.license.clone(),
+            safety: pinned.safety.clone(),
+        };
+        let exact =
+            read_exact_artifact(&artifact_path, &ArtifactProducerLimits::default()).unwrap();
+        let mut authored = produce_pinned_pack(
+            &pinned.kind,
+            &request,
+            &ArtifactProducerLimits::default(),
+            &CancellationToken::default(),
+            &exact,
+        )
+        .pack
+        .unwrap();
+        authored.schema_version = 2;
+        authored.producer.name = generated.producer_name.clone();
+        authored.producer.version = generated.producer_version.clone();
+        let compiled = compile_pack(&authored, &CompilerOptions::default()).unwrap();
+        let (manifest, semantic_digest, content_digest, shards) =
+            write_compiled_assets(&first, &compiled).unwrap();
+        let mut old_schema = first_bundle.index.clone();
+        let old_generated = &mut old_schema.generated_productions[0];
+        old_generated.schema_version = 2;
+        old_generated.manifest = manifest;
+        old_generated.manifest_semantic_sha256 = semantic_digest;
+        old_generated.manifest_content_sha256 = content_digest;
+        old_generated.shards = shards;
+        old_generated.completeness = compiled.manifest.completeness;
+        old_generated.production_digest = GeneratedProductionKey::new(
+            old_generated.input_digest.clone(),
+            old_generated.producer_name.clone(),
+            old_generated.producer_version.clone(),
+            2,
+        )
+        .unwrap()
+        .production_digest()
+        .to_owned();
+        fs::write(first.join("index.json"), json_bytes(&old_schema).unwrap()).unwrap();
+        fs::remove_file(first.join("SHA256SUMS")).unwrap();
+        write_checksums(&first, &old_schema).unwrap();
+        let verified = verify_release_bundle_for_install(&first).unwrap();
+        assert_eq!(
+            verified.generated_reuse,
+            vec![GeneratedProductionReuse::StaleSchema {
+                recorded: 2,
+                current: SEMANTIC_MODEL_SCHEMA_VERSION,
+            }]
+        );
+        assert!(
+            verify_release_bundle(&first)
+                .unwrap_err()
+                .to_string()
+                .contains("schema version 2 is not current")
+        );
+        // Installation consumes the checked bytes. Replacing a file after
+        // verification cannot change what enters the catalog.
+        let curated_manifest = &first_bundle.index.packs[0].manifest.path;
+        fs::write(first.join(curated_manifest), b"replaced").unwrap();
+        let schema_catalog =
+            SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        let proof = install_verified_release_bundle(verified, &schema_catalog, None).unwrap();
+        assert_eq!(proof.installations.len(), 1);
+        assert!(schema_catalog.generated_production(&key).unwrap().is_none());
+        assert_eq!(
+            schema_catalog
+                .inventory_bounded(usize::MAX)
+                .unwrap()
+                .packs
+                .len(),
+            1
+        );
+        // Restore the original index and manifest for the corruption check.
+        fs::copy(second.join(curated_manifest), first.join(curated_manifest)).unwrap();
+        fs::write(
+            first.join("index.json"),
+            json_bytes(&first_bundle.index).unwrap(),
+        )
+        .unwrap();
+        fs::remove_file(first.join("SHA256SUMS")).unwrap();
+        write_checksums(&first, &first_bundle.index).unwrap();
+
         fs::OpenOptions::new()
             .append(true)
             .open(first.join(&generated.manifest.path))
             .unwrap()
             .write_all(b"tampered")
             .unwrap();
-        assert!(verify_release_bundle(&first).is_err());
+        fs::remove_file(first.join("SHA256SUMS")).unwrap();
+        write_checksums(&first, &first_bundle.index).unwrap();
+        // A stale production is not decoded (#3364), and the rewrite above made
+        // the tampered bytes self-consistent with SHA256SUMS, so a future-epoch
+        // verification accepts the bundle and reports the entry stale: release
+        // integrity is the checksum pass, and this build installs nothing from
+        // the entry. At the current epoch the production is eligible, its bytes
+        // are decoded, and the index's declared digest catches the replacement.
+        let verified =
+            verify_release_bundle_for_cache_version(&first, future_cache_version).unwrap();
+        assert_eq!(
+            verified.generated_reuse,
+            vec![GeneratedProductionReuse::StaleCache {
+                recorded: GENERATED_PRODUCTION_CACHE_VERSION,
+                current: future_cache_version,
+            }]
+        );
+        let error =
+            verify_release_bundle_for_cache_version(&first, GENERATED_PRODUCTION_CACHE_VERSION)
+                .unwrap_err()
+                .to_string();
+        assert!(
+            error.contains("does not match its declared digest and size"),
+            "{error}"
+        );
+    }
+
+    /// A bundle directory holding nothing but `index.json`. An incompatible
+    /// generated production must be reported from the index alone; before the
+    /// currency gate ran beside the index-level checks, this same input failed
+    /// on the missing `SHA256SUMS` instead of naming the recorded version
+    /// (#3364).
+    fn index_only_bundle(schema_version: u32, cache_version: u32) -> (tempfile::TempDir, PathBuf) {
+        let directory = tempdir().unwrap();
+        let index = ReleaseBundleIndex {
+            schema_version: RELEASE_BUNDLE_SCHEMA_VERSION,
+            generator: current_release_generator(),
+            packs: Vec::new(),
+            generated_productions: vec![ReleaseGeneratedProduction {
+                source_pack_id: "bifrost.jdk".to_owned(),
+                source_pack_version: "21.0.8".to_owned(),
+                artifact_sha256: "a".repeat(64),
+                input_digest: "b".repeat(64),
+                producer_name: "fixture-producer".to_owned(),
+                producer_version: "1.0.0".to_owned(),
+                schema_version,
+                cache_version,
+                production_digest: "c".repeat(64),
+                pack_id: "bifrost.jdk.generated".to_owned(),
+                pack_version: "21.0.8".to_owned(),
+                language: "java".to_owned(),
+                ecosystem: "jdk".to_owned(),
+                manifest: ReleaseAsset {
+                    path: "manifests/fixture.json".to_owned(),
+                    sha256: "d".repeat(64),
+                    bytes: 1,
+                },
+                manifest_semantic_sha256: "e".repeat(64),
+                manifest_content_sha256: "f".repeat(64),
+                completeness: Completeness::Complete,
+                shards: Vec::new(),
+                rejects: Vec::new(),
+                suppressed_rejects: 0,
+            }],
+        };
+        let root = directory.path().join("bifrost-semantic-packs");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("index.json"), json_bytes(&index).unwrap()).unwrap();
+        (directory, root)
+    }
+
+    #[test]
+    fn an_undecodable_generated_schema_is_reported_before_any_asset_is_read() {
+        let (_guard, root) = index_only_bundle(
+            SEMANTIC_MODEL_SCHEMA_VERSION + 1,
+            GENERATED_PRODUCTION_CACHE_VERSION,
+        );
+        let error = verify_release_bundle_for_install(&root)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("unsupported generated production semantic schema"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_stale_generated_production_is_reported_before_any_asset_is_read() {
+        let (_guard, root) = index_only_bundle(
+            SEMANTIC_MODEL_SCHEMA_VERSION,
+            GENERATED_PRODUCTION_CACHE_VERSION - 1,
+        );
+        let error = verify_release_bundle(&root).unwrap_err().to_string();
+        assert!(
+            error.contains("generated production cache version")
+                && error.contains("is not current"),
+            "{error}"
+        );
+    }
+
+    /// A stale generated production is classified from the index and never
+    /// decoded: its bytes keep their checksum coverage, but the manifest and
+    /// shard decode leaves the acquisition path (#3364). Before the
+    /// index-level currency gate, the same bundle paid that decode and then
+    /// failed the manifest cross-check.
+    #[test]
+    fn a_stale_generated_production_is_not_decoded_during_verification() {
+        let fixture = tempdir().unwrap();
+        let artifact = fixture.path().join("src.zip");
+        write_zip(
+            &artifact,
+            &[
+                (
+                    "java.base/module-info.java",
+                    "module java.base { exports java.lang; }",
+                ),
+                (
+                    "java.base/java/lang/Object.java",
+                    "package java.lang; public class Object { public int hashCode() { return 0; } }",
+                ),
+            ],
+        );
+        fs::write(fixture.path().join("NOTICE.txt"), "fixture notice\n").unwrap();
+        let (artifact_sha256, _) = sha256_file(&artifact).unwrap();
+        let version = "21.0.8";
+        let activation = ActivationSelector {
+            package: None,
+            module: None,
+            toolchain: Some(NameSelector {
+                name: "jdk".to_owned(),
+                version: Some(format!("={version}")),
+            }),
+            targets: vec!["jvm".to_owned()],
+            configurations: Vec::new(),
+            artifact_sha256: None,
+        };
+        let pinned = PinnedPackSpec {
+            schema_version: PACK_SPEC_SCHEMA_VERSION,
+            pack_id: "bifrost.jdk".to_owned(),
+            pack_version: version.to_owned(),
+            ecosystem: "jdk".to_owned(),
+            kind: PinnedPackKind::JdkSourceZip {
+                layout: PinnedJdkSourceLayout::ModulePrefixed,
+            },
+            artifact: PinnedArtifact {
+                file_name: "src.zip".to_owned(),
+                sha256: artifact_sha256.clone(),
+                url: Some("https://example.invalid/src.zip".to_owned()),
+                container: None,
+            },
+            compatibility: Compatibility {
+                bifrost: ">=0.8.18, <1.0.0".to_owned(),
+                toolchains: vec![VersionConstraint {
+                    name: "jdk".to_owned(),
+                    requirement: format!("={version}"),
+                }],
+            },
+            activation: vec![activation.clone()],
+            provenance: Provenance {
+                source: "fixture".to_owned(),
+                revision: Some("fixture-v1".to_owned()),
+            },
+            license: "GPL-2.0-only WITH Classpath-exception-2.0".to_owned(),
+            safety: Safety {
+                generated_code_only: false,
+                review_required: false,
+            },
+            notices: vec!["NOTICE.txt".to_owned()],
+            measurement_activation: ActivationSelector {
+                module: Some(NameSelector {
+                    name: "java.base".to_owned(),
+                    version: None,
+                }),
+                ..activation
+            },
+            measurement_queries: vec![PinnedLookupQuery::Type {
+                name: "java.lang.Object".to_owned(),
+            }],
+        };
+        let spec = fixture.path().join("temurin-jdk.json");
+        fs::write(&spec, serde_json::to_vec_pretty(&pinned).unwrap()).unwrap();
+        let root = fixture.path().join("bundle");
+        let bundle = generate_release_bundle(
+            &root,
+            &[BundleInput {
+                spec_path: spec,
+                artifact_path: artifact,
+            }],
+        )
+        .unwrap();
+        let original = &bundle.index.generated_productions[0];
+        let current_key = GeneratedProductionKey::new(
+            original.input_digest.clone(),
+            original.producer_name.clone(),
+            original.producer_version.clone(),
+            original.schema_version,
+        )
+        .unwrap();
+        let stale_schema = *SEMANTIC_MODEL_SUPPORTED_SCHEMA_VERSIONS
+            .iter()
+            .filter(|schema| **schema != SEMANTIC_MODEL_SCHEMA_VERSION)
+            .max()
+            .expect("a supported schema version must precede the current one");
+
+        // Move only the index to the stale schema, digest consistent, bytes
+        // unchanged: the compiled pack still records the current schema.
+        let mut stale = bundle.index.clone();
+        let entry = &mut stale.generated_productions[0];
+        entry.schema_version = stale_schema;
+        entry.production_digest = GeneratedProductionKey::new(
+            entry.input_digest.clone(),
+            entry.producer_name.clone(),
+            entry.producer_version.clone(),
+            stale_schema,
+        )
+        .unwrap()
+        .production_digest()
+        .to_owned();
+        fs::write(root.join("index.json"), json_bytes(&stale).unwrap()).unwrap();
+        fs::remove_file(root.join("SHA256SUMS")).unwrap();
+        write_checksums(&root, &stale).unwrap();
+
+        let verified = verify_release_bundle_for_install(&root).unwrap();
+        assert_eq!(
+            verified.generated_reuse,
+            vec![GeneratedProductionReuse::StaleSchema {
+                recorded: stale_schema,
+                current: SEMANTIC_MODEL_SCHEMA_VERSION,
+            }]
+        );
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        let proof = install_verified_release_bundle(verified, &catalog, None).unwrap();
+        assert_eq!(
+            proof.installations.len(),
+            1,
+            "only the curated pack installs from a stale generated bundle"
+        );
+        assert!(
+            catalog
+                .generated_production(&current_key)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            catalog.inventory_bounded(usize::MAX).unwrap().packs.len(),
+            1
+        );
     }
 
     #[test]

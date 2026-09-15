@@ -9,5 +9,6 @@ pub mod graph;
 pub mod graph_support;
 pub mod hierarchy;
 pub mod imports;
+pub mod resolution;
 pub mod structural;
 pub mod test_detection;

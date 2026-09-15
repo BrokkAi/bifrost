@@ -1022,6 +1022,16 @@ pub struct UnitRowItem {
     /// different domain fact rather than analysis evidence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence: Option<CodeQuerySemanticEvidence>,
+    /// What the analysis that produced this row proves about the rows of the
+    /// same partition it did not return, and which partition that is (#3205).
+    ///
+    /// Carried unconditionally rather than derived from `fields`: a query
+    /// projection may drop the status column the coverage was derived from, and
+    /// a relation whose projection hid its solver outcome must not read as
+    /// exhaustive. Absent for a family that runs no solver, whose coverage is
+    /// the executed query's own envelope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage: Option<CodeQueryRowCoverage>,
     /// Every scalar the row's domain declares and this row carries, in the
     /// domain's own declaration order.
     ///
@@ -1092,6 +1102,7 @@ impl UnitRowItem {
             path: boxed(row_path(&item.value)),
             range: item.value.display_range(),
             evidence: row_semantic_evidence(&item.value).cloned(),
+            coverage: item.value.row_coverage(),
             fields,
             projected_field_names,
             unknown_fields,

@@ -274,6 +274,14 @@ pub enum EndpointOrigin {
         path: PolicyDependencyPath,
         source: PolicySourceIdentity,
     },
+    /// The endpoint was expanded from a workspace endpoint-set document.
+    /// `path` is the exact policy-local entry path in the imported document;
+    /// it is checked against the loaded endpoint-set manifest before a policy
+    /// can be constructed.
+    EndpointSetFile {
+        path: PolicyDependencyPath,
+        source: PolicySourceIdentity,
+    },
 }
 
 /// One endpoint leaf after all authoring-source forms have been normalized.
@@ -547,6 +555,50 @@ impl ResolvedMatchDirectoryManifest {
 
     pub const fn semantic_hash(&self) -> MatchSetManifestHash {
         self.semantic_hash
+    }
+}
+
+/// Provenance and semantic identity for one loaded endpoint-set document.
+///
+/// The source and expanded entry paths are retained for diagnostics and
+/// integrity checks. They are intentionally excluded from policy semantic
+/// identity; the content hash is the stable meaning of this dependency.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ResolvedEndpointSetDependency {
+    pub source: PolicySourceIdentity,
+    pub semantic_hash: EndpointSetSemanticHash,
+    pub entries: Vec<PolicyDependencyPath>,
+}
+
+impl ResolvedEndpointSetDependency {
+    pub fn new(
+        source: PolicySourceIdentity,
+        semantic_hash: EndpointSetSemanticHash,
+        mut entries: Vec<PolicyDependencyPath>,
+    ) -> Self {
+        entries.sort();
+        entries.dedup();
+        Self {
+            source,
+            semantic_hash,
+            entries,
+        }
+    }
+
+    pub fn source(&self) -> &PolicySourceIdentity {
+        &self.source
+    }
+
+    pub const fn semantic_hash(&self) -> EndpointSetSemanticHash {
+        self.semantic_hash
+    }
+
+    pub fn entries(&self) -> &[PolicyDependencyPath] {
+        &self.entries
+    }
+
+    pub(crate) const fn entries_capacity(&self) -> usize {
+        self.entries.capacity()
     }
 }
 
@@ -1130,6 +1182,7 @@ pub struct LoadedPolicy {
     catalogs: Vec<ResolvedCatalogIdentity>,
     endpoint_dependencies: Vec<ResolvedEndpointDependency>,
     match_directory_manifests: Vec<ResolvedMatchDirectoryManifest>,
+    endpoint_set_dependencies: Vec<ResolvedEndpointSetDependency>,
     precedence_manifest: PolicyPrecedenceManifest,
     resolved_taint: Option<ResolvedTaintPolicySpec>,
     resolved_typestate: Option<ResolvedTypestatePolicySpec>,
@@ -1149,6 +1202,7 @@ impl LoadedPolicy {
         mut catalogs: Vec<ResolvedCatalogIdentity>,
         mut endpoint_dependencies: Vec<ResolvedEndpointDependency>,
         mut match_directory_manifests: Vec<ResolvedMatchDirectoryManifest>,
+        mut endpoint_set_dependencies: Vec<ResolvedEndpointSetDependency>,
         mut precedence_manifest: PolicyPrecedenceManifest,
         resolved_taint: Option<ResolvedTaintPolicySpec>,
         resolved_typestate: Option<ResolvedTypestatePolicySpec>,
@@ -1181,6 +1235,13 @@ impl LoadedPolicy {
         {
             return Err(LoadedModelError::DuplicateManifestPath);
         }
+        endpoint_set_dependencies.sort_by(|left, right| left.source.cmp(&right.source));
+        if endpoint_set_dependencies
+            .windows(2)
+            .any(|dependencies| dependencies[0].source == dependencies[1].source)
+        {
+            return Err(LoadedModelError::DuplicateEndpointSetDependencySource);
+        }
         precedence_manifest.edges.sort();
         if precedence_manifest
             .edges
@@ -1202,6 +1263,7 @@ impl LoadedPolicy {
             &resolved_selectors,
             &endpoint_dependencies,
             &match_directory_manifests,
+            &endpoint_set_dependencies,
             &precedence_manifest,
             resolved_taint.as_ref(),
             resolved_typestate.as_ref(),
@@ -1225,6 +1287,7 @@ impl LoadedPolicy {
             &catalogs,
             &endpoint_dependencies,
             &match_directory_manifests,
+            &endpoint_set_dependencies,
             &precedence_manifest,
         )?;
         let selector_origins = resolved_selectors
@@ -1242,6 +1305,7 @@ impl LoadedPolicy {
             catalogs,
             endpoint_dependencies,
             match_directory_manifests,
+            endpoint_set_dependencies,
             precedence_manifest,
             resolved_taint,
             resolved_typestate,
@@ -1288,6 +1352,10 @@ impl LoadedPolicy {
         &self.match_directory_manifests
     }
 
+    pub fn endpoint_set_dependencies(&self) -> &[ResolvedEndpointSetDependency] {
+        &self.endpoint_set_dependencies
+    }
+
     pub const fn precedence_manifest(&self) -> &PolicyPrecedenceManifest {
         &self.precedence_manifest
     }
@@ -1325,6 +1393,7 @@ pub enum LoadedModelError {
         path: PolicySelectorPath,
     },
     DuplicateEndpointIdentity,
+    DuplicateEndpointSetDependencySource,
     DuplicateManifestEndpoint,
     DuplicateManifestPath,
     DuplicatePrecedenceEdge,
@@ -1380,6 +1449,8 @@ impl fmt::Display for LoadedModelError {
             Self::DuplicateEndpointIdentity => {
                 formatter.write_str("loaded endpoint dependencies contain a duplicate identity")
             }
+            Self::DuplicateEndpointSetDependencySource => formatter
+                .write_str("loaded endpoint-set dependencies contain a duplicate source identity"),
             Self::DuplicateManifestEndpoint => {
                 formatter.write_str("match-directory manifest contains a duplicate endpoint")
             }
@@ -1424,6 +1495,7 @@ fn validate_loaded_policy_model(
     selectors: &[ResolvedPolicySelector],
     dependencies: &[ResolvedEndpointDependency],
     manifests: &[ResolvedMatchDirectoryManifest],
+    endpoint_set_dependencies: &[ResolvedEndpointSetDependency],
     precedence: &PolicyPrecedenceManifest,
     resolved_taint: Option<&ResolvedTaintPolicySpec>,
     resolved_typestate: Option<&ResolvedTypestatePolicySpec>,
@@ -1477,6 +1549,11 @@ fn validate_loaded_policy_model(
         if contains_duplicates(dependency.origins.iter().cloned()) {
             return invalid("resolved endpoint origins must be duplicate-free");
         }
+        validate_endpoint_set_origins(
+            &dependency.origins,
+            &dependency.selector_path,
+            endpoint_set_dependencies,
+        )?;
         if contains_duplicates(dependency.model.categories.iter().cloned()) {
             return invalid("resolved endpoint categories must be duplicate-free");
         }
@@ -1505,6 +1582,16 @@ fn validate_loaded_policy_model(
             && !catalogs.contains(catalog)
         {
             return invalid("endpoint dependency references a catalog absent from the policy");
+        }
+    }
+
+    for dependency in endpoint_set_dependencies {
+        if dependency
+            .entries
+            .windows(2)
+            .any(|entries| entries[0] >= entries[1])
+        {
+            return invalid("endpoint-set dependency entries must be sorted and unique");
         }
     }
 
@@ -1552,6 +1639,7 @@ fn validate_loaded_policy_model(
             if !catalogs.is_empty()
                 || !dependencies.is_empty()
                 || !manifests.is_empty()
+                || !endpoint_set_dependencies.is_empty()
                 || !precedence.edges.is_empty()
             {
                 return invalid("selector-only policies cannot retain composition dependencies");
@@ -1563,13 +1651,13 @@ fn validate_loaded_policy_model(
             None,
         ) => {
             validate_resolved_taint(
-                &definition.metadata.id,
+                definition,
                 authored,
-                definition.analysis.set_segments(),
                 resolved,
                 catalogs,
                 dependencies,
                 manifests,
+                endpoint_set_dependencies,
             )?;
         }
         (PolicyAnalysis::Typestate { spec: authored }, None, Some(resolved)) => {
@@ -1580,6 +1668,7 @@ fn validate_loaded_policy_model(
                 dependencies,
                 manifests,
                 selectors,
+                endpoint_set_dependencies,
             )?;
         }
         _ => return Err(LoadedModelError::ResolvedAnalysisMismatch),
@@ -1588,14 +1677,16 @@ fn validate_loaded_policy_model(
 }
 
 fn validate_resolved_taint(
-    policy_id: &PolicyId,
+    definition: &PolicyDefinition,
     authored: &TaintPolicySpec,
-    segments: TaintSetSegments,
     resolved: &ResolvedTaintPolicySpec,
     catalogs: &[ResolvedCatalogIdentity],
     dependencies: &[ResolvedEndpointDependency],
     manifests: &[ResolvedMatchDirectoryManifest],
+    endpoint_set_dependencies: &[ResolvedEndpointSetDependency],
 ) -> Result<(), LoadedModelError> {
+    let policy_id = &definition.metadata.id;
+    let segments = definition.analysis.set_segments();
     if authored.mode != resolved.mode || authored.call_modeling != resolved.call_modeling {
         return invalid("resolved taint mode/call modeling differs from the authored policy");
     }
@@ -1635,19 +1726,49 @@ fn validate_resolved_taint(
         return invalid("resolved auxiliary taint identities must be globally unique");
     }
     for entry in &resolved.sanitizers {
-        validate_resolved_auxiliary(entry, segments.sanitizers, policy_id, catalogs)?;
+        validate_resolved_auxiliary(
+            entry,
+            segments.sanitizers,
+            policy_id,
+            catalogs,
+            endpoint_set_dependencies,
+        )?;
     }
     for entry in &resolved.transforms {
-        validate_resolved_auxiliary(entry, segments.transforms, policy_id, catalogs)?;
+        validate_resolved_auxiliary(
+            entry,
+            segments.transforms,
+            policy_id,
+            catalogs,
+            endpoint_set_dependencies,
+        )?;
     }
     for entry in &resolved.external_models {
-        validate_resolved_auxiliary(entry, segments.external_models, policy_id, catalogs)?;
+        validate_resolved_auxiliary(
+            entry,
+            segments.external_models,
+            policy_id,
+            catalogs,
+            endpoint_set_dependencies,
+        )?;
     }
     for entry in &resolved.store_writes {
-        validate_resolved_auxiliary(entry, segments.stores, policy_id, catalogs)?;
+        validate_resolved_auxiliary(
+            entry,
+            segments.stores,
+            policy_id,
+            catalogs,
+            endpoint_set_dependencies,
+        )?;
     }
     for entry in &resolved.store_reads {
-        validate_resolved_auxiliary(entry, segments.stores, policy_id, catalogs)?;
+        validate_resolved_auxiliary(
+            entry,
+            segments.stores,
+            policy_id,
+            catalogs,
+            endpoint_set_dependencies,
+        )?;
     }
     let endpoint_identities = resolved
         .sources
@@ -2087,6 +2208,7 @@ fn validate_resolved_typestate(
     dependencies: &[ResolvedEndpointDependency],
     manifests: &[ResolvedMatchDirectoryManifest],
     selectors: &[ResolvedPolicySelector],
+    endpoint_set_dependencies: &[ResolvedEndpointSetDependency],
 ) -> Result<(), LoadedModelError> {
     if resolved.mode != authored.mode
         || resolved.call_modeling != authored.call_modeling
@@ -2123,6 +2245,11 @@ fn validate_resolved_typestate(
         .map(|subject| subject.identity.clone())
         .collect();
     for subject in &resolved.subjects {
+        validate_endpoint_set_origins(
+            &subject.origins,
+            &subject.selector_path,
+            endpoint_set_dependencies,
+        )?;
         let dependency = dependency_by_identity.get(&subject.identity).ok_or(
             LoadedModelError::InvalidResolvedModel {
                 reason: "resolved typestate subject has no dependency",
@@ -2890,6 +3017,7 @@ fn validate_resolved_auxiliary<T>(
     set: &str,
     policy_id: &PolicyId,
     catalogs: &[ResolvedCatalogIdentity],
+    endpoint_set_dependencies: &[ResolvedEndpointSetDependency],
 ) -> Result<(), LoadedModelError> {
     if entry.origins.is_empty() || contains_duplicates(entry.origins.iter().cloned()) {
         return invalid("resolved auxiliary taint entry requires duplicate-free provenance");
@@ -2938,8 +3066,45 @@ fn validate_resolved_auxiliary<T>(
     if entry.selector_path != expected_path {
         return invalid("resolved auxiliary selector path disagrees with its qualified identity");
     }
-    if entry.origins.as_slice() != [expected_origin] {
+    if !entry.origins.contains(&expected_origin) {
         return invalid("resolved auxiliary provenance disagrees with its qualified identity");
+    }
+    if entry.origins.iter().any(|origin| {
+        origin != &expected_origin && !matches!(origin, EndpointOrigin::EndpointSetFile { .. })
+    }) {
+        return invalid("resolved auxiliary provenance has an unexpected origin");
+    }
+    validate_endpoint_set_origins(
+        &entry.origins,
+        &entry.selector_path,
+        endpoint_set_dependencies,
+    )?;
+    Ok(())
+}
+
+fn validate_endpoint_set_origins(
+    origins: &[EndpointOrigin],
+    selector_path: &PolicySelectorPath,
+    dependencies: &[ResolvedEndpointSetDependency],
+) -> Result<(), LoadedModelError> {
+    let expected_path = selector_path.as_str().strip_suffix("/selector").ok_or(
+        LoadedModelError::InvalidResolvedModel {
+            reason: "resolved endpoint selector path must end with /selector",
+        },
+    )?;
+    for origin in origins {
+        let EndpointOrigin::EndpointSetFile { path, source } = origin else {
+            continue;
+        };
+        let Some(manifest) = dependencies
+            .iter()
+            .find(|dependency| dependency.source == *source)
+        else {
+            return invalid("endpoint-set origin has no matching dependency manifest");
+        };
+        if path.as_str() != expected_path || !manifest.entries.iter().any(|entry| entry == path) {
+            return invalid("endpoint-set origin path does not match its resolved entry");
+        }
     }
     Ok(())
 }
@@ -3220,6 +3385,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(),
             PolicyPrecedenceManifest::default(),
             None,
             None,
@@ -3311,6 +3477,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             vec![first, second],
+            Vec::new(),
             PolicyPrecedenceManifest::default(),
             None,
             None,

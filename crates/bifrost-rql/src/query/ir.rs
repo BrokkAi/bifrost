@@ -1,5 +1,7 @@
 use super::domain::ConfigurationFormat;
-use super::schema::{CallTraversalCompleteness, CodeQueryExecutionMode, QueryStepOp};
+use super::schema::{
+    CallTraversalCompleteness, CodeQueryExecutionMode, QueryStepOp, RuntimeKeyKind,
+};
 use crate::refs::{ProtocolRef, TaintResultRef, ValueFlowPlanRef};
 use crate::structural::{CodeQueryRowField, CodeQueryRowScalarType, DetailedCodeQueryDomain};
 use brokk_bifrost_core::analyzer::Language;
@@ -744,14 +746,56 @@ pub struct FieldWriteValueTraversal {
 /// Typed identity constraints for one activation-aware runtime keyed load.
 /// The semantic oracle owns proof and completeness; this is authored selector
 /// data and never a proof shortcut.
+/// One authored key-selection mode for a runtime keyed load. Exact selectors
+/// retain their historical meaning; family selectors admit every static key of
+/// the stated kind, with optional inclusive bounds for indices.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyedReadKeySelector {
+    ExactProperty(String),
+    ExactIndex(u128),
+    StaticProperty,
+    StaticIndexRange {
+        min: Option<u128>,
+        max: Option<u128>,
+    },
+}
+
+impl KeyedReadKeySelector {
+    pub const fn key_kind(&self) -> Option<RuntimeKeyKind> {
+        match self {
+            Self::ExactProperty(_) | Self::StaticProperty => Some(RuntimeKeyKind::StaticProperty),
+            Self::ExactIndex(_) | Self::StaticIndexRange { .. } => {
+                Some(RuntimeKeyKind::StaticIndex)
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeyedReadValueTraversal {
     pub runtime: String,
     pub global: String,
     pub container: String,
-    pub property: Option<String>,
-    pub index: Option<u128>,
+    pub key: Option<KeyedReadKeySelector>,
     pub pristine_input: bool,
+}
+
+impl KeyedReadValueTraversal {
+    pub fn new(
+        runtime: String,
+        global: String,
+        container: String,
+        key: KeyedReadKeySelector,
+        pristine_input: bool,
+    ) -> Self {
+        Self {
+            runtime,
+            global,
+            container,
+            key: Some(key),
+            pristine_input,
+        }
+    }
 }
 
 impl Default for KeyedReadValueTraversal {
@@ -760,8 +804,7 @@ impl Default for KeyedReadValueTraversal {
             runtime: "node".to_owned(),
             global: "process".to_owned(),
             container: "env".to_owned(),
-            property: None,
-            index: None,
+            key: None,
             pristine_input: false,
         }
     }

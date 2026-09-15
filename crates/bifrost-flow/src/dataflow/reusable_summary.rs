@@ -32,7 +32,7 @@ use super::{PathQuality, PathQualityFrontier, SummaryCallCycle, UnmodeledCallBeh
 /// contract. Embedded procedure summaries remain
 /// `PROCEDURE_SUMMARY_CONTRACT_VERSION` 1; this revision invalidates only
 /// carriers whose keys embed this module's internal summary schema.
-pub const SUMMARY_SCHEMA_VERSION: u32 = 5;
+pub const SUMMARY_SCHEMA_VERSION: u32 = 6;
 pub const MAX_SUMMARY_TRANSFERS: usize =
     crate::analyzer::semantic_model::MAX_PROCEDURE_SUMMARY_TRANSFERS;
 pub const MAX_SUMMARY_EFFECTS: usize =
@@ -1267,6 +1267,23 @@ pub enum SummaryConcurrencyLockMode {
     Exclusive,
 }
 
+/// The acquisition shape one modeled lock-acquire event carries through a
+/// summary boundary (issue #3369).
+///
+/// `Unconditional` is a blocking acquire: the lock is held on every path that
+/// reaches the call's continuation. `CallResultTrue` is the try-acquire
+/// contract: the modeled call acquires the lock exactly when its boolean
+/// result is true, so a consumer must bind the acquisition to structured
+/// branch facts about that result and keep the failed and unconsumed paths
+/// acquisition free. The condition belongs to the modeled call whose event
+/// carries it; summary composition keeps it attached to the boundary result
+/// that the exact return transfer identifies with that call's result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SummaryLockAcquisition {
+    Unconditional,
+    CallResultTrue,
+}
+
 /// The equivalence relation a reviewed concurrency model applies to one
 /// stable subject. This survives composition separately from the subject's
 /// current boundary path: a modeled receiver can preserve backing identity
@@ -1520,6 +1537,22 @@ pub enum SummaryConcurrencyEffectKind {
     TaskJoin {
         group: SummaryConcurrencyTaskGroup,
     },
+    /// One `sync.Once.Do`: `callable` runs at most once per `once` object,
+    /// and the completion of that single execution synchronizes before the
+    /// return of every `Do` on the object.
+    ///
+    /// The event that carries this effect is both the conditional execution
+    /// of the callable and the completion barrier that publishes it, so a
+    /// consumer must not replay it as an unconditional spawn or as a generic
+    /// join. A completed `once` makes every later `Do` return without running
+    /// the callable; the package documentation treats a panic exit the same
+    /// way, because `Do` considers a panicking `f` to have returned.
+    OnceDo {
+        once: SummaryConcurrencyAccessPath,
+        identity: SummaryConcurrencySubjectIdentity,
+        callable: SummaryConcurrencyCallable,
+        target_coverage: SummaryConcurrencyTargetCoverage,
+    },
     /// Complete reviewed-model effect inventory for one source call. Effects
     /// sharing this event may replace live model lookup only when their count
     /// agrees with this certificate and every source witness rehydrates.
@@ -1531,6 +1564,7 @@ pub enum SummaryConcurrencyEffectKind {
         identity: SummaryConcurrencySubjectIdentity,
         operation: SummaryConcurrencyLockOperation,
         mode: SummaryConcurrencyLockMode,
+        acquisition: SummaryLockAcquisition,
     },
     Synchronize {
         subject: SummaryConcurrencyAccessPath,
@@ -1569,6 +1603,31 @@ pub enum SummaryConcurrencyEffectKind {
         value: SummaryConcurrencyAccessPath,
         destination: SummaryConcurrencyAccessPath,
     },
+    /// Associate the constructed condition variable with the locker it waits
+    /// on. `condition` names the construction result; `lock` names the locker
+    /// stored in it for the lifetime of the condition.
+    CondBind {
+        condition: SummaryConcurrencyAccessPath,
+        lock: SummaryConcurrencyAccessPath,
+    },
+    /// Release the associated locker, suspend the task, and re-acquire it
+    /// before returning.
+    CondWait {
+        condition: SummaryConcurrencyAccessPath,
+    },
+    /// Wake one or every suspended waiter. The notification itself orders
+    /// nothing: it can be missed, and it can resume a different waiter.
+    CondNotify {
+        condition: SummaryConcurrencyAccessPath,
+        waiters: SummaryConcurrencyCondWaiters,
+    },
+}
+
+/// How many suspended waiters one notification can resume.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SummaryConcurrencyCondWaiters {
+    One,
+    All,
 }
 
 /// A stable scalar operand. Unknown is an explicit lack of a count proof,
@@ -3248,6 +3307,24 @@ fn substitute_concurrency_effect_kind(
                 },
             }
         }
+        SummaryConcurrencyEffectKind::OnceDo {
+            once,
+            identity,
+            callable,
+            target_coverage,
+        } => SummaryConcurrencyEffectKind::OnceDo {
+            once: path(once)?,
+            identity: *identity,
+            callable: match callable {
+                SummaryConcurrencyCallable::Boundary(boundary) => {
+                    SummaryConcurrencyCallable::Boundary(port(boundary)?)
+                }
+                SummaryConcurrencyCallable::SourceArgument(ordinal) => {
+                    SummaryConcurrencyCallable::SourceArgument(*ordinal)
+                }
+            },
+            target_coverage: *target_coverage,
+        },
         SummaryConcurrencyEffectKind::ModeledCall { effect_count } => {
             SummaryConcurrencyEffectKind::ModeledCall {
                 effect_count: *effect_count,
@@ -3258,11 +3335,13 @@ fn substitute_concurrency_effect_kind(
             identity,
             operation,
             mode,
+            acquisition,
         } => SummaryConcurrencyEffectKind::Lock {
             lock: path(lock)?,
             identity: *identity,
             operation: *operation,
             mode: *mode,
+            acquisition: *acquisition,
         },
         SummaryConcurrencyEffectKind::Synchronize { subject, operation } => {
             SummaryConcurrencyEffectKind::Synchronize {
@@ -3324,6 +3403,23 @@ fn substitute_concurrency_effect_kind(
             SummaryConcurrencyEffectKind::OwnershipTransfer {
                 value: path(value)?,
                 destination: path(destination)?,
+            }
+        }
+        SummaryConcurrencyEffectKind::CondBind { condition, lock } => {
+            SummaryConcurrencyEffectKind::CondBind {
+                condition: path(condition)?,
+                lock: path(lock)?,
+            }
+        }
+        SummaryConcurrencyEffectKind::CondWait { condition } => {
+            SummaryConcurrencyEffectKind::CondWait {
+                condition: path(condition)?,
+            }
+        }
+        SummaryConcurrencyEffectKind::CondNotify { condition, waiters } => {
+            SummaryConcurrencyEffectKind::CondNotify {
+                condition: path(condition)?,
+                waiters: *waiters,
             }
         }
     })
@@ -4940,6 +5036,7 @@ fn concurrency_effect_heap_bytes(effect: &SummaryConcurrencyEffect) -> usize {
             .as_ref()
             .map_or(0, |group| path_bytes(&group.location)),
         SummaryConcurrencyEffectKind::TaskJoin { group } => path_bytes(&group.location),
+        SummaryConcurrencyEffectKind::OnceDo { once, .. } => path_bytes(once),
         SummaryConcurrencyEffectKind::WaitGroupAdd { group, .. }
         | SummaryConcurrencyEffectKind::WaitGroupDone { group, .. }
         | SummaryConcurrencyEffectKind::WaitGroupWait { group, .. } => path_bytes(group),
@@ -4954,6 +5051,11 @@ fn concurrency_effect_heap_bytes(effect: &SummaryConcurrencyEffect) -> usize {
         SummaryConcurrencyEffectKind::OwnershipTransfer { value, destination } => {
             path_bytes(value).saturating_add(path_bytes(destination))
         }
+        SummaryConcurrencyEffectKind::CondBind { condition, lock } => {
+            path_bytes(condition).saturating_add(path_bytes(lock))
+        }
+        SummaryConcurrencyEffectKind::CondWait { condition } => path_bytes(condition),
+        SummaryConcurrencyEffectKind::CondNotify { condition, .. } => path_bytes(condition),
     }
 }
 

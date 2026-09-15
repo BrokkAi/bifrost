@@ -5,20 +5,61 @@ analysis behavior, integrations, and release artifacts. It is curated from the
 complete private release range because the public open-core repository is a
 projection and its commit history does not contain every source commit.
 
-## Unreleased
+## [0.11.4] - 2026-09-15
 
 ### Added
 
+- Persistence taint policies distinguish complete finite string-key sets
+  through bounded Java local copies and reaching definitions. Unknown origins
+  and exhausted analysis bounds retain whole-store joins.
+
+- Runtime keyed-read queries support arbitrary static properties and inclusive
+  index ranges while preserving unresolved-key and activation limitations.
+- CSMI runtime-values 0.2 portable contracts retain separate target, review,
+  binding, and observation evidence through native semantic packs. Consumer
+  activation requires independent review acceptance; executable source joins
+  and automatic Node target discovery remain unsupported.
+- The built-in Java security pack now reports environment-derived command text
+  reaching the exact `Runtime.exec(String)` operand, backed by generated JDK
+  declaration identity and zero-configuration activation.
 - Go data-race analysis now composes witnessed task and join effects for
   errgroup and WaitGroup patterns from source summaries.
+- Go data-race analysis now models `sync.Once`: the callback runs at most once
+  per object, and the completion of that single execution is published before
+  the return of every `Do` on the same object. A write made before a `Do` in
+  another goroutine, a goroutine that never calls `Do`, and a callback bound to
+  a different object stay unordered, while a `Do` whose callback cannot be
+  resolved remains an explicit open boundary.
+- Go data-race analysis now models `sync.Cond` through its associated locker.
+  `Wait` unlocks, suspends, and reacquires that locker; `Signal` and `Broadcast`
+  remain notifications rather than unconditional joins, so a missed signal or
+  a different waiter does not invent ordering.
+- Go data-race analysis now applies `Mutex.TryLock`, `RWMutex.TryLock`, and
+  `RWMutex.TryRLock` protection only on paths where the returned boolean is
+  proven true, retaining the correct reader or writer mode. The false branch
+  holds no lock, and unresolved result flow remains an open boundary.
 - Python conditional type refinements now survive semantic-pack and CSMI
   wire round trips, with exact binding and preserved provenance.
 - Configuration facts are now exposed through canonical CodeQuery and RQL.
+  JSON, XML, TOML, and Java `.properties` documents ingest through
+  structured parsers with exact byte provenance; a `.properties` placeholder
+  such as `${host}` is recorded as unresolved interpolation, never expanded.
 - Scala semantic-model packs now record contextual declaration roles.
 - Reusable procedure summaries now publish typed dimension coverage, making
   the dimensions each reusable artifact proves explicit.
 - RQL relational policies now support set-equal and subset aggregates with
   per-operator cancellation.
+- Flow, taint, typestate and type-flow rows now publish a coverage envelope
+  beside their evidence: what the analysis that produced a row proved about the
+  rows of the same partition it did not return, and which partition that is.
+  Relational policy evaluation reads those values through the same coverage
+  lattice that already governs the executed query's row set, so an anti-join,
+  a zero count or any other absence verdict over an unfinished, abstained or
+  truncated solve is reported as an unmet obligation instead of a clean pass.
+  Each unmet obligation in the canonical report now carries the analysis
+  partitions the blocked claim is about, in the new `obligations[].partitions`
+  array (`{family, root}`, with `partitions_truncated` when the bounded list
+  dropped a name). No existing report field changed spelling or meaning.
 - Policies now support a treat-may-as-finding verdict on unknown evidence,
   reporting may-findings as findings when requested.
 - C++ value flow proves `std::string` by-value dependence from the standard
@@ -35,6 +76,9 @@ projection and its commit history does not contain every source commit.
 
 ### Changed
 
+- Cold-retention benchmark comparisons now judge the first request against a
+  monotonic absolute ceiling as well as its warm median, and expose the reason
+  structurally instead of inferring it from rendered detail text.
 - Python type-flow queries reuse semantic artifacts prepared by field-slot
   surveys. Binding and correlation refinement share their copy, open-binding,
   and relevant-event inventories, allowing more fixed-budget analyses to
@@ -68,6 +112,9 @@ projection and its commit history does not contain every source commit.
 - Diff-tool requests now report their execution phases to the client while
   running, and analyzer cache build-lock waits are cancellable and
   self-naming.
+- MCP clients can negotiate the stable 2026-07-28 protocol revision. Discovery
+  advertises only the revisions covered by Bifrost's wire and conformance
+  gates, and unadvertised prompt and resource-template methods fail explicitly.
 - Analyzer cache collection stays out of the way of interactive work and
   paces itself per new store.
 - Kotlin overload selection now resolves through the shared call_binding
@@ -75,6 +122,39 @@ projection and its commit history does not contain every source commit.
 
 ### Fixed
 
+- Semantic-pack acquisition now rejects incompatible generated productions
+  from bundle index metadata before reading their assets, skips decoding stale
+  productions that will not be installed, and avoids re-verifying the same
+  cache-miss bytes after a publish race.
+- A Python guard whose arm calls the builtin `exit` or `quit` now ends that
+  arm. The generated stdlib pack projects the `__call__` contract of the
+  `_sitebuiltins.Quitter` values those names bind, so the class the guard
+  excluded no longer reaches the code after the `if` and no longer produces
+  false absent-member findings.
+
+- CLI SARIF reports include the policy exit code and its meaning, so GitHub
+  code scanning can identify unreliable scans. Report notifications expose
+  their specific diagnostic codes for troubleshooting and automation.
+
+- `query_code` advertises schema versions as strings, avoiding Gemini tool-list
+  rejection of numeric enums. Canonical CodeQuery JSON emits `"1"`; existing
+  numeric version inputs remain readable.
+
+- The DeepSeek Harness npm plugin is now promoted from the same immutable
+  qualification bundle as the release binaries. Its launcher metadata is
+  checked after publication against the macOS archive sidecar, preventing a
+  stale `archiveSha256` pin from making every managed binary preparation fail.
+
+- Java receiver lookup now infers `var` locals from uniquely resolved factory
+  return declarations, preserving separate runtime-dispatch proof and incomplete
+  analysis diagnostics.
+- JavaScript files with embedded JSX preserve reserved-word attributes such as
+  `class`, `for`, and `in`, along with the surrounding element and later
+  declarations, through the Brokk-maintained JavaScript grammar.
+- Closing a persisted workspace now completes the analyzer cache collection
+  its build scheduled instead of cancelling one that had not started, so a
+  short watched session advances the store's collection cadence and no
+  maintenance write follows a close.
 - Go value flow now tracks address-taken cell values again, restoring flows
   lost to the address-cell regression.
 - Go data-race analysis now infers captured channel receive types from

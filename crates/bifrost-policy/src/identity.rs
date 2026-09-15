@@ -25,6 +25,7 @@ const ENDPOINT_ANALYSIS_DOMAIN: &[u8] = b"bifrost-policy-endpoint-analysis/v1";
 const POLICY_SEMANTIC_DOMAIN: &[u8] = b"bifrost-policy-semantic/v1";
 const CATALOG_SEMANTIC_DOMAIN: &[u8] = b"bifrost-policy-catalog/v1";
 const MATCH_SET_DOMAIN: &[u8] = b"bifrost-policy-match-set/v1";
+const ENDPOINT_SET_DOMAIN: &[u8] = b"bifrost-policy-endpoint-set/v1";
 const TYPESTATE_AUTHORING_DOMAIN: &[u8] = b"bifrost-policy-typestate-authoring/v1";
 
 macro_rules! define_sha256_identity {
@@ -82,6 +83,7 @@ define_sha256_identity!(PolicySourceHash);
 define_sha256_identity!(ResolvedSelectorSemanticHash);
 define_sha256_identity!(EndpointSemanticHash);
 define_sha256_identity!(EndpointAnalysisProjectionHash);
+define_sha256_identity!(EndpointSetSemanticHash);
 define_sha256_identity!(TypestateAuthoringProjectionHash);
 
 /// Semantic identity minted only by validated [`super::resolved::LoadedPolicy`]
@@ -195,6 +197,7 @@ impl PolicySemanticHash {
         catalogs: &[ResolvedCatalogIdentity],
         endpoints: &[ResolvedEndpointDependency],
         match_manifests: &[ResolvedMatchDirectoryManifest],
+        endpoint_set_dependencies: &[super::resolved::ResolvedEndpointSetDependency],
         precedence: &PolicyPrecedenceManifest,
     ) -> Result<Self, LoadedModelError> {
         let value = canonical_loaded::resolved_policy_to_json(
@@ -204,6 +207,7 @@ impl PolicySemanticHash {
             catalogs,
             endpoints,
             match_manifests,
+            endpoint_set_dependencies,
             precedence,
         )?;
         Ok(Self(hash_canonical_value(POLICY_SEMANTIC_DOMAIN, &value)))
@@ -224,6 +228,15 @@ impl TaintCatalogHash {
     /// Hash canonical typed catalog JSON, never the registration byte layout.
     pub(crate) fn from_canonical_catalog_value(value: &Value) -> Self {
         Self::from_bytes(hash_canonical_value(CATALOG_SEMANTIC_DOMAIN, value))
+    }
+}
+
+impl EndpointSetSemanticHash {
+    /// Hash the canonical typed endpoint-set document, never its source bytes
+    /// or workspace path. The loader is the only caller that may mint this
+    /// identity from a resolved document.
+    pub(crate) fn from_canonical_value(value: &Value) -> Self {
+        Self(hash_canonical_value(ENDPOINT_SET_DOMAIN, value))
     }
 }
 
@@ -344,6 +357,14 @@ mod tests {
     }
 
     #[test]
+    fn endpoint_set_hash_is_domain_separated() {
+        let value = json!({"entries": []});
+        let endpoint_set = EndpointSetSemanticHash::from_canonical_value(&value);
+        let policy = hash_canonical_value(POLICY_SEMANTIC_DOMAIN, &value);
+        assert_ne!(endpoint_set.as_bytes(), &policy);
+    }
+
+    #[test]
     fn source_hash_covers_comments_and_layout() {
         let compact = PolicySourceHash::from_source_bytes(b"(policy :id \"x\")");
         let commented = PolicySourceHash::from_source_bytes(b"(policy\n  ; note\n  :id \"x\")");
@@ -408,6 +429,7 @@ mod tests {
             &[],
             &[dependency_a],
             &[],
+            &[],
             &PolicyPrecedenceManifest::default(),
         )
         .unwrap();
@@ -417,6 +439,7 @@ mod tests {
             std::slice::from_ref(&selector),
             &[],
             &[dependency_b],
+            &[],
             &[],
             &PolicyPrecedenceManifest::default(),
         )
@@ -461,6 +484,7 @@ mod tests {
             &[],
             &[],
             std::slice::from_ref(&first),
+            &[],
             &PolicyPrecedenceManifest::default(),
         )
         .unwrap();
@@ -471,6 +495,7 @@ mod tests {
             &[],
             &[],
             &[first, second],
+            &[],
             &PolicyPrecedenceManifest::default(),
         )
         .unwrap();
@@ -564,6 +589,7 @@ mod tests {
             source.as_bytes(),
             schema_resolution,
             vec![selector],
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             Vec::new(),

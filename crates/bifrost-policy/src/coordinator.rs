@@ -2110,6 +2110,7 @@ fn evaluate_prepared_policy_inputs(
     // Qualified policy locators need the same analyzer snapshot and active
     // model publication that evaluation will use. Prepare both before closing
     // any policy so the loaded-policy boundary can resolve them exactly once.
+    registry.set_cancellation(cancellation.cloned());
     let needs_workspace = inputs
         .iter()
         .any(|input| matches!(input, InputOutcome::Pending(_) | InputOutcome::Runnable(_)));
@@ -2278,6 +2279,21 @@ fn evaluate_prepared_policy_inputs(
                 inputs[input_index] = InputOutcome::Runnable(policy_id);
             }
             Err(error) => {
+                if policy_deadline_reached(cancellation)? {
+                    return deadline_before_evaluation_outcome(
+                        options,
+                        batch_budget,
+                        suppression_sources.clone(),
+                        scope_document_state,
+                        vec![PolicyStageTiming::from_duration(
+                            PolicyExecutionStage::PolicyRegistration,
+                            registration_started.elapsed(),
+                        )],
+                        PolicyExecutionStage::PolicyRegistration,
+                        requested_policy_ids,
+                        None,
+                    );
+                }
                 inputs[input_index] =
                     InputOutcome::Diagnostic(registry_diagnostic(source, &error)?);
             }
@@ -4233,6 +4249,14 @@ fn prepare_parsed_input(
             None,
             Vec::new(),
         )?)),
+        RqlpDocument::EndpointSet { .. } => Ok(InputOutcome::Diagnostic(report_diagnostic(
+            PolicyReportDiagnosticCode::NotExecutableEndpoint,
+            "an endpoint-set document is a reusable dependency, not an executable policy root"
+                .to_string(),
+            Some(source),
+            None,
+            Vec::new(),
+        )?)),
     }
 }
 
@@ -4379,6 +4403,21 @@ fn registry_diagnostic(
     source: PolicySourceIdentity,
     error: &PolicyRegistryError,
 ) -> Result<PolicyReportDiagnostic, PolicyCoordinatorError> {
+    if let PolicyRegistryError::EndpointSetImport { source, error } = error {
+        return report_diagnostic(
+            PolicyReportDiagnosticCode::PolicyValidationFailed,
+            error.to_string(),
+            Some(source.clone()),
+            Some(
+                PolicySourceRange::try_from(error.diagnostic.range.clone()).map_err(|error| {
+                    PolicyCoordinatorError::new(format!(
+                        "invalid endpoint-set diagnostic range: {error}"
+                    ))
+                })?,
+            ),
+            error.diagnostic.related.clone(),
+        );
+    }
     let code = match error {
         PolicyRegistryError::Source(error) => match error.diagnostic.code {
             "unsupported-policy-schema-version" => {
@@ -4503,6 +4542,7 @@ fn dependency_source(
 ) -> Option<PolicySourceIdentity> {
     origins.iter().find_map(|origin| match origin {
         EndpointOrigin::ExactMatch { source, .. }
+        | EndpointOrigin::EndpointSetFile { source, .. }
         | EndpointOrigin::MatchDirectory { source, .. } => Some(source.clone()),
         EndpointOrigin::PolicyLocal { .. } => Some(policy.source().clone()),
         EndpointOrigin::Catalog { .. } => None,
@@ -5926,7 +5966,9 @@ mod tests {
         let analyzer =
             WorkspaceAnalyzer::build_ephemeral_footgun(project, AnalyzerConfig::default())
                 .expect("ephemeral workspace should build");
-        let cancellation = CancellationToken::timeout_after_checks_for_test(9);
+        // Include the registry's entry and pre-commit cancellation checks so
+        // this injection still reaches evaluation rather than registration.
+        let cancellation = CancellationToken::timeout_after_checks_for_test(11);
 
         let outcome = evaluate_policy_source(
             workspace.path(),

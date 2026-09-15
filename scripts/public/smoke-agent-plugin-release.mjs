@@ -397,7 +397,11 @@ async function assertMcpRootsWorkspaceBinding(codexLaunch, workspaceRoot, env) {
     );
     assert.ok(
       security.policies.some((entry) => entry.id === "bifrost.security.java.servlet-parameter-to-jdbc"),
-      "MCP list_policies omitted the Java security policy",
+      "MCP list_policies omitted the Servlet-to-JDBC security policy",
+    );
+    assert.ok(
+      security.policies.some((entry) => entry.id === "bifrost.security.java.system-getenv-to-runtime-exec"),
+      "MCP list_policies omitted the environment-to-command security policy",
     );
     const policies = codeSmells.policies;
     const policyIds = policies.map((entry) => entry.id);

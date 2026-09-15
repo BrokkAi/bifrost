@@ -79,7 +79,10 @@ test("requires the policy pack and at least one policy from a successful MCP cal
           },
           {
             id: "bifrost.security",
-            policies: [{ id: "bifrost.security.java.servlet-parameter-to-jdbc" }],
+            policies: [
+              { id: "bifrost.security.java.servlet-parameter-to-jdbc" },
+              { id: "bifrost.security.java.system-getenv-to-runtime-exec" },
+            ],
           },
         ],
       },

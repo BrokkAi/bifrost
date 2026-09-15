@@ -368,7 +368,7 @@ const BIFROST_EMBEDDED_PACK_ENTRIES: &[EmbeddedSemanticPack<'static>] = &[
         GO_STDLIB_TESTING_SHARDS,
     ),
     EmbeddedSemanticPack::new(
-        "bifrost.go.concurrency@1.0.0",
+        "bifrost.go.concurrency@1.1.0",
         include_bytes!("../embedded/go-concurrency/manifest.json"),
         GO_CONCURRENCY_SHARDS,
     ),
@@ -475,10 +475,11 @@ mod tests {
     use std::time::Duration;
 
     use brokk_bifrost_analysis::analyzer::semantic_model::{
-        CatalogCoordinate, CatalogOptions, CompiledConcurrencyEffect,
+        CatalogCoordinate, CatalogOptions, CompiledConcurrencyEffect, CompiledCondWaiters,
         CompiledConditionalIndirectWrite, CompiledConditionalResultRefinement,
         CompiledDeclaredEffect, CompiledDeclaredEffectCertainty, CompiledDeclaredEffectTiming,
-        CompiledIndirectWriteTarget, CompiledNormalReturnRefinement, CompiledOperationPrecondition,
+        CompiledIndirectWriteTarget, CompiledLockCondition, CompiledLockMode,
+        CompiledNormalReturnRefinement, CompiledOperationPrecondition,
         CompiledPredicateProofEffect, CompiledResultMemberContract, CompiledResultPredicate,
         CompiledSummaryEffect, CompiledSummaryExitKind, CompiledSummaryInput,
         CompiledSummaryOutput, CompiledSummaryTransfer, CompilerOptions, Completeness,
@@ -641,7 +642,7 @@ mod tests {
             .payload()
             .procedure_summaries()
             .expect("the Go sync shard carries procedure summaries");
-        assert_eq!(summaries.len(), 28);
+        assert_eq!(summaries.len(), 29);
         assert!(summaries.iter().any(|summary| {
             summary.id == "context.context.done"
                 && summary.transfers
@@ -693,15 +694,39 @@ mod tests {
             .collect::<Vec<_>>();
         unsupported_sync_protocols.sort_unstable();
         unsupported_sync_protocols.dedup();
+        assert_eq!(unsupported_sync_protocols, ["sync.Map"]);
+        assert!(summaries.iter().any(|summary| {
+            summary.id == "sync.cond.new"
+                && matches!(
+                    summary.concurrency_effects.as_slice(),
+                    [
+                        CompiledConcurrencyEffect::CondBind { lock, .. }
+                    ] if matches!(lock, CompiledSummaryInput::Parameter { ordinal: 0 })
+                )
+        }));
+        assert!(summaries.iter().any(|summary| {
+            summary.id == "sync.cond.wait"
+                && matches!(
+                    summary.concurrency_effects.as_slice(),
+                    [CompiledConcurrencyEffect::CondWait { condition }]
+                        if matches!(condition, CompiledSummaryInput::Receiver {})
+                )
+        }));
+        let mut cond_waiters = summaries
+            .iter()
+            .filter_map(|summary| match summary.concurrency_effects.as_slice() {
+                [CompiledConcurrencyEffect::CondNotify { waiters, .. }] => {
+                    Some((summary.id.as_str(), *waiters))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        cond_waiters.sort_unstable();
         assert_eq!(
-            unsupported_sync_protocols,
+            cond_waiters,
             [
-                "sync.Cond",
-                "sync.Map",
-                "sync.Mutex.TryLock",
-                "sync.Once",
-                "sync.RWMutex.TryLock",
-                "sync.RWMutex.TryRLock",
+                ("sync.cond.broadcast", CompiledCondWaiters::All),
+                ("sync.cond.signal", CompiledCondWaiters::One),
             ]
         );
         let mut ordinary_heap_unchanged = summaries
@@ -714,12 +739,38 @@ mod tests {
             ordinary_heap_unchanged,
             [
                 "sync.mutex.lock",
+                "sync.mutex.try-lock",
                 "sync.mutex.unlock",
                 "sync.rwmutex.lock",
                 "sync.rwmutex.rlock",
                 "sync.rwmutex.runlock",
+                "sync.rwmutex.try-lock",
+                "sync.rwmutex.try-rlock",
                 "sync.rwmutex.unlock",
             ]
+        );
+        let mut try_acquires = summaries
+            .iter()
+            .filter_map(|summary| match summary.concurrency_effects.as_slice() {
+                [
+                    CompiledConcurrencyEffect::LockAcquire {
+                        lock: CompiledSummaryInput::Receiver {},
+                        mode,
+                        condition: Some(CompiledLockCondition::CallResultTrue),
+                    },
+                ] => Some((summary.id.as_str(), *mode)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        try_acquires.sort_unstable();
+        assert_eq!(
+            try_acquires,
+            [
+                ("sync.mutex.try-lock", CompiledLockMode::Exclusive),
+                ("sync.rwmutex.try-lock", CompiledLockMode::Exclusive),
+                ("sync.rwmutex.try-rlock", CompiledLockMode::Shared),
+            ],
+            "the try-acquire summaries bind the receiver lock exactly when the call result is true"
         );
 
         let errgroup = concurrency
@@ -753,8 +804,9 @@ mod tests {
             summary.id == "sync.once.do"
                 && matches!(
                     summary.concurrency_effects.as_slice(),
-                    [CompiledConcurrencyEffect::Unsupported { protocol }]
-                        if protocol == "sync.Once"
+                    [CompiledConcurrencyEffect::OnceDo { once, callable }]
+                        if once == &CompiledSummaryInput::Receiver {}
+                            && callable == &CompiledSummaryInput::Parameter { ordinal: 0 }
                 )
         }));
 
@@ -826,8 +878,8 @@ mod tests {
             declaration_type_count += types.len();
             declaration_member_count += members.len();
         }
-        assert_eq!(declaration_type_count, 15);
-        assert_eq!(declaration_member_count, 36);
+        assert_eq!(declaration_type_count, 16);
+        assert_eq!(declaration_member_count, 38);
 
         let time_declarations = concurrency_declarations
             .shards

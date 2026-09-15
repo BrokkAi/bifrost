@@ -7,22 +7,22 @@ use super::ir::{
     ConfigurationRouteSegmentFilter, ControlRelationFilter, DEFAULT_LIMIT, DeclarationStateFilter,
     DecoratorBindingFilter, EdgeFilter, ExportFilter, ExportSeed, FailureUseConsumer,
     FailureUseProvenance, FieldWriteValueTraversal, FlowRelationFilter, GenerationSiteFilter,
-    GenerationSiteSeed, HierarchyTraversal, JsxAttributeValueTraversal, KeyedReadValueTraversal,
-    MAX_ARITY, MAX_BINDING_NAME_LENGTH, MAX_CAPTURE_LENGTH, MAX_CONFIGURATION_FILTER_ENTRIES,
-    MAX_CONFIGURATION_KEY_LENGTH, MAX_CONFIGURATION_ROUTE_SEGMENTS,
-    MAX_DECORATOR_BINDING_FILTER_LENGTH, MAX_ENVIRONMENT_FILTER_ENTRIES, MAX_KIND_LIST_ENTRIES,
-    MAX_KWARG_NAME_LENGTH, MAX_KWARGS, MAX_LANGUAGE_FILTERS, MAX_LIMIT,
-    MAX_OCCURRENCE_FILTER_ENTRIES, MAX_PATTERN_DEPTH, MAX_PATTERN_NODES, MAX_QUERY_BRANCHES,
-    MAX_QUERY_PLAN_DEPTH, MAX_QUERY_PLAN_NODES, MAX_QUERY_STEPS, MAX_ROLE_LIST_ENTRIES,
-    MAX_ROW_PREDICATE_SET_MEMBERS, MAX_ROW_PREDICATES, MAX_ROW_PROJECTION_COLUMNS,
-    MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS, OccurrenceFilter, OccurrenceSeed, PathFilter,
-    PathSeed, Pattern, QueryError, QueryPathScope, QueryRowLiteral, QueryRowPredicate,
-    QueryRowPredicateOp, QueryRowPredicateOperand, QueryRowProjectionColumn, QueryStep,
-    ReceiverTraversalFilter, ReferenceTraversalFilter, ResolvedCallFilter, ResolvedCallProof,
-    ResolvedCallReceiverType, ResultContractFailureUseFilter, RewritePathFilter, ScopeFilter,
-    ScopeSeed, SegmentsOfOptions, SetOperator, StateEventFilter, StringPredicate, TaintTraversal,
-    TypestateTraversal, UNATTRIBUTED_TIER_LABEL, ValueFlowTraversal, WitnessTraversal,
-    intersect_language_scopes,
+    GenerationSiteSeed, HierarchyTraversal, JsxAttributeValueTraversal, KeyedReadKeySelector,
+    KeyedReadValueTraversal, MAX_ARITY, MAX_BINDING_NAME_LENGTH, MAX_CAPTURE_LENGTH,
+    MAX_CONFIGURATION_FILTER_ENTRIES, MAX_CONFIGURATION_KEY_LENGTH,
+    MAX_CONFIGURATION_ROUTE_SEGMENTS, MAX_DECORATOR_BINDING_FILTER_LENGTH,
+    MAX_ENVIRONMENT_FILTER_ENTRIES, MAX_KIND_LIST_ENTRIES, MAX_KWARG_NAME_LENGTH, MAX_KWARGS,
+    MAX_LANGUAGE_FILTERS, MAX_LIMIT, MAX_OCCURRENCE_FILTER_ENTRIES, MAX_PATTERN_DEPTH,
+    MAX_PATTERN_NODES, MAX_QUERY_BRANCHES, MAX_QUERY_PLAN_DEPTH, MAX_QUERY_PLAN_NODES,
+    MAX_QUERY_STEPS, MAX_ROLE_LIST_ENTRIES, MAX_ROW_PREDICATE_SET_MEMBERS, MAX_ROW_PREDICATES,
+    MAX_ROW_PROJECTION_COLUMNS, MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS, OccurrenceFilter,
+    OccurrenceSeed, PathFilter, PathSeed, Pattern, QueryError, QueryPathScope, QueryRowLiteral,
+    QueryRowPredicate, QueryRowPredicateOp, QueryRowPredicateOperand, QueryRowProjectionColumn,
+    QueryStep, ReceiverTraversalFilter, ReferenceTraversalFilter, ResolvedCallFilter,
+    ResolvedCallProof, ResolvedCallReceiverType, ResultContractFailureUseFilter, RewritePathFilter,
+    ScopeFilter, ScopeSeed, SegmentsOfOptions, SetOperator, StateEventFilter, StringPredicate,
+    TaintTraversal, TypestateTraversal, UNATTRIBUTED_TIER_LABEL, ValueFlowTraversal,
+    WitnessTraversal, intersect_language_scopes,
 };
 use super::schema::{
     ALL_QUERY_STEP_OPS, CodeQueryExecutionMode, PatternField, QueryField, QueryStepField,
@@ -1612,8 +1612,17 @@ fn decode_schema_version(
 ) -> Result<u64, QueryError> {
     let authored_version = value
         .map(|value| {
-            let version = value.as_u64().ok_or_else(|| {
-                QueryError::new(path, "expected an unsigned integer schema version")
+            let version = match value {
+                Value::String(version) => version
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|parsed| parsed.to_string() == *version),
+                // Keep authored numeric queries readable while canonical JSON and
+                // the MCP tool schema use strings.
+                _ => value.as_u64(),
+            }
+            .ok_or_else(|| {
+                QueryError::new(path, "expected a schema version string such as \"1\"")
             })?;
             u32::try_from(version).map_err(|_| {
                 QueryError::new(
@@ -2164,6 +2173,9 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                     | QueryStepField::Container
                     | QueryStepField::Property
                     | QueryStepField::Index
+                    | QueryStepField::KeyKind
+                    | QueryStepField::IndexMin
+                    | QueryStepField::IndexMax
                     | QueryStepField::SourceOrigin,
                 ) if keyed_read_value => {}
                 Some(QueryStepField::Capture) if receiver => {}
@@ -2240,6 +2252,9 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                     | QueryStepField::Container
                     | QueryStepField::Property
                     | QueryStepField::Index
+                    | QueryStepField::KeyKind
+                    | QueryStepField::IndexMin
+                    | QueryStepField::IndexMax
                     | QueryStepField::SourceOrigin
                     | QueryStepField::ProtocolRef
                     | QueryStepField::PlanRef
@@ -2773,22 +2788,117 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                     })
                 })
                 .transpose()?;
-            if property.is_some() == index.is_some() {
+            let key_kind = object
+                .get("key_kind")
+                .map(|value| {
+                    let path = child_path(&entry_path, "key_kind");
+                    value
+                        .as_str()
+                        .and_then(crate::query::schema::RuntimeKeyKind::from_label)
+                        .ok_or_else(|| {
+                            QueryError::new(
+                                path,
+                                "key_kind must be static-property or static-index",
+                            )
+                        })
+                })
+                .transpose()?;
+            let decode_bound = |field: &str| -> Result<Option<u128>, QueryError> {
+                object
+                    .get(field)
+                    .map(|value| {
+                        let path = child_path(&entry_path, field);
+                        value.as_u64().map(u128::from).ok_or_else(|| {
+                            QueryError::new(path, "index bound must be a non-negative integer")
+                        })
+                    })
+                    .transpose()
+            };
+            let index_min = decode_bound("index_min")?;
+            let index_max = decode_bound("index_max")?;
+            if key_kind.is_some() && (property.is_some() || index.is_some()) {
+                return Err(QueryError::new(
+                    &entry_path,
+                    "keyed_read_value accepts either one exact property/index or key_kind, not both",
+                ));
+            }
+            if property.is_some() == index.is_some() && key_kind.is_none() {
                 return Err(QueryError::new(
                     &entry_path,
                     "keyed_read_value requires exactly one of property or index",
                 ));
             }
-            if (container == "env") != property.is_some() {
+            if key_kind.is_none() && (index_min.is_some() || index_max.is_some()) {
                 return Err(QueryError::new(
-                    child_path(&entry_path, "container"),
-                    "env requires property and argv requires index",
+                    &entry_path,
+                    "index bounds require key_kind static-index",
                 ));
             }
-            if container == "argv" && index.is_some_and(|index| index > u128::from(u32::MAX - 1)) {
+            let key = if let Some(key_kind) = key_kind {
+                if (index_min.is_some() || index_max.is_some())
+                    && key_kind != crate::query::schema::RuntimeKeyKind::StaticIndex
+                {
+                    return Err(QueryError::new(
+                        child_path(&entry_path, "key_kind"),
+                        "index bounds require key_kind static-index",
+                    ));
+                }
+                if index_min.is_some_and(|min| index_max.is_some_and(|max| min > max)) {
+                    return Err(QueryError::new(
+                        child_path(&entry_path, "index_min"),
+                        "index_min must not exceed index_max",
+                    ));
+                }
+                Some(match key_kind {
+                    crate::query::schema::RuntimeKeyKind::StaticProperty => {
+                        KeyedReadKeySelector::StaticProperty
+                    }
+                    crate::query::schema::RuntimeKeyKind::StaticIndex => {
+                        KeyedReadKeySelector::StaticIndexRange {
+                            min: index_min,
+                            max: index_max,
+                        }
+                    }
+                })
+            } else if let Some(property) = property {
+                Some(KeyedReadKeySelector::ExactProperty(property))
+            } else {
+                index.map(KeyedReadKeySelector::ExactIndex)
+            };
+            let offending_index_field = match key.as_ref() {
+                Some(KeyedReadKeySelector::ExactIndex(index))
+                    if *index > u128::from(u32::MAX - 1) =>
+                {
+                    Some("index")
+                }
+                Some(KeyedReadKeySelector::StaticIndexRange { min, max }) => {
+                    if min.is_some_and(|min| min > u128::from(u32::MAX - 1)) {
+                        Some("index_min")
+                    } else if max.is_some_and(|max| max > u128::from(u32::MAX - 1)) {
+                        Some("index_max")
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+            if let Some(field) = offending_index_field
+                && container == "argv"
+            {
                 return Err(QueryError::new(
-                    child_path(&entry_path, "index"),
+                    child_path(&entry_path, field),
                     "argv index must be at most 4294967294",
+                ));
+            }
+            let key = key.expect("one exact or family key selector was validated above");
+            let selector_is_property = matches!(
+                key,
+                KeyedReadKeySelector::ExactProperty(_) | KeyedReadKeySelector::StaticProperty
+            );
+            if (container == "env") != selector_is_property {
+                return Err(QueryError::new(
+                    child_path(&entry_path, "container"),
+                    "env requires a property selector and argv requires an index selector",
                 ));
             }
             let pristine_input = match object.get("source_origin") {
@@ -2805,8 +2915,7 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                 runtime,
                 global,
                 container,
-                property,
-                index,
+                key: Some(key),
                 pristine_input,
             });
         } else if receiver {

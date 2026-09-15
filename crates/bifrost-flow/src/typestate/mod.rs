@@ -48,6 +48,7 @@ pub use planned::{
     TypestatePlannedSolveError, solve_typestate_planned,
 };
 pub(crate) use production::direct_publication_destination;
+pub(crate) use production::summary_returns_identify_call_result;
 pub(crate) use production::{
     DirectConcurrencyPath, DirectScalarSource, direct_concurrency_modeled_subject_path,
     direct_concurrency_path, direct_scalar_source, direct_scalar_summary_port,

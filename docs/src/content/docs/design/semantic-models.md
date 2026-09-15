@@ -124,6 +124,24 @@ An interoperability test needs the exact artifact emitted by an independent
 producer and the analysis difference with that pack disabled and enabled. A
 hand-authored approximation cannot establish producer interoperability.
 
+Runtime-values 0.2 adds portable contracts alongside the existing 0.1 exact
+artifact profile. Contract content, source target, activation review, binding,
+and executable observation retain distinct identities. A target range must be
+fully covered by a supported contract; overlap alone stays indeterminate.
+Imported policy and review records require independent consumer acceptance.
+Neither a portable contract digest nor a declared target verifies runtime bytes.
+
+The portable consumer currently transports and evaluates these claims. Joining
+producer-owned observations to Bifrost's executable graph and discovering Node
+targets automatically remain unsupported. Catalog activation cannot bypass
+that boundary or create an exact runtime load.
+
+The `keyed-read-value` query can select an exact `:property` or `:index`, all
+static properties with `:key-kind static-property`, or static indices with
+`:key-kind static-index` and optional inclusive `:index-min` / `:index-max`.
+These selectors filter existing proven loads. Dynamic keys and missing runtime
+or effect evidence remain incomplete.
+
 ## Current boundaries
 
 Model coverage varies by pack. Coverage may close one procedure and leave the

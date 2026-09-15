@@ -25,7 +25,7 @@ use crate::dataflow::{
     SummaryConcurrencyAccessPath, SummaryConcurrencyAccessSelector, SummaryConcurrencyEffect,
     SummaryConcurrencyEffectKind, SummaryConcurrencyLockMode, SummaryConcurrencyLockOperation,
     SummaryConcurrencySubjectIdentity, SummaryDependencyKey, SummaryEffectKey, SummaryEventKey,
-    SummaryLocationKey, SummaryPort,
+    SummaryLocationKey, SummaryLockAcquisition, SummaryPort,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::scalar_state::{
@@ -520,9 +520,30 @@ pub enum ResolvedConcurrencyEffect {
     TaskJoin {
         group: ResolvedConcurrencySubject,
     },
+    /// One `sync.Once.Do` call on `once` with `callable`.
+    ///
+    /// The documented contract has two clauses, and the solver models both:
+    ///
+    /// - single execution: the callable runs at most once per `once` object,
+    ///   in the task that makes the call, and never again after the object is
+    ///   complete;
+    /// - return-before ordering: the completion of that one execution, normal
+    ///   return or panic unwind, synchronizes before the return of every `Do`
+    ///   on the same object, so every access after any `Do` return is ordered
+    ///   after every access the callable performed.
+    ///
+    /// The callable is conditional, not an unconditional spawn, and the
+    /// object is not a mutex: two callbacks for distinct objects may run in
+    /// parallel, and accesses made before a `Do` call are not ordered by it.
+    OnceDo {
+        once: ResolvedConcurrencySubject,
+        callable: ValueId,
+        targets: Vec<ProcedureHandle>,
+    },
     LockAcquire {
         lock: ResolvedConcurrencySubject,
         mode: ConcurrencyLockMode,
+        acquisition: ResolvedLockAcquisition,
     },
     LockRelease {
         lock: ResolvedConcurrencySubject,
@@ -542,6 +563,53 @@ pub enum ResolvedConcurrencyEffect {
         location: ResolvedConcurrencySubject,
         operation: ConcurrencyAtomicOperation,
     },
+    /// Associate the constructed condition variable with the locker it waits
+    /// on. The association holds for the lifetime of that condition object.
+    CondBind {
+        condition: ResolvedConcurrencySubject,
+        lock: ResolvedConcurrencySubject,
+    },
+    /// Release the associated locker, suspend this task, and re-acquire the
+    /// locker before returning.
+    CondWait {
+        condition: ResolvedConcurrencySubject,
+    },
+    /// Wake one or every suspended waiter. The notification itself orders
+    /// nothing: it may be missed, and it may resume another waiter.
+    CondNotify {
+        condition: ResolvedConcurrencySubject,
+        waiters: ConcurrencyCondWaiters,
+    },
+}
+
+/// How many suspended waiters one notification can resume.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ConcurrencyCondWaiters {
+    One,
+    All,
+}
+
+/// The acquisition shape one resolved lock-acquire effect carries (issue
+/// #3369).
+///
+/// `CallResultTrue` is the try-acquire contract in its unresolved form: the
+/// reviewed model states that the call acquires the lock exactly when its
+/// boolean result is true, and the solver must still bind that condition to
+/// this procedure's guard facts. Binding rewrites the effect to `OnResultTrue`
+/// with the proven true edges of the decision points that test the call's
+/// result, or to `Unestablished` when no structured guard ever consumes the
+/// result. `OnResultTrue` acquisition applies only along those exact CFG
+/// edges; every other path, including the guard's false edge, holds nothing.
+/// The failed, unconsumed, and dead paths therefore never gain protection,
+/// and a discarded result never produces a must-held lock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolvedLockAcquisition {
+    Unconditional,
+    CallResultTrue,
+    OnResultTrue {
+        edges: Vec<crate::analyzer::semantic::ControlEdgeId>,
+    },
+    Unestablished,
 }
 
 /// The field declaration one member locator stands for.
@@ -945,6 +1013,15 @@ struct Task {
     spawn_invocation: Option<InvocationId>,
     spawn_call: Option<CallSiteId>,
     group: Option<ResolvedConcurrencySubject>,
+    /// The reviewed `sync.Once` object whose conditional callback this task
+    /// models. A once task executes at most once per object, so two tasks that
+    /// name one object never run in parallel, and its completion is published
+    /// before the return of every `Do` on that object.
+    once: Option<ResolvedConcurrencySubject>,
+    /// The caller context that resolved the `once` subject. Retained so the
+    /// object's per-activation identity can be settled once every allocation
+    /// origin in the solve is known.
+    once_context: Option<ContextKey>,
     // Manual Done orders only effects before this event, unlike a reviewed
     // task join whose completion is the child's return.
     completion: Option<(InvocationId, ProgramPointId)>,
@@ -2821,6 +2898,8 @@ fn solve_concurrent_access_conflicts(
         spawn_invocation: None,
         spawn_call: None,
         group: None,
+        once: None,
+        once_context: None,
         completion: None,
         repetition: None,
         repetitions_serialized: false,
@@ -3255,6 +3334,9 @@ fn solve_concurrent_access_conflicts(
                                                 | SummaryConcurrencyEffectKind::WaitGroupWait { .. }
                                                 | SummaryConcurrencyEffectKind::TaskSpawn { .. }
                                                 | SummaryConcurrencyEffectKind::TaskJoin { .. }
+                                                | SummaryConcurrencyEffectKind::OnceDo { .. }
+                                                | SummaryConcurrencyEffectKind::CondWait { .. }
+                                                | SummaryConcurrencyEffectKind::CondNotify { .. }
                                         ) =>
                                 {
                                     Some((candidate_effect, candidate.evidence()))
@@ -3369,6 +3451,18 @@ fn solve_concurrent_access_conflicts(
                                 .push(ConcurrencyOpenReason::UnmodeledMemory(reason.into())),
                         }
                     }
+                    SummaryConcurrencyEffectKind::Unsupported { protocol }
+                        if protocol.starts_with("try-acquire:") =>
+                    {
+                        // A projected wrapper could not certify that its own
+                        // result identifies the guarded call's result, so the
+                        // try-acquire condition stays an open boundary.
+                        report
+                            .reasons
+                            .push(ConcurrencyOpenReason::UnsupportedSynchronization(
+                                protocol.clone(),
+                            ));
+                    }
                     _ => continue,
                 }
             }
@@ -3379,7 +3473,9 @@ fn solve_concurrent_access_conflicts(
                         | SummaryConcurrencyEffectKind::WaitGroupDone { .. }
                         | SummaryConcurrencyEffectKind::WaitGroupWait { .. }
                         | SummaryConcurrencyEffectKind::TaskSpawn { .. }
-                        | SummaryConcurrencyEffectKind::TaskJoin { .. })
+                        | SummaryConcurrencyEffectKind::TaskJoin { .. }
+                        | SummaryConcurrencyEffectKind::CondWait { .. }
+                        | SummaryConcurrencyEffectKind::CondNotify { .. })
                         && !unreachable_events.contains(&effect.event())
                         && !replayed_summary_modeled_events.contains(&effect.event()))
             }) {
@@ -4313,7 +4409,13 @@ fn solve_concurrent_access_conflicts(
                 };
             let call_effects_closed = matches!(&modeled_answer, ConcurrencyAnswer::Proven(_));
             let (effects, mut model_resolution_reasons) = modeled_answer.into_parts();
-            let call_has_no_modeled_effects = effects.is_empty();
+            let bound_effects = bind_try_lock_acquisitions(
+                &context.procedure,
+                call,
+                effects,
+                &mut model_resolution_reasons,
+            );
+            let call_has_no_modeled_effects = bound_effects.is_empty();
             if !call_effects_closed && model_resolution_reasons.is_empty() {
                 model_resolution_reasons.push(ConcurrencyOpenReason::UnsupportedSynchronization(
                     "open_call_effects".into(),
@@ -4335,20 +4437,28 @@ fn solve_concurrent_access_conflicts(
                             reason,
                         }),
                 );
+            let modeled_spawns = bound_effects
+                .iter()
+                .filter_map(|(_, effect)| match effect {
+                    ResolvedConcurrencyEffect::TaskSpawn {
+                        callable,
+                        targets,
+                        group,
+                    } => Some((targets.clone(), group.clone(), false, *callable, None)),
+                    ResolvedConcurrencyEffect::OnceDo {
+                        once,
+                        callable,
+                        targets,
+                    } => Some((targets.clone(), None, false, *callable, Some(once.clone()))),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
             modeled_by_context
                 .entry(context.clone())
                 .or_default()
-                .extend(effects.iter().cloned().map(|effect| (call.point, effect)));
+                .extend(bound_effects);
             let detached = call.invocation_mode == CallInvocationMode::Detached
                 && call.execution_timing == ExecutionTiming::DifferentTask;
-            let modeled_spawns = effects.iter().filter_map(|effect| match effect {
-                ResolvedConcurrencyEffect::TaskSpawn {
-                    callable,
-                    targets,
-                    group,
-                } => Some((targets.clone(), group.clone(), false, *callable)),
-                _ => None,
-            });
             let (targets, target_reasons) = resolved_targets.into_parts();
             let summary_call_matches = summary_call_dependencies
                 .remove(&call.id)
@@ -4387,12 +4497,12 @@ fn solve_concurrent_access_conflicts(
             }
             report.reasons.extend(target_reasons);
             let (direct_targets, synchronous_targets) = if detached {
-                (Some((targets, None, true, call.callee)), Vec::new())
+                (Some((targets, None, true, call.callee, None)), Vec::new())
             } else {
                 (None, targets)
             };
             let mut spawned_any_task = false;
-            for (targets, group, bind_invocation, invoked_callable) in
+            for (targets, group, bind_invocation, invoked_callable, once) in
                 direct_targets.into_iter().chain(modeled_spawns)
             {
                 for target in targets {
@@ -4456,6 +4566,8 @@ fn solve_concurrent_access_conflicts(
                         spawn_invocation: Some(context.invocation),
                         spawn_call: Some(call.id),
                         group: group.clone(),
+                        once: once.clone(),
+                        once_context: once.as_ref().map(|_| context.clone()),
                         completion: None,
                         repetition: invocations.entries[target_context.invocation.0 as usize]
                             .repetition,
@@ -4806,6 +4918,7 @@ fn solve_concurrent_access_conflicts(
         &mut modeled_by_context,
         &mut tasks,
     );
+    associate_once_tasks(&mut tasks, &mut synchronization_subjects);
     append_summary_accesses(
         provider,
         &mut synchronization_subjects,
@@ -4858,8 +4971,16 @@ fn solve_concurrent_access_conflicts(
         &mut accesses,
         &mut report,
     );
+    let cond_locks = cond_lock_bindings(&mut synchronization_subjects, &modeled_by_context);
     let entry_locks = must_entry_locks(&modeled_by_context, &synchronous_calls, request);
     let lock_states = must_lock_states(&accesses, &modeled_by_context, &entry_locks, request);
+    report_cond_wait_boundaries(
+        &mut synchronization_subjects,
+        &cond_locks,
+        &modeled_by_context,
+        &lock_states,
+        &mut report,
+    );
     let synchronizations = resolve_intrinsic_synchronizations(
         provider,
         &mut synchronization_subjects,
@@ -8507,6 +8628,51 @@ fn reference_captures_are_read_only(
     Ok(true)
 }
 
+/// Settle whether repeated activations of a reviewed Once callback can both
+/// run. They cannot when every activation observes the same object: the
+/// object's single-execution guarantee serializes them exactly as a manual
+/// completion would. An object created inside the repeated scope is a new
+/// object for each activation, so nothing serializes those activations and
+/// they keep the ordinary repetition obligation.
+fn associate_once_tasks(tasks: &mut [Task], classes: &mut SynchronizationSubjectClasses) {
+    for task in tasks.iter_mut().skip(1) {
+        if task.repetition.is_none() {
+            continue;
+        }
+        let stable = {
+            let (Some(once), Some(context)) = (task.once.as_ref(), task.once_context.as_ref())
+            else {
+                continue;
+            };
+            if !once.reasons.is_empty() {
+                continue;
+            }
+            let fact = classes.canonical_modeled_identity(context, once);
+            fact.as_ref()
+                .is_some_and(|fact| once_object_outlives_repetition(classes, fact))
+        };
+        task.repetitions_serialized = stable;
+    }
+}
+
+/// Whether one resolved Once identity names a single object across repeated
+/// activations of the scope that created it. An inline field of a repeated
+/// allocation leaves the location inexhaustive, so an unknown container keeps
+/// its ordinary repetition obligation.
+fn once_object_outlives_repetition(
+    classes: &SynchronizationSubjectClasses,
+    fact: &ConcurrencyIdentityFact,
+) -> bool {
+    if !fact.resolved.exhaustive {
+        return false;
+    }
+    let origin = fact
+        .storage_origin
+        .as_ref()
+        .or_else(|| fact.resolved.exact_candidate());
+    origin.is_some_and(|origin| !classes.repeated_allocations.contains(origin))
+}
+
 fn associate_wait_group_tasks(
     tasks: &mut [Task],
     modeled: &HashMap<ContextKey, Vec<(ProgramPointId, ResolvedConcurrencyEffect)>>,
@@ -8527,7 +8693,7 @@ fn associate_wait_group_tasks(
     let completion_effects = must_completion_effects(modeled, synchronous_calls, request)?;
     let mut completions = Vec::new();
     for (index, task) in tasks.iter().enumerate().skip(1) {
-        if task.group.is_some() {
+        if task.group.is_some() || task.once.is_some() {
             continue;
         }
         let (Some(parent), Some(entry), Some(spawn_procedure), Some(spawn_call)) = (
@@ -8683,7 +8849,7 @@ fn associate_wait_group_tasks(
     // resolver gap at `Done` from becoming a proven race while preserving the
     // access pair and its synchronization uncertainty for review.
     for task in tasks.iter_mut().skip(1) {
-        if task.group.is_some() {
+        if task.group.is_some() || task.once.is_some() {
             continue;
         }
         let (Some(parent), Some(spawn_procedure), Some(spawn_call)) =
@@ -8756,6 +8922,120 @@ fn associate_wait_group_tasks(
 }
 
 type CompletionEffects = HashMap<(InvocationId, ProgramPointId), ResolvedConcurrencySubject>;
+
+/// Bind every unresolved try-acquire in `effects` to the procedure's guard
+/// facts and return the rows to attach (issue #3369).
+///
+/// The reviewed model states the try-acquire contract (`CallResultTrue`); the
+/// structured evidence that a result is established lives in the calling
+/// procedure's guard facts. A guard whose subject is the call's result value
+/// proves the acquisition on its true edge and nothing anywhere else, so the
+/// bound effect re-attaches to the guard's decision point: the acquisition is
+/// an event on the guarded edge, not on the call's own continuation. A result
+/// no guard ever tests (discarded, or reached only through storage the guard
+/// table cannot name) proves nothing: the effect is dropped and the typed
+/// boundary reason keeps the answer open rather than granting protection the
+/// model cannot or denying protection that may exist on the unconsumed paths.
+fn bind_try_lock_acquisitions(
+    procedure: &ProcedureHandle,
+    call: &crate::analyzer::semantic::SemanticCallSite,
+    effects: Vec<ResolvedConcurrencyEffect>,
+    reasons: &mut Vec<ConcurrencyOpenReason>,
+) -> Vec<(ProgramPointId, ResolvedConcurrencyEffect)> {
+    let unresolved = effects.iter().any(|effect| {
+        matches!(
+            effect,
+            ResolvedConcurrencyEffect::LockAcquire {
+                acquisition: ResolvedLockAcquisition::CallResultTrue,
+                ..
+            }
+        )
+    });
+    if !unresolved {
+        return effects
+            .into_iter()
+            .map(|effect| (call.point, effect))
+            .collect();
+    }
+    let semantics = procedure.semantics();
+    let mut binding = None;
+    if let Some(result) = call.result {
+        for guard in semantics.guard_facts() {
+            if guard.subject == Some(result)
+                && let Some(edge) = guard.true_edge
+            {
+                let (point, edges) = binding.get_or_insert_with(|| (guard.point, Vec::new()));
+                if *point != guard.point {
+                    // One decision point guards one evaluation of this result;
+                    // several true edges of that point all prove the call.
+                    continue;
+                }
+                edges.push(edge);
+            }
+        }
+    }
+    let Some((guard_point, edges)) = binding.filter(|(_, edges)| !edges.is_empty()) else {
+        let exported = crate::typestate::summary_returns_identify_call_result(procedure, call);
+        let reason = if exported {
+            // The condition survives on the summary boundary (the projection
+            // retains it on the caller's result), but this solver cannot yet
+            // apply a callee's conditional acquisition in the caller's guard
+            // context; that caller-state application is the remaining
+            // exact-wrapper-protection work.
+            "try-acquire result is returned untested; its guard lives in a caller"
+        } else {
+            "try-acquire result is not established by a structured guard"
+        };
+        let mut rows = Vec::with_capacity(effects.len());
+        for effect in effects {
+            if matches!(
+                effect,
+                ResolvedConcurrencyEffect::LockAcquire {
+                    acquisition: ResolvedLockAcquisition::CallResultTrue,
+                    ..
+                }
+            ) {
+                continue;
+            }
+            rows.push((call.point, effect));
+        }
+        reasons.push(ConcurrencyOpenReason::UnsupportedSynchronization(
+            reason.into(),
+        ));
+        return rows;
+    };
+    effects
+        .into_iter()
+        .map(|effect| {
+            let effect = match effect {
+                ResolvedConcurrencyEffect::LockAcquire {
+                    lock,
+                    mode,
+                    acquisition: ResolvedLockAcquisition::CallResultTrue,
+                } => ResolvedConcurrencyEffect::LockAcquire {
+                    lock,
+                    mode,
+                    acquisition: ResolvedLockAcquisition::OnResultTrue {
+                        edges: edges.clone(),
+                    },
+                },
+                other => other,
+            };
+            let point = if matches!(
+                effect,
+                ResolvedConcurrencyEffect::LockAcquire {
+                    acquisition: ResolvedLockAcquisition::OnResultTrue { .. },
+                    ..
+                }
+            ) {
+                guard_point
+            } else {
+                call.point
+            };
+            (point, effect)
+        })
+        .collect()
+}
 
 fn must_completion_effects(
     modeled: &HashMap<ContextKey, Vec<(ProgramPointId, ResolvedConcurrencyEffect)>>,
@@ -8844,6 +9124,12 @@ fn resolve_modeled_subjects(
         }
     }
     for task in tasks.iter_mut().skip(1) {
+        // A Once callback's subject belongs to the caller that ran the Do, so
+        // it resolves against the retained caller context rather than against
+        // the callback's own entry.
+        if let (Some(context), Some(once)) = (task.once_context.clone(), task.once.as_mut()) {
+            resolve_modeled_subject(classes, &context, once);
+        }
         let (Some(parent), Some(procedure), Some(group)) = (
             task.parent,
             task.spawn_procedure.clone(),
@@ -8868,6 +9154,7 @@ fn resolve_modeled_subjects(
 fn modeled_effect_subjects(effect: &ResolvedConcurrencyEffect) -> Vec<&ResolvedConcurrencySubject> {
     match effect {
         ResolvedConcurrencyEffect::TaskSpawn { group, .. } => group.iter().collect(),
+        ResolvedConcurrencyEffect::OnceDo { once, .. } => vec![once],
         ResolvedConcurrencyEffect::TaskJoin { group }
         | ResolvedConcurrencyEffect::WaitGroupAdd { group, .. }
         | ResolvedConcurrencyEffect::WaitGroupDone { group }
@@ -8875,6 +9162,9 @@ fn modeled_effect_subjects(effect: &ResolvedConcurrencyEffect) -> Vec<&ResolvedC
         ResolvedConcurrencyEffect::LockAcquire { lock, .. }
         | ResolvedConcurrencyEffect::LockRelease { lock, .. } => vec![lock],
         ResolvedConcurrencyEffect::Atomic { location, .. } => vec![location],
+        ResolvedConcurrencyEffect::CondBind { condition, lock } => vec![condition, lock],
+        ResolvedConcurrencyEffect::CondWait { condition }
+        | ResolvedConcurrencyEffect::CondNotify { condition, .. } => vec![condition],
     }
 }
 
@@ -8883,6 +9173,7 @@ fn modeled_effect_subjects_mut(
 ) -> Vec<&mut ResolvedConcurrencySubject> {
     match effect {
         ResolvedConcurrencyEffect::TaskSpawn { group, .. } => group.iter_mut().collect(),
+        ResolvedConcurrencyEffect::OnceDo { once, .. } => vec![once],
         ResolvedConcurrencyEffect::TaskJoin { group }
         | ResolvedConcurrencyEffect::WaitGroupAdd { group, .. }
         | ResolvedConcurrencyEffect::WaitGroupDone { group }
@@ -8890,6 +9181,9 @@ fn modeled_effect_subjects_mut(
         ResolvedConcurrencyEffect::LockAcquire { lock, .. }
         | ResolvedConcurrencyEffect::LockRelease { lock, .. } => vec![lock],
         ResolvedConcurrencyEffect::Atomic { location, .. } => vec![location],
+        ResolvedConcurrencyEffect::CondBind { condition, lock } => vec![condition, lock],
+        ResolvedConcurrencyEffect::CondWait { condition }
+        | ResolvedConcurrencyEffect::CondNotify { condition, .. } => vec![condition],
     }
 }
 
@@ -11127,6 +11421,43 @@ fn source_summary_modeled_subject(
     })
 }
 
+/// Resolve the condition object one retained `CondBind` constructs.
+///
+/// The condition is the construction call's own result, not one of its inputs,
+/// so it is resolved from the exact result ordinal instead of from the input
+/// subject paths. Only a plain return port can name it: a captured or stored
+/// condition is a different object graph position and stays unresolved.
+fn source_summary_condition_subject(
+    pending: &PendingSummaryEffect,
+    call: &crate::analyzer::semantic::SemanticCallSite,
+    path: &SummaryConcurrencyAccessPath,
+    provider: &dyn ConcurrencyProvider,
+    request: &mut SolveRequest<'_, '_>,
+) -> Result<ResolvedConcurrencySubject, &'static str> {
+    if !path.selectors().is_empty() {
+        return Err("summary condition path has selectors");
+    }
+    let value = match path.root() {
+        SummaryPort::NormalReturn => call.result,
+        SummaryPort::IndexedNormalReturn(ordinal) => call.normal_result(*ordinal as usize),
+        _ => None,
+    }
+    .ok_or("summary condition result is unavailable")?;
+    let (canonical, reasons) = provider
+        .canonical_value(&pending.context.procedure, call.point, value, request)
+        .map_err(|_| "summary condition identity query is unavailable")?
+        .into_parts();
+    if canonical.is_none() && reasons.is_empty() {
+        return Err("summary condition identity is unavailable");
+    }
+    Ok(ResolvedConcurrencySubject {
+        value,
+        canonical,
+        reasons,
+        identity: ConcurrencySubjectIdentity::Value,
+    })
+}
+
 fn source_summary_modeled_effect(
     pending: &PendingSummaryEffect,
     expected_call: CallSiteId,
@@ -11192,6 +11523,56 @@ fn source_summary_modeled_effect(
             group,
         });
     }
+    if let SummaryConcurrencyEffectKind::OnceDo {
+        once,
+        identity,
+        callable,
+        target_coverage,
+    } = pending.effect.kind()
+    {
+        if *target_coverage != crate::dataflow::SummaryConcurrencyTargetCoverage::Exhaustive {
+            return Err("summary Once target coverage is incomplete");
+        }
+        let crate::dataflow::SummaryConcurrencyCallable::SourceArgument(ordinal) = callable else {
+            return Err("summary Once callable has no witnessed source argument");
+        };
+        let callable = call
+            .arguments
+            .get(*ordinal as usize)
+            .ok_or("summary Once callable argument is unavailable")?
+            .value;
+        let ConcurrencyAnswer::Proven(targets) =
+            source_callable_targets(&pending.context.procedure, callable)
+        else {
+            return Err("summary Once callable targets are unavailable");
+        };
+        let once = source_summary_modeled_subject(
+            &pending.context.procedure,
+            call,
+            once,
+            *identity,
+            provider,
+            request,
+        )?;
+        return Ok(ResolvedConcurrencyEffect::OnceDo {
+            once,
+            callable,
+            targets,
+        });
+    }
+    if let SummaryConcurrencyEffectKind::CondBind { condition, lock } = pending.effect.kind() {
+        let condition =
+            source_summary_condition_subject(pending, call, condition, provider, request)?;
+        let lock = source_summary_modeled_subject(
+            &pending.context.procedure,
+            call,
+            lock,
+            SummaryConcurrencySubjectIdentity::Value,
+            provider,
+            request,
+        )?;
+        return Ok(ResolvedConcurrencyEffect::CondBind { condition, lock });
+    }
     let (path, identity) = match pending.effect.kind() {
         SummaryConcurrencyEffectKind::Lock { lock, identity, .. } => (lock, *identity),
         SummaryConcurrencyEffectKind::WaitGroupAdd {
@@ -11202,6 +11583,12 @@ fn source_summary_modeled_effect(
         SummaryConcurrencyEffectKind::TaskJoin { group } => (&group.location, group.identity),
         SummaryConcurrencyEffectKind::Atomic { location, .. } => {
             (location, SummaryConcurrencySubjectIdentity::Value)
+        }
+        SummaryConcurrencyEffectKind::CondWait { condition } => {
+            (condition, SummaryConcurrencySubjectIdentity::Value)
+        }
+        SummaryConcurrencyEffectKind::CondNotify { condition, .. } => {
+            (condition, SummaryConcurrencySubjectIdentity::Value)
         }
         _ => return Err("summary modeled effect has an incompatible kind"),
     };
@@ -11252,7 +11639,10 @@ fn source_summary_modeled_effect(
             ResolvedConcurrencyEffect::WaitGroupWait { group: subject }
         }
         SummaryConcurrencyEffectKind::Lock {
-            operation, mode, ..
+            operation,
+            mode,
+            acquisition,
+            ..
         } => {
             let mode = match mode {
                 SummaryConcurrencyLockMode::Shared => ConcurrencyLockMode::Shared,
@@ -11263,6 +11653,14 @@ fn source_summary_modeled_effect(
                     ResolvedConcurrencyEffect::LockAcquire {
                         lock: subject,
                         mode,
+                        acquisition: match acquisition {
+                            SummaryLockAcquisition::CallResultTrue => {
+                                ResolvedLockAcquisition::CallResultTrue
+                            }
+                            SummaryLockAcquisition::Unconditional => {
+                                ResolvedLockAcquisition::Unconditional
+                            }
+                        },
                     }
                 }
                 SummaryConcurrencyLockOperation::Release => {
@@ -11271,6 +11669,22 @@ fn source_summary_modeled_effect(
                         mode,
                     }
                 }
+            }
+        }
+        SummaryConcurrencyEffectKind::CondWait { .. } => {
+            ResolvedConcurrencyEffect::CondWait { condition: subject }
+        }
+        SummaryConcurrencyEffectKind::CondNotify { waiters, .. } => {
+            ResolvedConcurrencyEffect::CondNotify {
+                condition: subject,
+                waiters: match waiters {
+                    crate::dataflow::SummaryConcurrencyCondWaiters::One => {
+                        ConcurrencyCondWaiters::One
+                    }
+                    crate::dataflow::SummaryConcurrencyCondWaiters::All => {
+                        ConcurrencyCondWaiters::All
+                    }
+                },
             }
         }
         SummaryConcurrencyEffectKind::Atomic { operation, .. } => {
@@ -12533,8 +12947,9 @@ fn compare_accesses(
         } else {
             compatible_lock_protection(access, access, lock_states)
         };
-        if let Some(group) = &tasks[access.site.task.0 as usize].group {
-            reasons.extend(group.reasons.iter().cloned());
+        let task = &tasks[access.site.task.0 as usize];
+        if let Some(subject) = task.group.as_ref().or(task.once.as_ref()) {
+            reasons.extend(subject.reasons.iter().cloned());
         }
         if protection == ConcurrentProtection::Open {
             reasons.push(ConcurrencyOpenReason::AmbiguousSynchronization);
@@ -12662,8 +13077,8 @@ fn repetition_orders_access(
             }
         }
     }
-    if let Some(group) = &task.group {
-        reasons.extend(group.reasons.iter().cloned());
+    if let Some(subject) = task.group.as_ref().or(task.once.as_ref()) {
+        reasons.extend(subject.reasons.iter().cloned());
     }
     Ok(if reasons.is_empty() {
         ConcurrencyAnswer::Proven(false)
@@ -13047,6 +13462,20 @@ fn tasks_may_parallel(
 ) -> Result<bool, ConcurrencyOpenReason> {
     let first_task = &tasks[first.site.task.0 as usize];
     let second_task = &tasks[second.site.task.0 as usize];
+    // A reviewed `sync.Once` runs its conditional callback at most once, so
+    // two callbacks bound to one object never execute together. This is the
+    // object's single-execution guarantee, and it is the only reason two
+    // tasks are mutually exclusive: distinct objects stay parallel.
+    if first.site.task != second.site.task
+        && let (Some(first_once), Some(second_once)) =
+            (first_task.once.as_ref(), second_task.once.as_ref())
+        && first_once.reasons.is_empty()
+        && second_once.reasons.is_empty()
+        && first_once.canonical.is_some()
+        && first_once.canonical == second_once.canonical
+    {
+        return Ok(false);
+    }
     let mut parent_child = |parent: &Access,
                             child: &Access,
                             child_task: &Task|
@@ -14741,7 +15170,14 @@ fn join_completion_barriers(
     request: &mut SolveRequest<'_, '_>,
 ) -> Result<Vec<CompletionBarrier>, ConcurrencyOpenReason> {
     let task = &tasks[child.site.task.0 as usize];
-    let (Some(parent), Some(task_group)) = (task.parent, task.group.as_ref()) else {
+    let Some(parent) = task.parent else {
+        return Ok(Vec::new());
+    };
+    // A reviewed task join completes a whole spawned task; a reviewed Once
+    // completes only its own conditional callback. Each kind therefore joins
+    // against its own effect and never against the other.
+    let once_task = task.once.as_ref();
+    let Some(task_subject) = task.group.as_ref().or(once_task) else {
         return Ok(Vec::new());
     };
     let completion_reasons = match completion_orders_access(tasks, invocations, child, request)? {
@@ -14752,30 +15188,41 @@ fn join_completion_barriers(
     let mut barriers = Vec::new();
     for (context, effects) in modeled {
         charge_concurrency_work(request, 1)?;
-        if context.task != parent {
+        // A completed Once publishes its callback to every later Do on the
+        // same object, wherever that Do runs: the completion state belongs to
+        // the object, not to the caller that happened to run the callback.
+        // The conditional dominance check below still requires the Do point
+        // to be mandatory before the compared access, so a Do that may not
+        // execute orders nothing.
+        if once_task.is_none() && context.task != parent {
             continue;
         }
         charge_concurrency_work(request, effects.len())?;
         let joins = effects
             .iter()
             .filter_map(|(point, effect)| {
-                let group = match effect {
+                let subject = match effect {
                     ResolvedConcurrencyEffect::TaskJoin { group }
-                    | ResolvedConcurrencyEffect::WaitGroupWait { group } => group,
+                    | ResolvedConcurrencyEffect::WaitGroupWait { group }
+                        if once_task.is_none() =>
+                    {
+                        group
+                    }
+                    ResolvedConcurrencyEffect::OnceDo { once, .. } if once_task.is_some() => once,
                     _ => return None,
                 };
-                Some((*point, group))
+                Some((*point, subject))
             })
             .collect::<Vec<_>>();
         let exact = joins
             .iter()
             .filter_map(|(point, group)| {
                 (group.canonical.is_some()
-                    && group.canonical == task_group.canonical
+                    && group.canonical == task_subject.canonical
                     && group
                         .reasons
                         .iter()
-                        .chain(&task_group.reasons)
+                        .chain(&task_subject.reasons)
                         .all(|reason| *reason == ConcurrencyOpenReason::UnknownLocation))
                 .then_some(*point)
             })
@@ -14791,16 +15238,16 @@ fn join_completion_barriers(
             .iter()
             .filter_map(|(point, group)| {
                 (!group.reasons.is_empty()
-                    || !task_group.reasons.is_empty()
+                    || !task_subject.reasons.is_empty()
                     || group.canonical.is_none()
-                    || task_group.canonical.is_none()
-                    || group.canonical == task_group.canonical)
+                    || task_subject.canonical.is_none()
+                    || group.canonical == task_subject.canonical)
                     .then_some(*point)
             })
             .collect::<HashSet<_>>();
         if !possible.is_empty() {
             let mut reasons = completion_reasons.clone();
-            reasons.extend(task_group.reasons.iter().cloned());
+            reasons.extend(task_subject.reasons.iter().cloned());
             reasons.extend(
                 joins
                     .iter()
@@ -14941,6 +15388,10 @@ fn must_lock_states(
             invocation: access.site.invocation,
             procedure: access.site.procedure.clone(),
         })
+        // A modeled protocol effect can require the locks held at its own
+        // point without producing an access row, so every context that
+        // contributes modeled effects keeps its states.
+        .chain(modeled.keys().cloned())
         .collect::<HashSet<_>>()
         .into_iter()
         .map(|context| {
@@ -14995,21 +15446,22 @@ fn must_locks_by_point(
                 }
                 let predecessors = graph
                     .predecessors(point.id)
-                    .map(|(_, source)| source)
+                    .map(|(edge, source)| (source, Some(edge)))
                     .collect::<Vec<_>>();
                 if predecessors.is_empty() {
                     continue;
                 }
                 let mut candidate: Option<MustLockSet> = None;
                 for predecessor in predecessors {
-                    let Some(mut state) = incoming.get(&predecessor).cloned().flatten() else {
+                    let (source, edge) = predecessor;
+                    let Some(mut state) = incoming.get(&source).cloned().flatten() else {
                         // `None` is lattice top, not an empty lock set. Ignoring it
                         // lets an entry predecessor initialize a loop header; when
                         // the backedge becomes reachable its facts can only shrink
                         // the intersection toward the greatest fixed point.
                         continue;
                     };
-                    apply_lock_effects_at(predecessor, effects, &mut state);
+                    apply_lock_effects_at(source, edge, effects, &mut state);
                     candidate = Some(match candidate {
                         None => state,
                         Some(mut intersection) => {
@@ -15033,6 +15485,7 @@ fn must_locks_by_point(
 
 fn apply_lock_effects_at(
     point: ProgramPointId,
+    edge: Option<crate::analyzer::semantic::ControlEdgeId>,
     effects: &[(ProgramPointId, ResolvedConcurrencyEffect)],
     locks: &mut MustLockSet,
 ) {
@@ -15041,7 +15494,27 @@ fn apply_lock_effects_at(
         .filter(|(effect_point, _)| *effect_point == point)
     {
         match effect {
-            ResolvedConcurrencyEffect::LockAcquire { lock, mode } => {
+            ResolvedConcurrencyEffect::LockAcquire {
+                lock,
+                mode,
+                acquisition,
+            } => {
+                // A try-acquire holds the lock only along the guarded true
+                // edges of the decisions that prove its result; the false
+                // edge, the dead, and the unconsumed paths hold nothing. An
+                // unresolved or unestablished condition never becomes a
+                // must-held lock.
+                let held = match acquisition {
+                    ResolvedLockAcquisition::Unconditional => true,
+                    ResolvedLockAcquisition::CallResultTrue
+                    | ResolvedLockAcquisition::Unestablished => false,
+                    ResolvedLockAcquisition::OnResultTrue { edges } => {
+                        edge.is_some_and(|edge| edges.contains(&edge))
+                    }
+                };
+                if !held {
+                    continue;
+                }
                 if let Some(lock) = exact_subject(lock) {
                     locks.exact.insert(lock.clone(), *mode);
                 } else {
@@ -15064,6 +15537,14 @@ fn apply_lock_effects_at(
                     });
                 }
             }
+            // `sync.Cond.Wait` releases the associated locker, suspends, and
+            // re-acquires that same locker before returning. Both steps happen
+            // inside one call, which is one program point here, so the set of
+            // locks held across the point is unchanged and nothing is applied.
+            // The association is still load-bearing: `report_cond_wait_boundaries`
+            // requires the associated locker to be held at this point and keeps
+            // the conflict open when it is not.
+            ResolvedConcurrencyEffect::CondWait { .. } => {}
             _ => {}
         }
     }
@@ -15075,6 +15556,139 @@ fn exact_subject(subject: &ResolvedConcurrencySubject) -> Option<&CanonicalConcu
         .is_empty()
         .then_some(subject.canonical.as_ref())
         .flatten()
+}
+
+/// The locker every modeled condition variable waits on.
+///
+/// Go's `sync.NewCond(l)` stores `l` in the condition for the lifetime of that
+/// object, so the association is stated once, at construction, and consumed by
+/// every later `Wait`, `Signal`, and `Broadcast` on the same object.
+///
+/// The association is keyed by the condition's backing equivalence class, not
+/// by its rendered identity: a modeled external construction has no body for
+/// the object oracle to name, while the value-flow relation already connects
+/// the constructed result, the cell or field that stores it, every later load
+/// of that storage, and the formal a wrapper receives it as. One key therefore
+/// covers the direct local, the struct field, and the source wrapper without a
+/// second identity system.
+#[derive(Debug, Default)]
+struct CondLockBindings {
+    bound: HashMap<LocalSynchronizationSubject, ResolvedConcurrencySubject>,
+    ambiguous: HashSet<LocalSynchronizationSubject>,
+}
+
+enum CondLockBinding<'a> {
+    Bound(&'a ResolvedConcurrencySubject),
+    Unbound,
+    Ambiguous,
+}
+
+impl CondLockBindings {
+    fn lock_for(
+        &self,
+        classes: &mut SynchronizationSubjectClasses,
+        context: &ContextKey,
+        condition: &ResolvedConcurrencySubject,
+    ) -> CondLockBinding<'_> {
+        let condition = classes.backing_root(cond_condition_subject(context, condition));
+        if self.ambiguous.contains(&condition) {
+            return CondLockBinding::Ambiguous;
+        }
+        self.bound
+            .get(&condition)
+            .map_or(CondLockBinding::Unbound, CondLockBinding::Bound)
+    }
+}
+
+fn cond_condition_subject(
+    context: &ContextKey,
+    condition: &ResolvedConcurrencySubject,
+) -> LocalSynchronizationSubject {
+    LocalSynchronizationSubject::Value {
+        task: context.task,
+        invocation: context.invocation,
+        procedure: context.procedure.clone(),
+        value: condition.value,
+    }
+}
+
+fn cond_lock_bindings(
+    classes: &mut SynchronizationSubjectClasses,
+    modeled: &HashMap<ContextKey, Vec<(ProgramPointId, ResolvedConcurrencyEffect)>>,
+) -> CondLockBindings {
+    let mut bindings = CondLockBindings::default();
+    for (context, effects) in modeled {
+        for (_, effect) in effects {
+            let ResolvedConcurrencyEffect::CondBind { condition, lock } = effect else {
+                continue;
+            };
+            let condition = classes.backing_root(cond_condition_subject(context, condition));
+            let Some(lock_identity) = exact_subject(lock) else {
+                // A condition whose locker is unresolved cannot answer which
+                // locker `Wait` releases. Keep every wait on that object
+                // explicitly open instead of guessing.
+                bindings.ambiguous.insert(condition);
+                continue;
+            };
+            match bindings.bound.get(&condition) {
+                Some(previous) if exact_subject(previous) != Some(lock_identity) => {
+                    bindings.ambiguous.insert(condition);
+                }
+                Some(_) => {}
+                None => {
+                    bindings.bound.insert(condition, lock.clone());
+                }
+            }
+        }
+    }
+    for condition in &bindings.ambiguous {
+        bindings.bound.remove(condition);
+    }
+    bindings
+}
+
+/// Keep every `Wait` whose protocol contract is not fully covered open.
+///
+/// `Wait` releases the associated locker and re-acquires it before returning.
+/// That contract is only complete when the condition names its locker and the
+/// task provably holds that locker at the call: without the association the
+/// release names no object, and without the held locker the source did not
+/// enter `Wait` through the documented protocol.
+fn report_cond_wait_boundaries(
+    classes: &mut SynchronizationSubjectClasses,
+    bindings: &CondLockBindings,
+    modeled: &HashMap<ContextKey, Vec<(ProgramPointId, ResolvedConcurrencyEffect)>>,
+    lock_states: &HashMap<ContextKey, HashMap<ProgramPointId, MustLockSet>>,
+    report: &mut ConcurrentAccessReport,
+) {
+    for (context, effects) in modeled {
+        for (point, effect) in effects {
+            let ResolvedConcurrencyEffect::CondWait { condition } = effect else {
+                continue;
+            };
+            let reason = match bindings.lock_for(classes, context, condition) {
+                CondLockBinding::Bound(lock) => {
+                    let held = exact_subject(lock).is_some_and(|lock| {
+                        lock_states
+                            .get(context)
+                            .and_then(|states| states.get(point))
+                            .is_some_and(|state| state.exact.contains_key(lock))
+                    });
+                    if held {
+                        continue;
+                    }
+                    "sync.Cond.wait-without-associated-lock"
+                }
+                CondLockBinding::Unbound => "sync.Cond.unbound-lock",
+                CondLockBinding::Ambiguous => "sync.Cond.ambiguous-lock",
+            };
+            report
+                .reasons
+                .push(ConcurrencyOpenReason::UnsupportedSynchronization(
+                    reason.into(),
+                ));
+        }
+    }
 }
 
 fn projected_point_dominates(
@@ -15669,6 +16283,8 @@ mod tests {
             spawn_invocation: None,
             spawn_call: None,
             group: None,
+            once: None,
+            once_context: None,
             completion: None,
             repetition: None,
             repetitions_serialized: false,
@@ -17745,6 +18361,8 @@ func root() {
                 spawn_invocation: None,
                 spawn_call: None,
                 group: None,
+                once: None,
+                once_context: None,
                 completion: None,
                 repetition: None,
                 repetitions_serialized: false,
@@ -18009,6 +18627,7 @@ func unlocked() { helper() }
                         identity: ConcurrencySubjectIdentity::Value,
                     },
                     mode: ConcurrencyLockMode::Exclusive,
+                    acquisition: ResolvedLockAcquisition::Unconditional,
                 },
             )],
         );

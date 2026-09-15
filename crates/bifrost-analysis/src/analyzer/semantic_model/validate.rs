@@ -225,6 +225,13 @@ impl Validator {
                     &shard.activation,
                 );
             }
+            if let Some(runtime_contracts) = &shard.runtime_contracts {
+                self.runtime_contracts(
+                    &format!("$.shards[{}/runtime_contracts]", shard.id),
+                    runtime_contracts,
+                    &shard.activation,
+                );
+            }
             if let Some(collection_flows) = &shard.collection_flows {
                 self.collection_flows(
                     &format!("$.shards[{}/collection_flows]", shard.id),
@@ -239,7 +246,9 @@ impl Validator {
             }
         }
         if pack.shards.iter().any(|shard| {
-            shard.deferred_yields.is_some() || shard.conditional_type_refinements.is_some()
+            shard.deferred_yields.is_some()
+                || shard.conditional_type_refinements.is_some()
+                || shard.runtime_contracts.is_some()
         }) {
             if native_profile_depth_within(pack, self.limits.max_depth) {
                 if self.validate_references {
@@ -300,6 +309,12 @@ impl Validator {
                         .runtime_values
                         .as_ref()
                         .map_or(0, RuntimeValuesPayload::record_count),
+                )
+                .saturating_add(
+                    shard
+                        .runtime_contracts
+                        .as_ref()
+                        .map_or(0, RuntimeContractsPayload::record_count),
                 )
                 .saturating_add(
                     shard
@@ -1465,6 +1480,50 @@ impl Validator {
         }
     }
 
+    fn runtime_contracts(
+        &mut self,
+        path: &str,
+        payload: &RuntimeContractsPayload,
+        activation: &[ActivationSelector],
+    ) {
+        if self.schema_version < RUNTIME_CONTRACTS_MIN_SCHEMA_VERSION {
+            self.error(
+                "runtime_contracts.schema_version",
+                path,
+                format!(
+                    "runtime-contracts 0.2 requires schema version at least {RUNTIME_CONTRACTS_MIN_SCHEMA_VERSION}"
+                ),
+            );
+        }
+        if payload.envelope.is_none() {
+            self.error(
+                "runtime_contracts.envelope_missing",
+                path,
+                "runtime-contracts 0.2 requires the retained CSMI semantic-model envelope",
+            );
+        }
+        if payload.payload.is_empty() {
+            self.error(
+                "runtime_contracts.empty",
+                path,
+                "runtime-contracts payload must contain at least one record",
+            );
+        }
+        let expected = payload
+            .payload
+            .contracts
+            .iter()
+            .flat_map(|record| record.definition.applicability.selectors.iter())
+            .count();
+        if expected > 0 && activation.is_empty() {
+            self.error(
+                "runtime_contracts.activation_missing",
+                path,
+                "runtime-contracts facts require shard activation selectors",
+            );
+        }
+    }
+
     fn runtime_applicability(&mut self, path: &str, runtime: &RuntimeApplicability) {
         for (field, value) in [
             ("runtime_family", runtime.runtime_family.as_str()),
@@ -1972,7 +2031,6 @@ impl Validator {
 
         self.declared_effects(path, &summary.declared_effects);
         self.operation_preconditions(path, &summary.preconditions, &summary.target);
-        self.concurrency_effects(path, &summary.concurrency_effects, &summary.target);
         if summary.normal_result_count.is_none()
             && (!summary.result_contracts.is_empty()
                 || !summary.conditional_result_refinements.is_empty()
@@ -2029,6 +2087,14 @@ impl Validator {
                 );
             }
         }
+
+        self.concurrency_effects(
+            path,
+            &summary.concurrency_effects,
+            &summary.target,
+            &locations,
+            summary.normal_result_count,
+        );
 
         for (index, transfer) in summary.transfers.iter().enumerate() {
             let transfer_path = format!("{path}.transfers[{index}]");
@@ -2123,6 +2189,8 @@ impl Validator {
         path: &str,
         effects: &[AuthoredConcurrencyEffect],
         target: &AuthoredProcedureTarget,
+        locations: &HashMap<&str, (AuthoredSummaryLocationKind, String)>,
+        normal_result_count: Option<u32>,
     ) {
         let mut seen = HashMap::new();
         let mut task_joins = HashSet::new();
@@ -2172,6 +2240,24 @@ impl Validator {
                     self.summary_input(&format!("{effect_path}.group"), group, target);
                     task_joins.insert(group);
                 }
+                AuthoredConcurrencyEffect::OnceDo { once, callable } => {
+                    self.summary_input(&format!("{effect_path}.once"), once, target);
+                    self.summary_input(&format!("{effect_path}.callable"), callable, target);
+                    if !matches!(callable, AuthoredSummaryInput::Parameter { .. }) {
+                        self.error(
+                            "summary.invalid_once_callable",
+                            format!("{effect_path}.callable"),
+                            "a Once callable must be a parameter port",
+                        );
+                    }
+                    if once == callable {
+                        self.error(
+                            "summary.conflicting_concurrency_effect",
+                            effect_path,
+                            "Once object and Once callable must be distinct ports",
+                        );
+                    }
+                }
                 AuthoredConcurrencyEffect::LockAcquire { lock, .. }
                 | AuthoredConcurrencyEffect::LockRelease { lock, .. } => {
                     self.summary_input(&format!("{effect_path}.lock"), lock, target);
@@ -2196,6 +2282,36 @@ impl Validator {
                 }
                 AuthoredConcurrencyEffect::Atomic { location, .. } => {
                     self.summary_input(&format!("{effect_path}.location"), location, target);
+                }
+                AuthoredConcurrencyEffect::CondBind { condition, lock } => {
+                    self.summary_input(&format!("{effect_path}.lock"), lock, target);
+                    self.summary_output(
+                        &format!("{effect_path}.condition"),
+                        condition,
+                        locations,
+                        target,
+                        normal_result_count,
+                    );
+                    // Only a returned object can carry the association to the
+                    // caller's value: a stored, captured, or escaped condition
+                    // has no call result to bind at the construction site.
+                    if !matches!(
+                        condition,
+                        AuthoredSummaryOutput::NormalReturn {}
+                            | AuthoredSummaryOutput::IndexedNormalReturn { .. }
+                    ) {
+                        self.error(
+                            "summary.invalid_condition_output",
+                            format!("{effect_path}.condition"),
+                            "a condition association must name a normal-return port",
+                        );
+                    }
+                }
+                AuthoredConcurrencyEffect::CondWait { condition } => {
+                    self.summary_input(&format!("{effect_path}.condition"), condition, target);
+                }
+                AuthoredConcurrencyEffect::CondNotify { condition, .. } => {
+                    self.summary_input(&format!("{effect_path}.condition"), condition, target);
                 }
             }
         }
@@ -2280,6 +2396,9 @@ impl Validator {
                 } => Some("an atomic memory mutation contradicts ordinary_heap_unchanged"),
                 AuthoredConcurrencyEffect::TaskSpawn { .. } => {
                     Some("a spawned callback contradicts ordinary_heap_unchanged")
+                }
+                AuthoredConcurrencyEffect::OnceDo { .. } => {
+                    Some("a conditional Once callback contradicts ordinary_heap_unchanged")
                 }
                 AuthoredConcurrencyEffect::Unsupported { .. } => {
                     Some("an unsupported concurrency protocol cannot certify heap preservation")
@@ -4404,11 +4523,29 @@ pub(crate) fn is_canonical_relative_path(value: &str) -> bool {
 // wire payloads. IDs stay native-local here; no display-name identity is created.
 fn validate_native_profile_contracts(pack: &AuthoredSemanticModelPack) -> Vec<Diagnostic> {
     let model = native_contract_model(pack);
-    super::csmi::validate_native_deferred_yield_model(&model)
+    let mut diagnostics = super::csmi::validate_native_deferred_yield_model(&model)
         .into_iter()
         .chain(super::csmi::validate_native_conditional_type_model(&model))
         .map(|diagnostic| Diagnostic::error(diagnostic.code, diagnostic.path, diagnostic.message))
-        .collect()
+        .collect::<Vec<_>>();
+    for shard in &pack.shards {
+        let Some(runtime_contracts) = &shard.runtime_contracts else {
+            continue;
+        };
+        if let Err(errors) = runtime_contracts.validate() {
+            diagnostics.extend(errors.into_iter().map(|diagnostic| {
+                Diagnostic::error(
+                    diagnostic.code,
+                    format!(
+                        "$.shards[{}/runtime_contracts]{}",
+                        shard.id, diagnostic.path
+                    ),
+                    diagnostic.message,
+                )
+            }));
+        }
+    }
+    diagnostics
 }
 
 fn native_contract_model(pack: &AuthoredSemanticModelPack) -> super::csmi::CsmiSemanticModel {

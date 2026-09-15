@@ -15,18 +15,20 @@ use crate::analyzer::semantic::{
 };
 use crate::analyzer::semantic_model::{
     ActiveSemanticModelSnapshot, CompiledAtomicOperation, CompiledConcurrencyEffect,
-    CompiledLockMode, CompiledSummaryInput, Completeness, ProcedureSummaryDeclarationKey,
-    ProcedureSummaryMemberKey, SemanticModelMatchDisposition, SemanticModelMemberTargetDisposition,
+    CompiledCondWaiters, CompiledLockCondition, CompiledLockMode, CompiledSummaryInput,
+    CompiledSummaryOutput, Completeness, ProcedureSummaryDeclarationKey, ProcedureSummaryMemberKey,
+    SemanticModelMatchDisposition, SemanticModelMemberTargetDisposition,
     SemanticModelOverlayDisposition, TypeKind, Visibility,
 };
 use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 use brokk_bifrost_core::analyzer::model::{Language, LanguageDialect, StructuredImportPathKind};
 use brokk_bifrost_flow::concurrency::{
-    CanonicalConcurrencyLocation, ConcurrencyAnswer, ConcurrencyAtomicOperation, ConcurrencyEscape,
-    ConcurrencyLockMode, ConcurrencyObjectCardinality, ConcurrencyOpenReason, ConcurrencyOwnership,
-    ConcurrencyProvider, ConcurrencySubjectIdentity, ConcurrentAccessConflict,
-    ResolvedConcurrencyEffect, ResolvedConcurrencyLocation, ResolvedConcurrencySubject,
-    ResolvedMemberDeclaration, field_step_selector,
+    CanonicalConcurrencyLocation, ConcurrencyAnswer, ConcurrencyAtomicOperation,
+    ConcurrencyCondWaiters, ConcurrencyEscape, ConcurrencyLockMode, ConcurrencyObjectCardinality,
+    ConcurrencyOpenReason, ConcurrencyOwnership, ConcurrencyProvider, ConcurrencySubjectIdentity,
+    ConcurrentAccessConflict, ResolvedConcurrencyEffect, ResolvedConcurrencyLocation,
+    ResolvedConcurrencySubject, ResolvedLockAcquisition, ResolvedMemberDeclaration,
+    field_step_selector,
 };
 use brokk_bifrost_flow::typestate::TypestateObjectKey;
 
@@ -807,14 +809,59 @@ impl<'a> WorkspaceConcurrencyProvider<'a> {
                     ResolvedConcurrencyEffect::TaskJoin { group }
                 })
             }
-            CompiledConcurrencyEffect::LockAcquire { lock, mode } => {
-                location(self.canonical_actual(call, lock, request)?, &|lock| {
-                    ResolvedConcurrencyEffect::LockAcquire {
-                        lock,
-                        mode: lock_mode(*mode),
+            CompiledConcurrencyEffect::OnceDo { once, callable } => {
+                let (targets, mut reasons) = Self::callback_targets(call, callable).into_parts();
+                let answer = if targets.is_empty() {
+                    ConcurrencyAnswer::Proven(None)
+                } else {
+                    let row = call
+                        .procedure()
+                        .semantics()
+                        .call_site(call.id())
+                        .expect("owned modeled call");
+                    let callable =
+                        Self::actual_input(row, callable).expect("callback targets bind an actual");
+                    location(self.canonical_actual(call, once, request)?, &|once| {
+                        ResolvedConcurrencyEffect::OnceDo {
+                            once,
+                            callable,
+                            targets: targets.clone(),
+                        }
+                    })
+                };
+                match answer {
+                    ConcurrencyAnswer::Proven(Some(effect)) if reasons.is_empty() => {
+                        ConcurrencyAnswer::Proven(Some(effect))
                     }
-                })
+                    ConcurrencyAnswer::Proven(effect) => ConcurrencyAnswer::Open {
+                        partial: effect,
+                        reasons,
+                    },
+                    ConcurrencyAnswer::Open {
+                        partial,
+                        reasons: open,
+                    } => {
+                        reasons.extend(open);
+                        ConcurrencyAnswer::Open { partial, reasons }
+                    }
+                }
             }
+            CompiledConcurrencyEffect::LockAcquire {
+                lock,
+                mode,
+                condition,
+            } => location(self.canonical_actual(call, lock, request)?, &|lock| {
+                ResolvedConcurrencyEffect::LockAcquire {
+                    lock,
+                    mode: lock_mode(*mode),
+                    acquisition: match condition {
+                        Some(CompiledLockCondition::CallResultTrue) => {
+                            ResolvedLockAcquisition::CallResultTrue
+                        }
+                        None => ResolvedLockAcquisition::Unconditional,
+                    },
+                }
+            }),
             CompiledConcurrencyEffect::LockRelease { lock, mode } => {
                 location(self.canonical_actual(call, lock, request)?, &|lock| {
                     ResolvedConcurrencyEffect::LockRelease {
@@ -850,6 +897,112 @@ impl<'a> WorkspaceConcurrencyProvider<'a> {
                     operation: atomic_operation(*operation),
                 }
             }),
+            CompiledConcurrencyEffect::CondBind { condition, lock } => {
+                // The condition is the construction call's own result, so it
+                // is resolved from the exact result ordinal rather than from an
+                // input port.
+                let (condition, mut reasons) = self
+                    .canonical_call_result(call, condition, request)?
+                    .into_parts();
+                let (lock, lock_reasons) = self.canonical_actual(call, lock, request)?.into_parts();
+                reasons.extend(lock_reasons);
+                let Some((condition, lock)) = condition.zip(lock) else {
+                    if reasons.is_empty() {
+                        reasons.push(ConcurrencyOpenReason::UnknownLocation);
+                    }
+                    return Ok(ConcurrencyAnswer::Open {
+                        partial: None,
+                        reasons,
+                    });
+                };
+                let effect = ResolvedConcurrencyEffect::CondBind { condition, lock };
+                let global_reasons = reasons
+                    .into_iter()
+                    .filter(|reason| *reason == ConcurrencyOpenReason::BudgetExhausted)
+                    .collect::<Vec<_>>();
+                if global_reasons.is_empty() {
+                    ConcurrencyAnswer::Proven(Some(effect))
+                } else {
+                    ConcurrencyAnswer::Open {
+                        partial: Some(effect),
+                        reasons: global_reasons,
+                    }
+                }
+            }
+            CompiledConcurrencyEffect::CondWait { condition } => location(
+                self.canonical_actual(call, condition, request)?,
+                &|condition| ResolvedConcurrencyEffect::CondWait { condition },
+            ),
+            CompiledConcurrencyEffect::CondNotify { condition, waiters } => location(
+                self.canonical_actual(call, condition, request)?,
+                &|condition| ResolvedConcurrencyEffect::CondNotify {
+                    condition,
+                    waiters: match waiters {
+                        CompiledCondWaiters::One => ConcurrencyCondWaiters::One,
+                        CompiledCondWaiters::All => ConcurrencyCondWaiters::All,
+                    },
+                },
+            ),
+        })
+    }
+
+    /// The exact object a modeled construction returns.
+    ///
+    /// Only a normal-return port names a value this call produces. A capture,
+    /// heap slot, receiver, or exceptional exit is a different position and
+    /// cannot stand for the constructed object.
+    fn canonical_call_result(
+        &self,
+        call: &CallSiteHandle,
+        output: &CompiledSummaryOutput,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<ConcurrencyAnswer<Option<ResolvedConcurrencySubject>>, SemanticProviderError> {
+        let row = call
+            .procedure()
+            .semantics()
+            .call_site(call.id())
+            .expect("validated call handle resolves");
+        let value = match output {
+            CompiledSummaryOutput::NormalReturn {} => row.result,
+            CompiledSummaryOutput::IndexedNormalReturn { ordinal } => {
+                row.normal_result(*ordinal as usize)
+            }
+            CompiledSummaryOutput::Receiver {}
+            | CompiledSummaryOutput::Capture { .. }
+            | CompiledSummaryOutput::Heap { .. }
+            | CompiledSummaryOutput::ExceptionalReturn {} => None,
+        };
+        let Some(value) = value else {
+            return Ok(ConcurrencyAnswer::Open {
+                partial: None,
+                reasons: vec![ConcurrencyOpenReason::UnknownLocation],
+            });
+        };
+        let (canonical, mut reasons) = self
+            .canonical_value_at(
+                call.procedure(),
+                row.point,
+                value,
+                ObservationPhase::AfterEffects,
+                request,
+            )?
+            .into_parts();
+        if canonical.is_none() && reasons.is_empty() {
+            reasons.push(ConcurrencyOpenReason::UnknownLocation);
+        }
+        let subject = ResolvedConcurrencySubject {
+            value,
+            canonical,
+            reasons: reasons.clone(),
+            identity: ConcurrencySubjectIdentity::Value,
+        };
+        Ok(if reasons.is_empty() {
+            ConcurrencyAnswer::Proven(Some(subject))
+        } else {
+            ConcurrencyAnswer::Open {
+                partial: Some(subject),
+                reasons,
+            }
         })
     }
 }

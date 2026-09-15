@@ -224,18 +224,13 @@ impl CSharpVisitor<'_, '_> {
     /// inside the body, so an adopted member is indexed exactly as its
     /// surviving siblings are.
     ///
-    /// What truncates a body in practice, and what this cannot repair
-    /// (#3326): `brokk-tree-sitter-c-sharp` 0.23.6 lists `async`, `file` and
-    /// `scoped` in `_reserved_identifier` but not `partial` or `required`, so
-    /// a statement that opens with either of those as an ordinary identifier
-    /// (`partial.State = ...;` in StockSharp's `CandleBuilderManager.cs`)
-    /// lexes as a modifier list, and the recovery that follows spends the
-    /// brace that would have closed the method on the class instead. Only the
-    /// declarations recovery re-emits as whole statements come back here; the
-    /// statements inside the method it derailed stay `ERROR` soup, and a
-    /// detached field, property, constructor or nested type keeps whatever
-    /// top-level shape recovery gave it. Repairing those needs the grammar to
-    /// accept both contextual keywords as identifiers.
+    /// What this cannot repair (#3326): only declarations recovery re-emits as
+    /// whole statements come back here. Statements inside the method that
+    /// triggered recovery stay `ERROR` soup, and a detached field, property,
+    /// constructor or nested type keeps whatever top-level shape recovery gave
+    /// it. `brokk-tree-sitter-c-sharp` 0.23.7 fixes the known `partial` and
+    /// `required` assignment trigger at the grammar layer; this fallback remains
+    /// for other malformed or unsupported source.
     fn truncated_type_member_scope<'tree>(
         &self,
         node: Node<'tree>,
@@ -1868,6 +1863,44 @@ mod grammar_regression_tests {
                 "ArrayConverterCore.Write",
             ]
         );
+    }
+
+    #[test]
+    fn contextual_partial_and_required_assignments_preserve_following_members() {
+        let source = r#"class Example {
+    void Run() {
+        var partial = Get();
+        partial = partial.Clone();
+        partial.Value = required.Value;
+        var required = Get();
+        required = required.Clone();
+    }
+    void After() { }
+}
+"#;
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_c_sharp::LANGUAGE.into())
+            .expect("C# grammar");
+        let tree = parser.parse(source, None).expect("C# tree");
+        assert!(
+            !tree.root_node().has_error(),
+            "published Brokk grammar must parse without recovery:\n{}",
+            tree.root_node().to_sexp()
+        );
+
+        let file = ProjectFile::new(
+            std::env::current_dir().expect("test working directory must be available"),
+            "Example.cs",
+        );
+        let parsed = parse_csharp_file(&file, source, &tree);
+        let mut declarations = parsed
+            .declarations()
+            .iter()
+            .map(|unit| unit.short_name().to_string())
+            .collect::<Vec<_>>();
+        declarations.sort();
+        assert_eq!(declarations, ["Example", "Example.After", "Example.Run"]);
     }
 }
 

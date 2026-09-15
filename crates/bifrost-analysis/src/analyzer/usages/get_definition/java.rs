@@ -16,7 +16,7 @@ use brokk_bifrost_jvm::java::graph::return_type::{
 };
 use brokk_bifrost_jvm::java::graph_support::{JavaSource, normalize_java_type_text};
 use brokk_bifrost_jvm::java::hierarchy::java_preferred_declaring_owners;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 
 #[derive(Debug, Clone, Copy)]
@@ -43,6 +43,7 @@ pub(crate) struct JavaResolutionSession<'a> {
     /// marks an expansion still in progress, which is the cycle a bound that
     /// names its own parameter would otherwise re-enter forever (#2048).
     type_parameter_bounds: RefCell<HashMap<JavaTypeSpelling, Option<Vec<JavaReceiverType>>>>,
+    receiver_depth: Cell<usize>,
 }
 
 impl<'a> JavaResolutionSession<'a> {
@@ -53,6 +54,7 @@ impl<'a> JavaResolutionSession<'a> {
             cancellation: None,
             state: RefCell::new(JavaResolutionState::default()),
             type_parameter_bounds: RefCell::new(HashMap::default()),
+            receiver_depth: Cell::new(0),
         }
     }
 
@@ -67,6 +69,7 @@ impl<'a> JavaResolutionSession<'a> {
             cancellation: cancellation.cloned(),
             state: RefCell::new(JavaResolutionState::default()),
             type_parameter_bounds: RefCell::new(HashMap::default()),
+            receiver_depth: Cell::new(0),
         }
     }
 
@@ -727,6 +730,7 @@ fn java_type_lookup_node_fqn(
     if let Some(parent) = node.parent() {
         if matches!(parent.kind(), "field_access" | "method_invocation")
             && parent.child_by_field_name("object") == Some(node)
+            && !java_names_inferred_local(session, file, source, root, node)
             && let Some(receiver) =
                 java_sole_receiver_type(analyzer, token, session, file, source, root, node)
         {
@@ -764,6 +768,27 @@ fn java_type_lookup_node_fqn(
         fqn: unit.fq_name().to_string(),
         target_kind: TypeLookupTargetKind::ValueExpression,
     })
+}
+
+/// Whether this identifier names a local whose only type evidence is a `var`
+/// initializer expression.
+///
+/// Receiver resolution recovers that type so member binding can proceed
+/// (#3359), but type lookup answers with the type a declaration writes. An
+/// inferred local writes none, which is the same answer the declared-binding
+/// tiers already give through [`JavaLocalType::Declared`].
+fn java_names_inferred_local(
+    session: &JavaResolutionSession<'_>,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    node: Node<'_>,
+) -> bool {
+    let bindings = java_bindings_before_scoped(session, file, source, root, node.start_byte());
+    matches!(
+        first_precise(&bindings, java_node_text(node, source)),
+        Some(JavaLocalType::Initializer(_))
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1071,6 +1096,30 @@ fn java_method_invocation_binding(
     let arity = argument_list_arity(node);
 
     if let Some(object) = node.child_by_field_name("object") {
+        if let Some(java) = resolve_analyzer::<JavaAnalyzer>(analyzer)
+            && let Some(owner) =
+                java_type_qualifier(analyzer, token, java, session, file, source, root, object)
+        {
+            let outcome = java_member_candidates(
+                analyzer,
+                token,
+                session,
+                &owner,
+                name,
+                JavaMemberLookupKind::Method,
+                Some(arity),
+            );
+            return JavaInvocationBinding {
+                outcome: java_static_context_member_outcome(
+                    analyzer,
+                    session,
+                    outcome,
+                    JavaMemberLookupKind::Method,
+                    name,
+                ),
+                receiver: vec![JavaReceiverType::plain(owner)],
+            };
+        }
         let receiver = java_receiver_types(analyzer, token, session, file, source, root, object);
         if !receiver.is_empty() {
             let outcome = java_member_candidates_across(
@@ -2380,6 +2429,15 @@ impl JavaTypeSpelling {
     }
 }
 
+/// A local's declared type or the exact initializer that supplies `var`'s type.
+/// Keeping the alternatives distinct prevents expression bytes from being
+/// interpreted as a written type by annotation-only consumers.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum JavaLocalType {
+    Declared(JavaTypeSpelling),
+    Initializer(JavaTypeSpelling),
+}
+
 /// A class a Java receiver's static type gives member lookup, with the type
 /// arguments the receiver's spelling supplied.
 ///
@@ -2409,6 +2467,52 @@ fn java_push_receiver_type(types: &mut Vec<JavaReceiverType>, candidate: JavaRec
     }
 }
 
+/// Resolve a method's syntactic type qualifier through its AST components.
+/// A lexical value with the first component's spelling takes precedence over
+/// a package/type path, including a value whose own type is unresolved.
+#[allow(clippy::too_many_arguments)]
+fn java_type_qualifier(
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    java: &JavaAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    object: Node<'_>,
+) -> Option<CodeUnit> {
+    let mut components = Vec::new();
+    let mut stack = vec![object];
+    while let Some(node) = stack.pop() {
+        if !session.charge_scope_step() {
+            return None;
+        }
+        match node.kind() {
+            "identifier" | "type_identifier" => components.push(java_node_text(node, source)),
+            "field_access" => {
+                stack.push(node.child_by_field_name("field")?);
+                stack.push(node.child_by_field_name("object")?);
+            }
+            _ => return None,
+        }
+    }
+    let first = components.first()?;
+    if java_bindings_before_scoped(session, file, source, root, object.start_byte())
+        .is_shadowed(first)
+    {
+        return None;
+    }
+    java_type_text_with_context(
+        analyzer,
+        token,
+        java,
+        session,
+        file,
+        &components.join("."),
+        object.start_byte(),
+    )
+}
+
 /// Every class a Java receiver expression's static type gives member lookup.
 ///
 /// Empty is "nothing structural typed this receiver". Exactly one entry is the
@@ -2426,8 +2530,17 @@ fn java_receiver_types(
     let Some(java) = resolve_analyzer::<JavaAnalyzer>(analyzer) else {
         return Vec::new();
     };
+    // Calls can depend on receiver calls and inferred locals can depend on
+    // earlier inferred locals. Bound the combined walk, including malformed
+    // cyclic initializers, before entering another Rust stack frame.
+    let depth = session.receiver_depth.get();
+    if depth >= JAVA_CHAINED_RECEIVER_LIMIT || !session.charge_scope_step() {
+        return Vec::new();
+    }
+    session.receiver_depth.set(depth + 1);
     let types =
         java_receiver_types_for_java(analyzer, token, java, session, file, source, root, object);
+    session.receiver_depth.set(depth);
     if !types.is_empty() {
         return types;
     }
@@ -2518,10 +2631,27 @@ fn java_receiver_types_for_java(
             // (#1569).
             let bindings =
                 java_bindings_before_scoped(session, file, source, root, object.start_byte());
-            if let Some(declared) = first_precise(&bindings, name) {
-                let types = java_receiver_types_of_spelling(
-                    analyzer, token, java, session, file, source, root, &declared,
-                );
+            if let Some(binding) = first_precise(&bindings, name) {
+                let types = match binding {
+                    JavaLocalType::Declared(declared) => java_receiver_types_of_spelling(
+                        analyzer, token, java, session, file, source, root, &declared,
+                    ),
+                    JavaLocalType::Initializer(initializer) => {
+                        debug_assert_eq!(&initializer.file, file);
+                        session
+                            .smallest_named_node_covering(
+                                root,
+                                initializer.start_byte,
+                                initializer.end_byte,
+                            )
+                            .map(|node| {
+                                java_receiver_types(
+                                    analyzer, token, session, file, source, root, node,
+                                )
+                            })
+                            .unwrap_or_default()
+                    }
+                };
                 if !types.is_empty() {
                     return types;
                 }
@@ -2562,9 +2692,16 @@ fn java_receiver_types_for_java(
             let binding = java_method_invocation_binding(
                 analyzer, token, session, file, source, root, object,
             );
-            let Some(method_unit) = binding.outcome.definitions.into_iter().next() else {
+            // Declaration selection supplies a return type, not runtime
+            // dispatch proof. An ambiguous origin cannot donate its first
+            // candidate's return type to a later exact member binding.
+            if binding.outcome.status != DefinitionLookupStatus::Resolved
+                || binding.outcome.definitions.len() != 1
+                || session.is_stopped()
+            {
                 return Vec::new();
-            };
+            }
+            let method_unit = &binding.outcome.definitions[0];
             let mut receiver = binding.receiver;
             if object.child_by_field_name("object").is_none() {
                 // An unqualified call reads the enclosing class. Its receiver is
@@ -2586,8 +2723,16 @@ fn java_receiver_types_for_java(
                 source,
                 root,
                 &receiver,
-                &method_unit,
+                method_unit,
             )
+        }
+        "parenthesized_expression" => {
+            let mut cursor = object.walk();
+            object
+                .named_children(&mut cursor)
+                .find(|child| !child.is_extra())
+                .map(|node| java_receiver_types(analyzer, token, session, file, source, root, node))
+                .unwrap_or_default()
         }
         "field_access" => {
             let Some(field_node) = object.child_by_field_name("field") else {
@@ -2662,7 +2807,11 @@ fn java_receiver_type_node<'tree>(
         "identifier" => {
             let bindings =
                 java_bindings_before_scoped(session, file, source, root, object.start_byte());
-            let declared = first_precise(&bindings, java_node_text(object, source))?;
+            let JavaLocalType::Declared(declared) =
+                first_precise(&bindings, java_node_text(object, source))?
+            else {
+                return None;
+            };
             session.smallest_named_node_covering(root, declared.start_byte, declared.end_byte)
         }
         _ => None,
@@ -3295,7 +3444,9 @@ fn java_type_of_identifier_before(
     before_byte: usize,
 ) -> Option<CodeUnit> {
     let bindings = java_bindings_before_scoped(session, file, source, root, before_byte);
-    let declared = first_precise(&bindings, name)?;
+    let JavaLocalType::Declared(declared) = first_precise(&bindings, name)? else {
+        return None;
+    };
     let type_node =
         session.smallest_named_node_covering(root, declared.start_byte, declared.end_byte)?;
     java_type_from_node_with_context(analyzer, token, java, session, file, source, type_node)
@@ -3315,7 +3466,7 @@ fn java_bindings_before_scoped(
     source: &str,
     root: Node<'_>,
     cutoff_start: usize,
-) -> LocalInferenceEngine<JavaTypeSpelling> {
+) -> LocalInferenceEngine<JavaLocalType> {
     java_bindings_before_scoped_inner(session, file, source, root, cutoff_start, true)
 }
 
@@ -3338,7 +3489,7 @@ fn java_bindings_before_scoped_inner(
     root: Node<'_>,
     cutoff_start: usize,
     include_fields: bool,
-) -> LocalInferenceEngine<JavaTypeSpelling> {
+) -> LocalInferenceEngine<JavaLocalType> {
     let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
     java_seed_active_path(
         session,
@@ -3360,7 +3511,7 @@ fn java_seed_active_path(
     node: Node<'_>,
     cutoff_start: usize,
     include_fields: bool,
-    bindings: &mut LocalInferenceEngine<JavaTypeSpelling>,
+    bindings: &mut LocalInferenceEngine<JavaLocalType>,
 ) {
     let root = node;
     let mut next = Some(root);
@@ -3401,7 +3552,7 @@ fn java_seed_scope_declarations(
     source: &str,
     node: Node<'_>,
     cutoff_start: usize,
-    bindings: &mut LocalInferenceEngine<JavaTypeSpelling>,
+    bindings: &mut LocalInferenceEngine<JavaLocalType>,
 ) {
     match node.kind() {
         "method_declaration" | "constructor_declaration" | "compact_constructor_declaration" => {
@@ -3460,7 +3611,7 @@ fn java_seed_inline_typed_binding(
     file: &ProjectFile,
     source: &str,
     node: Node<'_>,
-    bindings: &mut LocalInferenceEngine<JavaTypeSpelling>,
+    bindings: &mut LocalInferenceEngine<JavaLocalType>,
 ) {
     java_seed_inline_typed_binding_inner(session, file, source, node, true, bindings);
 }
@@ -3471,7 +3622,7 @@ fn java_seed_inline_typed_binding_inner(
     source: &str,
     node: Node<'_>,
     include_fields: bool,
-    bindings: &mut LocalInferenceEngine<JavaTypeSpelling>,
+    bindings: &mut LocalInferenceEngine<JavaLocalType>,
 ) {
     match node.kind() {
         "local_variable_declaration" | "field_declaration"
@@ -3492,8 +3643,19 @@ fn java_seed_inline_typed_binding_inner(
                     continue;
                 };
                 let binding_name = java_node_text(name, source);
-                match declared.as_ref() {
-                    Some(spelling) => bindings.seed_symbol(binding_name, spelling.clone()),
+                let inferred = node.kind() == "local_variable_declaration"
+                    && node.child_by_field_name("type").is_some_and(|ty| {
+                        ty.kind() == "type_identifier" && java_node_text(ty, source) == "var"
+                    });
+                let binding = if inferred {
+                    child
+                        .child_by_field_name("value")
+                        .map(|value| JavaLocalType::Initializer(JavaTypeSpelling::new(file, value)))
+                } else {
+                    declared.clone().map(JavaLocalType::Declared)
+                };
+                match binding {
+                    Some(binding) => bindings.seed_symbol(binding_name, binding),
                     None => bindings.declare_shadow(binding_name),
                 }
             }
@@ -3507,16 +3669,17 @@ fn java_seed_typed_name_binding(
     file: &ProjectFile,
     source: &str,
     node: Node<'_>,
-    bindings: &mut LocalInferenceEngine<JavaTypeSpelling>,
+    bindings: &mut LocalInferenceEngine<JavaLocalType>,
 ) {
     let Some(name) = node.child_by_field_name("name") else {
         return;
     };
     let binding_name = java_node_text(name, source);
     match node.child_by_field_name("type") {
-        Some(type_node) => {
-            bindings.seed_symbol(binding_name, JavaTypeSpelling::new(file, type_node))
-        }
+        Some(type_node) => bindings.seed_symbol(
+            binding_name,
+            JavaLocalType::Declared(JavaTypeSpelling::new(file, type_node)),
+        ),
         None => bindings.declare_shadow(binding_name),
     }
 }
@@ -4873,4 +5036,50 @@ fn java_node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
         .get(node.start_byte()..node.end_byte())
         .unwrap_or_default()
         .trim()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::inline_project::InlineTestProject;
+
+    #[test]
+    fn java_var_factory_return_resolves_member_like_explicit_type() {
+        for declared in ["var", "Store"] {
+            let source = format!(
+                "import api.Store; class App {{ void run() {{ {declared} store = Store.open(); store.put(1); }} }}"
+            );
+            let project = InlineTestProject::with_language(Language::Java)
+                .file("App.java", &source)
+                .file("api/Store.java", "package api; public final class Store { public static native Store open(); public native void put(int value); }")
+                .build();
+            let workspace = project.workspace_analyzer(crate::AnalyzerConfig::default());
+            let analyzer = workspace.analyzer();
+            let scope = AnalyzerQueryScope::new(analyzer);
+            let start = source.find("put(1)").expect("member call");
+            let outcomes = resolve_call_target_batch_with_source(
+                analyzer,
+                scope.token(),
+                vec![DefinitionLookupRequest {
+                    file: project.file("App.java"),
+                    line: None,
+                    column: None,
+                    start_byte: Some(start),
+                    end_byte: Some(start + 3),
+                }],
+                project.file("App.java"),
+                Arc::from(source),
+                None,
+            );
+            assert_eq!(outcomes.len(), 1);
+            let outcome = &outcomes[0].outcome;
+            assert_eq!(
+                outcome.status,
+                DefinitionLookupStatus::Resolved,
+                "{outcome:?}"
+            );
+            assert_eq!(outcome.definitions.len(), 1, "{outcome:?}");
+            assert_eq!(outcome.definitions[0].fq_name(), "api.Store.put");
+        }
+    }
 }

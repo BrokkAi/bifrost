@@ -43,7 +43,7 @@ pub(crate) fn symbol_tool_descriptors(render_line_numbers: bool) -> Vec<Value> {
         "scan_usages_by_reference"
     };
     let search_symbols_description = format!(
-        "Find classes, functions, methods, fields, modules, and other indexed declarations by name. Use this first for broad or partial symbol discovery, then pass fully qualified results to get_symbol_sources or {scan_tool_name}. Patterns that match too many symbols to rank return a too_many_matches count instead of results; re-run with more specific patterns."
+        "Find classes, functions, methods, fields, modules, and other indexed declarations by name. Use this first for broad or partial symbol discovery, then pass fully qualified results to get_symbol_sources or {scan_tool_name}. Patterns are case-insensitive regex; a pattern carrying `*`/`?` wildcards that is not valid as a regex (for example `*Name*`) is matched as a glob instead, and a pattern that is neither is reported under invalid_patterns without matching anything. Patterns that match too many symbols to rank return a too_many_matches count instead of results; re-run with more specific patterns."
     );
 
     let mut descriptors = vec![
@@ -60,7 +60,7 @@ pub(crate) fn symbol_tool_descriptors(render_line_numbers: bool) -> Vec<Value> {
                             "type": "string",
                             "maxLength": SEARCH_SYMBOL_MAX_PATTERN_BYTES
                         },
-                        "description": "Search patterns to match against indexed symbol names."
+                        "description": "Search patterns to match against indexed symbol names: case-insensitive regex, with `*`/`?` wildcard patterns that are not valid regex (for example `*Name*`) matched as globs."
                     },
                     "include_tests": {
                         "type": "boolean",

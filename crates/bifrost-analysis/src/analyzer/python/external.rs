@@ -167,6 +167,7 @@ impl DependencyPackAdapter for PythonDependencyPackAdapter {
                         relations: Vec::new(),
                     },
                     runtime_values: None,
+                    runtime_contracts: None,
                     collection_flows: None,
                     deferred_yields: None,
                     conditional_type_refinements: None,
@@ -289,7 +290,7 @@ impl PythonArtifactPackProducer {
             );
         };
         let mut diagnostics = BoundedProducerDiagnostics::new(limits);
-        let (mut types, mut members) = {
+        let (mut types, mut members, annotated_values) = {
             let mut collector = PythonApiCollector::new(
                 module,
                 artifact.path(),
@@ -299,8 +300,19 @@ impl PythonArtifactPackProducer {
                 &mut diagnostics,
             );
             collector.collect(tree.root_node(), cancellation);
-            (collector.types, collector.members)
+            (
+                collector.types,
+                collector.members,
+                collector.annotated_values,
+            )
         };
+        project_callable_object_values(
+            &annotated_values,
+            &types,
+            &mut members,
+            limits,
+            &mut diagnostics,
+        );
         dedup_declarations(&mut types, &mut members);
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             diagnostics.error(
@@ -347,6 +359,7 @@ impl PythonArtifactPackProducer {
                         relations: Vec::new(),
                     },
                     runtime_values: None,
+                    runtime_contracts: None,
                     collection_flows: None,
                     deferred_yields: None,
                     conditional_type_refinements: None,
@@ -465,6 +478,11 @@ impl PythonArtifactPackProducer {
             &mut diagnostics,
         );
         expand_explicit_reexports(&surfaces, &mut types);
+        let values = surfaces
+            .iter()
+            .flat_map(|surface| surface.annotated_values.iter().cloned())
+            .collect::<Vec<_>>();
+        project_callable_object_values(&values, &types, &mut members, limits, &mut diagnostics);
         dedup_declarations(&mut types, &mut members);
         resolve_hierarchy_references(&mut types);
         let (diagnostics, suppressed_diagnostics) = diagnostics.finish();
@@ -508,6 +526,7 @@ impl PythonArtifactPackProducer {
                         relations: Vec::new(),
                     },
                     runtime_values: None,
+                    runtime_contracts: None,
                     collection_flows: None,
                     deferred_yields: None,
                     conditional_type_refinements: None,
@@ -697,6 +716,9 @@ struct PythonApiCollector<'a, 'd> {
     unenumerable_owners: std::collections::HashSet<String>,
     /// What this module's `__all__` statements say it exports.
     exports: ModuleExports,
+    /// Every module-level annotated value this file declares, with the
+    /// qualified declaration its annotation resolves to.
+    annotated_values: Vec<ModuleAnnotatedValue>,
 }
 
 /// One `from m import *` a collected surface carries.
@@ -707,6 +729,21 @@ struct WildcardImport {
     target_module: Option<String>,
     /// The condition of the conditional block the wildcard sits in.
     guard: Option<DeclarationGuard>,
+}
+
+/// One module-level annotated value (`exit: _sitebuiltins.Quitter`), with the
+/// qualified declaration its annotation resolves to. A value whose class
+/// declares `__call__` is itself callable, so a production projects that
+/// signature onto the value's name (#3135). The target stays out of the
+/// hierarchy bindings: the value names an instance of the class, not the
+/// class, so it must never become a type alias.
+#[derive(Debug, Clone)]
+struct ModuleAnnotatedValue {
+    owner: String,
+    name: String,
+    target: Option<String>,
+    guard: Option<DeclarationGuard>,
+    locator_path: String,
 }
 
 /// What a module states about the names `from <module> import *` binds.
@@ -808,6 +845,7 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
             wildcard_imports: Vec::new(),
             unenumerable_owners: std::collections::HashSet::new(),
             exports: ModuleExports::PublicNames,
+            annotated_values: Vec::new(),
         };
         collector.push_type(
             module.to_owned(),
@@ -1109,6 +1147,17 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
             self.record_module_exports(assignment);
         }
         self.record_hierarchy_binding(owner, &name, None, guard, false);
+        if !class_scope && let Some(annotation) = assignment.child_by_field_name("type") {
+            self.annotated_values.push(ModuleAnnotatedValue {
+                owner: owner.to_owned(),
+                name: name.clone(),
+                target: self
+                    .resolved_hierarchy_binding(annotation, owner, guard)
+                    .and_then(|binding| binding.target),
+                guard: self.guard_of(guard).cloned(),
+                locator_path: self.locator_path.clone(),
+            });
+        }
         if assignment
             .child_by_field_name("type")
             .or_else(|| {
@@ -1433,6 +1482,7 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
             exports: self.exports.clone(),
             wildcards: self.wildcard_imports.clone(),
             opaque: self.unenumerable_owners.contains(self.module),
+            annotated_values: self.annotated_values.clone(),
         }
     }
 
@@ -1640,6 +1690,9 @@ struct CollectedModuleSurface {
     wildcards: Vec<WildcardImport>,
     /// True when this surface binds names no expansion can enumerate.
     opaque: bool,
+    /// The module-level annotated values this surface declares, carried for
+    /// the callable-object projection (#3135).
+    annotated_values: Vec<ModuleAnnotatedValue>,
 }
 
 /// One module-level name a surface binds.
@@ -1997,6 +2050,92 @@ fn conjoined_guard(
         (Some(left), Some(right)) => Some(left.and(&right)),
         (Some(guard), None) | (None, Some(guard)) => Some(guard),
         (None, None) => None,
+    }
+}
+
+/// Publish the callable each module-level annotated value inherits from its
+/// class (#3135).
+///
+/// Python calls values, not just functions: `builtins.exit` binds a
+/// `_sitebuiltins.Quitter` instance, and `exit(0)` invokes the class's
+/// `__call__`. When the value's annotation resolves to a class this
+/// production declares and that class declares `__call__`, the value's name
+/// contributes the `__call__` signature as a module-level callable, with the
+/// receiver parameter dropped. An annotation that names no collected class,
+/// a class without a declared `__call__`, and a non-static `__call__` with
+/// no receiver parameter to drop, all keep the conservative constant-only
+/// surface.
+fn project_callable_object_values(
+    values: &[ModuleAnnotatedValue],
+    types: &[TypeFact],
+    members: &mut Vec<MemberFact>,
+    limits: &ArtifactProducerLimits,
+    diagnostics: &mut BoundedProducerDiagnostics,
+) {
+    let mut calls = std::collections::HashMap::<String, Vec<usize>>::new();
+    for (index, member) in members.iter().enumerate() {
+        if member.name == "__call__"
+            && member.member_kind == MemberKind::Method
+            && member.signature.is_some()
+        {
+            calls.entry(member.owner.clone()).or_default().push(index);
+        }
+    }
+    for value in values {
+        let Some(target) = &value.target else {
+            continue;
+        };
+        let Some(class) = types.iter().find(|fact| {
+            fact.type_kind == TypeKind::Class && fact.name.as_str() == target.as_str()
+        }) else {
+            continue;
+        };
+        let Some(candidates) = calls.get(class.id.as_str()) else {
+            continue;
+        };
+        for &index in candidates {
+            let call = &members[index];
+            let signature = call
+                .signature
+                .as_ref()
+                .expect("the call lookup retains only members with signatures");
+            let projected_parameters = if call.is_static {
+                signature.parameters.as_slice()
+            } else {
+                match signature.parameters.split_first() {
+                    Some((_, rest)) => rest,
+                    // A non-static `__call__` without a receiver parameter
+                    // declares no callable shape this projection can name.
+                    None => continue,
+                }
+            };
+            let projected = Signature {
+                type_parameters: signature.type_parameters.clone(),
+                parameters: projected_parameters.to_vec(),
+                returns: signature.returns.clone(),
+            };
+            let guard = conjoined_guard(value.guard.clone(), call.guard.clone());
+            if types.len().saturating_add(members.len()) >= limits.max_records {
+                diagnostics.error(
+                    "limit.records",
+                    None,
+                    format!(
+                        "Python callable-object projection exceeds declaration limit {}",
+                        limits.max_records
+                    ),
+                );
+                return;
+            }
+            members.push(member_fact(
+                &value.owner,
+                &value.name,
+                MemberKind::Function,
+                false,
+                Some(projected),
+                &value.locator_path,
+                guard,
+            ));
+        }
     }
 }
 
@@ -4324,6 +4463,218 @@ setup(name=\"fixture\", packages=[\"fixture\"], python_requires=\">=3.11\")
         assert!(
             type_aliases(types, "pkg.case.TestCase").is_empty(),
             "the final target binding, not the stale class declaration, controls export identity"
+        );
+    }
+
+    #[test]
+    fn a_module_value_of_a_callable_class_projects_the_call_signature() {
+        let production = produce_stub_set(&[
+            (
+                "_sitebuiltins.pyi",
+                "import sys\n\
+                 from typing_extensions import Never\n\
+                 \n\
+                 class Quitter:\n\
+                 \x20   name: str\n\
+                 \x20   eof: str\n\
+                 \x20   def __init__(self, name: str, eof: str) -> None: ...\n\
+                 \x20   def __call__(self, code: sys._ExitCode = None) -> Never: ...\n",
+            ),
+            (
+                "builtins.pyi",
+                "import _sitebuiltins\n\
+                 \n\
+                 class object: ...\n\
+                 \n\
+                 exit: _sitebuiltins.Quitter\n",
+            ),
+        ]);
+        assert!(
+            production.diagnostics.is_empty(),
+            "{:#?}",
+            production.diagnostics
+        );
+        let (types, members) = declaration_facts(&production);
+        let builtins = type_declaration_id(TypeIdentity {
+            ecosystem: "python",
+            name: "builtins",
+        });
+        let projected = members
+            .iter()
+            .find(|member| {
+                member.owner == builtins
+                    && member.name == "exit"
+                    && member.member_kind == MemberKind::Function
+            })
+            .unwrap_or_else(|| {
+                panic!("the module value projects its class's __call__: {members:#?}")
+            });
+        let signature = projected
+            .signature
+            .as_ref()
+            .expect("the projected callable carries the __call__ signature");
+        assert_eq!(signature.parameters.len(), 1, "{signature:#?}");
+        assert_eq!(signature.parameters[0].name.as_deref(), Some("code"));
+        assert!(signature.parameters[0].optional, "{signature:#?}");
+        assert!(
+            matches!(
+                &signature.returns,
+                Some(TypeRef::Named { name, arguments, nullable: false })
+                    if name == "typing.Never" && arguments.is_empty()
+            ),
+            "{signature:#?}"
+        );
+        // The value names an instance of the class, not the class, so the
+        // binding never becomes a type alias.
+        assert!(type_aliases(types, "_sitebuiltins.Quitter").is_empty());
+    }
+
+    #[test]
+    fn a_receiverless_nonstatic_call_is_never_projected() {
+        let production = produce_stub_set(&[
+            (
+                "site.pyi",
+                "class Opaque:\n    def __call__() -> int: ...\n",
+            ),
+            ("app.pyi", "import site\n\nvalue: site.Opaque\n"),
+        ]);
+        let (_, members) = declaration_facts(&production);
+        let app = type_declaration_id(TypeIdentity {
+            ecosystem: "python",
+            name: "app",
+        });
+        assert!(
+            members
+                .iter()
+                .all(|member| member.owner != app || member.member_kind != MemberKind::Function),
+            "a nonstatic __call__ without a receiver parameter projects nothing: {members:#?}"
+        );
+    }
+
+    #[test]
+    fn an_unprojectable_value_annotation_keeps_the_constant_surface() {
+        let production = produce_stub_set(&[
+            (
+                "_sitebuiltins.pyi",
+                "class Quitter:\n    def __call__(self, code: int = 0) -> bool: ...\n",
+            ),
+            (
+                "builtins.pyi",
+                "import _sitebuiltins\n\
+                 from absent import Missing\n\
+                 \n\
+                 class Holder:\n\
+                 \x20   kept: _sitebuiltins.Quitter\n\
+                 \n\
+                 absent_class: _sitebuiltins.Absent\n\
+                 external: Missing\n\
+                 maybe: _sitebuiltins.Quitter | None\n",
+            ),
+        ]);
+        assert!(
+            production.diagnostics.is_empty(),
+            "{:#?}",
+            production.diagnostics
+        );
+        let (_, members) = declaration_facts(&production);
+        let builtins = type_declaration_id(TypeIdentity {
+            ecosystem: "python",
+            name: "builtins",
+        });
+        assert!(
+            members.iter().all(
+                |member| member.owner != builtins || member.member_kind != MemberKind::Function
+            ),
+            "an absent class, an unresolved name, and a union annotation project nothing: {members:#?}"
+        );
+        // A class-scope annotated attribute would need a receiver to call, so
+        // the projection stays a module-surface rule.
+        let holder = type_declaration_id(TypeIdentity {
+            ecosystem: "python",
+            name: "builtins.Holder",
+        });
+        assert!(
+            members
+                .iter()
+                .all(|member| member.owner != holder || member.member_kind != MemberKind::Function),
+            "{members:#?}"
+        );
+    }
+
+    #[test]
+    fn a_single_artifact_projects_its_own_callable_module_values() {
+        let fixture = tempdir().unwrap();
+        let path = fixture.path().join("single.pyi");
+        std::fs::write(
+            &path,
+            "from typing_extensions import Never\n\
+             \n\
+             class Quitter:\n\
+             \x20   def __call__(self, code: int = 0) -> Never: ...\n\
+             \n\
+             exit: Quitter\n",
+        )
+        .unwrap();
+        let production = PythonArtifactPackProducer.produce(
+            &ArtifactProductionRequest {
+                path: path.clone(),
+                artifact_kind: ExternalArtifactKind::PythonStub,
+                pack_id: "python-single-fixture".to_owned(),
+                pack_version: "1.0.0".to_owned(),
+                ecosystem: "python".to_owned(),
+                compatibility: Compatibility {
+                    bifrost: format!("={}", env!("CARGO_PKG_VERSION")),
+                    toolchains: Vec::new(),
+                },
+                activation: vec![ActivationSelector {
+                    package: None,
+                    module: None,
+                    toolchain: None,
+                    targets: Vec::new(),
+                    configurations: Vec::new(),
+                    artifact_sha256: None,
+                }],
+                provenance: Provenance {
+                    source: "fixture".to_owned(),
+                    revision: None,
+                },
+                license: "Apache-2.0".to_owned(),
+                safety: Safety {
+                    generated_code_only: false,
+                    review_required: false,
+                },
+            },
+            &ArtifactProducerLimits::default(),
+            None,
+        );
+        assert!(
+            production.diagnostics.is_empty(),
+            "{:#?}",
+            production.diagnostics
+        );
+        let (_, members) = declaration_facts(&production);
+        let single = type_declaration_id(TypeIdentity {
+            ecosystem: "python",
+            name: "single",
+        });
+        let projected = members
+            .iter()
+            .find(|member| {
+                member.owner == single
+                    && member.name == "exit"
+                    && member.member_kind == MemberKind::Function
+            })
+            .unwrap_or_else(|| {
+                panic!("the same-file value projects its class's __call__: {members:#?}")
+            });
+        let signature = projected.signature.as_ref().unwrap();
+        assert_eq!(signature.parameters.len(), 1, "{signature:#?}");
+        assert!(
+            matches!(
+                &signature.returns,
+                Some(TypeRef::Named { name, .. }) if name == "typing.Never"
+            ),
+            "{signature:#?}"
         );
     }
 

@@ -665,12 +665,10 @@ impl LanguageSupport for JavascriptSupport {
         true
     }
 
-    /// `.jsx` parses under the TSX grammar. tree-sitter-javascript's
-    /// `_jsx_attribute_name` admits only `identifier`/`jsx_identifier`, so a
-    /// reserved word as an attribute name (`class=`, `for=`, `in=`) leaves the
-    /// rest of the enclosing expression as `ERROR` and `regex_pattern` soup and
-    /// every declaration and usage below it is lost; the TSX grammar has no
-    /// reserved words in that position (#3322).
+    /// `.jsx` retains the TSX grammar and distinct storage identity introduced
+    /// by #3322. Standard `.js` uses Brokk's JavaScript grammar, whose #3342
+    /// repair admits reserved words in JSX name positions without importing
+    /// TSX's ordinary-JavaScript grammar differences.
     fn parser_language(&self, flavor: ParserFlavor) -> tree_sitter::Language {
         match flavor {
             ParserFlavor::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),

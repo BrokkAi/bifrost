@@ -7,8 +7,8 @@ mod heap;
 mod runtime_values;
 mod source;
 pub use runtime_values::{
-    RuntimeAccessKey, RuntimeKeyedReadEndpoint, RuntimeKeyedReadFilter, RuntimeKeyedReadResult,
-    RuntimeReadLimitation, RuntimeReadSourceOrigin,
+    RuntimeAccessKey, RuntimeKeyedReadEndpoint, RuntimeKeyedReadFilter, RuntimeKeyedReadKeyKind,
+    RuntimeKeyedReadResult, RuntimeReadLimitation, RuntimeReadSourceOrigin,
 };
 mod value_flow;
 

@@ -10,6 +10,7 @@ use crate::analyzer::usages::receiver_query::ReceiverQueryOperation;
 use brokk_bifrost_rql::QueryValueKind;
 
 mod configuration;
+mod coverage;
 mod diagnostics;
 mod environment;
 mod provenance;
@@ -20,6 +21,7 @@ mod sites;
 mod topology;
 
 pub use configuration::*;
+pub use coverage::*;
 pub use diagnostics::*;
 pub use environment::*;
 pub use provenance::*;

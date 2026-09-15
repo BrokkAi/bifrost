@@ -772,6 +772,7 @@ impl PackIdentity {
                 activation: vec![self.activation.clone()],
                 payload: AuthoredPayload::ProcedureSummaries { summaries },
                 runtime_values: None,
+                runtime_contracts: None,
                 collection_flows: None,
                 deferred_yields: None,
                 conditional_type_refinements: None,

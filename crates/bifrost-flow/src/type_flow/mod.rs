@@ -41,5 +41,6 @@ pub use solve::{
     RootIncompleteEvidence, SemanticExhaustionStage, TypeFlowError,
     TypeFlowRootPersistenceRejection, TypeFlowRootPersistenceStatus, TypeFlowRootResult,
     TypeFlowSolveAttempt, TypeFlowSolvePhase, solve_type_flow_for_root,
+    solve_type_flow_for_root_with_refinements,
 };
 pub use summary::{TypeFlowSummaryProfile, TypeFlowSummaryState};

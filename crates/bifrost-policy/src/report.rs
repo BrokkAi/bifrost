@@ -25,18 +25,22 @@ use super::finding::{
 use super::finding_identity::{FindingIdentityStability, PolicyFindingId};
 // The reuse review is a report section, so it is re-exported here beside the
 // other reviews; it lives with the units it describes.
-use super::identity::{EndpointAnalysisProjectionHash, EndpointSemanticHash, PolicySemanticHash};
+use super::identity::{
+    EndpointAnalysisProjectionHash, EndpointSemanticHash, EndpointSetSemanticHash,
+    PolicySemanticHash,
+};
 use super::resolved::{
     EndpointDefinitionSchemaResolution, EndpointOrigin, LoadedPolicy, PolicyPrecedenceManifest,
     ResolvedCatalogIdentity, ResolvedEndpointDependency, ResolvedEndpointIdentity,
     ResolvedEndpointManifestEntry, ResolvedEndpointModel, ResolvedEndpointSelectorSchemas,
-    ResolvedMatchDirectoryManifest, ResolvedPrecedenceEdge,
+    ResolvedEndpointSetDependency, ResolvedMatchDirectoryManifest, ResolvedPrecedenceEdge,
 };
 use super::retained::{RetainedSize, retained_extra, retained_vec_size_from_parts};
 use super::scope::{PolicyScopeReview, compare_scope_reviews};
 use super::source::{PolicySourceIdentity, PolicySourceRelatedDiagnostic};
 use super::suppression::{PolicyReportEvaluationContext, PolicySuppressionReview};
 pub use super::units::{PolicyIncrementalReview, PolicyIncrementalRun};
+use crate::is_false;
 
 const MAX_REPORT_TEXT_BYTES: usize = 4_096;
 const MAX_REPORT_RELATED_DIAGNOSTICS: usize = 64;
@@ -80,6 +84,7 @@ pub struct PolicyRuleDescriptor {
     selector_schemas: Vec<SelectorSchemaVersionResolution>,
     endpoint_dependencies: Vec<ResolvedEndpointDependency>,
     match_directory_manifests: Vec<ResolvedMatchDirectoryManifest>,
+    endpoint_set_dependencies: Vec<ResolvedEndpointSetDependency>,
     precedence_manifest: PolicyPrecedenceManifest,
     name: String,
     message: PolicyMessageSpec,
@@ -111,6 +116,10 @@ impl PolicyRuleDescriptor {
         match_directory_manifests.sort_by(|left, right| left.path().cmp(right.path()));
         tighten_vec(&mut match_directory_manifests);
 
+        let mut endpoint_set_dependencies = policy.endpoint_set_dependencies().to_vec();
+        endpoint_set_dependencies.sort_by(|left, right| left.source().cmp(right.source()));
+        tighten_vec(&mut endpoint_set_dependencies);
+
         let mut tags = metadata.tags.clone();
         tags.sort();
         tags.dedup();
@@ -125,6 +134,7 @@ impl PolicyRuleDescriptor {
             selector_schemas,
             endpoint_dependencies,
             match_directory_manifests,
+            endpoint_set_dependencies,
             precedence_manifest: policy.precedence_manifest().clone(),
             name: tight_string(metadata.name.clone()),
             message: metadata.message.clone(),
@@ -163,6 +173,10 @@ impl PolicyRuleDescriptor {
         &self.match_directory_manifests
     }
 
+    pub fn endpoint_set_dependencies(&self) -> &[ResolvedEndpointSetDependency] {
+        &self.endpoint_set_dependencies
+    }
+
     pub const fn precedence_manifest(&self) -> &PolicyPrecedenceManifest {
         &self.precedence_manifest
     }
@@ -199,6 +213,7 @@ impl RetainedSize for PolicyRuleDescriptor {
             .saturating_add(retained_extra(&self.selector_schemas))
             .saturating_add(retained_extra(&self.endpoint_dependencies))
             .saturating_add(retained_extra(&self.match_directory_manifests))
+            .saturating_add(retained_extra(&self.endpoint_set_dependencies))
             .saturating_add(retained_extra(&self.precedence_manifest))
             .saturating_add(self.name.capacity())
             .saturating_add(retained_extra(&self.message))
@@ -226,7 +241,7 @@ impl Serialize for PolicyRuleDescriptor {
     where
         S: Serializer,
     {
-        let mut state = serializer.serialize_struct("PolicyRuleDescriptor", 14)?;
+        let mut state = serializer.serialize_struct("PolicyRuleDescriptor", 15)?;
         state.serialize_field("policy_id", &self.policy_id)?;
         state.serialize_field("policy_hash", &self.policy_hash)?;
         state.serialize_field("analysis_type", &self.analysis_type)?;
@@ -239,6 +254,10 @@ impl Serialize for PolicyRuleDescriptor {
         state.serialize_field(
             "match_directory_manifests",
             &MatchDirectoryManifestsWire(&self.match_directory_manifests),
+        )?;
+        state.serialize_field(
+            "endpoint_set_dependencies",
+            &EndpointSetDependenciesWire(&self.endpoint_set_dependencies),
         )?;
         state.serialize_field(
             "precedence_manifest",
@@ -641,11 +660,63 @@ impl Serialize for EndpointOriginWire<'_> {
                 state.serialize_field("source", source)?;
                 state.end()
             }
+            EndpointOrigin::EndpointSetFile { path, source } => {
+                let mut state = serializer.serialize_struct("EndpointOrigin", 3)?;
+                state.serialize_field("type", "endpoint_set_file")?;
+                state.serialize_field("path", path.as_str())?;
+                state.serialize_field("source", source)?;
+                state.end()
+            }
         }
     }
 }
 
 struct MatchDirectoryManifestsWire<'a>(&'a [ResolvedMatchDirectoryManifest]);
+
+struct EndpointSetDependenciesWire<'a>(&'a [ResolvedEndpointSetDependency]);
+
+impl Serialize for EndpointSetDependenciesWire<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for dependency in self.0 {
+            sequence.serialize_element(&EndpointSetDependencyWire(dependency))?;
+        }
+        sequence.end()
+    }
+}
+
+struct EndpointSetDependencyWire<'a>(&'a ResolvedEndpointSetDependency);
+
+impl Serialize for EndpointSetDependencyWire<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer.serialize_struct("ResolvedEndpointSetDependency", 3)?;
+        state.serialize_field("source", self.0.source())?;
+        state.serialize_field("semantic_hash", &DisplayWire(self.0.semantic_hash()))?;
+        state.serialize_field("entries", &DependencyPathsWire(self.0.entries()))?;
+        state.end()
+    }
+}
+
+struct DependencyPathsWire<'a>(&'a [super::resolved::PolicyDependencyPath]);
+
+impl Serialize for DependencyPathsWire<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for path in self.0 {
+            sequence.serialize_element(path.as_str())?;
+        }
+        sequence.end()
+    }
+}
 
 impl Serialize for MatchDirectoryManifestsWire<'_> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
@@ -1292,7 +1363,9 @@ impl RetainedSize for EndpointOrigin {
         size_of::<Self>().saturating_add(match self {
             Self::PolicyLocal { path } => retained_extra(path),
             Self::Catalog { catalog } => retained_extra(catalog),
-            Self::ExactMatch { path, source } | Self::MatchDirectory { path, source } => {
+            Self::ExactMatch { path, source }
+            | Self::MatchDirectory { path, source }
+            | Self::EndpointSetFile { path, source } => {
                 retained_extra(path).saturating_add(retained_extra(source))
             }
         })
@@ -1308,6 +1381,16 @@ impl RetainedSize for ResolvedEndpointDependency {
             .saturating_add(retained_extra(self.selector_path()))
             .saturating_add(retained_extra(self.model()))
             .saturating_add(origins_extra)
+    }
+}
+
+impl RetainedSize for ResolvedEndpointSetDependency {
+    fn retained_size(&self) -> usize {
+        let entries_extra = retained_vec_size_from_parts(self.entries(), self.entries_capacity())
+            .saturating_sub(size_of::<Vec<super::resolved::PolicyDependencyPath>>());
+        size_of::<Self>()
+            .saturating_add(retained_extra(self.source()))
+            .saturating_add(entries_extra)
     }
 }
 
@@ -1384,6 +1467,7 @@ fixed_report_type_retained_size!(
     EndpointDefinitionSchemaResolution,
     EndpointSemanticHash,
     EndpointAnalysisProjectionHash,
+    EndpointSetSemanticHash,
     MatchSetManifestHash,
     TaintCatalogHash,
     EndpointRole,
@@ -1856,10 +1940,6 @@ impl RetainedSize for PolicyPackProcedureSummaryEvidence {
             .saturating_add(self.summary_id.capacity())
             .saturating_add(self.symbol.capacity())
     }
-}
-
-fn is_false(value: &bool) -> bool {
-    !*value
 }
 
 /// One pack-activation decision retained for attribution.
@@ -3884,6 +3964,7 @@ mod tests {
             source.as_bytes(),
             schema_resolution,
             vec![selector],
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             Vec::new(),

@@ -60,31 +60,14 @@
                 (rql
                   :schema-version 1
                   (language java
-                    (call-argument :formal-name "sql"
+                    (call-argument :formal-index 0
                       (resolved-call
                         :resolves-to member.statement.execute
                         :proof declared
                         (call-bindings
                           (call-shape
                             (call :callee (name "execute") (arity 1))))))))
-              :dangerous-operand (argument :name "sql")
-              :accepts [attacker-controlled])
-            (sink
-              :id generated-jdbc-statement-execute-sql
-              :display-name "Generated Statement.execute(String) SQL"
-              :categories [sql.structure]
-              :selector
-                (rql
-                  :schema-version 1
-                  (language java
-                    (call-argument :formal-name "sql"
-                      (resolved-call
-                        :resolves-to member.3032e0ed03b524a17379a2e259a980dc81d1f8e4f881a88921b0434637d1f982
-                        :proof declared
-                        (call-bindings
-                          (call-shape
-                            (call :callee (name "execute") (arity 1))))))))
-              :dangerous-operand (argument :name "sql")
+              :dangerous-operand (argument :index 0)
               :accepts [attacker-controlled])])
       :external-models
         (endpoint-set
@@ -136,25 +119,6 @@
                     (call-argument :formal-name "sql"
                       (resolved-call
                         :resolves-to member.statement.execute
-                        :proof declared
-                        (call-bindings
-                          (call-shape
-                            (call :callee (name "execute") (arity 1))))))))
-              :transfers [
-                (transfer
-                  :from receiver
-                  :to receiver
-                  :labels [attacker-controlled]
-                  :effect propagate)])
-            (external-model
-              :id generated-jdbc-statement-execute-sql-call
-              :selector
-                (rql
-                  :schema-version 1
-                  (language java
-                    (call-argument :formal-name "sql"
-                      (resolved-call
-                        :resolves-to member.3032e0ed03b524a17379a2e259a980dc81d1f8e4f881a88921b0434637d1f982
                         :proof declared
                         (call-bindings
                           (call-shape

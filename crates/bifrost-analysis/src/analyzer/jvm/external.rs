@@ -572,7 +572,24 @@ fn discover_jdk_semantic_pack_dependencies(
         let source = [home.join("lib").join("src.zip"), home.join("src.zip")]
             .into_iter()
             .find(|path| path.is_file());
-        let dependency = if let Some(source) = source {
+        let dependency = if !configured {
+            match discover_jdk_jmods(&home) {
+                Ok(Some(relative_paths)) => {
+                    resolved_jdk_jmod_dependency(version.clone(), home, relative_paths)
+                }
+                Ok(None) => resolved_jdk_dependency(version.clone(), source),
+                Err(message) => {
+                    discovery.diagnostics.push(DependencyPackDiagnostic {
+                        severity: DependencyPackDiagnosticSeverity::Warning,
+                        code: "jdk.jmods.invalid".to_owned(),
+                        dependency_id: Some(format!("jdk:{version}")),
+                        location: Some(home.to_string_lossy().into_owned()),
+                        message,
+                    });
+                    resolved_jdk_dependency(version.clone(), source)
+                }
+            }
+        } else if let Some(source) = source {
             let mut dependency = resolved_jdk_dependency(version.clone(), Some(source));
             match discover_jdk_jmods(&home) {
                 Ok(Some(relative_paths)) => {
@@ -599,7 +616,7 @@ fn discover_jdk_semantic_pack_dependencies(
                 }),
             }
             dependency
-        } else if configured {
+        } else {
             match discover_jdk_jmods(&home) {
                 Ok(Some(relative_paths)) => {
                     resolved_jdk_jmod_dependency(version.clone(), home, relative_paths)
@@ -620,12 +637,6 @@ fn discover_jdk_semantic_pack_dependencies(
                     resolved_jdk_dependency(version.clone(), None)
                 }
             }
-        } else {
-            // Automatic JAVA_HOME discovery without sources supplies exact
-            // toolchain evidence for a compatible released pack. Local JMOD
-            // production remains unavailable here because it could not retain
-            // source formal names needed for exact actual-to-formal binding.
-            resolved_jdk_dependency(version.clone(), None)
         };
         match dependency_by_version.entry(version) {
             std::collections::hash_map::Entry::Vacant(entry) => {
@@ -1327,6 +1338,7 @@ fn merge_java_dependency_packs(
             activation,
             payload,
             runtime_values,
+            runtime_contracts,
             collection_flows,
             deferred_yields,
             conditional_type_refinements,
@@ -1344,6 +1356,7 @@ fn merge_java_dependency_packs(
                         activation,
                         payload,
                         runtime_values,
+                        runtime_contracts,
                         collection_flows,
                         deferred_yields,
                         conditional_type_refinements,
@@ -1352,6 +1365,10 @@ fn merge_java_dependency_packs(
                 continue;
             }
         };
+        assert!(
+            runtime_contracts.is_none(),
+            "JVM declaration extraction cannot produce portable runtime contracts"
+        );
         let target_shard_index = pack
             .shards
             .iter()
@@ -1367,6 +1384,7 @@ fn merge_java_dependency_packs(
                         relations: Vec::new(),
                     },
                     runtime_values: None,
+                    runtime_contracts: None,
                     collection_flows: None,
                     deferred_yields: None,
                     conditional_type_refinements: None,
@@ -4341,7 +4359,7 @@ mod tests {
     }
 
     #[test]
-    fn automatic_java_home_with_only_jmods_uses_prebuilt_selection() {
+    fn automatic_java_home_with_only_jmods_produces_exact_binary_evidence() {
         let root = tempfile::tempdir().unwrap();
         let home = root.path().join("portable-jdk-home");
         fs::create_dir_all(home.join("jmods")).unwrap();
@@ -4357,7 +4375,15 @@ mod tests {
 
         assert!(discovered.diagnostics.is_empty());
         assert_eq!(discovered.dependencies.len(), 1);
-        assert!(discovered.dependencies[0].artifacts.is_empty());
+        assert_eq!(discovered.dependencies[0].artifacts.len(), 1);
+        assert_eq!(
+            discovered.dependencies[0].artifacts[0].kind,
+            ExternalArtifactKind::JdkJmodSet
+        );
+        assert_eq!(
+            discovered.dependencies[0].artifacts[0].path(),
+            fs::canonicalize(&home).unwrap()
+        );
         assert_eq!(
             discovered.dependencies[0]
                 .evidence
@@ -4365,6 +4391,31 @@ mod tests {
                 .as_ref()
                 .and_then(|coordinate| coordinate.version.as_ref()),
             Some(&Version::parse("21.0.8").unwrap())
+        );
+    }
+
+    #[test]
+    fn automatic_java_home_prefers_bounded_jmod_evidence() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("portable-jdk-home");
+        fs::create_dir_all(home.join("lib")).unwrap();
+        fs::create_dir_all(home.join("jmods")).unwrap();
+        fs::write(home.join("release"), "JAVA_VERSION=\"21.0.8\"\n").unwrap();
+        fs::write(home.join("lib/src.zip"), b"candidate source names").unwrap();
+        fs::write(home.join("jmods/java.base.jmod"), b"exact binary input").unwrap();
+
+        let discovered = discover_jdk_semantic_pack_dependencies(
+            &JvmAnalyzerConfig::default(),
+            root.path(),
+            Some(home.as_os_str().to_owned()),
+        );
+
+        assert!(discovered.diagnostics.is_empty());
+        assert_eq!(discovered.dependencies.len(), 1);
+        assert_eq!(discovered.dependencies[0].artifacts.len(), 1);
+        assert_eq!(
+            discovered.dependencies[0].artifacts[0].kind,
+            ExternalArtifactKind::JdkJmodSet
         );
     }
 
@@ -4739,6 +4790,7 @@ mod tests {
                         relations: Vec::new(),
                     },
                     runtime_values: None,
+                    runtime_contracts: None,
                     collection_flows: None,
                     deferred_yields: None,
                     conditional_type_refinements: None,

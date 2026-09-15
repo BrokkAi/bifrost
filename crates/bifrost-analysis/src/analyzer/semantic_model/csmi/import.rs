@@ -23,11 +23,12 @@ use crate::analyzer::semantic_model::{
     CppSpecialMemberOperation, CppSymbolDescriptor, CppTypeAliasEvidence, CppTypeQualifier,
     ImplicitOperation, KeyedReadBehavior, KeyedReadObservation, Locator, MemberFact, MemberKind,
     NameSelector, Parameter, ParameterPassingMode, Producer, Provenance, ReceiverFact,
-    RuntimeGlobalBindingEvidence, RuntimeGlobalExposure, RuntimeValueExtension,
-    RuntimeValuesPayload, Safety, Signature, SummaryMoveInvalidation, SummaryValuePreservation,
-    SummaryValueTransfer, SummaryValueTransferKind, SummaryValueTransferLimitation,
-    SummaryValueTransferLimitationKind, SummaryValueTransferOperation, TypeCopySemantics, TypeFact,
-    TypeKind, TypeMoveSemantics, TypeRef, TypeValueSemantics, Visibility, compile_pack,
+    RuntimeContractsPayload, RuntimeGlobalBindingEvidence, RuntimeGlobalExposure,
+    RuntimeValueExtension, RuntimeValuesPayload, Safety, Signature, SummaryMoveInvalidation,
+    SummaryValuePreservation, SummaryValueTransfer, SummaryValueTransferKind,
+    SummaryValueTransferLimitation, SummaryValueTransferLimitationKind,
+    SummaryValueTransferOperation, TypeCopySemantics, TypeFact, TypeKind, TypeMoveSemantics,
+    TypeRef, TypeValueSemantics, Visibility, compile_pack,
 };
 use serde_json::Value;
 use std::collections::{BTreeSet, HashMap};
@@ -235,11 +236,14 @@ fn import_semantic_document(
         }
     };
     let runtime_values = import_runtime_values(model, document.default_provenance.as_deref())?;
+    let runtime_contracts =
+        import_runtime_contracts(model, document, document.default_provenance.as_deref())?;
     let collection_flows = import_collection_flows(model, document.default_provenance.as_deref())?;
     let has_declaration_identity = !model.symbols.is_empty()
         || !model.declarations.is_empty()
         || !model.procedure_summaries.is_empty();
-    let runtime_only = runtime_values.is_some() && !has_declaration_identity;
+    let runtime_only =
+        (runtime_values.is_some() || runtime_contracts.is_some()) && !has_declaration_identity;
     let cpp_identity = !runtime_only
         && !model.symbols.is_empty()
         && model.symbols.iter().all(|symbol| {
@@ -281,7 +285,13 @@ fn import_semantic_document(
     let selectors = model
         .artifact_selectors
         .iter()
-        .map(|selector| selector_from_csmi(selector, &runtime_profile_digests))
+        .map(|selector| {
+            selector_from_csmi(
+                selector,
+                &runtime_profile_digests,
+                runtime_contracts.is_some(),
+            )
+        })
         .collect::<Result<Vec<_>, _>>()?;
     let cpp_native_ids = if cpp_identity {
         model
@@ -619,10 +629,31 @@ fn import_semantic_document(
             member.implicit_operation = Some(operation);
         }
     }
-    let runtime_identity = runtime_values
+    let runtime_values_identity = runtime_values
         .as_ref()
         .map(|payload| runtime_pack_identity(payload, requested_language))
         .transpose()?;
+    let runtime_contracts_identity = runtime_contracts
+        .as_ref()
+        .map(|carrier| runtime_contract_pack_identity(&carrier.payload, requested_language))
+        .transpose()?;
+    let runtime_identity = match (
+        runtime_values_identity.as_ref(),
+        runtime_contracts_identity.as_ref(),
+    ) {
+        (Some(values), Some(contracts)) if values != contracts => {
+            return Err(CsmiImportError::Unsupported {
+                path: "semanticModels[0].extensionFacts".to_owned(),
+                semantic: format!(
+                    "runtime values resolve to {}/{} but runtime contracts resolve to {}/{}",
+                    values.0, values.1, contracts.0, contracts.1
+                ),
+            });
+        }
+        (Some(values), _) => Some(values.clone()),
+        (_, Some(contracts)) => Some(contracts.clone()),
+        (None, None) => None,
+    };
     let declaration_identity = if python_identity {
         Some(("python".to_owned(), "python".to_owned()))
     } else if cpp_identity {
@@ -654,6 +685,7 @@ fn import_semantic_document(
             relations: Vec::new(),
         },
         runtime_values,
+        runtime_contracts,
         collection_flows,
         deferred_yields,
         conditional_type_refinements,
@@ -663,6 +695,7 @@ fn import_semantic_document(
         activation: shard.activation.clone(),
         payload: AuthoredPayload::ProcedureSummaries { summaries },
         runtime_values: None,
+        runtime_contracts: None,
         collection_flows: None,
         deferred_yields: None,
         conditional_type_refinements: None,
@@ -756,6 +789,68 @@ fn import_runtime_values(
         }
     }
     Ok((payload.record_count() > 0).then_some(payload))
+}
+
+/// Import all five runtime-values 0.2 families as one native companion. The
+/// complete semantic model is retained as an envelope so fields not needed by
+/// native evaluation remain available for a lossless export.
+fn import_runtime_contracts(
+    model: &CsmiSemanticModel,
+    document: &CsmiSemanticDocument,
+    default_provenance: Option<&str>,
+) -> Result<Option<RuntimeContractsPayload>, CsmiImportError> {
+    let mut payload =
+        crate::analyzer::semantic_model::runtime_contracts::RuntimeContractsPayloadV2 {
+            contracts: Vec::new(),
+            targets: Vec::new(),
+            activations: Vec::new(),
+            bindings: Vec::new(),
+            observations: Vec::new(),
+        };
+    for fact in &model.extension_facts {
+        if fact.vocabulary != CSMI_RUNTIME_VALUES_PROFILE_ID
+            || fact.version
+                != crate::analyzer::semantic_model::runtime_contracts::RUNTIME_VALUES_V2_VERSION
+        {
+            continue;
+        }
+        let record: crate::analyzer::semantic_model::runtime_contracts::CsmiRuntimeContractsV2Payload =
+            serde_json::from_value(fact.payload.clone()).map_err(|error| CsmiImportError::Unsupported {
+                path: format!("extensionFacts.{}.payload", fact.family),
+                semantic: error.to_string(),
+            })?;
+        if record.family() != fact.family {
+            return Err(CsmiImportError::Unsupported {
+                path: format!("extensionFacts.{}.family", fact.family),
+                semantic: format!("payload kind belongs to {}", record.family()),
+            });
+        }
+        match record {
+            CsmiRuntimeContractsV2Payload::RuntimeContract(record) => {
+                payload.contracts.push(record)
+            }
+            CsmiRuntimeContractsV2Payload::RuntimeTarget(record) => payload.targets.push(record),
+            CsmiRuntimeContractsV2Payload::RuntimeActivation(record) => {
+                payload.activations.push(record)
+            }
+            CsmiRuntimeContractsV2Payload::RuntimeBinding(record) => payload.bindings.push(record),
+            CsmiRuntimeContractsV2Payload::RuntimeObservation(record) => {
+                payload.observations.push(*record)
+            }
+        }
+    }
+    if payload.is_empty() {
+        return Ok(None);
+    }
+    let mut envelope = serde_json::to_value(document)
+        .map_err(|error| CsmiImportError::Identity(error.to_string()))?;
+    crate::analyzer::semantic_model::normalize_runtime_contract_envelope(&mut envelope)
+        .map_err(|error| CsmiImportError::Identity(error.to_string()))?;
+    let _ = default_provenance;
+    Ok(Some(RuntimeContractsPayload {
+        payload,
+        envelope: Some(envelope),
+    }))
 }
 
 fn import_collection_flows(
@@ -1236,6 +1331,89 @@ fn runtime_pack_identity(
     Ok((language, "npm".to_owned()))
 }
 
+fn runtime_contract_pack_identity(
+    payload: &crate::analyzer::semantic_model::runtime_contracts::RuntimeContractsPayloadV2,
+    requested_language: Option<&str>,
+) -> Result<(String, String), CsmiImportError> {
+    let mut languages = BTreeSet::new();
+    for contract in &payload.contracts {
+        for language in &contract.definition.languages {
+            let normalized = crate::analyzer::LanguageDialect::from_config_label(language)
+                .map(|dialect| dialect.semantic_pack_label().to_owned())
+                .ok_or_else(|| CsmiImportError::Unsupported {
+                    path: "runtime-contracts.contract.definition.languages".to_owned(),
+                    semantic: format!("unsupported Bifrost runtime language {language:?}"),
+                })?;
+            languages.insert(normalized);
+        }
+    }
+    // A binding is the most precise language claim when a producer emits a
+    // contract whose language set describes several source dialects.
+    for binding in &payload.bindings {
+        let normalized = crate::analyzer::LanguageDialect::from_config_label(&binding.language)
+            .map(|dialect| dialect.semantic_pack_label().to_owned())
+            .ok_or_else(|| CsmiImportError::Unsupported {
+                path: "runtime-bindings.language".to_owned(),
+                semantic: format!(
+                    "unsupported Bifrost runtime language {:?}",
+                    binding.language
+                ),
+            })?;
+        languages.insert(normalized);
+    }
+    let language = match requested_language {
+        Some(requested) => crate::analyzer::LanguageDialect::from_config_label(requested)
+            .map(|dialect| dialect.semantic_pack_label().to_owned())
+            .ok_or_else(|| CsmiImportError::Unsupported {
+                path: "import.target_language".to_owned(),
+                semantic: format!("unsupported Bifrost import language {requested:?}"),
+            })
+            .and_then(|normalized| {
+                if languages.contains(&normalized) {
+                    Ok(normalized)
+                } else {
+                    Err(CsmiImportError::Unsupported {
+                        path: "import.target_language".to_owned(),
+                        semantic: format!(
+                            "runtime contract does not apply to requested language {requested:?}"
+                        ),
+                    })
+                }
+            })?,
+        None if languages.len() == 1 => languages
+            .into_iter()
+            .next()
+            .expect("one runtime contract language exists"),
+        None => {
+            return Err(CsmiImportError::Unsupported {
+                path: "runtime-contracts.contract.definition.languages".to_owned(),
+                semantic: "a multi-language runtime document requires an explicit import target"
+                    .to_owned(),
+            });
+        }
+    };
+    // The current runtime-contract profile's supported target is Node. Keep
+    // this mapping explicit until another ecosystem has a reviewed native
+    // activation contract; accepting an unknown ecosystem would make a
+    // portable selector appear applicable to unrelated package managers.
+    if payload.contracts.iter().any(|contract| {
+        contract
+            .definition
+            .applicability
+            .selectors
+            .iter()
+            .all(|selector| !selector.purl.contains("nodejs.org/node"))
+    }) {
+        return Err(CsmiImportError::Unsupported {
+            path: "runtime-contracts.contract.definition.applicability.selectors".to_owned(),
+            semantic:
+                "runtime contract import currently has an explicit Node/npm activation mapping"
+                    .to_owned(),
+        });
+    }
+    Ok((language, "npm".to_owned()))
+}
+
 fn runtime_profile_digests(model: &CsmiSemanticModel) -> Result<Vec<String>, CsmiImportError> {
     let mut digests = model
         .extension_facts
@@ -1664,7 +1842,27 @@ fn cpp_context_ref(value: CsmiCppResolutionContext) -> CppResolutionContextRef {
 fn selector_from_csmi(
     selector: &CsmiArtifactSelector,
     runtime_profile_digests: &[String],
+    runtime_contracts: bool,
 ) -> Result<ActivationSelector, CsmiImportError> {
+    if runtime_contracts {
+        // Preserve the outer selector's exact PURL/VERS applicability in the
+        // retained envelope. Native catalog selectors cannot represent VERS;
+        // an artifact digest is optional for portable runtime contracts.
+        return Ok(ActivationSelector {
+            package: Some(NameSelector {
+                name: selector.purl.clone(),
+                version: None,
+            }),
+            module: None,
+            toolchain: None,
+            targets: Vec::new(),
+            configurations: runtime_profile_digests.to_vec(),
+            // A portable contract's selector can be a PURL/VERS range. An
+            // arbitrary digest in that outer selector is not a native exact
+            // artifact claim; retain and enforce it from the CSMI envelope.
+            artifact_sha256: None,
+        });
+    }
     if !selector.purl.starts_with("pkg:maven/") {
         if selector.version_range.is_some() {
             return Err(CsmiImportError::Selector(

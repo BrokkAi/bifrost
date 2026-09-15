@@ -31,6 +31,7 @@ use brokk_bifrost_rql::structural::{OwnerRelation, SiteClass};
 
 use super::classification::{TextValidationError, validate_single_line_text};
 use super::definition::*;
+use super::identity::EndpointSetSemanticHash;
 use super::schema::{
     AtomDomain, CollectionOrder, CvssBaseMetricSchema, CvssMetricScopeSchema, FieldPlacement,
     PolicyAnalysisKind, PolicyAtomValue, PolicyField, PolicyRecord, PolicyRecordContext,
@@ -201,6 +202,26 @@ pub(crate) struct PolicySelectorContext {
     pub(crate) schema_version: Option<(u32, Range<usize>)>,
 }
 
+impl PolicySelectorContext {
+    /// Compare inherited selector scope without comparing byte offsets. The
+    /// same standalone endpoint-set document may be reached through imports
+    /// at different source locations, but those locations do not change its
+    /// selector semantics or parser-cache identity.
+    pub(crate) fn same_scope(&self, other: &Self) -> bool {
+        self.languages
+            .iter()
+            .map(|expr| &expr.kind)
+            .eq(other.languages.iter().map(|expr| &expr.kind))
+            && self
+                .where_globs
+                .iter()
+                .map(|expr| &expr.kind)
+                .eq(other.where_globs.iter().map(|expr| &expr.kind))
+            && self.schema_version.as_ref().map(|(version, _)| *version)
+                == other.schema_version.as_ref().map(|(version, _)| *version)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ParsedRqlpDocument {
     identity: PolicySourceIdentity,
@@ -208,6 +229,7 @@ pub struct ParsedRqlpDocument {
     schema_resolution: SchemaVersionResolution,
     source_map: Vec<PolicySourceMapEntry>,
     unresolved_file_selectors: Vec<UnresolvedPolicySelectorReference>,
+    selector_context: PolicySelectorContext,
 }
 
 impl ParsedRqlpDocument {
@@ -229,6 +251,10 @@ impl ParsedRqlpDocument {
 
     pub fn unresolved_file_selectors(&self) -> &[UnresolvedPolicySelectorReference] {
         &self.unresolved_file_selectors
+    }
+
+    pub(crate) fn selector_context(&self) -> &PolicySelectorContext {
+        &self.selector_context
     }
 
     pub fn into_document(self) -> RqlpDocument {
@@ -260,6 +286,18 @@ pub fn parse_rqlp_source(
     Decoder::new(identity).decode_document(&expr)
 }
 
+/// Parse a standalone endpoint-set under selector defaults inherited from its
+/// importing policy. The source tree remains local to the imported document;
+/// only typed selector scope is inherited.
+pub(crate) fn parse_rqlp_source_with_context(
+    source: &str,
+    identity: PolicySourceIdentity,
+    context: PolicySelectorContext,
+) -> Result<ParsedRqlpDocument, PolicySourceError> {
+    let expr = parse_rqlp_expr(source)?;
+    Decoder::new(identity).decode_document_with_context(&expr, context)
+}
+
 fn parse_rqlp_expr(source: &str) -> Result<Expr, PolicySourceError> {
     if source.len() > MAX_RQLP_SOURCE_BYTES {
         return Err(source_error(
@@ -286,7 +324,7 @@ fn parse_rqlp_expr(source: &str) -> Result<Expr, PolicySourceError> {
         source_error(
             "missing-document",
             source.len()..source.len(),
-            "expected one `(policy ...)` or `(endpoint ...)` document",
+            "expected one `(policy ...)`, `(endpoint ...)`, or `(endpoint-set-document ...)` document",
         )
     })?;
     Ok(expr)
@@ -872,10 +910,23 @@ impl Decoder {
         }
     }
 
-    fn decode_document(mut self, expr: &Expr) -> Result<ParsedRqlpDocument, PolicySourceError> {
+    fn decode_document(self, expr: &Expr) -> Result<ParsedRqlpDocument, PolicySourceError> {
+        self.decode_document_with_context(expr, PolicySelectorContext::default())
+    }
+
+    fn decode_document_with_context(
+        mut self,
+        expr: &Expr,
+        inherited_context: PolicySelectorContext,
+    ) -> Result<ParsedRqlpDocument, PolicySourceError> {
+        self.selector_context = inherited_context;
         let (document, schema_resolution) = match select_record(
             expr,
-            &[PolicyRecord::Policy, PolicyRecord::Endpoint],
+            &[
+                PolicyRecord::Policy,
+                PolicyRecord::Endpoint,
+                PolicyRecord::EndpointSetDocument,
+            ],
             "top-level RQLP document",
         )? {
             PolicyRecord::Policy => {
@@ -898,6 +949,16 @@ impl Decoder {
                     schema,
                 )
             }
+            PolicyRecord::EndpointSetDocument => {
+                let definition = self.decode_endpoint_set_document(expr)?;
+                let schema = definition.schema_version;
+                (
+                    RqlpDocument::EndpointSet {
+                        definition: Box::new(definition),
+                    },
+                    schema,
+                )
+            }
             record => unreachable!("document selector returned {record:?}"),
         };
         self.source_map
@@ -908,6 +969,7 @@ impl Decoder {
             schema_resolution,
             source_map: self.source_map,
             unresolved_file_selectors: self.unresolved_file_selectors,
+            selector_context: self.selector_context,
         })
     }
 
@@ -1168,6 +1230,150 @@ impl Decoder {
         Ok(definition)
     }
 
+    fn decode_endpoint_set_document(
+        &mut self,
+        expr: &Expr,
+    ) -> Result<EndpointSetDocument, PolicySourceError> {
+        let fields = RecordCursor::parse(
+            expr,
+            PolicyRecord::EndpointSetDocument,
+            DecodeContext::ENDPOINT_SET,
+        )?;
+        let version_expr = fields.get("schema-version");
+        let authored_version = version_expr
+            .map(|value| expect_u32(value, "endpoint-set document schema version", false))
+            .transpose()?;
+        let schema_version = resolve_policy_schema_version(authored_version).map_err(|error| {
+            source_error(
+                "unsupported-policy-schema-version",
+                version_expr.map_or_else(|| expr.range.clone(), |value| value.range.clone()),
+                error.to_string(),
+            )
+        })?;
+        let kind = decode_endpoint_set_kind(fields.required("kind"))?;
+
+        // Standalone documents inherit selector defaults from the importing
+        // policy. Explicit document defaults replace the inherited value for
+        // selectors authored in this document and its nested imports.
+        let mut selector_context = self.selector_context.clone();
+        if let Some(language) = fields.get("language") {
+            let language = expect_token(language, "endpoint-set language")?;
+            expand_language_labels(&[language]).map_err(|error| {
+                source_error(
+                    "invalid-language-label",
+                    fields
+                        .get("language")
+                        .expect("language is present")
+                        .range
+                        .clone(),
+                    format!("unknown analyzer language `{language}`: {error}"),
+                )
+            })?;
+            selector_context.languages =
+                vec![fields.get("language").expect("language is present").clone()];
+        }
+        if let Some(version) = fields.get("rql-schema-version") {
+            let version = expect_u32(version, "RQL schema version", false)?;
+            let version_range = fields
+                .get("rql-schema-version")
+                .expect("rql-schema-version is present")
+                .range
+                .clone();
+            resolve_rql_schema_version(Some(version)).map_err(|error| {
+                source_error(
+                    "unsupported-rql-schema-version",
+                    version_range.clone(),
+                    error.to_string(),
+                )
+            })?;
+            selector_context.schema_version = Some((version, version_range));
+        }
+        self.selector_context = selector_context;
+        let path = "/set";
+        let set = fields.required("set");
+        let spec = match kind {
+            EndpointSetKind::Sources => TaintPolicySpec {
+                mode: MayMode::May,
+                call_modeling: CallModelingSpec::default(),
+                sources: self.decode_source_set(set, path)?,
+                ..empty_taint_policy_spec()
+            },
+            EndpointSetKind::Sinks => TaintPolicySpec {
+                mode: MayMode::May,
+                call_modeling: CallModelingSpec::default(),
+                sinks: self.decode_sink_set(set, path)?,
+                ..empty_taint_policy_spec()
+            },
+            EndpointSetKind::Sanitizers => TaintPolicySpec {
+                mode: MayMode::May,
+                call_modeling: CallModelingSpec::default(),
+                sanitizers: self.decode_sanitizer_set(set, path)?,
+                ..empty_taint_policy_spec()
+            },
+            EndpointSetKind::EntryPoints => TaintPolicySpec {
+                mode: MayMode::May,
+                call_modeling: CallModelingSpec::default(),
+                entry_points: self.decode_entry_point_set(set, path)?,
+                ..empty_taint_policy_spec()
+            },
+            EndpointSetKind::Transforms => TaintPolicySpec {
+                mode: MayMode::May,
+                call_modeling: CallModelingSpec::default(),
+                transforms: self.decode_transform_set(set, path)?,
+                ..empty_taint_policy_spec()
+            },
+            EndpointSetKind::FlowTransforms => TaintPolicySpec {
+                mode: MayMode::May,
+                call_modeling: CallModelingSpec::default(),
+                transforms: self.decode_flow_transform_set(set, path)?,
+                ..empty_taint_policy_spec()
+            },
+            EndpointSetKind::ExternalModels => TaintPolicySpec {
+                mode: MayMode::May,
+                call_modeling: CallModelingSpec::default(),
+                external_models: self.decode_external_model_set(set, path)?,
+                ..empty_taint_policy_spec()
+            },
+            EndpointSetKind::Stores => {
+                let stores = self.decode_store_set(set, path)?;
+                TaintPolicySpec {
+                    mode: MayMode::May,
+                    call_modeling: CallModelingSpec::default(),
+                    store_writes: stores.writes,
+                    store_reads: stores.reads,
+                    store_include_files: stores.include_files,
+                    ..empty_taint_policy_spec()
+                }
+            }
+            EndpointSetKind::Origins => TaintPolicySpec {
+                mode: MayMode::May,
+                call_modeling: CallModelingSpec::default(),
+                sources: self.decode_flow_origin_set(set, path)?,
+                ..empty_taint_policy_spec()
+            },
+            EndpointSetKind::Observations => TaintPolicySpec {
+                mode: MayMode::May,
+                call_modeling: CallModelingSpec::default(),
+                sinks: self.decode_flow_observation_set(set, path)?,
+                ..empty_taint_policy_spec()
+            },
+            EndpointSetKind::Kills => TaintPolicySpec {
+                mode: MayMode::May,
+                call_modeling: CallModelingSpec::default(),
+                sanitizers: self.decode_flow_kill_set(set, path)?,
+                ..empty_taint_policy_spec()
+            },
+        };
+        self.map("/schema_version", version_expr.unwrap_or(expr));
+        self.map("/kind", fields.required("kind"));
+        self.map("/set", set);
+        Ok(EndpointSetDocument {
+            schema_version,
+            kind,
+            spec,
+        })
+    }
+
     fn decode_analysis(
         &mut self,
         expr: &Expr,
@@ -1226,7 +1432,6 @@ impl Decoder {
                 spec: self.decode_flow_analysis(&fields, path)?,
             },
         };
-        self.selector_context = PolicySelectorContext::default();
         Ok(DecodedAnalysis {
             analysis,
             on_unknown,
@@ -1438,6 +1643,7 @@ impl Decoder {
             external_models: TaintEndpointSet::default(),
             store_writes: Vec::new(),
             store_reads: Vec::new(),
+            store_include_files: Vec::new(),
             finding_combinations: Vec::new(),
         })
     }
@@ -1471,6 +1677,7 @@ impl Decoder {
         Ok(TaintEndpointSet {
             include_sets: parts.include_sets,
             include_matches: parts.include_matches,
+            include_files: parts.include_files,
             entries,
         })
     }
@@ -1504,6 +1711,7 @@ impl Decoder {
         Ok(TaintEndpointSet {
             include_sets: parts.include_sets,
             include_matches: parts.include_matches,
+            include_files: parts.include_files,
             entries,
         })
     }
@@ -1537,6 +1745,7 @@ impl Decoder {
         Ok(TaintEndpointSet {
             include_sets: parts.include_sets,
             include_matches: parts.include_matches,
+            include_files: parts.include_files,
             entries,
         })
     }
@@ -1570,6 +1779,7 @@ impl Decoder {
         Ok(TaintEndpointSet {
             include_sets: parts.include_sets,
             include_matches: parts.include_matches,
+            include_files: parts.include_files,
             entries,
         })
     }
@@ -1732,7 +1942,7 @@ impl Decoder {
             .map(|value| self.decode_external_model_set(value, &format!("{path}/external_models")))
             .transpose()?
             .unwrap_or_default();
-        let (store_writes, store_reads) = fields
+        let stores = fields
             .get("stores")
             .map(|value| self.decode_store_set(value, &format!("{path}/stores")))
             .transpose()?
@@ -1757,8 +1967,9 @@ impl Decoder {
             entry_points,
             transforms,
             external_models,
-            store_writes,
-            store_reads,
+            store_writes: stores.writes,
+            store_reads: stores.reads,
+            store_include_files: stores.include_files,
             finding_combinations,
         })
     }
@@ -1792,6 +2003,7 @@ impl Decoder {
         Ok(TaintEndpointSet {
             include_sets: parts.include_sets,
             include_matches: parts.include_matches,
+            include_files: parts.include_files,
             entries,
         })
     }
@@ -1825,6 +2037,7 @@ impl Decoder {
         Ok(TaintEndpointSet {
             include_sets: parts.include_sets,
             include_matches: parts.include_matches,
+            include_files: parts.include_files,
             entries,
         })
     }
@@ -1858,6 +2071,7 @@ impl Decoder {
         Ok(TaintEndpointSet {
             include_sets: parts.include_sets,
             include_matches: parts.include_matches,
+            include_files: parts.include_files,
             entries,
         })
     }
@@ -1891,6 +2105,7 @@ impl Decoder {
         Ok(TaintEndpointSet {
             include_sets: parts.include_sets,
             include_matches: parts.include_matches,
+            include_files: parts.include_files,
             entries,
         })
     }
@@ -1924,6 +2139,7 @@ impl Decoder {
         Ok(TaintEndpointSet {
             include_sets: parts.include_sets,
             include_matches: parts.include_matches,
+            include_files: parts.include_files,
             entries,
         })
     }
@@ -1957,20 +2173,20 @@ impl Decoder {
         Ok(TaintEndpointSet {
             include_sets: parts.include_sets,
             include_matches: parts.include_matches,
+            include_files: parts.include_files,
             entries,
         })
     }
 
     /// Decode `:stores (endpoint-set :entries [(store-write ...)|(store-read
-    /// ...)...])` into the two local entry vectors. Stores compose only local
-    /// entries: the schema registry rejects `:include-sets` and
-    /// `:include-matches` in the store context, so the shared set parts can
-    /// never carry composition inputs here.
+    /// ...])` into the two entry vectors and typed file imports. Stores do not
+    /// accept catalog or match composition, but nested endpoint-set files are
+    /// retained beside the solver-facing write/read vectors.
     fn decode_store_set(
         &mut self,
         expr: &Expr,
         path: &str,
-    ) -> Result<(Vec<TaintStoreWriteSpec>, Vec<TaintStoreReadSpec>), PolicySourceError> {
+    ) -> Result<DecodedStoreSet, PolicySourceError> {
         let parts = self.decode_taint_set_parts(
             expr,
             PolicyAnalysisKind::Taint,
@@ -1997,7 +2213,11 @@ impl Decoder {
         }
         writes.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
         reads.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
-        Ok((writes, reads))
+        Ok(DecodedStoreSet {
+            writes,
+            reads,
+            include_files: parts.include_files,
+        })
     }
 
     fn decode_store_write(
@@ -2117,6 +2337,11 @@ impl Decoder {
         } else {
             Vec::new()
         };
+        let include_files = fields
+            .get("include-files")
+            .map(decode_endpoint_set_file_refs)
+            .transpose()?
+            .unwrap_or_default();
         let entries = fields
             .get("entries")
             .map(|value| {
@@ -2129,6 +2354,7 @@ impl Decoder {
         Ok(DecodedTaintSetParts {
             include_sets,
             include_matches,
+            include_files,
             entries,
         })
     }
@@ -4512,13 +4738,38 @@ struct DecodeContext {
 struct DecodedTaintSetParts<'a> {
     include_sets: Vec<CatalogRef>,
     include_matches: Vec<MatchEndpointSetRef>,
+    include_files: Vec<EndpointSetFileRef>,
     entries: Vec<&'a Expr>,
+}
+
+#[derive(Default)]
+struct DecodedStoreSet {
+    writes: Vec<TaintStoreWriteSpec>,
+    reads: Vec<TaintStoreReadSpec>,
+    include_files: Vec<EndpointSetFileRef>,
 }
 
 struct DecodedMatchEndpointSet {
     set: MatchEndpointSetRef,
     role: Option<EndpointRole>,
     phase: Option<EndpointObservationPhase>,
+}
+
+fn empty_taint_policy_spec() -> TaintPolicySpec {
+    TaintPolicySpec {
+        mode: MayMode::May,
+        call_modeling: CallModelingSpec::default(),
+        sources: TaintEndpointSet::default(),
+        sinks: TaintEndpointSet::default(),
+        sanitizers: TaintEndpointSet::default(),
+        entry_points: TaintEndpointSet::default(),
+        transforms: TaintEndpointSet::default(),
+        external_models: TaintEndpointSet::default(),
+        store_writes: Vec::new(),
+        store_reads: Vec::new(),
+        store_include_files: Vec::new(),
+        finding_combinations: Vec::new(),
+    }
 }
 
 struct SpannedValue<T> {
@@ -4570,6 +4821,12 @@ impl PredicateBudget {
 impl DecodeContext {
     const ENDPOINT: Self = Self {
         document: RqlpDocumentKind::Endpoint,
+        analysis: None,
+        record: PolicyRecordContext::Ordinary,
+    };
+
+    const ENDPOINT_SET: Self = Self {
+        document: RqlpDocumentKind::EndpointSet,
         analysis: None,
         record: PolicyRecordContext::Ordinary,
     };
@@ -5157,6 +5414,66 @@ fn decode_endpoint_role(expr: &Expr) -> Result<EndpointRole, PolicySourceError> 
         PolicyAtomValue::EndpointSink => Ok(EndpointRole::Sink),
         value => unreachable!("EndpointRole registry returned {value:?}"),
     }
+}
+
+fn decode_endpoint_set_kind(expr: &Expr) -> Result<EndpointSetKind, PolicySourceError> {
+    match expect_atom(expr, AtomDomain::EndpointSetKind, "endpoint-set kind")? {
+        PolicyAtomValue::EndpointSetSources => Ok(EndpointSetKind::Sources),
+        PolicyAtomValue::EndpointSetSinks => Ok(EndpointSetKind::Sinks),
+        PolicyAtomValue::EndpointSetSanitizers => Ok(EndpointSetKind::Sanitizers),
+        PolicyAtomValue::EndpointSetEntryPoints => Ok(EndpointSetKind::EntryPoints),
+        PolicyAtomValue::EndpointSetTransforms => Ok(EndpointSetKind::Transforms),
+        PolicyAtomValue::EndpointSetExternalModels => Ok(EndpointSetKind::ExternalModels),
+        PolicyAtomValue::EndpointSetStores => Ok(EndpointSetKind::Stores),
+        PolicyAtomValue::EndpointSetOrigins => Ok(EndpointSetKind::Origins),
+        PolicyAtomValue::EndpointSetObservations => Ok(EndpointSetKind::Observations),
+        PolicyAtomValue::EndpointSetKills => Ok(EndpointSetKind::Kills),
+        PolicyAtomValue::EndpointSetFlowTransforms => Ok(EndpointSetKind::FlowTransforms),
+        value => unreachable!("EndpointSetKind registry returned {value:?}"),
+    }
+}
+
+fn decode_endpoint_set_file_refs(
+    expr: &Expr,
+) -> Result<Vec<EndpointSetFileRef>, PolicySourceError> {
+    let values = expect_vector(expr, "endpoint-set file references", 0, 64)?;
+    let mut references = Vec::with_capacity(values.len());
+    for item in values {
+        let fields = RecordCursor::parse(
+            item,
+            PolicyRecord::EndpointSetFile,
+            DecodeContext::policy(PolicyAnalysisKind::Taint),
+        )?;
+        let path_expr = fields.required("path");
+        let raw_path = expect_string(path_expr, "endpoint-set file path", MAX_DISPLAY_TEXT_BYTES)?;
+        let path = WorkspaceRelativePath::new(raw_path).map_err(|error| {
+            source_error(
+                "invalid-workspace-path",
+                path_expr.range.clone(),
+                error.to_string(),
+            )
+        })?;
+        let sha256 = fields
+            .get("sha256")
+            .map(|value| {
+                let token = expect_string(value, "endpoint-set semantic SHA-256", 64)?;
+                EndpointSetSemanticHash::from_lower_hex(&token).map_err(|error| {
+                    source_error("invalid-sha256", value.range.clone(), error.to_string())
+                })
+            })
+            .transpose()?;
+        references.push(EndpointSetFileRef {
+            path,
+            sha256,
+            range: item.range.clone(),
+        });
+    }
+    references.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.sha256.cmp(&right.sha256))
+    });
+    Ok(references)
 }
 
 fn decode_finding_severity(expr: &Expr) -> Result<FindingSeverity, PolicySourceError> {
@@ -7063,6 +7380,91 @@ mod tests {
         let error = parse(source).unwrap_err().diagnostic;
         assert_eq!(error.code, code);
         assert_eq!(&source[error.range], token);
+    }
+
+    #[test]
+    fn standalone_endpoint_set_preserves_typed_import_edges_and_ranges() {
+        let source = r#"(endpoint-set-document
+            :schema-version 1
+            :kind sources
+            :set (endpoint-set :include-files [
+                (endpoint-set-file :path "nested.rqlp")
+                (endpoint-set-file :path "nested.rqlp")]))"#;
+        let parsed = parse_rqlp_source(source, PolicySourceIdentity::new("sources.rqlp"))
+            .expect("standalone endpoint-set document");
+        let RqlpDocument::EndpointSet { definition } = parsed.document() else {
+            panic!("expected endpoint-set document")
+        };
+        assert_eq!(definition.kind, EndpointSetKind::Sources);
+        assert_eq!(definition.spec.sources.include_files.len(), 2);
+        assert_eq!(
+            definition.spec.sources.include_files[0].path.as_str(),
+            "nested.rqlp"
+        );
+        assert_ne!(
+            definition.spec.sources.include_files[0].range,
+            definition.spec.sources.include_files[1].range
+        );
+        assert_eq!(
+            parsed.document().to_normalized_authored_json()["set"]["include_files"],
+            serde_json::json!([{ "path": "nested.rqlp" }])
+        );
+    }
+
+    #[test]
+    fn standalone_endpoint_set_fields_have_schema_hover_help() {
+        let source = r#"(endpoint-set-document
+            :schema-version 1
+            :kind sources
+            :set (endpoint-set :include-files [
+                (endpoint-set-file
+                  :path "nested.rqlp"
+                  :sha256 "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")]))"#;
+        for (token, signature) in [
+            (
+                "endpoint-set-document",
+                "(endpoint-set-document [:schema-version N] :kind KIND [:language LANGUAGE] [:rql-schema-version N] :set (endpoint-set ...))",
+            ),
+            (
+                ":kind",
+                ":kind sources|sinks|sanitizers|entry-points|transforms|external-models|stores|origins|observations|kills|flow-transforms",
+            ),
+            (":set", ":set (endpoint-set ...)"),
+            (
+                ":include-files",
+                ":include-files [(endpoint-set-file :path \"workspace-relative.rqlp\" [:sha256 HEX])...]",
+            ),
+            (
+                "endpoint-set-file",
+                "(endpoint-set-file :path \"workspace-relative.rqlp\" [:sha256 HEX])",
+            ),
+            (":path", ":path \"workspace-relative.rqlp\""),
+            (":sha256", ":sha256 \"64-lower-hex\""),
+        ] {
+            let offset = source.find(token).expect("hover token") + token.len().min(2);
+            let help = rqlp_source_help_at(source, offset).expect("schema-driven hover help");
+            assert_eq!(help.signature, signature, "hover for {token}");
+            assert_eq!(
+                &source[help.range.clone()],
+                token,
+                "hover range for {token}"
+            );
+        }
+    }
+
+    #[test]
+    fn standalone_endpoint_sets_reject_typestate_subject_and_event_entries() {
+        let subject = r#"(endpoint-set-document
+            :kind sources
+            :set (endpoint-set :entries [
+                (subject :id seed :selector (rql (call)) :subject return-value)]))"#;
+        assert_error_token(subject, "wrong-record-kind", "subject");
+
+        let event = r#"(endpoint-set-document
+            :kind sources
+            :set (endpoint-set :entries [
+                (event :id close :on (normal-procedure-exit :scope analysis-root))]))"#;
+        assert_error_token(event, "wrong-record-kind", "event");
     }
 
     #[test]

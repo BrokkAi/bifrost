@@ -27,6 +27,7 @@ use crate::hash::HashSet;
 use crate::text_utils::compute_line_starts;
 use brokk_bifrost_core::analyzer::BoundedDefinitionLookup;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
+use brokk_bifrost_core::analyzer::tree_walk::ParentIndex;
 use brokk_bifrost_jvm::scala::graph::inverted::ScalaProjectTypesSeed;
 use brokk_bifrost_jvm::scala::graph::query::{
     ScalaCatalogBuildError, ScalaFileEligibility, ScalaQueryHitSink, ScalaQueryTargetCatalog,
@@ -373,12 +374,34 @@ impl<'a> ScalaFrontierScan<'a> {
                 relevant_names.len()
             )
         });
+        // Parent lookup in tree-sitter re-descends from the root. The Scala
+        // walk asks that relation from many per-node resolution helpers and
+        // may replay a file after each relational barrier, so build one index
+        // per prepared tree and share it across those evaluations.
+        let parent_indexes = prepared
+            .iter()
+            .map(|item| ParentIndex::new(item.tree.root_node()))
+            .collect::<Vec<_>>();
+        let parent_index_by_file = prepared
+            .iter()
+            .enumerate()
+            .map(|(index, item)| (item.file.clone(), index))
+            .collect::<HashMap<_, _>>();
         self.session
             .resolve_owned_items("scala_semantic_scan", prepared, |item, frontier| {
-                let types = self.scala.build_project_types_from_frontier(
-                    Arc::clone(&frontier),
-                    self.resolved_seed.clone(),
-                );
+                let parent_index = parent_index_by_file
+                    .get(&item.file)
+                    .copied()
+                    .map(|index| &parent_indexes[index])
+                    .expect("every prepared Scala file has a parent index");
+                let types = {
+                    let _scope =
+                        crate::profiling::scope("relational_item_frontier::build_project_types");
+                    self.scala.build_project_types_from_frontier(
+                        Arc::clone(&frontier),
+                        self.resolved_seed.clone(),
+                    )
+                };
                 let dispatch = ScalaFrontierDispatch {
                     types: &types,
                     file: &item.file,
@@ -415,18 +438,23 @@ impl<'a> ScalaFrontierScan<'a> {
                     max_usages,
                     limit_exceeded: false,
                 };
-                scan_scala_query_tree(
-                    self.scala,
-                    token,
-                    &types,
-                    &dispatch,
-                    &item.file,
-                    &item.source,
-                    &item.tree,
-                    item.class_ranges.clone(),
-                    &mut sink,
-                    Some(self.cancellation),
-                );
+                {
+                    let _scope =
+                        crate::profiling::scope("relational_item_frontier::scan_scala_query_tree");
+                    scan_scala_query_tree(
+                        self.scala,
+                        token,
+                        &types,
+                        &dispatch,
+                        &item.file,
+                        &item.source,
+                        &item.tree,
+                        item.class_ranges.clone(),
+                        &mut sink,
+                        Some(self.cancellation),
+                        parent_index,
+                    );
+                }
                 let limit_exceeded = sink.limit_exceeded;
                 drop(sink);
                 ScalaFileScan {

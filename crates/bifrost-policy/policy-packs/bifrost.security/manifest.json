@@ -1,14 +1,14 @@
 {
   "schema_version": 1,
   "id": "bifrost.security",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "name": "Bifrost security",
   "description": "High-precision security policies backed by exact structural identity and value-flow evidence.",
   "policies": [
     {
       "path": "policies/jvm/servlet-parameter-to-jdbc.rqlp",
       "id": "bifrost.security.java.servlet-parameter-to-jdbc",
-      "semantic_hash": "760d433a7d90e481dbf4636dd82abcd2f22c5291934327133f156a8515fff7df",
+      "semantic_hash": "b88225d8df37ba00381431577a1f54fc18d43c981ed9bc44f02124279e255c21",
       "category": "security",
       "supported_languages": [
         "java"
@@ -22,6 +22,25 @@
       ],
       "severity_rationale": "Attacker-controlled data used as JDBC SQL structure can change the executed statement and compromise application data.",
       "remediation": "Use a PreparedStatement with placeholders and bind untrusted values through typed setter methods instead of concatenating SQL text."
+    },
+    {
+      "path": "policies/jvm/system-getenv-to-runtime-exec.rqlp",
+      "id": "bifrost.security.java.system-getenv-to-runtime-exec",
+      "semantic_hash": "e6124423292a84eb827aafd80379d40c788b9759fad5eab9ed046b4a9eeb234e",
+      "category": "security",
+      "supported_languages": [
+        "java"
+      ],
+      "required_capabilities": [
+        "taint",
+        "exact-call-target",
+        "actual-to-formal-binding",
+        "semantic-model-provenance",
+        "scoped-callable-completeness",
+        "call-argument-conversion"
+      ],
+      "severity_rationale": "Attacker-controlled command text can execute unintended operating-system commands with the application's privileges.",
+      "remediation": "Avoid passing untrusted text to Runtime.exec. Use a fixed executable and validate arguments against an allowlist."
     }
   ]
 }

@@ -1169,16 +1169,16 @@ fn binding_carrier(
     ))
 }
 
-/// Procedure-local refinements derived once for one root's solve.
+/// Procedure-local refinements derived once for one request's root solves.
 ///
 /// One root solve builds its plan more than once: a summary-cut build whose
 /// sources still need refinement is discarded and rebuilt in full, and every
 /// feedback iteration rebuilds the plan again. Binding refinement is a pure
 /// function of the procedure's semantic identity, and field refinement of
-/// that identity together with the gaps the procedure's snapshot discharges,
-/// which the local structure digest already records. Deriving them once per
-/// build repeats the work and charges the root's semantic budget for it once
-/// per build: one `uvicorn/config.py` root spent 837k of its 1,000,000
+/// that identity together with the gaps the procedure's snapshot discharges
+/// and the workspace field-slot surface. Deriving them once per build repeats
+/// the work and charges the root's semantic budget for it once per build: one
+/// `uvicorn/config.py` root spent 837k of its 1,000,000
 /// nested-entry budget deriving `Config.__init__` for a plan it then threw
 /// away, leaving too little for the plan it kept (#3163).
 ///
@@ -1205,8 +1205,14 @@ fn reused_or_derived<T: Clone>(
     cache: &mut HashMap<StableDigest, DerivedRefinement<T>>,
     identity: StableDigest,
     budget: &mut SemanticBudget,
+    cancellation: &CancellationToken,
     derive: impl FnOnce(&mut SemanticBudget) -> Result<T, CorrelationError>,
 ) -> Result<T, CorrelationError> {
+    if cancellation.is_cancelled() {
+        return Err(CorrelationError::Cancelled {
+            timed_out: cancellation.is_timed_out(),
+        });
+    }
     if let Some(derived) = cache.get(&identity) {
         if !budget.has_charged_artifact(identity) {
             budget
@@ -1262,6 +1268,21 @@ fn procedure_semantics_identity(
             .to_le_bytes(),
     );
     digest
+}
+
+fn field_refinement_identity(
+    procedure: &ProcedureHandle,
+    local_structure: Option<StableDigest>,
+    field_slot_digest: StableDigest,
+) -> StableDigest {
+    let mut identity =
+        procedure_semantics_identity(b"bifrost-type-flow-field-refinement-v1", procedure);
+    match local_structure {
+        Some(local_structure) => identity.push(local_structure.as_bytes()),
+        None => identity.push(b"no-snapshot"),
+    }
+    identity.push(field_slot_digest.as_bytes());
+    identity.finish()
 }
 
 /// Closure discovery is independent of class seeding and field refinement.
@@ -1537,6 +1558,7 @@ impl TypeFlowPlan {
                 procedure_semantics_identity(b"bifrost-type-flow-binding-refinement-v1", procedure)
                     .finish(),
                 semantic_budget,
+                cancellation,
                 |budget| {
                     binding_refinement::derive(workspace, adapter, procedure, budget, cancellation)
                 },
@@ -1573,6 +1595,7 @@ impl TypeFlowPlan {
                         )
                         .finish(),
                         semantic_budget,
+                        cancellation,
                         |budget| {
                             let mut analysis = analyze_correlations_with_boolean_bindings(
                                 procedure,
@@ -1614,22 +1637,17 @@ impl TypeFlowPlan {
                     .iter()
                     .find(|snapshot| snapshot.value().procedure() == procedure)
                     .map(|snapshot| snapshot.value());
-                // The enclosing class and the field-slot index are fixed for
-                // one root solve, so the snapshot's local structure -- which
-                // records exactly the gap discharges field refinement reads --
-                // completes the procedure's identity here.
-                let mut identity = procedure_semantics_identity(
-                    b"bifrost-type-flow-field-refinement-v1",
-                    procedure,
-                );
-                match local_structure_digests.get(&procedure.durable_key()) {
-                    Some(local_structure) => identity.push(local_structure.as_bytes()),
-                    None => identity.push(b"no-snapshot"),
-                }
                 match reused_or_derived(
                     &mut refinements.fields,
-                    identity.finish(),
+                    field_refinement_identity(
+                        procedure,
+                        local_structure_digests
+                            .get(&procedure.durable_key())
+                            .copied(),
+                        field_slots.digest(),
+                    ),
                     semantic_budget,
+                    cancellation,
                     |budget| {
                         field_refinement::derive(
                             workspace,
@@ -1663,6 +1681,7 @@ impl TypeFlowPlan {
                 procedure_semantics_identity(b"bifrost-type-flow-closed-loads-v1", procedure)
                     .finish(),
                 semantic_budget,
+                cancellation,
                 |budget| {
                     let loads = adapter
                         .closed_memory_loads(
@@ -3226,16 +3245,18 @@ mod tests {
         let identity = StableDigest::sha256(b"one-refinement");
         let mut cache = HashMap::default();
         let mut budget = SemanticBudget::uniform(1_000).expect("a finite budget");
+        let cancellation = CancellationToken::default();
         let mut derivations = 0_usize;
         for _ in 0..5 {
-            let value = reused_or_derived(&mut cache, identity, &mut budget, |budget| {
-                derivations += 1;
-                budget
-                    .charge(nested(400))
-                    .map_err(CorrelationError::Budget)?;
-                Ok(7_u32)
-            })
-            .expect("the refinement derives and then reuses");
+            let value =
+                reused_or_derived(&mut cache, identity, &mut budget, &cancellation, |budget| {
+                    derivations += 1;
+                    budget
+                        .charge(nested(400))
+                        .map_err(CorrelationError::Budget)?;
+                    Ok(7_u32)
+                })
+                .expect("the refinement derives and then reuses");
             assert_eq!(value, 7);
         }
         assert_eq!(derivations, 1, "one ledger derives the refinement once");
@@ -3251,6 +3272,7 @@ mod tests {
     #[test]
     fn one_ledger_holds_only_one_derivation_of_this_size() {
         let mut budget = SemanticBudget::uniform(1_000).expect("a finite budget");
+        let cancellation = CancellationToken::default();
         for (round, label) in [b"first".as_slice(), b"second".as_slice()]
             .into_iter()
             .enumerate()
@@ -3260,6 +3282,7 @@ mod tests {
                 &mut cache,
                 StableDigest::sha256(label),
                 &mut budget,
+                &cancellation,
                 |budget| {
                     budget
                         .charge(nested(600))
@@ -3275,14 +3298,15 @@ mod tests {
         }
     }
 
-    /// A ledger that has not paid for a reused refinement is charged the work
-    /// the derivation measured, so a rolled-back attempt pays again.
+    /// A later root has its own child ledger. It reuses the request cache
+    /// without deriving again, while still paying the measured semantic work.
     #[test]
-    fn an_unpaid_ledger_is_charged_for_a_reused_refinement() {
+    fn a_later_root_ledger_reuses_and_pays_for_the_refinement() {
         let identity = StableDigest::sha256(b"one-refinement");
         let mut cache = HashMap::default();
         let mut first = SemanticBudget::uniform(1_000).expect("a finite budget");
-        reused_or_derived(&mut cache, identity, &mut first, |budget| {
+        let cancellation = CancellationToken::default();
+        reused_or_derived(&mut cache, identity, &mut first, &cancellation, |budget| {
             budget
                 .charge(nested(400))
                 .map_err(CorrelationError::Budget)?;
@@ -3292,7 +3316,7 @@ mod tests {
 
         let mut fresh = SemanticBudget::uniform(1_000).expect("a finite budget");
         let mut derivations = 0_usize;
-        reused_or_derived(&mut cache, identity, &mut fresh, |budget| {
+        reused_or_derived(&mut cache, identity, &mut fresh, &cancellation, |budget| {
             derivations += 1;
             budget
                 .charge(nested(400))
@@ -3304,7 +3328,184 @@ mod tests {
         assert_eq!(
             fresh.used().nested_entries,
             400,
-            "a ledger that never paid is charged the measured work"
+            "the later root ledger is charged the measured work"
+        );
+    }
+
+    #[test]
+    fn cancelled_lookup_does_not_return_a_cached_refinement() {
+        let identity = StableDigest::sha256(b"cancelled-refinement");
+        let mut cache = HashMap::default();
+        let mut first = SemanticBudget::uniform(1_000).expect("a finite budget");
+        let active = CancellationToken::default();
+        reused_or_derived(&mut cache, identity, &mut first, &active, |_| Ok(7_u32))
+            .expect("the active lookup populates the cache");
+
+        let cancelled = CancellationToken::default();
+        cancelled.cancel();
+        let mut later = SemanticBudget::uniform(1_000).expect("a finite budget");
+        assert!(matches!(
+            reused_or_derived(&mut cache, identity, &mut later, &cancelled, |_| {
+                panic!("a cache hit does not derive")
+            }),
+            Err(CorrelationError::Cancelled { timed_out: false })
+        ));
+        assert_eq!(later.used(), SemanticWork::default());
+    }
+
+    #[test]
+    fn field_refinement_identity_includes_the_slot_index() {
+        use crate::analyzer::semantic::SemanticRequest;
+        use crate::analyzer::{AnalyzerConfig, Language};
+        use crate::inline_project::InlineTestProject;
+
+        let project = InlineTestProject::with_language(Language::Python)
+            .file(
+                "app.py",
+                "class Box:\n    def read(self):\n        return self.value\n",
+            )
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let cancellation = CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let artifact = workspace
+            .materialize_program_semantics(
+                &project.file("app.py"),
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .expect("fixture semantics materialize")
+            .available_value()
+            .cloned()
+            .expect("fixture semantics remain available");
+        let procedure = artifact
+            .procedures()
+            .iter()
+            .find(|procedure| {
+                procedure
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|segment| segment.name())
+                    == Some("read")
+            })
+            .and_then(|procedure| artifact.procedure_handle(procedure.id()))
+            .expect("fixture declares Box.read");
+        let structure = StableDigest::sha256(b"same-local-structure");
+
+        assert_ne!(
+            field_refinement_identity(
+                &procedure,
+                Some(structure),
+                StableDigest::sha256(b"field-slots-a"),
+            ),
+            field_refinement_identity(
+                &procedure,
+                Some(structure),
+                StableDigest::sha256(b"field-slots-b"),
+            ),
+            "different field-slot surfaces cannot share a refinement"
+        );
+    }
+
+    #[test]
+    fn overlapping_roots_share_request_refinements_without_changing_plans() {
+        use crate::analyzer::semantic::{SemanticRequest, type_flow_adapter};
+        use crate::analyzer::{AnalyzerConfig, Language};
+        use crate::inline_project::InlineTestProject;
+        use crate::value_flow::ValueFlowCache;
+
+        let project = InlineTestProject::with_language(Language::Python)
+            .file(
+                "app.py",
+                "def shared(value):\n    if isinstance(value, str):\n        return value.upper()\n    return value\n\ndef first(value):\n    return shared(value)\n\ndef second(value):\n    return shared(value)\n",
+            )
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let cancellation = CancellationToken::default();
+        let mut materialization_budget = SemanticBudget::default();
+        let artifact = workspace
+            .materialize_program_semantics(
+                &project.file("app.py"),
+                &mut SemanticRequest::new(&mut materialization_budget, &cancellation),
+            )
+            .expect("fixture semantics materialize")
+            .available_value()
+            .cloned()
+            .expect("fixture semantics remain available");
+        let root = |name: &str| {
+            artifact
+                .procedures()
+                .iter()
+                .find(|procedure| {
+                    procedure
+                        .locator()
+                        .declaration()
+                        .segments()
+                        .last()
+                        .and_then(|segment| segment.name())
+                        == Some(name)
+                })
+                .and_then(|procedure| artifact.procedure_handle(procedure.id()))
+                .unwrap_or_else(|| panic!("fixture declares {name}"))
+        };
+        let first = root("first");
+        let second = root("second");
+        let adapter =
+            type_flow_adapter(Language::Python).expect("Python registers a type-flow adapter");
+        let mut field_budget = SemanticBudget::default();
+        let field_slots =
+            FieldSlotIndex::build(&workspace, adapter, &mut field_budget, &cancellation)
+                .expect("fixture field slots build");
+        let provider = WorkspaceValueFlowProvider::new(&workspace, ValueFlowCache::default());
+        let build = |root: &ProcedureHandle, refinements: &mut ProcedureRefinements| {
+            let mut budget = SemanticBudget::default();
+            TypeFlowPlan::build(
+                &workspace,
+                adapter,
+                &field_slots,
+                root,
+                &provider,
+                ClosureLimits { max_procedures: 16 },
+                &mut budget,
+                &cancellation,
+                refinements,
+            )
+            .unwrap_or_else(|error| panic!("plan for {root:?} builds: {error}"))
+        };
+
+        let mut shared = ProcedureRefinements::default();
+        let shared_first = build(&first, &mut shared);
+        let after_first = (
+            shared.bindings.len(),
+            shared.correlations.len(),
+            shared.closed_loads.len(),
+        );
+        let shared_second = build(&second, &mut shared);
+        let after_second = (
+            shared.bindings.len(),
+            shared.correlations.len(),
+            shared.closed_loads.len(),
+        );
+        assert!(
+            after_first.0 >= 2,
+            "first root reaches shared: {after_first:?}"
+        );
+        assert_eq!(
+            after_second,
+            (after_first.0 + 1, after_first.1 + 1, after_first.2 + 1),
+            "the second root adds only itself; the shared closure is reused"
+        );
+
+        assert_eq!(
+            shared_first,
+            build(&first, &mut ProcedureRefinements::default()),
+            "request reuse does not change the first root plan"
+        );
+        assert_eq!(
+            shared_second,
+            build(&second, &mut ProcedureRefinements::default()),
+            "request reuse does not change the second root plan"
         );
     }
 

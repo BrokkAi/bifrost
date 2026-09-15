@@ -1045,7 +1045,11 @@ fn validate_keyed_read_value_wrapper(args: &[Expr], query: &Expr, analysis: &mut
         .join(", ");
     let mut seen = HashSet::new();
     let mut property = false;
-    let mut index = false;
+    let mut index = None;
+    let mut key_kind = None;
+    let mut index_min = None;
+    let mut index_max = None;
+    let mut container = None;
     for pair in options.chunks_exact(2) {
         let Some(label) = pair[0].as_symbol() else {
             analysis.error(
@@ -1095,10 +1099,17 @@ fn validate_keyed_read_value_wrapper(args: &[Expr], query: &Expr, analysis: &mut
                 }
             }
             QueryStepField::Container => {
-                if !matches!(
-                    pair[1].as_symbol().or_else(|| pair[1].as_string()),
-                    Some("env") | Some("argv")
-                ) {
+                if let Some(value) = pair[1].as_symbol().or_else(|| pair[1].as_string()) {
+                    if matches!(value, "env" | "argv") {
+                        container = Some((value.to_owned(), pair[1].range.clone()));
+                    } else {
+                        analysis.error(
+                            pair[1].range.clone(),
+                            "unknown-value",
+                            "container must be env or argv",
+                        );
+                    }
+                } else {
                     analysis.error(
                         pair[1].range.clone(),
                         "unknown-value",
@@ -1121,12 +1132,48 @@ fn validate_keyed_read_value_wrapper(args: &[Expr], query: &Expr, analysis: &mut
                 }
             }
             QueryStepField::Index => {
-                index = true;
-                if !matches!(pair[1].kind, ExprKind::Number(_)) {
+                if let Some(value) = pair[1].as_number() {
+                    index = Some((value, pair[1].range.clone()));
+                } else {
                     analysis.error(
                         pair[1].range.clone(),
                         "wrong-value-shape",
                         "index must be a non-negative integer",
+                    );
+                }
+            }
+            QueryStepField::KeyKind => {
+                let Some(label) = pair[1].as_symbol().or_else(|| pair[1].as_string()) else {
+                    analysis.error(
+                        pair[1].range.clone(),
+                        "wrong-value-shape",
+                        "key-kind must be static-property or static-index",
+                    );
+                    continue;
+                };
+                let Some(kind) = super::schema::RuntimeKeyKind::from_label(label) else {
+                    analysis.error(
+                        pair[1].range.clone(),
+                        "unknown-value",
+                        "key-kind must be static-property or static-index",
+                    );
+                    continue;
+                };
+                key_kind = Some((kind, pair[1].range.clone()));
+            }
+            QueryStepField::IndexMin | QueryStepField::IndexMax => {
+                let target = if option.field() == QueryStepField::IndexMin {
+                    &mut index_min
+                } else {
+                    &mut index_max
+                };
+                if let Some(value) = pair[1].as_number() {
+                    *target = Some((value, pair[1].range.clone()));
+                } else {
+                    analysis.error(
+                        pair[1].range.clone(),
+                        "wrong-value-shape",
+                        "index bound must be a non-negative integer",
                     );
                 }
             }
@@ -1142,12 +1189,112 @@ fn validate_keyed_read_value_wrapper(args: &[Expr], query: &Expr, analysis: &mut
             _ => unreachable!("keyed-read-value registry contains only its options"),
         }
     }
-    if property == index {
+    let exact_count = property as usize + index.is_some() as usize;
+    if exact_count > 0 && key_kind.is_some() {
         analysis.error(
             query.range.clone(),
             "wrong-value-shape",
-            "keyed-read-value requires exactly one of :property or :index",
+            "keyed-read-value accepts either :property/:index or :key-kind, not both",
         );
+    }
+    if exact_count == 2 || (exact_count == 0 && key_kind.is_none()) {
+        analysis.error(
+            query.range.clone(),
+            "wrong-value-shape",
+            "keyed-read-value requires exactly one exact selector or :key-kind",
+        );
+    }
+    if let Some((kind, range)) = &key_kind {
+        if *kind == super::schema::RuntimeKeyKind::StaticProperty
+            && (index_min.is_some() || index_max.is_some())
+        {
+            analysis.error(
+                range.clone(),
+                "wrong-value-shape",
+                "index bounds require :key-kind static-index",
+            );
+        }
+    } else if index_min.is_some() || index_max.is_some() {
+        analysis.error(
+            query.range.clone(),
+            "wrong-value-shape",
+            "index bounds require :key-kind static-index",
+        );
+    }
+    if let (Some((min, min_range)), Some((max, _))) = (&index_min, &index_max)
+        && min > max
+    {
+        analysis.error(
+            min_range.clone(),
+            "invalid-query",
+            "index-min must not exceed index-max",
+        );
+    }
+    for required in [
+        QueryStepField::Runtime,
+        QueryStepField::Global,
+        QueryStepField::Container,
+    ] {
+        if !seen.contains(&required) {
+            analysis.error(
+                query.range.clone(),
+                "missing-property",
+                format!("keyed-read-value requires {}", required.signature()),
+            );
+        }
+    }
+    if let Some((kind, _)) = &key_kind {
+        let requires_property = *kind == super::schema::RuntimeKeyKind::StaticProperty;
+        if container
+            .as_ref()
+            .is_some_and(|(container, _)| (container == "env") != requires_property)
+        {
+            analysis.error(
+                container
+                    .as_ref()
+                    .expect("container was checked above")
+                    .1
+                    .clone(),
+                "wrong-value-shape",
+                "env requires a property selector and argv requires an index selector",
+            );
+        }
+    } else if let Some((container, range)) = &container
+        && (container == "env") != property
+    {
+        analysis.error(
+            range.clone(),
+            "wrong-value-shape",
+            "env requires a property selector and argv requires an index selector",
+        );
+    }
+    if let Some((container, _)) = &container
+        && container == "argv"
+    {
+        let max_index = u64::from(u32::MAX - 1);
+        let out_of_range = index
+            .as_ref()
+            .filter(|(value, _)| *value > max_index)
+            .map(|(_, range)| range.clone())
+            .or_else(|| {
+                index_min
+                    .as_ref()
+                    .filter(|(value, _)| *value > max_index)
+                    .map(|(_, range)| range.clone())
+            })
+            .or_else(|| {
+                index_max
+                    .as_ref()
+                    .filter(|(value, _)| *value > max_index)
+                    .map(|(_, range)| range.clone())
+            });
+        if let Some(range) = out_of_range {
+            analysis.error(
+                range,
+                "invalid-query",
+                "argv index must be at most 4294967294",
+            );
+        }
     }
     if args.is_empty() {
         analysis.error(
@@ -2575,6 +2722,7 @@ fn validate_property_value(
         | super::schema::ValueShape::RuntimeGlobal
         | super::schema::ValueShape::RuntimeContainer
         | super::schema::ValueShape::RuntimeSourceOrigin
+        | super::schema::ValueShape::RuntimeKeyKind
         | super::schema::ValueShape::CallIdentity
         | super::schema::ValueShape::ReceiverTypeConstraint
         | super::schema::ValueShape::CallProof

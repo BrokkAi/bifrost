@@ -1409,6 +1409,8 @@ fn why_joins_the_runs_unmet_obligations_for_the_same_assertion() {
         PolicyObligationKind::AbsenceRequiresExhaustiveCoverage,
         "by-read",
         Some("app.ts#alias"),
+        Vec::new(),
+        false,
         vec![PolicyIncompleteReason::PipelineRowBudget],
     )
     .expect("a valid obligation");
@@ -1417,6 +1419,8 @@ fn why_joins_the_runs_unmet_obligations_for_the_same_assertion() {
         PolicyObligationKind::VerdictRequiresWitnessedRows,
         "by-read",
         None,
+        Vec::new(),
+        false,
         vec![PolicyIncompleteReason::PartialDiscovery],
     )
     .expect("a valid obligation");
@@ -3533,6 +3537,7 @@ fn replay_occurrence(
         path: path.into(),
         range: None,
         evidence: None,
+        coverage: None,
         fields: vec![
             UnitRowField {
                 name: "target_id".into(),
@@ -3569,7 +3574,7 @@ fn why_not_ir_replays_each_join_kind_and_absence_coverage() {
                 let plan = replay_ir_plan(kind);
                 let seed = || ReplayInput {
                     rows: vec![replay_occurrence("app.ts", "candidate", "value_reference")],
-                    coverage: RelationCoverage::Exhaustive,
+                    coverage: RelationCoverage::exhaustive(),
                 };
                 let mut queried = Vec::new();
                 let replay = replay_candidate_ir(
@@ -3599,9 +3604,9 @@ fn why_not_ir_replays_each_join_kind_and_absence_coverage() {
                                 Vec::new()
                             },
                             coverage: if exhaustive {
-                                RelationCoverage::Exhaustive
+                                RelationCoverage::exhaustive()
                             } else {
-                                RelationCoverage::ProvenSubset
+                                RelationCoverage::proven_subset()
                             },
                         })
                     },
@@ -3675,7 +3680,7 @@ fn why_not_ir_group_counts_peers_and_proves_zero_only_with_coverage() {
 
             let seed = || ReplayInput {
                 rows: vec![replay_occurrence("app.ts", "candidate", "value_reference")],
-                coverage: RelationCoverage::Exhaustive,
+                coverage: RelationCoverage::exhaustive(),
             };
             let replay = replay_candidate_ir(
                 &plan,
@@ -3692,9 +3697,9 @@ fn why_not_ir_group_counts_peers_and_proves_zero_only_with_coverage() {
                             vec![replay_occurrence("app.ts", "right", "declaration_name")]
                         },
                         coverage: if exhaustive {
-                            RelationCoverage::Exhaustive
+                            RelationCoverage::exhaustive()
                         } else {
-                            RelationCoverage::ProvenSubset
+                            RelationCoverage::proven_subset()
                         },
                     })
                 },
@@ -3750,7 +3755,7 @@ fn why_not_ir_replay_honors_comparison_and_group_budgets() {
         bound(&mut plan.limits);
         let seed = || ReplayInput {
             rows: vec![replay_occurrence("app.ts", "candidate", "value_reference")],
-            coverage: RelationCoverage::Exhaustive,
+            coverage: RelationCoverage::exhaustive(),
         };
         let replay = replay_candidate_ir(
             &plan,
@@ -3792,7 +3797,7 @@ fn why_not_ir_replay_preserves_composite_nullable_key_equality() {
                 .retain(|field| field.name.as_ref() != "target_id");
             ReplayInput {
                 rows: vec![row],
-                coverage: RelationCoverage::Exhaustive,
+                coverage: RelationCoverage::exhaustive(),
             }
         };
         let replay = replay_candidate_ir(
@@ -3842,7 +3847,7 @@ fn why_not_ir_replay_propagates_cancellation() {
         &replay_ir_plan(IrJoinKind::Left),
         ReplayInput {
             rows: vec![replay_occurrence("app.ts", "candidate", "value_reference")],
-            coverage: RelationCoverage::Exhaustive,
+            coverage: RelationCoverage::exhaustive(),
         },
         &[0],
         &mut |_, _| panic!("cancelled replay must not execute another source"),

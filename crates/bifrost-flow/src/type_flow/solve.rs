@@ -438,6 +438,46 @@ pub fn solve_type_flow_for_root(
     semantic_budget: &mut SemanticBudget,
     request: &mut DataflowRequest<'_>,
 ) -> Result<TypeFlowRootResult, TypeFlowError> {
+    let mut refinements = ProcedureRefinements::default();
+    solve_type_flow_for_root_with_refinements(
+        workspace,
+        adapter,
+        field_slots,
+        root,
+        active_semantic_model_snapshot,
+        limits,
+        feedback_limits,
+        value_flow_cache,
+        summary_state,
+        semantic_budget,
+        request,
+        &mut refinements,
+    )
+}
+
+/// Solve one root while reusing successful procedure-local refinement
+/// components from the caller-owned request cache.
+///
+/// The cache is deliberately limited to this request. It contains only pure,
+/// identity-keyed derivations; plans, failures, cancellation, budgets, hints,
+/// cuts, and results remain owned by this solve. Each semantic ledger still
+/// pays a reused component's measured work once through the existing
+/// `reused_or_derived` accounting.
+#[allow(clippy::too_many_arguments)]
+pub fn solve_type_flow_for_root_with_refinements(
+    workspace: &WorkspaceAnalyzer,
+    adapter: &dyn TypeFlowAdapter,
+    field_slots: &FieldSlotIndex,
+    root: &ProcedureHandle,
+    active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
+    limits: ClosureLimits,
+    feedback_limits: FeedbackLimits,
+    value_flow_cache: ValueFlowCache,
+    summary_state: TypeFlowSummaryState,
+    semantic_budget: &mut SemanticBudget,
+    request: &mut DataflowRequest<'_>,
+    refinements: &mut ProcedureRefinements,
+) -> Result<TypeFlowRootResult, TypeFlowError> {
     let _semantic_scope = AnalyzerQueryScope::with_active_semantic_model_snapshot(
         workspace.analyzer(),
         active_semantic_model_snapshot.clone(),
@@ -475,9 +515,9 @@ pub fn solve_type_flow_for_root(
     let root_solver_limits = request.budget.limits();
     let query_plan_config = request.query_plan_config();
     let mut solver_attempts = Vec::new();
-    // Every plan attempt in this solve rederives the same procedure-local
-    // refinements. Hold them across attempts so the work is performed once.
-    let mut refinements = ProcedureRefinements::default();
+    // Every plan attempt in this solve reuses the caller-owned procedure-local
+    // refinements. Keeping the cache outside the root solve also lets
+    // overlapping roots in one request share successful derivations.
     for iteration in 0..feedback_limits.max_iterations() {
         // A feedback pass is a speculative refinement of the preceding
         // result. Stage its semantic charges so an exhausted refinement can
@@ -518,7 +558,7 @@ pub fn solve_type_flow_for_root(
                     limits,
                     &mut iteration_budget,
                     request.cancellation,
-                    &mut refinements,
+                    refinements,
                     &mut acquisition_cuts,
                 )
             } else {
@@ -531,7 +571,7 @@ pub fn solve_type_flow_for_root(
                     limits,
                     &mut iteration_budget,
                     request.cancellation,
-                    &mut refinements,
+                    refinements,
                 )
             };
             let plan_cache_writes = discovery_provider.take_retained_writes();

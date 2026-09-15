@@ -515,7 +515,7 @@ const releaseCrateCount = Number(
   ).trim(),
 );
 
-function completeBundle(dir, { crates = releaseCrateCount, wheels = 10, vsix = 1, tgz = 1, sidecars = 7, notices = true } = {}) {
+function completeBundle(dir, { crates = releaseCrateCount, wheels = 10, vsix = 1, tgz = 2, sidecars = 7, notices = true } = {}) {
   const bundle = path.join(dir, "qualification-bundle");
   fs.mkdirSync(bundle, { recursive: true });
   for (let index = 0; index < crates; index += 1) {
@@ -548,6 +548,14 @@ test("a complete qualification bundle passes the inventory check", () => {
   withTempDir((dir) => {
     const result = inventoryRun(completeBundle(dir));
     assert.equal(result.status, 0, result.stderr);
+  });
+});
+
+test("a qualification bundle missing the DSH npm archive is refused", () => {
+  withTempDir((dir) => {
+    const result = inventoryRun(completeBundle(dir, { tgz: 1 }));
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /holds 1 \*\.tgz, expected at-least 2/u);
   });
 });
 

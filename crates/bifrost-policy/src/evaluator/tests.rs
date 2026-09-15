@@ -2310,3 +2310,322 @@ fn toml_configuration_rejected_document_stays_typed_inconclusive() {
         "{run:#?}"
     );
 }
+
+fn configuration_properties_fixture(
+    body: &str,
+) -> (
+    crate::inline_project::BuiltInlineTestProject,
+    TypescriptAnalyzer,
+    String,
+) {
+    let project = crate::inline_project::InlineTestProject::with_language(Language::TypeScript)
+        .file("application.properties", body)
+        .build();
+    let analyzer = TypescriptAnalyzer::from_project(project.project().clone());
+    (project, analyzer, body.to_string())
+}
+
+fn properties_configuration_policy_source(role: &str, key: &str) -> String {
+    format!(
+        r#"(policy
+      :id "test.properties-configuration-fact"
+      :name "Properties configuration fact"
+      :message "Matched properties server host"
+      :severity warning
+      :analysis (analysis
+        :type match
+        :selector (rql (configuration-facts
+          :format properties
+          :node-kind member
+          :role {role}
+          :scalar-kind string
+          :key "{key}"
+          :route [[(key "{key}")]]))))"#
+    )
+}
+
+fn evaluate_properties_configuration_selector_policy(
+    analyzer: &TypescriptAnalyzer,
+    source: &str,
+) -> PolicyRun {
+    let registry = policy_registry("test:properties-configuration-fact", source);
+    let policy = registry.policies().next().unwrap();
+    let context = PolicyEvaluationContext {
+        analyzer,
+        workspace: None,
+        flow_state: &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        cancellation: None,
+        cvss_overlays: &[],
+        organizational_risk: &[],
+        incremental: None,
+    };
+    let mut budget = PolicyBudget::default();
+    DefaultPolicyEvaluator::new()
+        .evaluate(policy, &context, &mut budget)
+        .unwrap()
+}
+
+#[test]
+fn properties_configuration_selector_policy_anchors_each_occurrence_and_excludes_near_misses() {
+    let source = "# deployment\n\
+server.host = primary.example\n\
+server.host: backup.example\n\
+server.hostname=near-miss.example\n\
+host=segment-near-miss.example\n";
+    let (_temp, analyzer, source) = configuration_properties_fixture(source);
+
+    let run = evaluate_properties_configuration_selector_policy(
+        &analyzer,
+        &properties_configuration_policy_source("property", "server.host"),
+    );
+    assert_eq!(run.completion(), &PolicyRunCompletion::Complete, "{run:#?}");
+    assert_eq!(run.findings().len(), 2, "{run:#?}");
+    assert_ne!(run.findings()[0].id(), run.findings()[1].id());
+    // Each duplicate occurrence is anchored at the exact bytes of its own
+    // authored logical line.
+    let mut anchored: Vec<_> = run
+        .findings()
+        .iter()
+        .map(|finding| {
+            assert!(
+                finding.primary().path().ends_with("application.properties"),
+                "{finding:#?}"
+            );
+            let span = finding.primary().byte_span().expect("byte span");
+            &source[span.start() as usize..span.end() as usize]
+        })
+        .collect();
+    anchored.sort_unstable();
+    assert_eq!(
+        anchored,
+        vec![
+            "server.host = primary.example",
+            "server.host: backup.example"
+        ],
+        "{run:#?}"
+    );
+
+    // A dotted key is one authored segment, so its last segment alone reaches
+    // only the bare `host` line; the TOML role is a different format's member.
+    let segment_run = evaluate_properties_configuration_selector_policy(
+        &analyzer,
+        &properties_configuration_policy_source("property", "host"),
+    );
+    assert_eq!(
+        segment_run.completion(),
+        &PolicyRunCompletion::Complete,
+        "{segment_run:#?}"
+    );
+    assert_eq!(segment_run.findings().len(), 1, "{segment_run:#?}");
+    let role_run = evaluate_properties_configuration_selector_policy(
+        &analyzer,
+        &properties_configuration_policy_source("table_entry", "server.host"),
+    );
+    assert_eq!(
+        role_run.completion(),
+        &PolicyRunCompletion::Complete,
+        "{role_run:#?}"
+    );
+    assert!(role_run.findings().is_empty(), "{role_run:#?}");
+}
+
+#[test]
+fn properties_configuration_malformed_document_stays_typed_inconclusive() {
+    // A `\u` escape without four hex digits fails `Properties.load`, so the
+    // run must report absence of evidence rather than a clean pass.
+    let (_temp, analyzer, _source) =
+        configuration_properties_fixture("server.host=kept.example\nbroken=\\u12x\n");
+    let run = evaluate_properties_configuration_selector_policy(
+        &analyzer,
+        &properties_configuration_policy_source("property", "server.host"),
+    );
+
+    assert!(
+        matches!(run.completion(), PolicyRunCompletion::Inconclusive { .. }),
+        "{run:#?}"
+    );
+    // The gap is the malformed escape, not a missing adapter.
+    assert!(
+        run.diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.message().contains("malformed syntax")),
+        "{run:#?}"
+    );
+}
+
+fn configuration_yaml_fixture(
+    body: &str,
+) -> (
+    crate::inline_project::BuiltInlineTestProject,
+    TypescriptAnalyzer,
+    String,
+) {
+    let project = crate::inline_project::InlineTestProject::with_language(Language::TypeScript)
+        .file("server.yaml", body)
+        .build();
+    let analyzer = TypescriptAnalyzer::from_project(project.project().clone());
+    (project, analyzer, body.to_string())
+}
+
+fn yaml_configuration_policy_source(route: &str) -> String {
+    format!(
+        r#"(policy
+      :id "test.yaml-configuration-fact"
+      :name "YAML configuration fact"
+      :message "Matched YAML server host"
+      :severity warning
+      :analysis (analysis
+        :type match
+        :selector (rql (configuration-facts
+          :format yaml
+          :node-kind member
+          :role object_member
+          :scalar-kind string
+          :key "host"
+          :route [[{route}]]))))"#
+    )
+}
+
+fn evaluate_yaml_configuration_selector_policy(
+    analyzer: &TypescriptAnalyzer,
+    source: &str,
+) -> PolicyRun {
+    let registry = policy_registry("test:yaml-configuration-fact", source);
+    let policy = registry.policies().next().unwrap();
+    let context = PolicyEvaluationContext {
+        analyzer,
+        workspace: None,
+        flow_state: &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        cancellation: None,
+        cvss_overlays: &[],
+        organizational_risk: &[],
+        incremental: None,
+    };
+    let mut budget = PolicyBudget::default();
+    DefaultPolicyEvaluator::new()
+        .evaluate(policy, &context, &mut budget)
+        .unwrap()
+}
+
+#[test]
+fn yaml_configuration_selector_policy_anchors_nested_and_indexed_routes() {
+    let source = r#"server:
+  host: primary.example
+  hostname: near-miss.example
+mirrors:
+  - host: first.example
+  - host: second.example
+"#;
+    let (_temp, analyzer, source) = configuration_yaml_fixture(source);
+
+    let nested_run = evaluate_yaml_configuration_selector_policy(
+        &analyzer,
+        &yaml_configuration_policy_source(r#"(key "server") (key "host")"#),
+    );
+    assert_eq!(
+        nested_run.completion(),
+        &PolicyRunCompletion::Complete,
+        "{nested_run:#?}"
+    );
+    assert_eq!(nested_run.findings().len(), 1, "{nested_run:#?}");
+    let finding = &nested_run.findings()[0];
+    assert!(
+        finding.primary().path().ends_with("server.yaml"),
+        "{finding:#?}"
+    );
+    let member_start = source.find("host: primary.example").expect("host member");
+    assert_eq!(
+        finding
+            .primary()
+            .byte_span()
+            .map(|span| span.start()..span.end()),
+        Some(member_start as u64..(member_start + "host: primary.example".len()) as u64),
+        "{finding:#?}"
+    );
+
+    // The same key under a block sequence is a different route per element,
+    // and the index segment is required to reach it.
+    let indexed_run = evaluate_yaml_configuration_selector_policy(
+        &analyzer,
+        &yaml_configuration_policy_source(r#"(key "mirrors") (index 1) (key "host")"#),
+    );
+    assert_eq!(
+        indexed_run.completion(),
+        &PolicyRunCompletion::Complete,
+        "{indexed_run:#?}"
+    );
+    assert_eq!(indexed_run.findings().len(), 1, "{indexed_run:#?}");
+    assert_ne!(indexed_run.findings()[0].id(), finding.id());
+    let second_start = source.find("host: second.example").expect("second host");
+    assert_eq!(
+        indexed_run.findings()[0]
+            .primary()
+            .byte_span()
+            .map(|span| span.start()),
+        Some(second_start as u64)
+    );
+
+    let near_miss_run = evaluate_yaml_configuration_selector_policy(
+        &analyzer,
+        &yaml_configuration_policy_source(r#"(key "mirrors") (key "host")"#),
+    );
+    assert_eq!(
+        near_miss_run.completion(),
+        &PolicyRunCompletion::Complete,
+        "{near_miss_run:#?}"
+    );
+    assert!(near_miss_run.findings().is_empty(), "{near_miss_run:#?}");
+}
+
+#[test]
+fn yaml_configuration_rejected_and_multi_document_files_stay_typed_inconclusive() {
+    // A tab indent is a YAML error the grammar cannot recover from, so no
+    // authored row survives and the run reports absence of evidence rather
+    // than a clean pass.
+    let (_temp, analyzer, _source) =
+        configuration_yaml_fixture("server:\n\thost: primary.example\n");
+    let run = evaluate_yaml_configuration_selector_policy(
+        &analyzer,
+        &yaml_configuration_policy_source(r#"(key "server") (key "host")"#),
+    );
+    assert!(
+        matches!(run.completion(), PolicyRunCompletion::Inconclusive { .. }),
+        "{run:#?}"
+    );
+    assert!(run.findings().is_empty(), "{run:#?}");
+    assert!(
+        run.diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.message().contains("malformed syntax")),
+        "{run:#?}"
+    );
+
+    // A second document in the stream is well-formed authored evidence the
+    // single-root model cannot represent: the first document's finding keeps
+    // its exact anchor, and the run cannot claim completion.
+    let (_temp, analyzer, source) = configuration_yaml_fixture(
+        "server:\n  host: primary.example\n---\nserver:\n  host: shadow.example\n",
+    );
+    let run = evaluate_yaml_configuration_selector_policy(
+        &analyzer,
+        &yaml_configuration_policy_source(r#"(key "server") (key "host")"#),
+    );
+    assert!(
+        matches!(run.completion(), PolicyRunCompletion::Inconclusive { .. }),
+        "{run:#?}"
+    );
+    assert_eq!(run.findings().len(), 1, "{run:#?}");
+    assert_eq!(
+        run.findings()[0]
+            .primary()
+            .byte_span()
+            .map(|span| span.start()),
+        Some(source.find("host: primary.example").unwrap() as u64)
+    );
+    assert!(
+        run.diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.message().contains("unsupported construct")),
+        "{run:#?}"
+    );
+}

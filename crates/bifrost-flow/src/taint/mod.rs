@@ -24,11 +24,11 @@ pub use model::{
     TaintUniverse, TaintUniverseHash,
 };
 pub use plan::{
-    TaintAnalysisPlan, TaintBatch, TaintBatchCompatibilityKey, TaintBatchPlanner,
-    TaintLocalTransformBinding, TaintPlanError, TaintPolicyPlan, TaintPolicyProjection,
-    TaintPropagationSemanticsId, TaintSanitizerBinding, TaintSinkBinding, TaintSourceBinding,
-    TaintStoreChannel, TaintStoreDimension, TaintStoreReadBinding, TaintStoreWriteBinding,
-    TaintTransformBinding,
+    ProvenStoreIdentities, TaintAnalysisPlan, TaintBatch, TaintBatchCompatibilityKey,
+    TaintBatchPlanner, TaintLocalTransformBinding, TaintPlanError, TaintPolicyPlan,
+    TaintPolicyProjection, TaintPropagationSemanticsId, TaintSanitizerBinding, TaintSinkBinding,
+    TaintSourceBinding, TaintStoreChannel, TaintStoreDimension, TaintStoreReadBinding,
+    TaintStoreWriteBinding, TaintTransformBinding,
 };
 pub use planned::{
     TaintCanonicalFinding, TaintPlannedEvidence, TaintPlannedResult, TaintPlannedSolveError,

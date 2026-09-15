@@ -133,7 +133,7 @@ fn parse_for_formatting(source: &str) -> Result<Expr, PolicySourceError> {
         format_error(
             "missing-document",
             source.len()..source.len(),
-            "expected one `(policy ...)` or `(endpoint ...)` document",
+            "expected one `(policy ...)`, `(endpoint ...)`, or `(endpoint-set-document ...)` document",
         )
     })
 }
@@ -667,5 +667,31 @@ mod tests {
         let too_large = "x".repeat(MAX_RQLP_SOURCE_BYTES + 1);
         let error = format_rqlp_source(&too_large).unwrap_err();
         assert_eq!(error.diagnostic.code, "source-too-large");
+    }
+
+    #[test]
+    fn standalone_endpoint_set_documents_use_the_same_source_formatter() {
+        let source = r#"(endpoint-set-document :schema-version 1 :kind sources
+  :language java
+  :set (endpoint-set :include-files [
+    (endpoint-set-file :path "sets/common.rqlp")
+  ]))"#;
+
+        let formatted = format_rqlp_source_with_options(
+            source,
+            &PolicyFormatOptions::new(MIN_RQLP_FORMAT_WIDTH).unwrap(),
+        )
+        .unwrap();
+        assert!(formatted.starts_with("(endpoint-set-document"));
+        assert!(formatted.contains(":include-files"));
+        assert_eq!(
+            format_rqlp_source_with_options(
+                &formatted,
+                &PolicyFormatOptions::new(MIN_RQLP_FORMAT_WIDTH).unwrap(),
+            )
+            .unwrap(),
+            formatted,
+            "standalone endpoint-set formatting must be idempotent"
+        );
     }
 }

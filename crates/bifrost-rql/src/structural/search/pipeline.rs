@@ -1,7 +1,8 @@
 use super::*;
 
 use crate::analyzer::semantic::{
-    RuntimeKeyedReadEndpoint, RuntimeKeyedReadFilter, RuntimeKeyedReadResult, SemanticOutcome,
+    RuntimeKeyedReadEndpoint, RuntimeKeyedReadFilter, RuntimeKeyedReadKeyKind,
+    RuntimeKeyedReadResult, SemanticOutcome,
 };
 use crate::query::ResolvedCallReceiverType;
 use crate::query::{
@@ -60,7 +61,11 @@ fn resolved_call_identity_matches(value: &CallBindingValue, identity: &CallIdent
         return false;
     };
     match identity {
-        CallIdentity::Stable(_) => value.site.model_id.as_deref() == Some(expected),
+        CallIdentity::Stable(_) => stable_model_identity_matches(
+            value.site.model_id.as_deref(),
+            &value.site.model_aliases,
+            expected,
+        ),
         CallIdentity::Qualified {
             resolved: Some(resolved),
             ..
@@ -76,6 +81,14 @@ fn resolved_call_identity_matches(value: &CallBindingValue, identity: &CallIdent
         },
         CallIdentity::Qualified { resolved: None, .. } => false,
     }
+}
+
+fn stable_model_identity_matches(
+    model_id: Option<&str>,
+    model_aliases: &[String],
+    expected: &str,
+) -> bool {
+    model_id == Some(expected) || model_aliases.iter().any(|alias| alias == expected)
 }
 
 fn resolved_call_receiver_matches(
@@ -1556,8 +1569,34 @@ pub(super) fn apply_pipeline_step(
                 runtime: filter.runtime.clone(),
                 global: filter.global.clone(),
                 container: filter.container.clone(),
-                property: filter.property.clone(),
-                index: filter.index,
+                property: match filter.key.as_ref() {
+                    Some(crate::query::KeyedReadKeySelector::ExactProperty(property)) => {
+                        Some(property.clone())
+                    }
+                    _ => None,
+                },
+                index: match filter.key.as_ref() {
+                    Some(crate::query::KeyedReadKeySelector::ExactIndex(index)) => Some(*index),
+                    _ => None,
+                },
+                key_kind: filter.key.as_ref().and_then(|key| match key {
+                    crate::query::KeyedReadKeySelector::StaticProperty => {
+                        Some(RuntimeKeyedReadKeyKind::StaticProperty)
+                    }
+                    crate::query::KeyedReadKeySelector::StaticIndexRange { .. } => {
+                        Some(RuntimeKeyedReadKeyKind::StaticIndex)
+                    }
+                    crate::query::KeyedReadKeySelector::ExactProperty(_)
+                    | crate::query::KeyedReadKeySelector::ExactIndex(_) => None,
+                }),
+                index_min: match filter.key.as_ref() {
+                    Some(crate::query::KeyedReadKeySelector::StaticIndexRange { min, .. }) => *min,
+                    _ => None,
+                },
+                index_max: match filter.key.as_ref() {
+                    Some(crate::query::KeyedReadKeySelector::StaticIndexRange { max, .. }) => *max,
+                    _ => None,
+                },
                 pristine_input: filter.pristine_input,
             };
             let (result, interrupted) = match semantic.as_mut() {
@@ -2887,7 +2926,11 @@ pub(super) fn apply_pipeline_step(
                         .effective_identity()
                         .is_some_and(|expected| {
                             value.site.model_callable_id.as_deref() == Some(expected)
-                                || value.site.model_id.as_deref() == Some(expected)
+                                || stable_model_identity_matches(
+                                    value.site.model_id.as_deref(),
+                                    &value.site.model_aliases,
+                                    expected,
+                                )
                         }),
                 };
                 if resolved_call_filter_matches(value, filter) {
@@ -3822,4 +3865,41 @@ pub(super) fn advance_pipeline_trace(
             }),
     );
     trace
+}
+
+#[cfg(test)]
+mod resolved_call_identity_tests {
+    use super::stable_model_identity_matches;
+
+    #[test]
+    fn accepts_the_selected_model_id_and_its_declared_alias() {
+        let aliases = vec!["member.system.getenv-string".to_owned()];
+
+        assert!(stable_model_identity_matches(
+            Some("jdk.java.lang.System.getenv(String)"),
+            &aliases,
+            "jdk.java.lang.System.getenv(String)"
+        ));
+        assert!(stable_model_identity_matches(
+            Some("jdk.java.lang.System.getenv(String)"),
+            &aliases,
+            "member.system.getenv-string"
+        ));
+    }
+
+    #[test]
+    fn rejects_an_unrelated_or_partial_alias() {
+        let aliases = vec!["member.system.getenv-string".to_owned()];
+
+        assert!(!stable_model_identity_matches(
+            Some("jdk.java.lang.System.getenv(String)"),
+            &aliases,
+            "member.runtime.exec-string"
+        ));
+        assert!(!stable_model_identity_matches(
+            Some("jdk.java.lang.System.getenv(String)"),
+            &aliases,
+            "member.system.getenv"
+        ));
+    }
 }

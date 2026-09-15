@@ -2894,7 +2894,7 @@ fn attach_relational_obligations(
     evaluation: &super::super::assertion_policy::RelationalAssertionEvaluation,
     budget: &PolicyBudget,
 ) {
-    use super::super::finding::PolicyObligation;
+    use super::super::finding::{PolicyCoveragePartition, PolicyObligation};
 
     if !matches!(run.completion(), PolicyRunCompletion::Inconclusive { .. }) {
         return;
@@ -2914,6 +2914,13 @@ fn attach_relational_obligations(
             policy_obligation_kind(obligation.kind),
             obligation.group.as_str(),
             (!key.is_empty()).then_some(key.as_str()),
+            obligation
+                .partition
+                .roots()
+                .iter()
+                .map(|root| PolicyCoveragePartition::new(root.family.label(), root.root.as_ref()))
+                .collect(),
+            obligation.partition.truncated(),
             obligation.reasons.clone(),
         );
         match projected {
@@ -3033,8 +3040,11 @@ fn retain_relational_obligation_diagnostics(
         } else {
             format!("group `{}` key `{key}`", obligation.group)
         };
+        // The partition is what makes an analysis-backed obligation actionable:
+        // the reasons say a solve did not finish, and this says which one.
+        let partition = render_coverage_partition(&obligation.partition);
         let message = format!(
-            "relational assertion `{}` published no verdict for {scope}: {} ({reasons})",
+            "relational assertion `{}` published no verdict for {scope}{partition}: {} ({reasons})",
             obligation.assertion,
             obligation.kind.label(),
         );
@@ -3051,6 +3061,29 @@ fn retain_relational_obligation_diagnostics(
             Err(_) => *diagnostics_truncated = true,
         }
     }
+}
+
+/// Render the analysis partitions an obligation is about, as the phrase that
+/// follows the blocked group in a diagnostic message.
+///
+/// Empty for a query-scope partition: the row set itself was short, which the
+/// reasons already state, and naming "the whole query" adds nothing.
+fn render_coverage_partition(partition: &super::super::relational::CoveragePartition) -> String {
+    if partition.roots().is_empty() {
+        return if partition.truncated() {
+            " in analysis partitions the report could not retain".to_string()
+        } else {
+            String::new()
+        };
+    }
+    let named = partition
+        .roots()
+        .iter()
+        .map(|root| format!("{} `{}`", root.family.label(), root.root))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let suffix = if partition.truncated() { ", ..." } else { "" };
+    format!(" in analysis partition {named}{suffix}")
 }
 
 /// Render one group key as a stable, human-readable correlation string. Group
@@ -3209,6 +3242,7 @@ fn evaluate_lowered_occurrence_assert<'rows>(
             path: "".into(),
             range: None,
             evidence: None,
+            coverage: None,
             fields: vec![
                 UnitRowField {
                     name: "id".into(),
@@ -3249,14 +3283,14 @@ fn evaluate_lowered_occurrence_assert<'rows>(
                     .source_binding(IrRelationId(0))
                     .expect("capture source"),
                 rows: &captures,
-                coverage: RelationCoverage::Exhaustive,
+                coverage: RelationCoverage::exhaustive(),
             },
             RelationalInput {
                 binding: plan
                     .source_binding(IrRelationId(1))
                     .expect("occurrence source"),
                 rows: &occurrence_rows,
-                coverage: RelationCoverage::Exhaustive,
+                coverage: RelationCoverage::exhaustive(),
             },
         ],
         cancellation,

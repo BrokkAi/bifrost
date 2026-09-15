@@ -7,6 +7,12 @@ import { PLATFORMS, ROOT_PACKAGE, tarballBasename, versionFromTag } from "./pack
 
 const VISIBILITY_ATTEMPTS = 20;
 const VISIBILITY_DELAY_MS = 15_000;
+export const DSH_PACKAGE = "@brokkai/dsh-plugin-bifrost";
+export const RELEASE_PACKAGES = [
+  ...PLATFORMS.map((platform) => platform.packageName),
+  ROOT_PACKAGE,
+  DSH_PACKAGE,
+];
 
 function parseArgs(argv) {
   const options = { publish: false };
@@ -55,6 +61,13 @@ export function publishTarball(tarball, spawnProcess = spawnSync) {
   return result.status === 0;
 }
 
+export function releaseEntries(dist, version) {
+  return RELEASE_PACKAGES.map((packageName) => ({
+    packageName,
+    tarball: path.join(dist, tarballBasename(packageName, version)),
+  }));
+}
+
 function delay(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
@@ -90,13 +103,10 @@ async function main() {
   const options = parseArgs(process.argv.slice(2));
   const version = versionFromTag(options.releaseTag);
   const dist = path.resolve(options.dist);
-  const packages = [...PLATFORMS.map((platform) => platform.packageName), ROOT_PACKAGE];
-  const entries = packages.map((packageName) => ({
-    packageName,
-    tarball: path.join(dist, tarballBasename(packageName, version)),
-  }));
-  const platformEntries = entries.slice(0, -1);
-  const rootEntry = entries.at(-1);
+  const entries = releaseEntries(dist, version);
+  const platformEntries = entries.slice(0, PLATFORMS.length);
+  const rootEntry = entries.at(PLATFORMS.length);
+  const dshEntry = entries.at(PLATFORMS.length + 1);
   for (const entry of entries) validateTarball(entry.tarball, entry.packageName, version);
 
   if (!options.publish) {
@@ -111,6 +121,9 @@ async function main() {
 
   await publishOrRecover(rootEntry, version);
   await waitForVersion(rootEntry.packageName, version);
+
+  await publishOrRecover(dshEntry, version);
+  await waitForVersion(dshEntry.packageName, version);
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {

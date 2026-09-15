@@ -29,3 +29,5 @@ bifrost_searchtools/*.so
 # .bifrost/suppressions.private.json (not published).
 /.bifrost/suppressions.local.json
 /.brokk.local-hold/
+# Private comparison checkout created by quick-performance.yml.
+/.quick-performance-base/

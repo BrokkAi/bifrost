@@ -360,10 +360,39 @@ fn obligation_node(obligation: &PolicyObligation) -> RawNode {
         obligation.group()
     ))
     .with_actual(match obligation.group_key() {
-        Some(key) => format!("no verdict was published at group key `{key}`"),
-        None => String::from("no verdict was published for the group relation"),
+        Some(key) => format!(
+            "no verdict was published at group key `{key}`{}",
+            obligation_partition(obligation)
+        ),
+        None => format!(
+            "no verdict was published for the group relation{}",
+            obligation_partition(obligation)
+        ),
     })
     .with_reasons(obligation.reasons().to_vec())
+}
+
+/// The analysis partitions a blocked verdict is about, as the phrase that
+/// follows it in the node's `actual` text.
+///
+/// Empty for a query-scope obligation: the row set itself was short, which the
+/// node's reasons already state.
+fn obligation_partition(obligation: &PolicyObligation) -> String {
+    if obligation.partitions().is_empty() {
+        return String::new();
+    }
+    let named = obligation
+        .partitions()
+        .iter()
+        .map(|partition| format!("{} `{}`", partition.family(), partition.root()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let suffix = if obligation.partitions_truncated() {
+        ", ..."
+    } else {
+        ""
+    };
+    format!(" in analysis partition {named}{suffix}")
 }
 
 /// The stable snake_case node label for one related-location relationship.

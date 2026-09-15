@@ -142,6 +142,7 @@ impl RubyGemArchivePackProducer {
                         relations: Vec::new(),
                     },
                     runtime_values: None,
+                    runtime_contracts: None,
                     collection_flows: None,
                     deferred_yields: None,
                     conditional_type_refinements: None,

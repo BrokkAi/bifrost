@@ -44,16 +44,18 @@ use crate::graph_support::{
 };
 use crate::imports::{
     RustImportBindingName, resolve_rust_module_path_with_crate,
-    resolve_rust_module_segments_with_crate, rust_external_module_segments,
-    rust_target_kind_root_alternative,
+    resolve_rust_module_segments_with_crate, rust_crate_root_package,
+    rust_external_module_segments, rust_target_kind_root_alternative,
 };
 use crate::lexical_scope::RustCfgCondition;
 use crate::usage::{
-    Domain, ModuleKey, RustImportEdge, RustImportEdgeKind, RustImportExtent, RustMacroScopeEdge,
-    RustMacroScopeKey, RustMacroScopeRanges, RustModuleAliasRoute, RustOriginRoute,
-    RustResolvedModuleRoute, RustRouteProvenance, RustSymbolIdentity, RustSymbolNamespace,
-    direct_import_scope_for_module_with_identity, edge_target_matches_exact_module,
-    imported_identity_domain, module_route_for_identity, rust_mod_item_has_macro_use,
+    Domain, ModuleKey, RustBindingSeeds, RustImportEdge, RustImportEdgeKind, RustImportExtent,
+    RustMacroInvocationCandidate, RustMacroInvocationIncomplete, RustMacroInvocationResolution,
+    RustMacroInvocationRoute, RustMacroScopeEdge, RustMacroScopeKey, RustMacroScopeRanges,
+    RustModuleAliasRoute, RustOriginRoute, RustResolvedModuleRoute, RustRouteProvenance,
+    RustSymbolIdentity, RustSymbolNamespace, direct_import_scope_for_module_with_identity,
+    edge_target_matches_exact_module, imported_identity_domain, module_route_for_identity,
+    rust_mod_item_has_macro_use,
 };
 use crate::usage_queries::{RustImportBinding, RustUsageQueries};
 use brokk_bifrost_core::analyzer::rust_facts::RUST_OCCURRENCE_CODE;
@@ -2003,6 +2005,9 @@ impl<'a> RustUsageWalks<'a> {
     ) -> Vec<CodeUnit> {
         let mut candidates = Vec::new();
         for root in self.owner_roots_of(file).iter() {
+            if self.cancelled() {
+                return Vec::new();
+            }
             let Some(root_module) = self.queries.module_at_byte(root, 0) else {
                 continue;
             };
@@ -2035,6 +2040,187 @@ impl<'a> RustUsageWalks<'a> {
         }
         candidates.sort();
         candidates.dedup();
+        candidates
+    }
+
+    /// Structured `#[macro_use]` candidates for one bare invocation.
+    ///
+    /// The module route reuses the exact scope-edge walk. The extern-crate
+    /// route reuses the existing imported-declaration walk, but records which
+    /// binding and dependency route selected the macro. Neither route expands
+    /// a macro or infers visibility from an unresolved candidate.
+    pub fn macro_use_invocation_candidates_named(
+        &self,
+        file: &ProjectFile,
+        name: &str,
+        byte: usize,
+    ) -> Vec<RustMacroInvocationCandidate> {
+        let mut module_candidates = Vec::new();
+        let Some(scope) = self
+            .queries
+            .module_at_byte(file, byte)
+            .map(|module| RustMacroScopeKey {
+                file: file.clone(),
+                module,
+            })
+        else {
+            return Vec::new();
+        };
+        for declaration in self.macro_declarations_named(name) {
+            if self.cancelled() {
+                return Vec::new();
+            }
+            let identity = match self.macro_identity_of(&declaration) {
+                Some(identity) => identity,
+                None => continue,
+            };
+            if let Some(route) = self.macro_use_module_route_of(&declaration, &scope, byte) {
+                module_candidates.push(RustMacroInvocationCandidate {
+                    identity,
+                    route,
+                    provenance: RustRouteProvenance::Local,
+                });
+            }
+        }
+
+        let mut candidates = module_candidates;
+        let extern_crate_candidates = self.macro_use_extern_crate_candidates_named(file, name);
+        candidates.extend(extern_crate_candidates);
+        candidates.sort_by(|left, right| {
+            left.identity
+                .file
+                .cmp(&right.identity.file)
+                .then_with(|| left.provenance.cmp(&right.provenance))
+        });
+        candidates.dedup();
+        candidates
+    }
+
+    /// Structured candidates from selected synthetic-std roots and exact
+    /// `#[macro_use]` routes.
+    pub fn selected_macro_invocation_candidates_named(
+        &self,
+        seeds: &RustBindingSeeds,
+        file: &ProjectFile,
+        name: &str,
+        byte: usize,
+    ) -> Vec<RustMacroInvocationCandidate> {
+        let mut candidates = self.macro_use_invocation_candidates_named(file, name, byte);
+        let implicit_prelude_enabled =
+            self.analyzer
+                .prepared_syntax(self.token, file)
+                .is_some_and(|prepared| {
+                    let source = prepared.source();
+                    let root = prepared.tree().root_node();
+                    let mut cursor = root.walk();
+                    !root.named_children(&mut cursor).any(|node| {
+                        node.kind() == "inner_attribute_item"
+                            && node
+                                .named_child(0)
+                                .and_then(|attribute| attribute.named_child(0))
+                                .is_some_and(|path| {
+                                    source.get(path.start_byte()..path.end_byte())
+                                        == Some("no_implicit_prelude")
+                                })
+                    })
+                });
+        if !implicit_prelude_enabled {
+            return candidates;
+        }
+        for root in seeds.roots().filter(|root| {
+            root.is_macro()
+                && root.identifier() == name
+                && root.is_synthetic()
+                && rust_crate_root_package(root.source()) == "std"
+        }) {
+            if self.cancelled() {
+                return Vec::new();
+            }
+            let Some(identity) = self.identity_of(root) else {
+                continue;
+            };
+            candidates.push(RustMacroInvocationCandidate {
+                identity,
+                route: RustMacroInvocationRoute::SelectedPrelude,
+                provenance: RustRouteProvenance::CurrentLibrary,
+            });
+        }
+        candidates
+    }
+
+    /// Resolve one invocation without flattening cancellation into absence.
+    pub fn resolve_selected_macro_invocation(
+        &self,
+        seeds: &RustBindingSeeds,
+        file: &ProjectFile,
+        name: &str,
+        byte: usize,
+    ) -> RustMacroInvocationResolution {
+        if self.cancelled() {
+            return RustMacroInvocationResolution::Incomplete(
+                RustMacroInvocationIncomplete::Cancelled,
+            );
+        }
+        let candidates = self.selected_macro_invocation_candidates_named(seeds, file, name, byte);
+        if self.cancelled() {
+            return RustMacroInvocationResolution::Incomplete(
+                RustMacroInvocationIncomplete::Cancelled,
+            );
+        }
+        seeds.resolve_macro_invocation_targets(&candidates)
+    }
+
+    fn macro_use_extern_crate_candidates_named(
+        &self,
+        file: &ProjectFile,
+        name: &str,
+    ) -> Vec<RustMacroInvocationCandidate> {
+        let mut candidates = Vec::new();
+        for root in self.owner_roots_of(file).iter() {
+            let Some(root_module) = self.queries.module_at_byte(root, 0) else {
+                continue;
+            };
+            for binding in self
+                .queries
+                .import_bindings_of(root)
+                .iter()
+                .filter(|binding| {
+                    binding.is_extern_crate
+                        && binding.is_macro_use
+                        && !binding.extent.is_local_only()
+                        && binding.importer_module == root_module
+                })
+            {
+                for route in self.resolve_segments(root, &binding.owner_module, &binding.path) {
+                    let module_files = [route.target_file];
+                    for (target_file, target_name) in
+                        self.export_targets_from_files(self.analyzer, &module_files, name)
+                    {
+                        for declaration in
+                            self.analyzer
+                                .declarations(&target_file)
+                                .iter()
+                                .filter(|candidate| {
+                                    candidate.identifier() == target_name && candidate.is_macro()
+                                })
+                        {
+                            let Some(identity) = self.macro_identity_of(declaration) else {
+                                continue;
+                            };
+                            candidates.push(RustMacroInvocationCandidate {
+                                identity,
+                                route: RustMacroInvocationRoute::MacroUseExternCrate {
+                                    crate_root: root.clone(),
+                                    importer_module: binding.importer_module.clone(),
+                                    extent: binding.extent.clone(),
+                                },
+                                provenance: route.provenance,
+                            });
+                        }
+                    }
+                }
+            }
+        }
         candidates
     }
 
@@ -2200,6 +2386,81 @@ impl<'a> RustUsageWalks<'a> {
                 .insert(file.clone(), Arc::clone(&edges));
         }
         edges
+    }
+
+    /// Find the structured route that admits a macro at one invocation scope.
+    ///
+    /// This repeats the stateful walk in `macro_visible_ranges_of` with the
+    /// admitting edge retained. The two walks keep the same guards: a child
+    /// imports macros only at its visibility byte, and a descendant module
+    /// admits its parent's macros only after that module starts.
+    fn macro_use_module_route_of(
+        &self,
+        declaration: &CodeUnit,
+        caller_scope: &RustMacroScopeKey,
+        caller_byte: usize,
+    ) -> Option<RustMacroInvocationRoute> {
+        let identity = self.macro_identity_of(declaration)?;
+        let definition_end = self
+            .analyzer
+            .ranges(declaration)
+            .into_iter()
+            .map(|range| range.end_byte)
+            .min()?;
+        let mut visited = HashSet::default();
+        let mut pending = vec![(
+            RustMacroScopeKey {
+                file: identity.file.clone(),
+                module: identity.module.clone(),
+            },
+            definition_end,
+            RustMacroInvocationRoute::LocalModule {
+                scope: RustMacroScopeKey {
+                    file: identity.file.clone(),
+                    module: identity.module.clone(),
+                },
+            },
+        )];
+        while let Some((scope, visible_after, arrival_route)) = pending.pop() {
+            if self.cancelled() {
+                return None;
+            }
+            if !visited.insert((scope.clone(), visible_after)) {
+                continue;
+            }
+            let shadow_start = self
+                .macro_definitions_in_scope(&scope, &identity.name)
+                .into_iter()
+                .filter(|(candidate, start)| candidate != declaration && *start >= visible_after)
+                .map(|(_, start)| start)
+                .min()
+                .unwrap_or(usize::MAX);
+            if scope == *caller_scope && visible_after <= caller_byte && caller_byte < shadow_start
+            {
+                return Some(arrival_route);
+            }
+            for edge in self.macro_scope_edges_into(&scope) {
+                if edge.imports_macros && edge.visibility_start < shadow_start {
+                    pending.push((
+                        edge.parent.clone(),
+                        edge.visibility_start,
+                        RustMacroInvocationRoute::MacroUseModule {
+                            declaration_start: edge.declaration_start,
+                            visibility_start: edge.visibility_start,
+                            parent: edge.parent,
+                            child: edge.child,
+                        },
+                    ));
+                }
+            }
+            for edge in self.macro_scope_edges_out_of(&scope) {
+                if edge.declaration_start >= visible_after && edge.declaration_start < shadow_start
+                {
+                    pending.push((edge.child.clone(), 0, arrival_route.clone()));
+                }
+            }
+        }
+        None
     }
 
     /// Scope edges whose child is `scope`. An inline module's parent is in the

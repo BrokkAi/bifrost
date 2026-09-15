@@ -401,7 +401,62 @@ pub struct RustMacroScopeEdge {
 /// One macro's visible byte ranges per scope, the lazy form's answer shape.
 pub type RustMacroScopeRanges = HashMap<RustMacroScopeKey, Vec<(usize, usize)>>;
 
-#[derive(Debug)]
+/// The structured route that proves a macro invocation target was selected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RustMacroInvocationRoute {
+    /// A module declaration carrying `#[macro_use]`, with the bytes recorded
+    /// by the exact scope walk.
+    MacroUseModule {
+        declaration_start: usize,
+        visibility_start: usize,
+        parent: RustMacroScopeKey,
+        child: RustMacroScopeKey,
+    },
+    /// A root-level `#[macro_use] extern crate` binding.
+    MacroUseExternCrate {
+        crate_root: ProjectFile,
+        importer_module: ModuleKey,
+        extent: RustImportExtent,
+    },
+    /// A macro declared directly in the invocation's module.
+    LocalModule { scope: RustMacroScopeKey },
+    /// A prelude target explicitly present in the caller's selected facts.
+    SelectedPrelude,
+}
+
+/// One macro candidate with the structured route that selected it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RustMacroInvocationCandidate {
+    pub identity: RustSymbolIdentity,
+    pub route: RustMacroInvocationRoute,
+    pub provenance: RustRouteProvenance,
+}
+
+/// The authoritative selected macro-invocation answer. `Exact` carries both
+/// identity and the structured route/provenance that selected it; ambiguous
+/// and unresolved answers never promote a candidate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RustMacroInvocationResolution {
+    Exact(RustMacroInvocationTarget),
+    Ambiguous(Vec<RustSymbolIdentity>),
+    Unresolved,
+    Incomplete(RustMacroInvocationIncomplete),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RustMacroInvocationIncomplete {
+    Cancelled,
+}
+
+/// An exact macro invocation target with its selected route evidence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RustMacroInvocationTarget {
+    pub identity: RustSymbolIdentity,
+    pub route: RustMacroInvocationRoute,
+    pub provenance: RustRouteProvenance,
+}
+
+#[derive(Debug, PartialEq, Eq)]
 pub enum RustReferenceResolution {
     Exact(RustSymbolIdentity),
     Ambiguous(Vec<RustSymbolIdentity>),
@@ -429,6 +484,83 @@ impl RustBindingSeeds {
         self.identities
             .iter()
             .map(|identity| identity.name.as_str())
+    }
+
+    pub(crate) fn roots(&self) -> impl Iterator<Item = &CodeUnit> {
+        self.roots.iter()
+    }
+
+    /// Partition route-backed macro candidates against this selected context.
+    pub fn resolve_macro_invocation_targets(
+        &self,
+        candidates: &[RustMacroInvocationCandidate],
+    ) -> RustMacroInvocationResolution {
+        fn route_rank(route: &RustMacroInvocationRoute) -> u8 {
+            match route {
+                RustMacroInvocationRoute::MacroUseModule { .. } => 0,
+                RustMacroInvocationRoute::MacroUseExternCrate { .. } => 1,
+                RustMacroInvocationRoute::LocalModule { .. } => 2,
+                RustMacroInvocationRoute::SelectedPrelude => 3,
+            }
+        }
+
+        fn provenance_rank(provenance: RustRouteProvenance) -> u8 {
+            match provenance {
+                RustRouteProvenance::Local => 0,
+                RustRouteProvenance::CurrentLibrary => 1,
+                RustRouteProvenance::Dependency => 2,
+            }
+        }
+
+        let mut selected: Vec<&RustMacroInvocationCandidate> = candidates
+            .iter()
+            .filter(|candidate| self.root_origins.contains(&candidate.identity))
+            .collect();
+        if selected.len() != candidates.len() {
+            return RustMacroInvocationResolution::Unresolved;
+        }
+        selected.sort_by(|left, right| {
+            left.identity
+                .file
+                .cmp(&right.identity.file)
+                .then_with(|| {
+                    left.identity
+                        .module
+                        .crate_root
+                        .cmp(&right.identity.module.crate_root)
+                })
+                .then_with(|| {
+                    left.identity
+                        .module
+                        .components
+                        .cmp(&right.identity.module.components)
+                })
+                .then_with(|| left.identity.name.cmp(&right.identity.name))
+                .then_with(|| {
+                    provenance_rank(left.provenance).cmp(&provenance_rank(right.provenance))
+                })
+                .then_with(|| route_rank(&left.route).cmp(&route_rank(&right.route)))
+        });
+        let mut identities: Vec<RustSymbolIdentity> = selected
+            .iter()
+            .map(|candidate| candidate.identity.clone())
+            .collect();
+        identities.dedup();
+        match identities.as_slice() {
+            [] => RustMacroInvocationResolution::Unresolved,
+            [identity] => {
+                let candidate = selected
+                    .iter()
+                    .find(|candidate| candidate.identity == *identity)
+                    .expect("at least one selected candidate for the exact identity");
+                RustMacroInvocationResolution::Exact(RustMacroInvocationTarget {
+                    identity: identity.clone(),
+                    route: candidate.route.clone(),
+                    provenance: candidate.provenance,
+                })
+            }
+            identities => RustMacroInvocationResolution::Ambiguous(identities.to_vec()),
+        }
     }
 
     pub fn verified_importer_files(&self) -> impl Iterator<Item = &ProjectFile> {
@@ -2211,32 +2343,39 @@ pub fn usage_reference_at_with_walks(
         && segments.len() == 1
         && (!leading_absolute || leading_absolute_local)
     {
-        let scope = RustMacroScopeKey {
-            file: file.clone(),
-            module: module.clone(),
-        };
-        let visible_macros = walks
-            .macro_declarations_named(segments[0])
-            .into_iter()
-            .filter(|declaration| {
-                walks
-                    .macro_visible_ranges_of(declaration)
-                    .get(&scope)
-                    .is_some_and(|ranges| {
-                        ranges
-                            .iter()
-                            .any(|(start, end)| *start <= byte && byte < *end)
-                    })
-            })
-            .collect::<Vec<_>>();
-        if !visible_macros.is_empty() {
-            matches.clear();
-            matches.extend(
-                visible_macros
-                    .into_iter()
-                    .filter(|declaration| seeds.roots.contains(declaration))
-                    .filter_map(|declaration| walks.identity_of(&declaration)),
-            );
+        let resolution = walks.resolve_selected_macro_invocation(seeds, file, segments[0], byte);
+        if resolution != RustMacroInvocationResolution::Unresolved {
+            return match resolution {
+                RustMacroInvocationResolution::Exact(target)
+                    if origin_routes.iter().all(|route| {
+                        seeds
+                            .canonical_identities
+                            .get(&route.origin)
+                            .is_some_and(|origins| {
+                                !origins.is_empty()
+                                    && origins.iter().all(|origin| origin == &target.identity)
+                            })
+                            || route.origin == target.identity
+                    }) =>
+                {
+                    RustReferenceResolution::Exact(target.identity)
+                }
+                RustMacroInvocationResolution::Exact(_) => {
+                    RustReferenceResolution::Ambiguous(Vec::new())
+                }
+                RustMacroInvocationResolution::Ambiguous(identities) => {
+                    RustReferenceResolution::Ambiguous(identities)
+                }
+                RustMacroInvocationResolution::Unresolved => {
+                    // Structured candidates exist, but none belongs to this
+                    // selected context. Do not fall back to same-package or
+                    // name-only macro candidates.
+                    RustReferenceResolution::Ambiguous(Vec::new())
+                }
+                RustMacroInvocationResolution::Incomplete(_) => {
+                    RustReferenceResolution::Ambiguous(Vec::new())
+                }
+            };
         }
     }
 
@@ -2945,7 +3084,14 @@ pub fn edge_target_matches_exact_module(edge: &RustImportEdge, crate_root_packag
 
 #[cfg(test)]
 mod unnamed_guard_tests {
-    use super::*;
+    use super::{
+        Domain, HashMap, HashSet, ModuleKey, ProjectFile, RustBindingSeeds, RustCfgCondition,
+        RustImportExtent, RustMacroInvocationCandidate, RustMacroInvocationResolution,
+        RustMacroInvocationRoute, RustMacroInvocationTarget, RustRouteProvenance,
+        RustSymbolIdentity, RustSymbolNamespace, RustUnnamedImportVisibility,
+        combine_rust_cfg_conditions,
+    };
+    use std::collections::BTreeSet;
 
     #[test]
     fn guard_conjunction_rejects_internal_and_cross_set_contradictions() {
@@ -3006,5 +3152,94 @@ mod unnamed_guard_tests {
         ));
         seeds.unnamed_visibility[0].cfg_conditions = vec![RustCfgCondition::Unknown];
         assert!(!seeds.unnamed_target_visible_at(&target, &file, &module, 10, &[]));
+    }
+
+    fn macro_candidate(
+        name: &str,
+        crate_name: &str,
+        provenance: RustRouteProvenance,
+    ) -> RustMacroInvocationCandidate {
+        let root = tempfile::tempdir().expect("temporary root");
+        let file = ProjectFile::new(root.path().to_path_buf(), "lib.rs");
+        let identity = RustSymbolIdentity {
+            module: ModuleKey::new(&file, crate_name),
+            file: file.clone(),
+            name: name.into(),
+            namespace: RustSymbolNamespace::Macro,
+        };
+        RustMacroInvocationCandidate {
+            identity,
+            route: RustMacroInvocationRoute::MacroUseExternCrate {
+                crate_root: file.clone(),
+                importer_module: ModuleKey::new(&file, ""),
+                extent: RustImportExtent::Module { start: 0, end: 100 },
+            },
+            provenance,
+        }
+    }
+
+    fn empty_seeds() -> RustBindingSeeds {
+        RustBindingSeeds {
+            roots: BTreeSet::new(),
+            root_origins: HashSet::default(),
+            root_identities: super::HashMap::default(),
+            canonical_identities: super::HashMap::default(),
+            identities: HashSet::default(),
+            identity_domains: super::HashMap::default(),
+            edges_by_importer: super::HashMap::default(),
+            verified_importers: HashSet::default(),
+            unnamed_visibility: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn selected_macro_use_route_is_exact_but_unselected_is_unresolved() {
+        let target = macro_candidate("target", "target-crate", RustRouteProvenance::Dependency);
+        let other = macro_candidate("other", "other-crate", RustRouteProvenance::Dependency);
+        let mut seeds = empty_seeds();
+        seeds.root_origins.insert(target.identity.clone());
+
+        assert_eq!(
+            seeds.resolve_macro_invocation_targets(std::slice::from_ref(&target)),
+            RustMacroInvocationResolution::Exact(RustMacroInvocationTarget {
+                identity: target.identity.clone(),
+                route: target.route.clone(),
+                provenance: RustRouteProvenance::Dependency,
+            }),
+        );
+        assert_eq!(
+            seeds.resolve_macro_invocation_targets(std::slice::from_ref(&other)),
+            RustMacroInvocationResolution::Unresolved,
+        );
+    }
+
+    #[test]
+    fn two_selected_macro_routes_remain_ambiguous() {
+        let left = macro_candidate("target", "left", RustRouteProvenance::Dependency);
+        let right = macro_candidate("target", "right", RustRouteProvenance::Dependency);
+        let mut seeds = empty_seeds();
+        seeds.root_origins.insert(left.identity.clone());
+        seeds.root_origins.insert(right.identity.clone());
+
+        let candidates = [left.clone(), right.clone()];
+        let mut expected = vec![left.identity, right.identity];
+        expected.sort_by(|left, right| left.file.cmp(&right.file));
+        assert_eq!(
+            seeds.resolve_macro_invocation_targets(&candidates),
+            RustMacroInvocationResolution::Ambiguous(expected),
+        );
+    }
+
+    #[test]
+    fn an_unselected_visible_macro_prevents_selected_prelude_exactness() {
+        let prelude = macro_candidate("vec", "std", RustRouteProvenance::CurrentLibrary);
+        let local = macro_candidate("vec", "consumer", RustRouteProvenance::Local);
+        let mut seeds = empty_seeds();
+        seeds.root_origins.insert(prelude.identity.clone());
+
+        assert_eq!(
+            seeds.resolve_macro_invocation_targets(&[prelude, local]),
+            RustMacroInvocationResolution::Unresolved,
+        );
     }
 }

@@ -1226,6 +1226,7 @@ mod tests {
                 "Showing 1 of 3 matching files. Raise `limit` or use a more specific identifier, qualified, or regex-like pattern to see the rest."
                     .to_string(),
             ),
+            invalid_patterns: Vec::new(),
             too_many_matches: None,
         };
 

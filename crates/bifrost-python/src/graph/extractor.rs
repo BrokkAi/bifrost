@@ -41,7 +41,7 @@ use brokk_bifrost_core::hash::{HashMap, HashSet};
 use brokk_bifrost_core::text_utils::compute_line_starts;
 use rayon::prelude::*;
 use std::collections::BTreeSet;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tree_sitter::{Node, Parser, Tree};
 
 pub struct ParsedFile {
@@ -115,6 +115,45 @@ pub fn build_python_graph(
     PythonProjectGraph { parsed }
 }
 
+/// Immutable target facts shared by every file in one forward usage scan.
+pub struct PythonScanTarget<'a> {
+    target: &'a CodeUnit,
+    target_short: String,
+    target_member: Option<String>,
+    target_owner: Option<CodeUnit>,
+    member_unique_in_target_file: bool,
+}
+
+impl<'a> PythonScanTarget<'a> {
+    /// Derive all target facts once before the per-file frontier evaluates.
+    pub fn new(index: &dyn CodeUnitIndex, target: &'a CodeUnit) -> Self {
+        let target_member = member_name(index, target);
+        // A same-file best-effort for unresolvable receivers is only safe when
+        // the member name is unambiguous in the target's file (exactly one
+        // class there declares it), so `recv.member` can only mean the target.
+        let member_unique_in_target_file = target_member.as_deref().is_some_and(|member| {
+            let owners: HashSet<CodeUnit> = index
+                .declarations(target.source())
+                .into_iter()
+                .filter(|decl| {
+                    decl.identifier() == member && target_owner_code_unit(index, decl).is_some()
+                })
+                .filter_map(|decl| target_owner_code_unit(index, &decl))
+                .collect();
+            owners.len() == 1
+        });
+        Self {
+            target,
+            target_short: top_level_identifier(index, target),
+            target_member,
+            target_owner: target_owner_code_unit(index, target),
+            member_unique_in_target_file,
+        }
+    }
+}
+
+/// Scan a set of files, retaining the historical whole-set API for callers
+/// that do not need per-file frontier replay.
 pub fn scan_files_for_seeds(
     graph: &PythonGraphSource<'_>,
     python: &dyn PythonUsageSource,
@@ -124,50 +163,67 @@ pub fn scan_files_for_seeds(
     seeds: &BTreeSet<(ProjectFile, String)>,
     cancellation: Option<&CancellationToken>,
 ) -> ScanResult {
-    let collected: Mutex<BTreeSet<UsageHit>> = Mutex::new(BTreeSet::new());
-    let unproven_collected: Mutex<BTreeSet<UsageHit>> = Mutex::new(BTreeSet::new());
-    let target_short = top_level_identifier(graph.index, target);
-    let target_member = member_name(graph.index, target);
-    let target_owner = target_owner_code_unit(graph.index, target);
-    // A same-file best-effort for unresolvable receivers is only safe when the
-    // member name is unambiguous in the target's file (exactly one class there
-    // declares it), so `recv.member` can only mean the target.
-    let member_unique_in_target_file = target_member.as_deref().is_some_and(|member| {
-        let owners: HashSet<CodeUnit> = graph
-            .index
-            .declarations(target.source())
-            .into_iter()
-            .filter(|decl| {
-                decl.identifier() == member && target_owner_code_unit(graph.index, decl).is_some()
-            })
-            .filter_map(|decl| target_owner_code_unit(graph.index, &decl))
-            .collect();
-        owners.len() == 1
-    });
-    let files_vec: Vec<&ProjectFile> = files.iter().collect();
-    let parser_language = tree_sitter_python::LANGUAGE.into();
+    let scan_target = PythonScanTarget::new(graph.index, target);
+    files
+        .par_iter()
+        .map(|file| {
+            scan_file_for_seeds(
+                graph,
+                python,
+                project_graph,
+                file,
+                &scan_target,
+                seeds,
+                cancellation,
+            )
+        })
+        .reduce(ScanResult::default, |mut collected, result| {
+            collected.hits.extend(result.hits);
+            collected.unproven_hits.extend(result.unproven_hits);
+            collected
+        })
+}
 
-    files_vec.par_iter().for_each(|file| {
-        if cancellation.is_some_and(CancellationToken::is_cancelled) {
-            return;
-        }
-        let owned_source: Option<Arc<String>>;
-        let owned_tree: Option<Tree>;
-        let (source_str, tree_ref) = if let Some(parsed) = project_graph.parsed.get(*file) {
+/// Scan one file against one target. The owned result is suitable for replay
+/// by a relational item frontier: no provisional result is published through
+/// shared state.
+pub fn scan_file_for_seeds(
+    graph: &PythonGraphSource<'_>,
+    python: &dyn PythonUsageSource,
+    project_graph: &PythonProjectGraph,
+    file: &ProjectFile,
+    scan_target: &PythonScanTarget<'_>,
+    seeds: &BTreeSet<(ProjectFile, String)>,
+    cancellation: Option<&CancellationToken>,
+) -> ScanResult {
+    let parser_language = tree_sitter_python::LANGUAGE.into();
+    let target = scan_target.target;
+    let target_short = scan_target.target_short.as_str();
+    let target_member = scan_target.target_member.as_deref();
+    let target_owner = scan_target.target_owner.as_ref();
+
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        return ScanResult::default();
+    }
+    let owned_source: Option<Arc<String>>;
+    let owned_tree: Option<Tree>;
+    let (source_str, tree_ref) = {
+        let _scope = brokk_bifrost_core::profiling::scope("python_graph::read_or_parse_candidate");
+        if let Some(parsed) = project_graph.parsed.get(file) {
             (parsed.source.as_str(), &parsed.tree)
         } else {
             let Ok(source) = file.read_to_string() else {
-                return;
+                return ScanResult::default();
             };
             if source.is_empty() {
-                return;
+                return ScanResult::default();
             }
             let mut parser = Parser::new();
             if parser.set_language(&parser_language).is_err() {
-                return;
+                return ScanResult::default();
             }
             let Some(tree) = parser.parse(source.as_str(), None) else {
-                return;
+                return ScanResult::default();
             };
             owned_source = Some(Arc::new(source));
             owned_tree = Some(tree);
@@ -175,114 +231,98 @@ pub fn scan_files_for_seeds(
                 owned_source.as_deref().unwrap().as_str(),
                 owned_tree.as_ref().unwrap(),
             )
-        };
-        if cancellation.is_some_and(CancellationToken::is_cancelled) {
-            return;
         }
+    };
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        return ScanResult::default();
+    }
 
-        let edges = {
-            let _scope = brokk_bifrost_core::profiling::scope("python_graph::matching_edges");
-            usage_matching_edges(python, file, seeds)
-        };
-        // This is an AST-name gate, not a source-text resolver. Every usage
-        // accepted by the later structural walk has a matching identifier or
-        // can occur inside an annotation string. Skip files that lack both
-        // before building their scope facts and performing that expensive walk.
-        if !file_may_reference_target(
+    let edges = {
+        let _scope = brokk_bifrost_core::profiling::scope("python_graph::matching_edges");
+        usage_matching_edges(python, file, seeds)
+    };
+    // This is an AST-name gate, not a source-text resolver. Every usage
+    // accepted by the later structural walk has a matching identifier or
+    // can occur inside an annotation string. Skip files that lack both
+    // before building their scope facts and performing that expensive walk.
+    let may_reference_target = {
+        let _scope = brokk_bifrost_core::profiling::scope("python_graph::target_ast_gate");
+        file_may_reference_target(
             tree_ref.root_node(),
             source_str,
             target,
-            target_short.as_str(),
-            target_member.as_deref(),
+            target_short,
+            target_member,
             &edges,
-        ) {
-            return;
-        }
-        let raw_module_bindings = {
-            let _scope =
-                brokk_bifrost_core::profiling::scope("python_graph::module_binding_timeline");
-            usage_module_binding_timeline(python, file, || {
-                collect_module_binding_timeline(tree_ref.root_node(), source_str)
-            })
-        };
-        let module_bindings = classify_module_binding_timeline(
-            python,
-            file,
-            raw_module_bindings.as_ref(),
-            seeds,
-            &edges,
-        );
-        let scoped_import_bindings = parse_python_import_bindings(source_str);
-        let target_self_file = *file == target.source();
-        let scope_facts = {
-            let _scope = brokk_bifrost_core::profiling::scope("python_graph::scope_facts");
-            usage_scope_facts(python, file, || {
-                collect_scope_facts_from_parsed_source(
-                    graph,
-                    python,
-                    file,
-                    source_str,
-                    tree_ref.root_node(),
-                )
-            })
-        };
-        let scope_range_index = build_scope_range_index(graph, scope_facts.as_ref());
+        )
+    };
+    if !may_reference_target {
+        return ScanResult::default();
+    }
+    let raw_module_bindings = {
+        let _scope = brokk_bifrost_core::profiling::scope("python_graph::module_binding_timeline");
+        usage_module_binding_timeline(python, file, || {
+            collect_module_binding_timeline(tree_ref.root_node(), source_str)
+        })
+    };
+    let module_bindings =
+        classify_module_binding_timeline(python, file, raw_module_bindings.as_ref(), seeds, &edges);
+    let scoped_import_bindings = parse_python_import_bindings(source_str);
+    let target_self_file = file == target.source();
+    let scope_facts = {
+        let _scope = brokk_bifrost_core::profiling::scope("python_graph::scope_facts");
+        usage_scope_facts(python, file, || {
+            collect_scope_facts_from_parsed_source(
+                graph,
+                python,
+                file,
+                source_str,
+                tree_ref.root_node(),
+            )
+        })
+    };
+    let scope_range_index = {
+        let _scope = brokk_bifrost_core::profiling::scope("python_graph::scope_range_index");
+        build_scope_range_index(graph, scope_facts.as_ref())
+    };
 
-        let mut local_hits = BTreeSet::new();
-        let mut local_unproven_hits = BTreeSet::new();
-        let line_starts = compute_line_starts(source_str);
+    let mut local_hits = BTreeSet::new();
+    let mut local_unproven_hits = BTreeSet::new();
+    let line_starts = compute_line_starts(source_str);
 
-        let mut scan_ctx = ScanCtx {
-            python,
-            file,
-            source: source_str,
-            line_starts: &line_starts,
-            graph,
-            target,
-            target_short: &target_short,
-            target_member: target_member.as_deref(),
-            target_owner: target_owner.clone(),
-            target_is_module: target.is_module(),
-            target_source: target.source(),
-            seeds,
-            edges: &edges,
-            target_self_file,
-            member_best_effort_unique: target_self_file && member_unique_in_target_file,
-            raw_module_bindings: raw_module_bindings.as_ref(),
-            module_bindings: &module_bindings,
-            scoped_import_bindings: &scoped_import_bindings,
-            scope_facts: scope_facts.as_ref(),
-            scope_range_index: &scope_range_index,
-            hits: &mut local_hits,
-            unproven_hits: &mut local_unproven_hits,
-        };
+    let mut scan_ctx = ScanCtx {
+        python,
+        file,
+        source: source_str,
+        line_starts: &line_starts,
+        graph,
+        target,
+        target_short,
+        target_member,
+        target_owner: target_owner.cloned(),
+        target_is_module: target.is_module(),
+        target_source: target.source(),
+        seeds,
+        edges: &edges,
+        target_self_file,
+        member_best_effort_unique: target_self_file && scan_target.member_unique_in_target_file,
+        raw_module_bindings: raw_module_bindings.as_ref(),
+        module_bindings: &module_bindings,
+        scoped_import_bindings: &scoped_import_bindings,
+        scope_facts: scope_facts.as_ref(),
+        scope_range_index: &scope_range_index,
+        hits: &mut local_hits,
+        unproven_hits: &mut local_unproven_hits,
+    };
 
-        {
-            let _scope = brokk_bifrost_core::profiling::scope("python_graph::scan_tree");
-            scan_node(tree_ref.root_node(), &mut scan_ctx);
-        }
-
-        if !local_hits.is_empty() {
-            let mut sink = collected
-                .lock()
-                .expect("usage hit collector mutex poisoned");
-            sink.extend(local_hits);
-        }
-        if !local_unproven_hits.is_empty() {
-            let mut sink = unproven_collected
-                .lock()
-                .expect("usage unproven hit collector mutex poisoned");
-            sink.extend(local_unproven_hits);
-        }
-    });
+    {
+        let _scope = brokk_bifrost_core::profiling::scope("python_graph::scan_tree");
+        scan_node(tree_ref.root_node(), &mut scan_ctx);
+    }
 
     ScanResult {
-        hits: collected
-            .into_inner()
-            .expect("usage hit collector mutex poisoned"),
-        unproven_hits: unproven_collected
-            .into_inner()
-            .expect("usage unproven hit collector mutex poisoned"),
+        hits: local_hits,
+        unproven_hits: local_unproven_hits,
     }
 }
 
@@ -322,6 +362,7 @@ fn file_may_reference_target(
     false
 }
 
+#[derive(Default)]
 pub struct ScanResult {
     pub hits: BTreeSet<UsageHit>,
     pub unproven_hits: BTreeSet<UsageHit>,

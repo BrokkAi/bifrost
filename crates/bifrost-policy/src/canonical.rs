@@ -32,6 +32,7 @@ impl RqlpDocument {
         match self {
             Self::Policy { definition } => policy_definition_to_json(definition),
             Self::Endpoint { definition } => endpoint_definition_to_json(definition),
+            Self::EndpointSet { definition } => endpoint_set_document_to_json(definition),
         }
     }
 
@@ -55,6 +56,7 @@ impl RqlpDocument {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InlineLocalSemanticProjectionError {
     FileSelector { path: String },
+    EndpointSetFile { path: String },
     CatalogReference { name: String, version: u32 },
     MatchDirectory { path: String },
     ExactEndpointSet { endpoint_ids: Vec<String> },
@@ -70,6 +72,9 @@ impl fmt::Display for InlineLocalSemanticProjectionError {
         match self {
             Self::FileSelector { path } => {
                 write!(formatter, "RQL file selector `{path}` has not been loaded")
+            }
+            Self::EndpointSetFile { path } => {
+                write!(formatter, "endpoint-set file `{path}` has not been loaded")
             }
             Self::CatalogReference { name, version } => {
                 write!(
@@ -125,6 +130,9 @@ fn ensure_inline_local_document(
                 });
             }
             Ok(())
+        }
+        RqlpDocument::EndpointSet { definition } => {
+            ensure_inline_local_taint(&definition.spec, &HashSet::new())
         }
     }
 }
@@ -333,6 +341,11 @@ fn ensure_inline_local_taint(
     for read in &spec.store_reads {
         ensure_inline_selector(&read.selector)?;
     }
+    if let Some(reference) = spec.store_include_files.first() {
+        return Err(InlineLocalSemanticProjectionError::EndpointSetFile {
+            path: reference.path.as_str().to_string(),
+        });
+    }
     for combination in &spec.finding_combinations {
         ensure_local_endpoint_predicate(&combination.source, local_endpoint_ids)?;
         ensure_local_endpoint_predicate(&combination.sink, local_endpoint_ids)?;
@@ -376,6 +389,11 @@ fn ensure_inline_local_typestate(
 fn ensure_local_endpoint_set<T>(
     set: &TaintEndpointSet<T>,
 ) -> Result<(), InlineLocalSemanticProjectionError> {
+    if let Some(reference) = set.include_files.first() {
+        return Err(InlineLocalSemanticProjectionError::EndpointSetFile {
+            path: reference.path.as_str().to_string(),
+        });
+    }
     if let Some(reference) = set.include_sets.first() {
         return Err(InlineLocalSemanticProjectionError::CatalogReference {
             name: reference.name.to_string(),
@@ -643,6 +661,98 @@ fn endpoint_definition_to_json(definition: &MatchEndpointDefinition) -> Value {
     Value::Object(object)
 }
 
+fn endpoint_set_document_to_json(definition: &EndpointSetDocument) -> Value {
+    let mut object = Map::new();
+    insert(&mut object, "type", json!("endpoint-set-document"));
+    insert(
+        &mut object,
+        "schema_version",
+        json!(definition.schema_version.version),
+    );
+    insert(&mut object, "kind", json!(definition.kind.label()));
+    let set = match definition.kind {
+        EndpointSetKind::Sources => endpoint_set_to_json(
+            &definition.spec.sources,
+            |left, right| left.id.cmp(&right.id),
+            taint_source_to_json,
+        ),
+        EndpointSetKind::Origins => endpoint_set_to_json(
+            &definition.spec.sources,
+            |left, right| left.id.cmp(&right.id),
+            flow_origin_to_json,
+        ),
+        EndpointSetKind::Sinks => endpoint_set_to_json(
+            &definition.spec.sinks,
+            |left, right| left.id.cmp(&right.id),
+            taint_sink_to_json,
+        ),
+        EndpointSetKind::Observations => endpoint_set_to_json(
+            &definition.spec.sinks,
+            |left, right| left.id.cmp(&right.id),
+            flow_observation_to_json,
+        ),
+        EndpointSetKind::Sanitizers => endpoint_set_to_json(
+            &definition.spec.sanitizers,
+            |left, right| left.id.cmp(&right.id),
+            taint_sanitizer_to_json,
+        ),
+        EndpointSetKind::Kills => endpoint_set_to_json(
+            &definition.spec.sanitizers,
+            |left, right| left.id.cmp(&right.id),
+            flow_kill_to_json,
+        ),
+        EndpointSetKind::EntryPoints => endpoint_set_to_json(
+            &definition.spec.entry_points,
+            |left, right| left.id.cmp(&right.id),
+            taint_entry_point_to_json,
+        ),
+        EndpointSetKind::Transforms => endpoint_set_to_json(
+            &definition.spec.transforms,
+            |left, right| left.id.cmp(&right.id),
+            taint_transform_to_json,
+        ),
+        EndpointSetKind::FlowTransforms => endpoint_set_to_json(
+            &definition.spec.transforms,
+            |left, right| left.id.cmp(&right.id),
+            flow_transform_to_json,
+        ),
+        EndpointSetKind::ExternalModels => endpoint_set_to_json(
+            &definition.spec.external_models,
+            |left, right| left.id.cmp(&right.id),
+            taint_external_model_to_json,
+        ),
+        EndpointSetKind::Stores => {
+            let mut stores = Map::new();
+            insert(
+                &mut stores,
+                "writes",
+                sorted_typed_values(
+                    definition.spec.store_writes.iter(),
+                    |left, right| left.id.cmp(&right.id),
+                    taint_store_write_to_json,
+                ),
+            );
+            insert(
+                &mut stores,
+                "reads",
+                sorted_typed_values(
+                    definition.spec.store_reads.iter(),
+                    |left, right| left.id.cmp(&right.id),
+                    taint_store_read_to_json,
+                ),
+            );
+            insert(
+                &mut stores,
+                "include_files",
+                endpoint_set_file_refs_to_json(&definition.spec.store_include_files),
+            );
+            Value::Object(stores)
+        }
+    };
+    insert(&mut object, "set", set);
+    Value::Object(object)
+}
+
 /// The authored canonical projection of one analysis record, exposed so the
 /// loaded-model projection can overlay resolved selectors on top of it rather
 /// than restating the assertion shape.
@@ -724,7 +834,10 @@ fn policy_analysis_to_json(analysis: &PolicyAnalysis) -> Value {
             // existed byte-identical under this projection, and therefore
             // keeps its semantic hash, its baselines and its suppressions
             // valid.
-            if !(spec.store_writes.is_empty() && spec.store_reads.is_empty()) {
+            if !(spec.store_writes.is_empty()
+                && spec.store_reads.is_empty()
+                && spec.store_include_files.is_empty())
+            {
                 let mut stores = Map::new();
                 insert(
                     &mut stores,
@@ -744,6 +857,13 @@ fn policy_analysis_to_json(analysis: &PolicyAnalysis) -> Value {
                         taint_store_read_to_json,
                     ),
                 );
+                if !spec.store_include_files.is_empty() {
+                    insert(
+                        &mut stores,
+                        "include_files",
+                        endpoint_set_file_refs_to_json(&spec.store_include_files),
+                    );
+                }
                 insert(&mut object, "stores", Value::Object(stores));
             }
             insert(
@@ -773,8 +893,8 @@ fn policy_analysis_to_json(analysis: &PolicyAnalysis) -> Value {
             insert(
                 &mut object,
                 "origins",
-                sorted_typed_values(
-                    spec.sources.entries.iter(),
+                flow_endpoint_set_to_json(
+                    &spec.sources,
                     |left, right| left.id.cmp(&right.id),
                     flow_origin_to_json,
                 ),
@@ -782,8 +902,8 @@ fn policy_analysis_to_json(analysis: &PolicyAnalysis) -> Value {
             insert(
                 &mut object,
                 "observations",
-                sorted_typed_values(
-                    spec.sinks.entries.iter(),
+                flow_endpoint_set_to_json(
+                    &spec.sinks,
                     |left, right| left.id.cmp(&right.id),
                     flow_observation_to_json,
                 ),
@@ -791,18 +911,18 @@ fn policy_analysis_to_json(analysis: &PolicyAnalysis) -> Value {
             insert(
                 &mut object,
                 "kills",
-                sorted_typed_values(
-                    spec.sanitizers.entries.iter(),
+                flow_endpoint_set_to_json(
+                    &spec.sanitizers,
                     |left, right| left.id.cmp(&right.id),
                     flow_kill_to_json,
                 ),
             );
-            if !spec.transforms.entries.is_empty() {
+            if !(spec.transforms.entries.is_empty() && spec.transforms.include_files.is_empty()) {
                 insert(
                     &mut object,
                     "transforms",
-                    sorted_typed_values(
-                        spec.transforms.entries.iter(),
+                    flow_endpoint_set_to_json(
+                        &spec.transforms,
                         |left, right| left.id.cmp(&right.id),
                         flow_transform_to_json,
                     ),
@@ -1514,19 +1634,71 @@ fn endpoint_set_to_json<T>(
     compare_entries: fn(&T, &T) -> Ordering,
     entry_to_json: fn(&T) -> Value,
 ) -> Value {
-    json!({
-        "include_sets": sorted_typed_values(
+    let mut object = Map::new();
+    insert(
+        &mut object,
+        "include_sets",
+        sorted_typed_values(
             set.include_sets.iter(),
             compare_catalog_refs,
             catalog_ref_to_json,
         ),
-        "include_matches": sorted_typed_values(
+    );
+    insert(
+        &mut object,
+        "include_matches",
+        sorted_typed_values(
             set.include_matches.iter(),
             compare_match_endpoint_set_refs,
             match_endpoint_set_ref_to_json,
         ),
-        "entries": sorted_typed_values(set.entries.iter(), compare_entries, entry_to_json),
-    })
+    );
+    if !set.include_files.is_empty() {
+        insert(
+            &mut object,
+            "include_files",
+            endpoint_set_file_refs_to_json(&set.include_files),
+        );
+    }
+    insert(
+        &mut object,
+        "entries",
+        sorted_typed_values(set.entries.iter(), compare_entries, entry_to_json),
+    );
+    Value::Object(object)
+}
+
+fn flow_endpoint_set_to_json<T>(
+    set: &TaintEndpointSet<T>,
+    compare_entries: fn(&T, &T) -> Ordering,
+    entry_to_json: fn(&T) -> Value,
+) -> Value {
+    if set.include_sets.is_empty() && set.include_matches.is_empty() && set.include_files.is_empty()
+    {
+        return sorted_typed_values(set.entries.iter(), compare_entries, entry_to_json);
+    }
+    endpoint_set_to_json(set, compare_entries, entry_to_json)
+}
+
+fn endpoint_set_file_refs_to_json(references: &[EndpointSetFileRef]) -> Value {
+    sorted_typed_values(
+        references.iter(),
+        |left, right| {
+            left.path
+                .cmp(&right.path)
+                .then_with(|| left.sha256.cmp(&right.sha256))
+        },
+        |reference| {
+            let mut object = Map::new();
+            insert(&mut object, "path", json!(reference.path.as_str()));
+            insert_option(
+                &mut object,
+                "sha256",
+                reference.sha256.map(|hash| json!(hash.to_string())),
+            );
+            Value::Object(object)
+        },
+    )
 }
 
 fn catalog_ref_to_json(reference: &CatalogRef) -> Value {
@@ -2806,6 +2978,7 @@ mod tests {
                                     EndpointId::new("bifrost.sources.request").unwrap(),
                                 ],
                             }],
+                            include_files: vec![],
                             entries: vec![],
                         },
                         sinks: TaintEndpointSet::default(),
@@ -2815,6 +2988,7 @@ mod tests {
                         external_models: TaintEndpointSet::default(),
                         store_writes: vec![],
                         store_reads: vec![],
+                        store_include_files: vec![],
                         finding_combinations: vec![],
                     },
                 },

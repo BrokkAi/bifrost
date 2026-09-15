@@ -31,12 +31,12 @@ use brokk_bifrost_core::text_utils::compute_line_starts;
 use tree_sitter::{Node, Parser};
 
 use crate::java::graph_support::{
-    JavaSource, java_package_name_of, java_type_name_candidate_fqns,
+    JavaSource, java_package_name_of, java_single_type_import_gap, java_type_name_candidate_fqns,
     resolve_java_type_name_candidates_in_realm,
 };
 use crate::proof::{
-    JvmActiveSemanticModel, JvmNameProof, model_disposition_over_tiers, prove_against_active_model,
-    record_jvm_name_proof,
+    JvmActiveSemanticModel, JvmNameProof, JvmProofGap, model_disposition_over_tiers,
+    prove_against_active_model, record_jvm_name_proof,
 };
 
 pub const JAVA_UNRECOGNIZED_SYMBOL: &str = "java_unrecognized_symbol";
@@ -111,7 +111,20 @@ pub fn collect_java_semantic_diagnostics(
                     name,
                 );
                 let proof = match candidates.len() {
-                    1 => JvmNameProof::Workspace,
+                    // A workspace answer is complete only when the routes that
+                    // produced it are proven. A single-type import whose
+                    // package-prefix split is still open can be satisfied by
+                    // another reading, so the outcome carries that gap instead
+                    // of claiming a clean resolution.
+                    1 => match java_single_type_import_gap(java, token, definitions, file, name) {
+                        Some(gap) => JvmNameProof::Incomplete(JvmProofGap::Unsupported {
+                            detail: format!(
+                                "the single-type import binding `{name}` has an unproven \
+                                 package-prefix split: {gap:?}"
+                            ),
+                        }),
+                        None => JvmNameProof::Workspace,
+                    },
                     n if n > 1 => JvmNameProof::Ambiguous {
                         boundaries: vec![BoundaryStatus::WorkspaceLocal; n],
                     },

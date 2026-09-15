@@ -8,6 +8,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub use crate::analyzer::semantic_model::runtime_contracts::CsmiRuntimeContractsV2Payload;
+
 pub const CSMI_PYTHON_PROFILE_ID: &str = "csmi.python";
 pub const CSMI_PYTHON_PROFILE_VERSION: &str = "0.1.0";
 pub const CSMI_PYTHON_PROFILE_SCHEMA: &str =
@@ -37,6 +39,9 @@ pub const CSMI_RUNTIME_VALUES_PROFILE_ID: &str = "csmi.runtime-values";
 pub const CSMI_RUNTIME_VALUES_PROFILE_VERSION: &str = "0.1.0";
 pub const CSMI_RUNTIME_VALUES_PROFILE_SCHEMA: &str =
     "https://csmi.brokk.ai/schema/profiles/runtime-values/0.1/schema.json";
+pub const CSMI_RUNTIME_CONTRACTS_PROFILE_VERSION: &str = "0.2.0";
+pub const CSMI_RUNTIME_CONTRACTS_PROFILE_SCHEMA: &str =
+    "https://csmi.brokk.ai/schema/profiles/runtime-values/0.2/schema.json";
 pub const CSMI_COLLECTION_FLOW_PROFILE_ID: &str = "csmi.collection-flow";
 pub const CSMI_COLLECTION_FLOW_PROFILE_VERSION: &str = "0.1.0";
 pub const CSMI_COLLECTION_FLOW_PROFILE_SCHEMA: &str =

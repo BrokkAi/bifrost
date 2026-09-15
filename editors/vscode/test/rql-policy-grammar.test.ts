@@ -60,6 +60,12 @@ void test("tokenizes policy structure with conservative syntactic scopes", async
   assertScoped(tokens, "scala", "constant.other.symbol.bifrost-rql-policy");
   assertScoped(tokens, "javascript", "constant.other.symbol.bifrost-rql-policy");
   assertScoped(tokens, "typescript", "constant.other.symbol.bifrost-rql-policy");
+  assertScoped(tokens, "endpoint-set-document", "entity.name.function.record.bifrost-rql-policy");
+  assertScoped(tokens, "endpoint-set-file", "entity.name.function.record.bifrost-rql-policy");
+  assertScoped(tokens, ":kind", "variable.parameter.keyword.bifrost-rql-policy");
+  assertScoped(tokens, ":path", "variable.parameter.keyword.bifrost-rql-policy");
+  assertScoped(tokens, ":sha256", "variable.parameter.keyword.bifrost-rql-policy");
+  assertScoped(tokens, "sources", "constant.other.symbol.bifrost-rql-policy");
 });
 
 void test("includes native RQL scopes only inside inline rql bodies", async () => {

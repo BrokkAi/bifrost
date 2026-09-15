@@ -19,7 +19,41 @@ pub struct RuntimeKeyedReadFilter {
     pub container: String,
     pub property: Option<String>,
     pub index: Option<u128>,
+    pub key_kind: Option<RuntimeKeyedReadKeyKind>,
+    pub index_min: Option<u128>,
+    pub index_max: Option<u128>,
     pub pristine_input: bool,
+}
+
+/// Select a family of already resolved keys without creating binding evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RuntimeKeyedReadKeyKind {
+    StaticProperty,
+    StaticIndex,
+}
+
+impl RuntimeKeyedReadFilter {
+    fn accepts_key(&self, key: &RuntimeAccessKey) -> bool {
+        match key {
+            RuntimeAccessKey::Property(property) => {
+                self.index.is_none()
+                    && self.index_min.is_none()
+                    && self.index_max.is_none()
+                    && self.key_kind != Some(RuntimeKeyedReadKeyKind::StaticIndex)
+                    && self
+                        .property
+                        .as_ref()
+                        .is_none_or(|expected| expected == property)
+            }
+            RuntimeAccessKey::Index(index) => {
+                self.property.is_none()
+                    && self.key_kind != Some(RuntimeKeyedReadKeyKind::StaticProperty)
+                    && self.index.is_none_or(|expected| expected == *index)
+                    && self.index_min.is_none_or(|minimum| minimum <= *index)
+                    && self.index_max.is_none_or(|maximum| *index <= maximum)
+            }
+        }
+    }
 }
 
 /// Static value-access identity, independent of declaration identity.
@@ -185,13 +219,9 @@ impl WorkspaceSemanticOracle<'_> {
                     same_byte_span(candidate.anchor, range)
                         && candidate.global == filter.global
                         && candidate.container == filter.container
-                        && candidate.key.as_ref().is_none_or(|candidate_key| {
-                            filter.property.as_ref().is_none_or(|key| {
-                                candidate_key == &RuntimeAccessKey::Property(key.clone())
-                            }) && filter.index.is_none_or(|index| {
-                                candidate_key == &RuntimeAccessKey::Index(index)
-                            })
-                        })
+                        // Missing key identity retains dynamic/unsupported
+                        // limitations for this surface; it is not a filtered zero.
+                        && candidate.key.as_ref().is_none_or(|key| filter.accepts_key(key))
                 };
                 for endpoint in &reads.endpoints {
                     if (same_byte_span(endpoint.expression, range)
@@ -199,12 +229,7 @@ impl WorkspaceSemanticOracle<'_> {
                         && endpoint.runtime == filter.runtime
                         && endpoint.global == filter.global
                         && endpoint.container == filter.container
-                        && filter.property.as_ref().is_none_or(|key| {
-                            endpoint.key == RuntimeAccessKey::Property(key.clone())
-                        })
-                        && filter
-                            .index
-                            .is_none_or(|index| endpoint.key == RuntimeAccessKey::Index(index))
+                        && filter.accepts_key(&endpoint.key)
                         && (!filter.pristine_input
                             || endpoint.source_origin
                                 == RuntimeReadSourceOrigin::PristineRuntimeInput)
@@ -614,10 +639,7 @@ impl WorkspaceSemanticOracle<'_> {
                 }
             };
             result.candidates.push(RuntimeKeyedReadCandidate {
-                anchor: match read.access {
-                    JsTsRuntimeAccessKey::Property(_) => read.range,
-                    _ => read.container_range,
-                },
+                anchor: read.candidate_anchor,
                 global: read.root_name.clone(),
                 container: read.container.clone(),
                 key: key.clone(),
@@ -724,6 +746,16 @@ impl WorkspaceSemanticOracle<'_> {
             result
                 .limitations
                 .push(RuntimeReadLimitation::ActivationConflict);
+            return Ok(());
+        }
+        if active.runtime_contracts().next().is_some() {
+            // Portable bindings carry producer-owned locator schemes and effect
+            // evidence. Until those join this artifact through a supported
+            // producer adapter, catalog presence cannot authorize a native load
+            // or silently fall back to a potentially conflicting older profile.
+            result
+                .limitations
+                .push(RuntimeReadLimitation::ActivationUnsupported);
             return Ok(());
         }
         let mut matches = Vec::new();
@@ -892,9 +924,13 @@ impl WorkspaceSemanticOracle<'_> {
                 .push(RuntimeReadLimitation::AmbiguousOwner);
             return Ok(());
         }
-        let identity_observation = match key {
-            RuntimeAccessKey::Index(_) => container,
-            RuntimeAccessKey::Property(_) => &load.0,
+        // Resolve the identity of the same AST-derived structural seed used
+        // by the query. Both string and numeric subscripts use their container
+        // field as that seed; the endpoint still owns the full load below.
+        let identity_observation = if same_byte_span(read.candidate_anchor, read.container_range) {
+            container
+        } else {
+            &load.0
         };
         let identity_row = procedure
             .semantics()
@@ -964,10 +1000,7 @@ impl WorkspaceSemanticOracle<'_> {
         result.endpoints.push(RuntimeKeyedReadEndpoint {
             file: file.clone(),
             expression: read.range,
-            candidate_anchor: match key {
-                RuntimeAccessKey::Index(_) => read.container_range,
-                _ => read.range,
-            },
+            candidate_anchor: read.candidate_anchor,
             structural_identity,
             runtime: exposure.runtime.runtime_family.clone(),
             global: read.root_name.clone(),
@@ -1028,6 +1061,7 @@ impl WorkspaceSemanticOracle<'_> {
                 _ => None,
             },
             pristine_input: true,
+            ..RuntimeKeyedReadFilter::default()
         };
         let rebound = self.runtime_keyed_read_at_source(
             &endpoint.file,

@@ -12,7 +12,7 @@ Set `execution_mode` on a JSON query:
 <!-- code-query-test:json:explain-mode -->
 ```json
 {
-  "schema_version": 1,
+  "schema_version": "1",
   "execution_mode": "explain",
   "union": [
     {"match": {"kind": "class", "name": "Legacy"}},

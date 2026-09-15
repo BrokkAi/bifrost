@@ -294,7 +294,7 @@ impl TaintLocalTransformBinding {
 /// value is stored under, or the store instance it is stored in).
 ///
 /// A dimension separates two ends of a persistence boundary only when both
-/// ends carry a proven identity and the identities differ. Everything else
+/// ends carry proven identities and their sets are disjoint. Everything else
 /// joins: an undeclared dimension expresses "the whole store" and an unproven
 /// one must not manufacture a separation the analysis cannot defend. Joining
 /// is the sound direction for a may-analysis.
@@ -308,12 +308,54 @@ pub enum TaintStoreDimension {
     /// Declared and resolved to a stable identity digest minted by the
     /// policy compiler (a constant key token, or a store-instance location).
     Proven(StableDigest),
+    /// Declared and resolved to a finite, non-singleton set of stable
+    /// identities. The set is canonicalized by [`Self::proven_set`].
+    ProvenSet(ProvenStoreIdentities),
 }
 
+/// Canonical nonempty set of stable store identities.
+///
+/// The field is private so callers cannot bypass the sorting and
+/// deduplication invariant required by [`TaintStoreDimension::separates`].
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ProvenStoreIdentities(Box<[StableDigest]>);
+
 impl TaintStoreDimension {
+    /// Build a proven finite identity set.
+    ///
+    /// The input must contain at least one digest. Values are sorted and
+    /// deduplicated so equivalent sets have identical equality, ordering, and
+    /// hash identities. A singleton uses the existing [`Self::Proven`]
+    /// representation so existing callers and persisted identities retain
+    /// their representation.
+    pub fn proven_set(digests: impl IntoIterator<Item = StableDigest>) -> Self {
+        let mut digests: Vec<_> = digests.into_iter().collect();
+        assert!(
+            !digests.is_empty(),
+            "a proven store dimension requires at least one identity"
+        );
+        digests.sort_unstable();
+        digests.dedup();
+        if let [digest] = digests.as_slice() {
+            Self::Proven(*digest)
+        } else {
+            Self::ProvenSet(ProvenStoreIdentities(digests.into_boxed_slice()))
+        }
+    }
+
     fn separates(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Proven(left), Self::Proven(right)) => left != right,
+            (Self::Proven(left), Self::ProvenSet(ProvenStoreIdentities(digests)))
+            | (Self::ProvenSet(ProvenStoreIdentities(digests)), Self::Proven(left)) => {
+                digests.binary_search(left).is_err()
+            }
+            (
+                Self::ProvenSet(ProvenStoreIdentities(left)),
+                Self::ProvenSet(ProvenStoreIdentities(right)),
+            ) => left
+                .iter()
+                .all(|digest| right.binary_search(digest).is_err()),
             _ => false,
         }
     }
@@ -1776,6 +1818,7 @@ mod tests {
         WorkspaceRelativePath,
     };
     use crate::taint::SourceClassId;
+    use std::hash::{Hash, Hasher};
 
     fn locator(path: &str, name: &str) -> SemanticLocator {
         let span =
@@ -1906,6 +1949,50 @@ mod tests {
             )),
             "distinct store names must separate"
         );
+    }
+
+    #[test]
+    fn proven_store_dimension_sets_are_canonical_and_alias_on_intersection() {
+        let a = snapshot(10);
+        let b = snapshot(11);
+        let c = snapshot(12);
+        let d = snapshot(13);
+
+        // A singleton remains the established Proven representation.
+        assert_eq!(
+            TaintStoreDimension::proven_set([a]),
+            TaintStoreDimension::Proven(a)
+        );
+
+        // Input order and duplicate identities do not affect the canonical
+        // equality, ordering, or hash identity of a finite set.
+        let first = TaintStoreDimension::proven_set([b, a, b]);
+        let second = TaintStoreDimension::proven_set([a, b]);
+        assert_eq!(first, second);
+        assert_eq!(first.cmp(&second), std::cmp::Ordering::Equal);
+        let mut first_hash = std::collections::hash_map::DefaultHasher::new();
+        first.hash(&mut first_hash);
+        let mut second_hash = std::collections::hash_map::DefaultHasher::new();
+        second.hash(&mut second_hash);
+        assert_eq!(first_hash.finish(), second_hash.finish());
+
+        let channel = |key: TaintStoreDimension| {
+            TaintStoreChannel::new("primary", TaintStoreDimension::Undeclared, key)
+        };
+        // Overlapping proven sets may refer to the same stored value.
+        assert!(
+            channel(first.clone()).may_alias(&channel(TaintStoreDimension::proven_set([b, c]),))
+        );
+        // Disjoint proven sets cannot refer to the same stored value.
+        assert!(
+            !channel(first.clone()).may_alias(&channel(TaintStoreDimension::proven_set([c, d]),))
+        );
+        // Singleton and finite-set dimensions use the same intersection rule.
+        assert!(
+            channel(TaintStoreDimension::Proven(a))
+                .may_alias(&channel(TaintStoreDimension::proven_set([a, c]),))
+        );
+        assert!(!channel(TaintStoreDimension::Proven(c)).may_alias(&channel(first)));
     }
 
     #[test]

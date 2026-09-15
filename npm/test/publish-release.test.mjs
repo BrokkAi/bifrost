@@ -1,7 +1,24 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { packageExists, publishOrRecover, publishTarball } from "../scripts/publish-release.mjs";
+import {
+  DSH_PACKAGE,
+  packageExists,
+  publishOrRecover,
+  publishTarball,
+  releaseEntries,
+} from "../scripts/publish-release.mjs";
+import { tarballBasename } from "../scripts/package-release.mjs";
+
+test("includes the prepacked DSH plugin in the qualified release entries", () => {
+  const entries = releaseEntries("/tmp/npm-qualified", "0.11.4");
+  const dshEntry = entries.find((entry) => entry.packageName === DSH_PACKAGE);
+
+  assert.deepEqual(dshEntry, {
+    packageName: DSH_PACKAGE,
+    tarball: `/tmp/npm-qualified/${tarballBasename(DSH_PACKAGE, "0.11.4")}`,
+  });
+});
 
 test("treats a registry 404 as a version that is not visible", () => {
   const exists = packageExists("@brokkai/bifrost-linux-arm64-gnu", "0.8.22", () => ({

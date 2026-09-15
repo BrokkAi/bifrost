@@ -194,6 +194,13 @@ pub struct SearchSymbolsResult {
     pub model_symbols: Vec<crate::analyzer::semantic_model::SemanticModelSymbol>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// Request patterns that are neither valid regex nor a translatable glob,
+    /// reported verbatim. They matched nothing because they could not be
+    /// interpreted, not because the workspace lacks the symbols -- answering
+    /// "no files matched" without this list is a false negative about the
+    /// code (#3279).
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub invalid_patterns: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub too_many_matches: Option<TooManySymbolMatches>,
 }
@@ -422,6 +429,7 @@ pub(super) fn search_symbols_with_cap(
         .filter(|pattern| !pattern.trim().is_empty())
         .collect();
     let pattern_batch = SearchSymbolPatternBatch::compile(patterns.clone(), false, cancellation);
+    let invalid_patterns = pattern_batch.invalid_patterns().to_vec();
 
     let definitions = {
         let _scope = profiling::scope("searchtools::search_symbols.resolve");
@@ -513,7 +521,11 @@ pub(super) fn search_symbols_with_cap(
             files: Vec::new(),
             total_model_symbols: 0,
             model_symbols: Vec::new(),
-            note: Some(too_many_symbol_matches_note()),
+            note: merge_invalid_patterns_note(
+                Some(too_many_symbol_matches_note()),
+                &invalid_patterns,
+            ),
+            invalid_patterns,
             too_many_matches: Some(TooManySymbolMatches {
                 total_candidates: filtered.len(),
                 cap: max_ranked_candidates,
@@ -704,9 +716,35 @@ pub(super) fn search_symbols_with_cap(
         files,
         total_model_symbols,
         model_symbols,
-        note,
+        note: merge_invalid_patterns_note(note, &invalid_patterns),
+        invalid_patterns,
         too_many_matches: None,
     }
+}
+
+/// Put the invalid-pattern warning ahead of whatever else the result wants to
+/// say: it is a request-shape problem, not a property of the search, and a
+/// caller who fixes the patterns changes the answer regardless of the rest.
+fn merge_invalid_patterns_note(
+    note: Option<String>,
+    invalid_patterns: &[String],
+) -> Option<String> {
+    if invalid_patterns.is_empty() {
+        return note;
+    }
+    let invalid_note = format!(
+        "{} request pattern(s) could not be interpreted as regex or wildcard and matched nothing: {}. Results cover only the remaining patterns.",
+        invalid_patterns.len(),
+        invalid_patterns
+            .iter()
+            .map(|pattern| format!("`{pattern}`"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    Some(match note {
+        Some(note) => format!("{invalid_note} {note}"),
+        None => invalid_note,
+    })
 }
 
 /// Guidance for a request that tripped the candidate cap. The counts live in
@@ -734,7 +772,7 @@ pub(super) fn search_symbols_note(
         ))
     } else if total == 0 {
         Some(
-            "No files matched. Try a broader identifier, qualified, or regex-like pattern; if the symbol is itself a test (or lives under a test-tree path), set `include_tests` to true."
+            "No files matched. Try a broader identifier, a wildcard pattern such as `*Name*`, a qualified name, or a regex; if the symbol is itself a test (or lives under a test-tree path), set `include_tests` to true."
                 .to_string(),
         )
     } else if history_unavailable {

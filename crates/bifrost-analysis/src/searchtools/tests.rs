@@ -1,5 +1,5 @@
 use super::SearchSymbolsParams;
-use super::navigation::search_symbols_with_cap;
+use super::navigation::{search_symbols_with_cancellation, search_symbols_with_cap};
 use super::scan_usages::render_symbol_usages;
 use super::summaries::SummariesParams;
 use super::{
@@ -1801,6 +1801,101 @@ fn search_symbols_under_candidate_cap_ranks_and_reports_files_as_before() {
     assert_eq!(1, result.total_files);
     assert_eq!(1, result.files.len(), "{:?}", result.files);
     assert_eq!(5, result.files[0].classes.len(), "{:?}", result.files[0]);
+}
+
+/// #3279: the issue's discovery request spelled its patterns as globs
+/// (`*Capability*`, `*Language*`, ...), which are invalid regex -- a leading
+/// repetition operator has nothing to repeat -- and compile dropped them
+/// silently, so search_symbols answered "No files matched" on a workspace
+/// full of matching symbols. The declarations here go through the real
+/// store-backed candidate path, so the glob interpretation and its
+/// required-literal prefilter are both exercised.
+#[test]
+fn search_symbols_matches_leading_wildcard_patterns_as_globs() {
+    use crate::analyzer::{JavaAnalyzer, TestProject};
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    ProjectFile::new(root.clone(), std::path::PathBuf::from("Capability.java"))
+        .write(
+            "public class LanguageRegistry {}\n\
+             public class PolicyDefinition {}\n\
+             public class Unrelated {}\n",
+        )
+        .unwrap();
+    let analyzer = JavaAnalyzer::from_project(TestProject::new(root, Language::Java));
+
+    let result = search_symbols_with_cancellation(
+        &analyzer,
+        SearchSymbolsParams {
+            patterns: vec![
+                "*Capability*".to_string(),
+                "*Language*".to_string(),
+                "*PolicyDefinition*".to_string(),
+                "*Query*Domain*".to_string(),
+            ],
+            include_tests: true,
+            limit: 100,
+        },
+        None,
+    );
+
+    assert!(
+        result.invalid_patterns.is_empty(),
+        "{:?}",
+        result.invalid_patterns
+    );
+    assert!(result.too_many_matches.is_none());
+    assert_eq!(1, result.total_files, "{result:?}");
+    let classes = &result.files[0].classes;
+    assert_eq!(2, classes.len(), "{classes:?}");
+    let names: Vec<&str> = classes.iter().map(|hit| hit.symbol.as_str()).collect();
+    assert!(
+        names.iter().any(|name| name.contains("LanguageRegistry")),
+        "{names:?}"
+    );
+    assert!(
+        names.iter().any(|name| name.contains("PolicyDefinition")),
+        "{names:?}"
+    );
+}
+
+/// A pattern that is neither regex nor glob is a malformed request, and the
+/// answer must say so instead of reporting the absence of symbols (#3279).
+#[test]
+fn search_symbols_reports_uninterpretable_patterns_instead_of_matching_nothing() {
+    use crate::analyzer::{JavaAnalyzer, TestProject};
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    ProjectFile::new(root.clone(), std::path::PathBuf::from("Language.java"))
+        .write("public class LanguageRegistry {}\n")
+        .unwrap();
+    let analyzer = JavaAnalyzer::from_project(TestProject::new(root, Language::Java));
+
+    let result = search_symbols_with_cancellation(
+        &analyzer,
+        SearchSymbolsParams {
+            patterns: vec!["foo(bar".to_string(), "Language".to_string()],
+            include_tests: false,
+            limit: 100,
+        },
+        None,
+    );
+
+    assert_eq!(result.invalid_patterns, vec!["foo(bar".to_string()]);
+    assert_eq!(1, result.total_files, "{result:?}");
+    let note = result
+        .note
+        .as_deref()
+        .expect("the invalid pattern must be said");
+    assert!(
+        note.contains("could not be interpreted as regex or wildcard"),
+        "{note}"
+    );
+    assert!(note.contains("`foo(bar`"), "{note}");
+    let rendered = result.render_text(RenderOptions::default());
+    assert!(rendered.contains("could not be interpreted"), "{rendered}");
 }
 
 /// #1775: boost's preprocessor limit headers write their preamble as null

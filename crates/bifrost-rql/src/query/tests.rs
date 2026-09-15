@@ -25,6 +25,140 @@ fn parse_ok(json: Value) -> CodeQuery {
 }
 
 #[test]
+fn keyed_read_value_accepts_exact_and_static_key_family_selectors() {
+    let exact = parse_ok(json!({
+        "match": { "kind": "call" },
+        "steps": [{
+            "op": "keyed_read_value",
+            "runtime": "node",
+            "global": "process",
+            "container": "env",
+            "property": "TOKEN"
+        }]
+    }));
+    assert_eq!(
+        exact.plan.steps,
+        vec![QueryStep::KeyedReadValue(KeyedReadValueTraversal::new(
+            "node".to_owned(),
+            "process".to_owned(),
+            "env".to_owned(),
+            KeyedReadKeySelector::ExactProperty("TOKEN".to_owned()),
+            false,
+        ))]
+    );
+
+    let family = parse_ok(json!({
+        "match": { "kind": "call" },
+        "steps": [{
+            "op": "keyed_read_value",
+            "runtime": "node",
+            "global": "process",
+            "container": "argv",
+            "key_kind": "static-index",
+            "index_min": 1,
+            "index_max": 3
+        }]
+    }));
+    assert_eq!(
+        family.plan.steps,
+        vec![QueryStep::KeyedReadValue(KeyedReadValueTraversal::new(
+            "node".to_owned(),
+            "process".to_owned(),
+            "argv".to_owned(),
+            KeyedReadKeySelector::StaticIndexRange {
+                min: Some(1),
+                max: Some(3),
+            },
+            false,
+        ))]
+    );
+    assert_eq!(
+        family.to_canonical_json()["steps"][0],
+        json!({
+            "op": "keyed_read_value",
+            "runtime": "node",
+            "global": "process",
+            "container": "argv",
+            "key_kind": "static-index",
+            "index_min": 1,
+            "index_max": 3
+        })
+    );
+
+    for spelling in ["keyed-read-value", "keyed_read_value"] {
+        let source = format!(
+            "({spelling} :runtime node :global process :container argv :key-kind static-index :index-min 1 :index-max 3 (call))"
+        );
+        let rql = CodeQuery::from_sexp(&source).expect("key family RQL should lower");
+        assert_eq!(rql.to_canonical_json(), family.to_canonical_json());
+    }
+}
+
+#[test]
+fn keyed_read_value_rejects_mixed_selector_modes_and_invalid_bounds() {
+    let mixed = error_of(json!({
+        "match": { "kind": "call" },
+        "steps": [{
+            "op": "keyed_read_value",
+            "runtime": "node",
+            "global": "process",
+            "container": "env",
+            "property": "TOKEN",
+            "key_kind": "static-property"
+        }]
+    }));
+    assert!(
+        mixed
+            .message
+            .contains("either one exact property/index or key_kind")
+    );
+
+    let wrong_bounds = error_of(json!({
+        "match": { "kind": "call" },
+        "steps": [{
+            "op": "keyed_read_value",
+            "runtime": "node",
+            "global": "process",
+            "container": "env",
+            "key_kind": "static-property",
+            "index_min": 1
+        }]
+    }));
+    assert!(
+        wrong_bounds
+            .message
+            .contains("index bounds require key_kind static-index")
+    );
+
+    let reversed = error_of(json!({
+        "match": { "kind": "call" },
+        "steps": [{
+            "op": "keyed_read_value",
+            "runtime": "node",
+            "global": "process",
+            "container": "argv",
+            "key_kind": "static-index",
+            "index_min": 4,
+            "index_max": 2
+        }]
+    }));
+    assert_eq!(reversed.path, "steps[0].index_min");
+
+    let out_of_range_min = error_of(json!({
+        "match": { "kind": "call" },
+        "steps": [{
+            "op": "keyed_read_value",
+            "runtime": "node",
+            "global": "process",
+            "container": "argv",
+            "key_kind": "static-index",
+            "index_min": 4294967295u64
+        }]
+    }));
+    assert_eq!(out_of_range_min.path, "steps[0].index_min");
+}
+
+#[test]
 fn decorator_bindings_accepts_exact_import_identity_filters() {
     let json_query = parse_ok(json!({
         "match": { "kind": "parameter" },
@@ -92,7 +226,7 @@ fn row_filter_and_projection_round_trip_across_rql_and_json() {
     )
     .expect("typed row steps should parse");
     let canonical = json!({
-        "schema_version": 1,
+        "schema_version": "1",
         "occurrences": {},
         "steps": [
             {
@@ -301,7 +435,7 @@ fn declaration_bounded_containment_round_trips() {
             .kinds,
         vec![NormalizedKind::Loop]
     );
-    assert_eq!(query.to_canonical_json()["schema_version"], json!(1));
+    assert_eq!(query.to_canonical_json()["schema_version"], json!("1"));
     assert_eq!(query.to_canonical_json()["match"], json["match"]);
     assert_eq!(
         query.to_canonical_json()["inside_decl"],
@@ -496,7 +630,10 @@ fn receiver_steps_parse_canonically_and_validate_capture_domains() {
             capture: Some("service".to_string()),
         })
     );
-    assert_eq!(query.to_canonical_json()["schema_version"], SCHEMA_VERSION);
+    assert_eq!(
+        query.to_canonical_json()["schema_version"],
+        SCHEMA_VERSION.to_string()
+    );
 
     let rql = CodeQuery::from_sexp(
         r#"(file-of (receiver-targets :capture service (call :receiver (capture "service"))))"#,
@@ -749,7 +886,7 @@ fn parses_and_rejects_schema_version() {
         "match": { "kind": "call" }
     }));
     assert_eq!(query.schema_version, 1);
-    assert_eq!(query.to_canonical_json()["schema_version"], 1);
+    assert_eq!(query.to_canonical_json()["schema_version"], "1");
 
     let defaulted = parse_ok(json!({ "match": { "kind": "call" } }));
     assert_eq!(defaulted.schema_version, SCHEMA_VERSION);
@@ -2050,7 +2187,7 @@ fn field_write_value_parses_canonically_and_lowers_from_both_frontends() {
     assert_eq!(
         json_query.to_canonical_json(),
         json!({
-            "schema_version": SCHEMA_VERSION,
+            "schema_version": SCHEMA_VERSION.to_string(),
             "match": {
                 "kind": "assignment",
                 "operator": { "text": { "regex": "^=$" } }
@@ -3627,4 +3764,26 @@ fn shared_scope_errors_retain_local_or_embedding_provenance() {
         .unwrap();
     let error = sexp::code_query_from_expr_with_scope(&invalid, schema, &[], &[]).unwrap_err();
     assert_eq!(error.origin, sexp::QueryExprErrorOrigin::Local);
+}
+
+#[test]
+fn schema_version_strings_round_trip_and_normalize_legacy_numbers() {
+    for version in [json!("1"), json!(1)] {
+        let query = parse_ok(json!({"schema_version": version, "match": {"kind": "call"}}));
+        let canonical = query.to_canonical_json();
+        assert_eq!(canonical["schema_version"], "1");
+        assert_eq!(parse_ok(canonical.clone()).to_canonical_json(), canonical);
+    }
+    for version in [
+        json!("2"),
+        json!("1.0.0"),
+        json!("01"),
+        json!("+1"),
+        json!(""),
+        json!(true),
+        json!(null),
+    ] {
+        let error = error_of(json!({"schema_version": version, "match": {"kind": "call"}}));
+        assert_eq!(error.path, "schema_version");
+    }
 }

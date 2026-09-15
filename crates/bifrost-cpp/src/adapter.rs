@@ -67,6 +67,7 @@ pub fn parse_cpp_file_with_object_macro_fields(
 ) -> ParsedFile {
     let root = tree.root_node();
     let ancestry = ParentIndex::new(root);
+    let orphaned_namespaces = OrphanedNamespaceScopeIndex::build(root, source);
     parse_cpp_reading_with_object_macro_fields(
         file,
         source,
@@ -74,6 +75,7 @@ pub fn parse_cpp_file_with_object_macro_fields(
         LanguageDialect::for_path(Language::Cpp, file.rel_path()),
         &ancestry,
         object_macro_fields,
+        &orphaned_namespaces,
     )
 }
 
@@ -99,7 +101,8 @@ pub fn parse_cpp_file_in_dialect(
 ) -> ParsedFile {
     let root = tree.root_node();
     let ancestry = ParentIndex::new(root);
-    parse_cpp_reading(file, source, root, dialect, &ancestry)
+    let orphaned_namespaces = OrphanedNamespaceScopeIndex::build(root, source);
+    parse_cpp_reading(file, source, root, dialect, &ancestry, &orphaned_namespaces)
 }
 
 /// Extract `file` under the dialect its own path selects, asking its ancestor
@@ -114,12 +117,36 @@ pub fn parse_cpp_file_with_ancestry<'tree>(
     root: Node<'tree>,
     ancestry: &ParentIndex<'tree>,
 ) -> ParsedFile {
+    let orphaned_namespaces = OrphanedNamespaceScopeIndex::build(root, source);
+    parse_cpp_file_with_ancestry_and_orphaned_namespaces(
+        file,
+        source,
+        root,
+        ancestry,
+        &orphaned_namespaces,
+    )
+}
+
+/// Extract the primary reading using caller-owned recovery state.
+///
+/// The recovery index is a property of the tree and source, rather than of a
+/// dialect reading. Callers that need both the C++ and C readings should build
+/// it once and pass it to this function and
+/// [`parse_cpp_c_reading_with_orphaned_namespaces`].
+pub fn parse_cpp_file_with_ancestry_and_orphaned_namespaces<'tree>(
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'tree>,
+    ancestry: &ParentIndex<'tree>,
+    orphaned_namespaces: &OrphanedNamespaceScopeIndex,
+) -> ParsedFile {
     parse_cpp_reading(
         file,
         source,
         root,
         LanguageDialect::for_path(Language::Cpp, file.rel_path()),
         ancestry,
+        orphaned_namespaces,
     )
 }
 
@@ -141,18 +168,51 @@ pub fn parse_cpp_c_reading<'tree>(
     ancestry: &ParentIndex<'tree>,
     primary: &ParsedFile,
 ) -> ParsedFile {
-    let mut parsed = ParsedFile::new(String::new());
-    parsed.imports = primary.imports.clone();
-    parsed.type_identifiers = primary.type_identifiers.clone();
-    walk_cpp_declarations(
+    let orphaned_namespaces = OrphanedNamespaceScopeIndex::build(root, source);
+    parse_cpp_c_reading_with_orphaned_namespaces(
         file,
         source,
         root,
-        LanguageDialect::CppC,
         ancestry,
-        &mut parsed,
-        HashMap::default(),
-    );
+        primary,
+        &orphaned_namespaces,
+    )
+}
+
+/// Extract the C reading while reusing the primary reading's recovery index.
+///
+/// The declaration walk remains separate because C tag scope changes the
+/// identity and ownership of declarations. Only recovery state proven to be
+/// dialect-independent is shared.
+pub fn parse_cpp_c_reading_with_orphaned_namespaces<'tree>(
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'tree>,
+    ancestry: &ParentIndex<'tree>,
+    primary: &ParsedFile,
+    orphaned_namespaces: &OrphanedNamespaceScopeIndex,
+) -> ParsedFile {
+    let mut parsed = ParsedFile::new(String::new());
+    parsed.imports = primary.imports.clone();
+    parsed.type_identifiers = primary.type_identifiers.clone();
+    {
+        let mut visitor = CppVisitor {
+            file,
+            source,
+            parsed: &mut parsed,
+            c_tag_semantics: true,
+            recovered_class_sibling_scopes: HashMap::default(),
+            consumed_fragment_regions: Vec::new(),
+            orphaned_namespaces,
+            partitioned_regions: Vec::new(),
+            namespace_forward_scans: HashMap::default(),
+            field_owners: None,
+            recovery_captures: Vec::new(),
+            object_macro_fields: HashMap::default(),
+            ambiguous_object_macro_fields: HashSet::default(),
+        };
+        visitor.visit_container(root, ancestry, "", None, None, None, Vec::new());
+    }
     parsed.finalize_deferred_replacements();
 
     #[cfg(debug_assertions)]
@@ -183,6 +243,7 @@ fn parse_cpp_reading<'tree>(
     root: Node<'tree>,
     dialect: LanguageDialect,
     ancestry: &ParentIndex<'tree>,
+    orphaned_namespaces: &OrphanedNamespaceScopeIndex,
 ) -> ParsedFile {
     parse_cpp_reading_with_object_macro_fields(
         file,
@@ -191,6 +252,7 @@ fn parse_cpp_reading<'tree>(
         dialect,
         ancestry,
         HashMap::default(),
+        orphaned_namespaces,
     )
 }
 
@@ -201,57 +263,37 @@ fn parse_cpp_reading_with_object_macro_fields<'tree>(
     dialect: LanguageDialect,
     ancestry: &ParentIndex<'tree>,
     object_macro_fields: HashMap<String, ObjectMacroReplacement>,
+    orphaned_namespaces: &OrphanedNamespaceScopeIndex,
 ) -> ParsedFile {
     let mut parsed = ParsedFile::new(String::new());
 
     collect_cpp_includes(root, source, &mut parsed);
     collect_cpp_identifiers(root, source, &mut parsed.type_identifiers);
 
-    walk_cpp_declarations(
-        file,
-        source,
-        root,
-        dialect,
-        ancestry,
-        &mut parsed,
-        object_macro_fields,
-    );
+    {
+        let mut visitor = CppVisitor {
+            file,
+            source,
+            parsed: &mut parsed,
+            c_tag_semantics: dialect == LanguageDialect::CppC,
+            recovered_class_sibling_scopes: HashMap::default(),
+            consumed_fragment_regions: Vec::new(),
+            orphaned_namespaces,
+            partitioned_regions: Vec::new(),
+            namespace_forward_scans: HashMap::default(),
+            field_owners: None,
+            recovery_captures: Vec::new(),
+            object_macro_fields,
+            ambiguous_object_macro_fields: HashSet::default(),
+        };
+        visitor.visit_container(root, ancestry, "", None, None, None, Vec::new());
+    }
     // A line scan over the source rather than a tree walk: it recovers the
     // quoted directives a parse error hid from the tree, skipping any snippet
     // the sweep above already recorded.
     recover_quoted_includes(source, &mut parsed);
     parsed.finalize_deferred_replacements();
     parsed
-}
-
-/// The declaration walk itself: the only part of an extraction the dialect
-/// changes. The caller finalizes, because the primary reading recovers its
-/// quoted includes between the walk and that compaction.
-fn walk_cpp_declarations<'tree>(
-    file: &ProjectFile,
-    source: &str,
-    root: Node<'tree>,
-    dialect: LanguageDialect,
-    ancestry: &ParentIndex<'tree>,
-    parsed: &mut ParsedFile,
-    object_macro_fields: HashMap<String, ObjectMacroReplacement>,
-) {
-    let mut visitor = CppVisitor {
-        file,
-        source,
-        parsed,
-        c_tag_semantics: dialect == LanguageDialect::CppC,
-        recovered_class_sibling_scopes: HashMap::default(),
-        consumed_fragment_regions: Vec::new(),
-        orphaned_namespaces: OrphanedNamespaceScopeIndex::build(root, source),
-        partitioned_regions: Vec::new(),
-        namespace_forward_scans: HashMap::default(),
-        field_owners: None,
-        recovery_captures: Vec::new(),
-        object_macro_fields,
-        ambiguous_object_macro_fields: HashSet::default(),
-    };
-    visitor.visit_container(root, ancestry, "", None, None, None, Vec::new());
 }
 
 /// Whether two readings of one blob disagree about any identity-bearing

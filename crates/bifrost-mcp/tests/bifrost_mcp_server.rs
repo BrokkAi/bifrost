@@ -1698,13 +1698,13 @@ fn task_capable_rmcp_run_policy_malformed_suppressions_is_not_a_task() {
     let mut stdin = child.stdin.take().expect("stdin");
     let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
     let mut stderr = child.stderr.take().expect("stderr");
-    initialize_tasks_session(&mut stdin, &mut reader, &mut stderr, "2026-07-28");
+    discover_tasks_server(&mut stdin, &mut reader, &mut stderr);
 
     let response = round_trip(
         &mut stdin,
         &mut reader,
         &mut stderr,
-        malformed_run_policy_request(1),
+        stateless_malformed_run_policy_request(1),
     );
     assert_compact_malformed_run_policy_reply(&response, true);
 
@@ -1751,7 +1751,13 @@ fn bifrost_mcp_lists_and_runs_built_in_policies() {
             .any(|policy| policy["id"] == "bifrost.correctness.go-data-race")
     );
     assert_eq!(packs[1]["id"], "bifrost.security");
-    assert_eq!(packs[1]["policies"].as_array().map(Vec::len), Some(1));
+    let security_policies = packs[1]["policies"].as_array().expect("security policies");
+    assert_eq!(security_policies.len(), 2);
+    assert!(
+        security_policies.iter().any(|policy| {
+            policy["id"] == "bifrost.security.java.system-getenv-to-runtime-exec"
+        })
+    );
 
     let run = round_trip(
         &mut stdin,
@@ -2260,6 +2266,120 @@ fn bifrost_mcp_get_summaries_accepts_go_import_path() {
         .unwrap_or_else(|| panic!("missing package type in {structured}"));
     assert_eq!("go", package_type["language"]);
     assert_eq!("internal/pkg/foo.go", package_type["path"]);
+
+    drop(stdin);
+    let status = child.wait().expect("wait bifrost");
+    assert!(status.success(), "bifrost exited unsuccessfully: {status}");
+}
+
+/// #3279: the issue's discovery request spelled its patterns as globs
+/// (`*Capability*`, `*Language*`, ...), which are invalid regex and were
+/// silently dropped, so the wire answer was "No files matched" on a workspace
+/// full of matching symbols. Glob patterns must match over the real MCP wire,
+/// and the structured answer must still satisfy the advertised outputSchema
+/// (which now carries `invalid_patterns`).
+#[test]
+fn bifrost_mcp_search_symbols_matches_glob_wildcard_patterns() {
+    let fixture_root = TempDir::new().expect("temp dir");
+    fs::write(
+        fixture_root.path().join("Capability.java"),
+        "public class LanguageRegistry {}\n\
+         public class PolicyDefinition {}\n\
+         public class Unrelated {}\n",
+    )
+    .expect("write fixture");
+
+    let mut child = spawn_server(fixture_root.path(), "searchtools", &[]);
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut stderr = child.stderr.take().expect("stderr");
+    let mut reader = BufReader::new(stdout);
+
+    initialize_session(&mut stdin, &mut reader, &mut stderr);
+    let listed = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {} }),
+    );
+    let tools = listed["result"]["tools"]
+        .as_array()
+        .expect("tools array")
+        .clone();
+
+    let response = call_tool(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        2,
+        "search_symbols",
+        json!({
+            "patterns": [
+                "*Capability*",
+                "*Language*",
+                "*PolicyDefinition*",
+                "*Query*Domain*"
+            ],
+            "include_tests": true,
+            "limit": 100
+        }),
+    );
+    let structured = &response["result"]["structuredContent"];
+    assert_eq!(1, structured["total_files"], "{structured}");
+    let classes: Vec<&str> = structured["files"][0]["classes"]
+        .as_array()
+        .expect("classes array")
+        .iter()
+        .filter_map(|class| class["symbol"].as_str())
+        .collect();
+    assert_eq!(2, classes.len(), "{structured}");
+    assert!(
+        classes
+            .iter()
+            .any(|symbol| symbol.contains("LanguageRegistry")),
+        "{classes:?}"
+    );
+    assert!(
+        classes
+            .iter()
+            .any(|symbol| symbol.contains("PolicyDefinition")),
+        "{classes:?}"
+    );
+    assert!(
+        structured.get("invalid_patterns").is_none(),
+        "every pattern compiled: {structured}"
+    );
+    assert_structured_content_matches_advertised_schema(&tools, "search_symbols", &response);
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .expect("tool text");
+    assert!(!text.contains("No files matched"), "{text}");
+
+    // A pattern that is neither regex nor glob is reported as invalid instead
+    // of silently matching nothing, while the valid pattern still answers.
+    let mixed = call_tool(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        3,
+        "search_symbols",
+        json!({ "patterns": ["foo(bar", "Language"], "include_tests": false, "limit": 10 }),
+    );
+    let mixed_structured = &mixed["result"]["structuredContent"];
+    assert_eq!(
+        json!(["foo(bar"]),
+        mixed_structured["invalid_patterns"],
+        "{mixed_structured}"
+    );
+    assert_eq!(1, mixed_structured["total_files"], "{mixed_structured}");
+    let mixed_text = mixed["result"]["content"][0]["text"]
+        .as_str()
+        .expect("tool text");
+    assert!(
+        mixed_text.contains("could not be interpreted as regex or wildcard"),
+        "{mixed_text}"
+    );
+    assert_structured_content_matches_advertised_schema(&tools, "search_symbols", &mixed);
 
     drop(stdin);
     let status = child.wait().expect("wait bifrost");
@@ -3373,12 +3493,11 @@ fn rmcp_host_answers_2026_07_28_discovery_before_any_handshake() {
     let versions = discover["result"]["supportedVersions"]
         .as_array()
         .unwrap_or_else(|| panic!("server/discover must list supported versions: {discover}"));
-    for expected in ["2025-11-25", "2026-07-28"] {
-        assert!(
-            versions.iter().any(|version| version == expected),
-            "server/discover must advertise {expected}: {discover}"
-        );
-    }
+    assert_eq!(
+        versions,
+        &[json!("2025-11-25"), json!("2026-07-28")],
+        "server/discover must advertise exactly the revisions Bifrost validates: {discover}"
+    );
     assert_eq!(
         discover["result"]["_meta"]["io.modelcontextprotocol/serverInfo"]["name"], "bifrost",
         "{discover}"
@@ -3398,28 +3517,22 @@ fn mcp_2026_07_28_clients_get_result_types() {
     let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
     let mut stderr = child.stderr.take().expect("stderr");
 
-    let initialize = round_trip(
+    let discover = round_trip(
         &mut stdin,
         &mut reader,
         &mut stderr,
         json!({
             "jsonrpc": "2.0",
             "id": 1,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": "2026-07-28",
-                "capabilities": {},
-                "clientInfo": { "name": "modern", "version": "1" }
-            }
+            "method": "server/discover",
+            "params": { "_meta": stateless_2026_meta() }
         }),
     );
-    assert_eq!(
-        initialize["result"]["protocolVersion"], "2026-07-28",
-        "a client asking for the new revision must get it: {initialize}"
-    );
-    write_line(
-        &mut stdin,
-        json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+    assert!(
+        discover["result"]["supportedVersions"]
+            .as_array()
+            .is_some_and(|versions| versions.iter().any(|version| version == "2026-07-28")),
+        "the server must advertise the stateless revision: {discover}"
     );
 
     // The discriminator is what tells a 2026-07-28 client the result is final
@@ -3428,12 +3541,7 @@ fn mcp_2026_07_28_clients_get_result_types() {
         &mut stdin,
         &mut reader,
         &mut stderr,
-        json!({
-            "jsonrpc": "2.0",
-            "id": 3,
-            "method": "tools/call",
-            "params": { "name": "search_symbols", "arguments": { "patterns": ["DiscoverMe"] } }
-        }),
+        stateless_search_symbols_call(3, "DiscoverMe"),
     );
     assert_eq!(call["result"]["resultType"], "complete", "{call}");
     assert_eq!(call["result"]["isError"], false, "{call}");
@@ -3459,24 +3567,21 @@ fn cache_hints_reach_new_clients_and_stay_off_the_legacy_wire() {
         json!({
             "jsonrpc": "2.0",
             "id": 1,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": "2026-07-28",
-                "capabilities": {},
-                "clientInfo": { "name": "modern", "version": "1" }
-            }
+            "method": "server/discover",
+            "params": { "_meta": stateless_2026_meta() }
         }),
-    );
-    write_line(
-        &mut stdin,
-        json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
     );
 
     let tools = round_trip(
         &mut stdin,
         &mut reader,
         &mut stderr,
-        json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {} }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list",
+            "params": { "_meta": stateless_2026_meta() }
+        }),
     );
     assert_eq!(tools["result"]["ttlMs"], 300_000, "{tools}");
     // Two servers started in different modes publish different tool lists and
@@ -3491,12 +3596,34 @@ fn cache_hints_reach_new_clients_and_stay_off_the_legacy_wire() {
             "jsonrpc": "2.0",
             "id": 3,
             "method": "resources/read",
-            "params": { "uri": "bifrost://agent-guidance/agents.md" }
+            "params": {
+                "uri": "bifrost://agent-guidance/agents.md",
+                "_meta": stateless_2026_meta()
+            }
         }),
     );
     // Compiled into the binary, so identical for every client of this build.
     assert_eq!(resource["result"]["ttlMs"], 3_600_000, "{resource}");
     assert_eq!(resource["result"]["cacheScope"], "public", "{resource}");
+
+    // Bifrost advertises neither prompts nor resource templates. Returning an
+    // SDK-default empty list here would be worse than rejecting the method:
+    // every 2026-07-28 list result must carry cache hints, so that default is
+    // schema-invalid even though the corresponding capability is absent.
+    for (id, method) in [(4, "prompts/list"), (5, "resources/templates/list")] {
+        let unsupported = round_trip(
+            &mut stdin,
+            &mut reader,
+            &mut stderr,
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": method,
+                "params": { "_meta": stateless_2026_meta() }
+            }),
+        );
+        assert_eq!(unsupported["error"]["code"], -32601, "{unsupported}");
+    }
 
     // Tool results are never cacheable: every one depends on the bound
     // workspace and the current state of the files in it.
@@ -3504,12 +3631,7 @@ fn cache_hints_reach_new_clients_and_stay_off_the_legacy_wire() {
         &mut stdin,
         &mut reader,
         &mut stderr,
-        json!({
-            "jsonrpc": "2.0",
-            "id": 4,
-            "method": "tools/call",
-            "params": { "name": "search_symbols", "arguments": { "patterns": ["Cacheable"] } }
-        }),
+        stateless_search_symbols_call(6, "Cacheable"),
     );
     assert!(call["result"]["ttlMs"].is_null(), "{call}");
     assert!(call["result"]["cacheScope"].is_null(), "{call}");
@@ -3544,6 +3666,15 @@ fn cache_hints_reach_new_clients_and_stay_off_the_legacy_wire() {
     );
     assert!(resource["result"]["ttlMs"].is_null(), "{resource}");
     assert!(resource["result"]["cacheScope"].is_null(), "{resource}");
+    for (id, method) in [(4, "prompts/list"), (5, "resources/templates/list")] {
+        let unsupported = round_trip(
+            &mut stdin,
+            &mut reader,
+            &mut stderr,
+            json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": {} }),
+        );
+        assert_eq!(unsupported["error"]["code"], -32601, "{unsupported}");
+    }
 
     drop(stdin);
     assert!(child.wait().expect("wait bifrost").success());
@@ -3598,7 +3729,7 @@ const OUTPUT_SCHEMA_TOOLS: [&str; 7] = [
 ];
 
 #[test]
-fn output_schema_reaches_new_clients_and_stays_off_the_legacy_wire() {
+fn output_schema_reaches_every_supported_revision() {
     let workspace = InlineTestProject::new()
         .file("Described.java", "class Described {}\n")
         .build();
@@ -3647,28 +3778,46 @@ fn output_schema_reaches_new_clients_and_stays_off_the_legacy_wire() {
     drop(stdin);
     assert!(child.wait().expect("wait bifrost").success());
 
-    // `outputSchema` entered the MCP spec at 2025-06-18. A 2025-03-26 client
-    // has no schema for the field, so the server has to strip it.
+    // The other supported revision is stateless. Its tools/list result must
+    // publish the same reviewed output contracts through the modern wire
+    // shape; revisions older than 2025-11-25 are intentionally not advertised.
     let mut child = spawn_server(workspace.root(), "searchtools", &[]);
     let mut stdin = child.stdin.take().expect("stdin");
     let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
     let mut stderr = child.stderr.take().expect("stderr");
-    initialize_session_speaking(&mut stdin, &mut reader, &mut stderr, "2025-03-26");
+    round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 0,
+            "method": "server/discover",
+            "params": { "_meta": stateless_2026_meta() }
+        }),
+    );
 
     let listed = round_trip(
         &mut stdin,
         &mut reader,
         &mut stderr,
-        json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {} }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list",
+            "params": { "_meta": stateless_2026_meta() }
+        }),
     );
-    let legacy_advertising: Vec<&str> = listed["result"]["tools"]
+    let mut stateless_advertising: Vec<&str> = listed["result"]["tools"]
         .as_array()
         .expect("tools array")
         .iter()
         .filter(|tool| tool.get("outputSchema").is_some())
         .map(|tool| tool["name"].as_str().expect("tool name"))
         .collect();
-    assert!(legacy_advertising.is_empty(), "{listed}");
+    stateless_advertising.sort_unstable();
+    assert_eq!(stateless_advertising, expected, "{listed}");
+    assert_eq!(listed["result"]["resultType"], "complete", "{listed}");
 
     drop(stdin);
     assert!(child.wait().expect("wait bifrost").success());
@@ -4085,28 +4234,15 @@ fn rootless_mcp_binds_through_mrtr_roots_on_2026_07_28() {
         json!({
             "jsonrpc": "2.0",
             "id": 1,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": "2026-07-28",
-                "capabilities": {},
-                "clientInfo": { "name": "modern", "version": "1" }
-            }
+            "method": "server/discover",
+            "params": { "_meta": stateless_2026_meta() }
         }),
-    );
-    write_line(
-        &mut stdin,
-        json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
     );
 
     // 2026-07-28 removed the post-handshake roots lifecycle, so an unbound
     // server answers the tool call with an embedded roots request instead of a
     // result, and the client retries the same call once it can answer.
-    let search = json!({
-        "jsonrpc": "2.0",
-        "id": 2,
-        "method": "tools/call",
-        "params": { "name": "search_symbols", "arguments": { "patterns": ["MrtrWorkspace"] } }
-    });
+    let search = stateless_search_symbols_call(2, "MrtrWorkspace");
     let input_required = round_trip(&mut stdin, &mut reader, &mut stderr, search.clone());
     assert_eq!(
         input_required["result"]["resultType"], "input_required",
@@ -4169,6 +4305,15 @@ fn stateless_2026_meta() -> Value {
     })
 }
 
+fn stateless_2026_tasks_meta() -> Value {
+    json!({
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities": {
+            "extensions": { "io.modelcontextprotocol/tasks": {} }
+        }
+    })
+}
+
 fn stateless_search_symbols_call(id: i64, pattern: &str) -> Value {
     json!({
         "jsonrpc": "2.0",
@@ -4180,6 +4325,18 @@ fn stateless_search_symbols_call(id: i64, pattern: &str) -> Value {
             "_meta": stateless_2026_meta()
         }
     })
+}
+
+fn stateless_run_policy_request(id: i64) -> Value {
+    let mut request = run_policy_request(id);
+    request["params"]["_meta"] = stateless_2026_tasks_meta();
+    request
+}
+
+fn stateless_malformed_run_policy_request(id: i64) -> Value {
+    let mut request = malformed_run_policy_request(id);
+    request["params"]["_meta"] = stateless_2026_tasks_meta();
+    request
 }
 
 /// Issue #2007: the `2026-07-28` lifecycle is stateless. A rootless client
@@ -4753,6 +4910,25 @@ fn initialize_tasks_session(
     initialize
 }
 
+/// Discover a stateless server while declaring the MCP Tasks extension.
+fn discover_tasks_server(
+    stdin: &mut impl Write,
+    reader: &mut impl BufRead,
+    stderr: &mut impl Read,
+) -> Value {
+    round_trip(
+        stdin,
+        reader,
+        stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 0,
+            "method": "server/discover",
+            "params": { "_meta": stateless_2026_tasks_meta() }
+        }),
+    )
+}
+
 fn run_policy_request(id: i64) -> Value {
     json!({
         "jsonrpc": "2.0",
@@ -4874,7 +5050,7 @@ fn poll_task_until_terminal(
                 "jsonrpc": "2.0",
                 "id": id,
                 "method": "tasks/get",
-                "params": { "taskId": task_id }
+                "params": { "taskId": task_id, "_meta": stateless_2026_tasks_meta() }
             }),
         );
         let status = response["result"]["status"]
@@ -4931,15 +5107,20 @@ fn mcp_tasks_run_policy_completes_through_a_task_handle() {
     let mut stdin = child.stdin.take().expect("stdin");
     let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
     let mut stderr = child.stderr.take().expect("stderr");
-    let initialize = initialize_tasks_session(&mut stdin, &mut reader, &mut stderr, "2026-07-28");
+    let discover = discover_tasks_server(&mut stdin, &mut reader, &mut stderr);
     assert!(
-        initialize["result"]["capabilities"]["extensions"]
+        discover["result"]["capabilities"]["extensions"]
             .get("io.modelcontextprotocol/tasks")
             .is_some(),
-        "the server must advertise the tasks extension: {initialize}"
+        "the server must advertise the tasks extension: {discover}"
     );
 
-    let created = round_trip(&mut stdin, &mut reader, &mut stderr, run_policy_request(1));
+    let created = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        stateless_run_policy_request(1),
+    );
     assert_eq!(created["result"]["resultType"], "task", "{created}");
     assert_eq!(created["result"]["status"], "working", "{created}");
     assert!(created["result"]["ttlMs"].is_number(), "{created}");
@@ -4982,7 +5163,7 @@ fn mcp_tasks_never_reach_incapable_or_legacy_clients() {
         .file("policies/dynamic-eval.rqlp", MCP_DYNAMIC_EVAL_POLICY)
         .build();
 
-    // A 2026-07-28 client without the capability keeps synchronous behavior,
+    // A 2026-07-28 request without the capability keeps synchronous behavior,
     // and its tasks/get is refused before reaching Bifrost's handler.
     let mut child = spawn_server(workspace.root(), "searchtools", &[]);
     let mut stdin = child.stdin.take().expect("stdin");
@@ -4995,19 +5176,13 @@ fn mcp_tasks_never_reach_incapable_or_legacy_clients() {
         json!({
             "jsonrpc": "2.0",
             "id": 0,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": "2026-07-28",
-                "capabilities": {},
-                "clientInfo": { "name": "no-tasks", "version": "1" }
-            }
+            "method": "server/discover",
+            "params": { "_meta": stateless_2026_meta() }
         }),
     );
-    write_line(
-        &mut stdin,
-        json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
-    );
-    let synchronous = round_trip(&mut stdin, &mut reader, &mut stderr, run_policy_request(1));
+    let mut request = run_policy_request(1);
+    request["params"]["_meta"] = stateless_2026_meta();
+    let synchronous = round_trip(&mut stdin, &mut reader, &mut stderr, request);
     assert_eq!(
         synchronous["result"]["resultType"], "complete",
         "{synchronous}"
@@ -5024,7 +5199,7 @@ fn mcp_tasks_never_reach_incapable_or_legacy_clients() {
             "jsonrpc": "2.0",
             "id": 2,
             "method": "tasks/get",
-            "params": { "taskId": "irrelevant" }
+            "params": { "taskId": "irrelevant", "_meta": stateless_2026_meta() }
         }),
     );
     assert!(
@@ -5063,9 +5238,14 @@ fn mcp_tasks_cancel_settles_cancelled() {
     let mut stdin = child.stdin.take().expect("stdin");
     let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
     let mut stderr = child.stderr.take().expect("stderr");
-    initialize_tasks_session(&mut stdin, &mut reader, &mut stderr, "2026-07-28");
+    discover_tasks_server(&mut stdin, &mut reader, &mut stderr);
 
-    let created = round_trip(&mut stdin, &mut reader, &mut stderr, run_policy_request(1));
+    let created = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        stateless_run_policy_request(1),
+    );
     assert_eq!(created["result"]["resultType"], "task", "{created}");
     let task_id = created["result"]["taskId"]
         .as_str()
@@ -5082,7 +5262,7 @@ fn mcp_tasks_cancel_settles_cancelled() {
             "jsonrpc": "2.0",
             "id": 2,
             "method": "tasks/cancel",
-            "params": { "taskId": task_id }
+            "params": { "taskId": task_id, "_meta": stateless_2026_tasks_meta() }
         }),
     );
     assert!(ack["error"].is_null(), "{ack}");
@@ -5107,9 +5287,14 @@ fn mcp_tasks_expire_to_failed() {
     let mut stdin = child.stdin.take().expect("stdin");
     let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
     let mut stderr = child.stderr.take().expect("stderr");
-    initialize_tasks_session(&mut stdin, &mut reader, &mut stderr, "2026-07-28");
+    discover_tasks_server(&mut stdin, &mut reader, &mut stderr);
 
-    let created = round_trip(&mut stdin, &mut reader, &mut stderr, run_policy_request(1));
+    let created = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        stateless_run_policy_request(1),
+    );
     assert_eq!(created["result"]["resultType"], "task", "{created}");
     assert_eq!(created["result"]["ttlMs"], 300, "{created}");
     let task_id = created["result"]["taskId"]
@@ -5136,19 +5321,17 @@ fn mcp_tasks_unknown_ids_fail_safely() {
     let mut stdin = child.stdin.take().expect("stdin");
     let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
     let mut stderr = child.stderr.take().expect("stderr");
-    initialize_tasks_session(&mut stdin, &mut reader, &mut stderr, "2026-07-28");
+    discover_tasks_server(&mut stdin, &mut reader, &mut stderr);
 
     for (id, method) in [(1, "tasks/get"), (2, "tasks/update"), (3, "tasks/cancel")] {
         let mut params = json!({ "taskId": "no-such-task" });
         if method == "tasks/update" {
             params["inputResponses"] = json!({});
         }
-        let refused = round_trip(
-            &mut stdin,
-            &mut reader,
-            &mut stderr,
-            json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }),
-        );
+        let refused = round_trip(&mut stdin, &mut reader, &mut stderr, {
+            params["_meta"] = stateless_2026_tasks_meta();
+            json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })
+        });
         assert!(
             !refused["error"].is_null(),
             "{method} with an unknown id must fail safely: {refused}"
@@ -5178,12 +5361,17 @@ fn mcp_tasks_handles_die_with_workspace_rebinding() {
     let mut stdin = child.stdin.take().expect("stdin");
     let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
     let mut stderr = child.stderr.take().expect("stderr");
-    initialize_tasks_session(&mut stdin, &mut reader, &mut stderr, "2026-07-28");
+    discover_tasks_server(&mut stdin, &mut reader, &mut stderr);
 
     // Rootless 2026-07-28 binding goes through MRTR: the first call is
     // answered with a roots activation, and the retry that carries the roots
     // is the call that becomes the task.
-    let activation = round_trip(&mut stdin, &mut reader, &mut stderr, run_policy_request(1));
+    let activation = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        stateless_run_policy_request(1),
+    );
     assert_eq!(
         activation["result"]["resultType"], "input_required",
         "{activation}"
@@ -5192,7 +5380,7 @@ fn mcp_tasks_handles_die_with_workspace_rebinding() {
         .as_str()
         .expect("requestState")
         .to_string();
-    let mut retry = run_policy_request(2);
+    let mut retry = stateless_run_policy_request(2);
     retry["params"]["requestState"] = json!(request_state);
     retry["params"]["inputResponses"] = json!({ "roots": { "roots": [{ "uri": workspace_uri }] } });
     let created = round_trip(&mut stdin, &mut reader, &mut stderr, retry);
@@ -5222,7 +5410,11 @@ fn mcp_tasks_handles_die_with_workspace_rebinding() {
             "jsonrpc": "2.0",
             "id": 40,
             "method": "tools/call",
-            "params": { "name": "search_symbols", "arguments": { "patterns": ["handler"] } }
+            "params": {
+                "name": "search_symbols",
+                "arguments": { "patterns": ["handler"] },
+                "_meta": stateless_2026_tasks_meta()
+            }
         }),
     );
     assert_eq!(
@@ -5238,7 +5430,7 @@ fn mcp_tasks_handles_die_with_workspace_rebinding() {
             "jsonrpc": "2.0",
             "id": 41,
             "method": "tasks/get",
-            "params": { "taskId": task_id }
+            "params": { "taskId": task_id, "_meta": stateless_2026_tasks_meta() }
         }),
     );
     assert!(
@@ -5256,34 +5448,33 @@ fn assert_codex_metadata_cannot_bind_before_initialize(
     cwd: &std::path::Path,
     sandbox_root: &std::path::Path,
 ) {
-    // Shape 1: a bare pre-initialize call. The MCP lifecycle permits only
-    // `ping` before `initialize`, so the server refuses the whole session.
+    // Shape 1: a bare pre-initialize call. RMCP 3.3 returns a bounded protocol
+    // error before ending startup negotiation; the request never reaches
+    // Bifrost's handler and its sandbox metadata is never interpreted.
     let mut child = spawn_rootless_server(cwd, "workspace|symbol");
     let mut stdin = child.stdin.take().expect("stdin");
     let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
     let mut stderr = child.stderr.take().expect("stderr");
 
-    write_line(
+    let refused = round_trip(
         &mut stdin,
+        &mut reader,
+        &mut stderr,
         codex_search_symbols_call(0, sandbox_root, "codex-test-thread", "CodexWorkspace"),
     );
-    let mut response = String::new();
-    reader
-        .read_line(&mut response)
-        .expect("read pre-initialize response");
+    assert_eq!(refused["error"]["code"], -32602, "{refused}");
     assert!(
-        response.is_empty(),
-        "a tools/call before initialize must not be served: {response}"
+        refused["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message
+                .contains("request _meta is missing or has malformed required fields")),
+        "pre-initialize traffic must fail at protocol negotiation: {refused}"
+    );
+    assert!(
+        !refused.to_string().contains("CodexWorkspace"),
+        "no analyzer result may be returned for an unauthorized workspace: {refused}"
     );
     drop(stdin);
-    let mut diagnostics = String::new();
-    stderr
-        .read_to_string(&mut diagnostics)
-        .expect("read server diagnostics");
-    assert!(
-        diagnostics.contains("expect initialized request"),
-        "the server must refuse the session, not the individual call: {diagnostics}"
-    );
     child.wait().expect("wait bifrost");
 
     // Shape 2, and the one that actually got through: MCP 2026-07-28 has a
@@ -5418,8 +5609,9 @@ fn spawn_server_at_production_budget(root: &std::path::Path, mode: &str) -> std:
 /// request-wide time budget" error instead of a result -- so asserting success
 /// is asserting the latency.
 ///
-/// `get_symbol_sources` is the request under test because
-/// `default_cold_workspace_budget_applies` exempts `search_symbols`, which
+/// `get_symbol_sources` is the request under test because the fallback budget
+/// ladder exempts `search_symbols` from the cold fail-fast (discovery waits
+/// out initialization within the default interactive budget instead), which
 /// would make the assertion vacuous.
 ///
 /// `.config/nextest.toml` reserves the machine for this test: a wall-clock

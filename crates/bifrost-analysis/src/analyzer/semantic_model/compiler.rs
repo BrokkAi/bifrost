@@ -1,20 +1,21 @@
 use super::artifact::{
     ArtifactEncoding, ArtifactError, CompiledAtomicOperation, CompiledClassDecoratorIdentity,
-    CompiledClassDecoratorKeyword, CompiledConcurrencyEffect, CompiledConditionalIndirectWrite,
-    CompiledConditionalResultRefinement, CompiledDeclaredEffect, CompiledDeclaredEffectCertainty,
-    CompiledDeclaredEffectTiming, CompiledIndirectWriteTarget, CompiledLockMode,
-    CompiledNormalReturnRefinement, CompiledNormalReturnTypeRefinement,
-    CompiledOperationPrecondition, CompiledPackManifest, CompiledPayload,
-    CompiledPredicateProofEffect, CompiledProcedureSummary, CompiledProcedureTarget,
-    CompiledResultContract, CompiledResultMemberContract, CompiledResultPredicate,
-    CompiledSemanticModelPack, CompiledShard, CompiledShardArtifact, CompiledShardDescriptor,
-    CompiledSummaryEffect, CompiledSummaryExitKind, CompiledSummaryInput, CompiledSummaryLocation,
-    CompiledSummaryLocationKind, CompiledSummaryMoveInvalidation, CompiledSummaryOutput,
-    CompiledSummaryTransfer, CompiledSummaryValuePreservation, CompiledSummaryValueTransfer,
-    CompiledSummaryValueTransferKind, CompiledSummaryValueTransferLimitation,
-    CompiledSummaryValueTransferLimitationKind, CompiledSummaryValueTransferOperation,
-    DecodeLimits, canonical_json, content_digest, manifest_content_digest,
-    manifest_semantic_digest, routing_keys, semantic_digest, shard_inventory, stored_digest,
+    CompiledClassDecoratorKeyword, CompiledConcurrencyEffect, CompiledCondWaiters,
+    CompiledConditionalIndirectWrite, CompiledConditionalResultRefinement, CompiledDeclaredEffect,
+    CompiledDeclaredEffectCertainty, CompiledDeclaredEffectTiming, CompiledIndirectWriteTarget,
+    CompiledLockCondition, CompiledLockMode, CompiledNormalReturnRefinement,
+    CompiledNormalReturnTypeRefinement, CompiledOperationPrecondition, CompiledPackManifest,
+    CompiledPayload, CompiledPredicateProofEffect, CompiledProcedureSummary,
+    CompiledProcedureTarget, CompiledResultContract, CompiledResultMemberContract,
+    CompiledResultPredicate, CompiledSemanticModelPack, CompiledShard, CompiledShardArtifact,
+    CompiledShardDescriptor, CompiledSummaryEffect, CompiledSummaryExitKind, CompiledSummaryInput,
+    CompiledSummaryLocation, CompiledSummaryLocationKind, CompiledSummaryMoveInvalidation,
+    CompiledSummaryOutput, CompiledSummaryTransfer, CompiledSummaryValuePreservation,
+    CompiledSummaryValueTransfer, CompiledSummaryValueTransferKind,
+    CompiledSummaryValueTransferLimitation, CompiledSummaryValueTransferLimitationKind,
+    CompiledSummaryValueTransferOperation, DecodeLimits, canonical_json, content_digest,
+    manifest_content_digest, manifest_semantic_digest, routing_keys, semantic_digest,
+    shard_inventory, stored_digest,
 };
 use super::model::*;
 use super::source::{SourceFormat, parse_source};
@@ -115,6 +116,7 @@ pub fn compile_pack(
             completeness: normalized.completeness,
             safety: normalized.safety.clone(),
             runtime_values: shard.runtime_values.clone(),
+            runtime_contracts: shard.runtime_contracts.clone(),
             collection_flows: shard.collection_flows.clone(),
             deferred_yields: shard.deferred_yields.clone(),
             conditional_type_refinements: shard.conditional_type_refinements.clone(),
@@ -268,6 +270,16 @@ pub(crate) fn normalize(mut pack: AuthoredSemanticModelPack) -> AuthoredSemantic
             runtime_values
                 .observations
                 .sort_by(|left, right| left.observation_id.cmp(&right.observation_id));
+        }
+        if let Some(runtime_contracts) = &mut shard.runtime_contracts {
+            crate::analyzer::semantic_model::normalize_runtime_contract_payload(
+                &mut runtime_contracts.payload,
+            )
+            .expect("typed runtime-contract payload is JSON serializable");
+            if let Some(envelope) = &mut runtime_contracts.envelope {
+                crate::analyzer::semantic_model::normalize_runtime_contract_envelope(envelope)
+                    .expect("retained runtime-contract envelope is JSON serializable");
+            }
         }
         if let Some(collection_flows) = &mut shard.collection_flows {
             collection_flows
@@ -772,15 +784,24 @@ fn compile_concurrency_effect(effect: &AuthoredConcurrencyEffect) -> CompiledCon
         AuthoredConcurrencyEffect::TaskJoin { group } => CompiledConcurrencyEffect::TaskJoin {
             group: compile_summary_input(group),
         },
-        AuthoredConcurrencyEffect::LockAcquire { lock, mode } => {
-            CompiledConcurrencyEffect::LockAcquire {
-                lock: compile_summary_input(lock),
-                mode: match mode {
-                    AuthoredLockMode::Shared => CompiledLockMode::Shared,
-                    AuthoredLockMode::Exclusive => CompiledLockMode::Exclusive,
-                },
-            }
-        }
+        AuthoredConcurrencyEffect::OnceDo { once, callable } => CompiledConcurrencyEffect::OnceDo {
+            once: compile_summary_input(once),
+            callable: compile_summary_input(callable),
+        },
+        AuthoredConcurrencyEffect::LockAcquire {
+            lock,
+            mode,
+            condition,
+        } => CompiledConcurrencyEffect::LockAcquire {
+            lock: compile_summary_input(lock),
+            mode: match mode {
+                AuthoredLockMode::Shared => CompiledLockMode::Shared,
+                AuthoredLockMode::Exclusive => CompiledLockMode::Exclusive,
+            },
+            condition: condition.map(|condition| match condition {
+                AuthoredLockCondition::CallResultTrue => CompiledLockCondition::CallResultTrue,
+            }),
+        },
         AuthoredConcurrencyEffect::LockRelease { lock, mode } => {
             CompiledConcurrencyEffect::LockRelease {
                 lock: compile_summary_input(lock),
@@ -819,6 +840,24 @@ fn compile_concurrency_effect(effect: &AuthoredConcurrencyEffect) -> CompiledCon
                 }
             },
         },
+        AuthoredConcurrencyEffect::CondBind { condition, lock } => {
+            CompiledConcurrencyEffect::CondBind {
+                condition: compile_summary_output(condition),
+                lock: compile_summary_input(lock),
+            }
+        }
+        AuthoredConcurrencyEffect::CondWait { condition } => CompiledConcurrencyEffect::CondWait {
+            condition: compile_summary_input(condition),
+        },
+        AuthoredConcurrencyEffect::CondNotify { condition, waiters } => {
+            CompiledConcurrencyEffect::CondNotify {
+                condition: compile_summary_input(condition),
+                waiters: match waiters {
+                    AuthoredCondWaiters::One => CompiledCondWaiters::One,
+                    AuthoredCondWaiters::All => CompiledCondWaiters::All,
+                },
+            }
+        }
     }
 }
 

@@ -43,9 +43,9 @@ use brokk_bifrost_flow::dataflow::{
 use brokk_bifrost_flow::flow_state::procedure_public_digest;
 use brokk_bifrost_flow::type_flow::{
     ClassSetStatus, FeedbackLimits, FieldSlotIndex, FieldSlotIndexAcquisitionKind,
-    FieldSlotIndexMissReason, RootExhaustedLane, RootIncompleteEvidence, TypeFlowError,
-    TypeFlowPlanError, TypeFlowRootPersistenceStatus, TypeFlowRootResult,
-    active_semantic_model_pack_digest, solve_type_flow_for_root,
+    FieldSlotIndexMissReason, ProcedureRefinements, RootExhaustedLane, RootIncompleteEvidence,
+    TypeFlowError, TypeFlowPlanError, TypeFlowRootPersistenceStatus, TypeFlowRootResult,
+    active_semantic_model_pack_digest, solve_type_flow_for_root_with_refinements,
 };
 use brokk_bifrost_flow::value_flow::{ClosureLimits, ValueFlowCache, ValueFlowCacheStatsSnapshot};
 
@@ -117,6 +117,10 @@ enum RootResultPublicationOutcome {
 pub(super) struct TypeFlowQueryState {
     value_flow_cache: ValueFlowCache,
     summary_state: brokk_bifrost_flow::type_flow::TypeFlowSummaryState,
+    /// Exact procedure-local derivations shared only by roots in this query.
+    /// The query owns one pinned analyzer/model context and one diagnostics
+    /// ledger, so reuse cannot cross policy, request, or snapshot boundaries.
+    refinements: ProcedureRefinements,
     provider_stats_baseline: ValueFlowCacheStatsSnapshot,
     cache: HashMap<TypeFlowCacheKey, CachedTypeFlowAnalysis>,
     field_slots: HashMap<FieldSlotCacheKey, Option<QueryFieldSlots>>,
@@ -150,6 +154,7 @@ impl TypeFlowQueryState {
         Self {
             value_flow_cache,
             summary_state,
+            refinements: ProcedureRefinements::default(),
             provider_stats_baseline,
             cache: HashMap::default(),
             field_slots: HashMap::default(),
@@ -752,7 +757,7 @@ impl TypeFlowQueryState {
                     semantic_budget.limits(),
                     &query_field_slots.semantic_scope,
                 );
-                let outcome = solve_type_flow_for_root(
+                let outcome = solve_type_flow_for_root_with_refinements(
                     workspace,
                     adapter,
                     &field_slots,
@@ -764,6 +769,7 @@ impl TypeFlowQueryState {
                     self.summary_state.clone(),
                     &mut child_budget,
                     &mut request,
+                    &mut self.refinements,
                 );
                 // A later root inherits both the workspace census paid by the
                 // prepass and any additional complete artifacts paid here,

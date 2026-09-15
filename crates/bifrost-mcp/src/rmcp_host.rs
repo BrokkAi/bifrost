@@ -38,10 +38,10 @@ use rmcp::model::{
     Annotations, CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult,
     CancelTaskParams, ContentBlock, CreateTaskResult, CustomRequest, CustomResult, ErrorData,
     GetTaskParams, GetTaskResult, Implementation, InitializeRequestParams, InitializeResult,
-    ListResourcesResult, ListToolsResult, MetaObject, PaginatedRequestParams,
-    ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Resource,
-    ResourceContents, Role, ServerCapabilities, ServerInfo, TASKS_EXTENSION_ID, Tool,
-    UpdateTaskParams,
+    ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult, ListToolsResult,
+    MetaObject, PaginatedRequestParams, ProtocolVersion, ReadResourceRequestParams,
+    ReadResourceResponse, ReadResourceResult, Resource, ResourceContents, Role, ServerCapabilities,
+    ServerInfo, TASKS_EXTENSION_ID, Tool, UpdateTaskParams,
 };
 use rmcp::task_manager::{TaskContext, TaskExit, TaskManager, TaskOptions};
 // MCP 2026-07-28 deprecates Roots wholesale (SEP-2577) without yet shipping a
@@ -56,6 +56,7 @@ use rmcp::service::{NotificationContext, RequestContext};
 use rmcp::transport::IntoTransport;
 use rmcp::{RoleServer, ServerHandler, ServiceExt};
 use serde_json::{Value, json};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::io::Write;
@@ -1478,7 +1479,10 @@ impl BifrostMcpHandler {
                         progress.phase(format!("cancelling {name}")).await;
                     }
                     let budget = mcp_analyzer_request_budget()
-                        .unwrap_or(crate::mcp_common::COLD_WORKSPACE_REQUEST_BUDGET);
+                        .or_else(|| {
+                            crate::mcp_common::fallback_request_budget(&name, cold_workspace)
+                        })
+                        .expect("the deadline fired, so a configured or fallback budget applied");
                     let phase = bifrost_cancellation.phase().expect(
                         "the request entered its execution phase before the budget could fire",
                     );
@@ -1870,16 +1874,6 @@ fn map_service_error(code: SearchToolsServiceErrorCode, message: String) -> Erro
     }
 }
 
-/// Apply the bounded cold-start fallback to every analyzer tool except symbol
-/// discovery. `search_symbols` is the first request that agent clients use to
-/// discover a workspace. It waits for the already-running snapshot build
-/// without holding the workspace lock or an analyzer permit. Giving that wait
-/// the fallback deadline makes a cold workspace report a retryable failure
-/// even when the snapshot becomes ready immediately afterwards.
-fn default_cold_workspace_budget_applies(tool_name: &str, cold_workspace: bool) -> bool {
-    cold_workspace && tool_name != "search_symbols"
-}
-
 /// Whether this request's peer negotiated MCP `2026-07-28` or newer.
 ///
 /// Gates every field that revision added. `rmcp` strips `resultType` for a
@@ -1930,21 +1924,6 @@ fn request_negotiates_per_request(meta: &rmcp::model::RequestMetaObject) -> bool
     negotiated
 }
 
-/// Echo the client's requested revision when it is one the SDK knows, and
-/// otherwise fall back to the server's own. This mirrors what `rmcp`'s default
-/// `initialize` does; Bifrost overrides `initialize` only to record
-/// authorization state, not to change negotiation.
-fn negotiated_protocol_version(
-    request: &InitializeRequestParams,
-    server_fallback: rmcp::model::ProtocolVersion,
-) -> rmcp::model::ProtocolVersion {
-    if rmcp::model::ProtocolVersion::KNOWN_VERSIONS.contains(&request.protocol_version) {
-        request.protocol_version.clone()
-    } else {
-        server_fallback
-    }
-}
-
 fn log_codex_workspace_event(event: &str, thread_id: Option<&str>) {
     match thread_id {
         Some(thread_id) => eprintln!(
@@ -1982,6 +1961,14 @@ impl BifrostMcpHandler {
 }
 
 impl ServerHandler for BifrostMcpHandler {
+    fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
+        // These are the two revisions covered by Bifrost's real-process wire
+        // and conformance gates. Do not advertise every revision the SDK knows:
+        // adding one is a Bifrost compatibility decision, not an rmcp upgrade
+        // side effect.
+        Cow::Borrowed(&[ProtocolVersion::V_2025_11_25, ProtocolVersion::V_2026_07_28])
+    }
+
     fn get_info(&self) -> ServerInfo {
         let mut info = InitializeResult::new(
             ServerCapabilities::builder()
@@ -2047,6 +2034,30 @@ impl ServerHandler for BifrostMcpHandler {
         })
     }
 
+    async fn list_prompts(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListPromptsResult, ErrorData> {
+        Err(ErrorData::new(
+            rmcp::model::ErrorCode::METHOD_NOT_FOUND,
+            "Method not found: prompts/list",
+            None,
+        ))
+    }
+
+    async fn list_resource_templates(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourceTemplatesResult, ErrorData> {
+        Err(ErrorData::new(
+            rmcp::model::ErrorCode::METHOD_NOT_FOUND,
+            "Method not found: resources/templates/list",
+            None,
+        ))
+    }
+
     async fn read_resource(
         &self,
         request: ReadResourceRequestParams,
@@ -2110,7 +2121,7 @@ impl ServerHandler for BifrostMcpHandler {
         };
 
         context.peer.set_peer_info(request.clone());
-        let mut info = self.get_info();
+        let mut info = self.negotiate_initialize(&request)?;
         if advertise_codex_sandbox_state {
             // Tells a Codex client its per-call sandbox metadata will be
             // honored, which is how it learns it need not implement Roots.
@@ -2123,7 +2134,6 @@ impl ServerHandler for BifrostMcpHandler {
                 .collect(),
             );
         }
-        info.protocol_version = negotiated_protocol_version(&request, info.protocol_version);
         Ok(info)
     }
 
@@ -2302,10 +2312,7 @@ impl ServerHandler for BifrostMcpHandler {
         let accepted_at = Instant::now();
         let cold_workspace = service.workspace_build_pending();
         let mut workspace_readiness_wait = Duration::ZERO;
-        let deadline = mcp_request_deadline(
-            accepted_at,
-            default_cold_workspace_budget_applies(&name, cold_workspace),
-        );
+        let deadline = mcp_request_deadline(accepted_at, &name, cold_workspace);
         if !serial {
             if let Some(progress) = &progress {
                 progress.phase("waiting for workspace readiness").await;
@@ -2398,11 +2405,14 @@ impl ServerHandler for BifrostMcpHandler {
             transport_phase_label("queue_wait", &name, correlation_id.as_deref()),
             queue_wait,
         );
-        if queue_wait >= ANALYZER_QUEUE_WAIT_REPORT_THRESHOLD {
+        if analyzer_admission_wait >= ANALYZER_QUEUE_WAIT_REPORT_THRESHOLD {
             // Otherwise a saturated pool is invisible without BIFROST_TIMING,
-            // and every client just appears slow for no stated reason.
+            // and every client just appears slow for no stated reason. The
+            // readiness wait is deliberately excluded: a slow cold build is
+            // the workspace's story, not the pool's, and attributing it to
+            // analyzer slots sent #3279's investigation down the wrong path.
             eprintln!(
-                "bifrost: {name} waited {queue_wait:?} for one of {ANALYZER_POOL_CAPACITY} analyzer slots"
+                "bifrost: {name} waited {analyzer_admission_wait:?} for one of {ANALYZER_POOL_CAPACITY} analyzer slots"
             );
         }
 
@@ -2840,19 +2850,28 @@ mod cold_workspace_deadline_tests {
     use super::*;
 
     #[test]
-    fn cold_search_symbols_does_not_take_the_default_readiness_deadline() {
-        assert!(!default_cold_workspace_budget_applies(
-            "search_symbols",
-            true
-        ));
-        assert!(default_cold_workspace_budget_applies(
-            "scan_usages_by_location",
-            true
-        ));
-        assert!(!default_cold_workspace_budget_applies(
-            "search_symbols",
-            false
-        ));
+    fn cold_search_symbols_waits_out_initialization_within_the_default_budget() {
+        // Discovery still gets to wait out a cold snapshot build (a 4.5 s
+        // fail-fast would reject the client's first discovery call right
+        // before the build finishes), but the wait is bounded by the default
+        // interactive budget instead of running forever (#3279).
+        let accepted_at = Instant::now();
+        let deadline = mcp_request_deadline(accepted_at, "search_symbols", true)
+            .expect("cold discovery must still be bounded");
+        assert_eq!(
+            deadline.duration_since(accepted_at),
+            crate::mcp_common::DEFAULT_INTERACTIVE_REQUEST_BUDGET
+        );
+        assert_eq!(
+            mcp_request_deadline(accepted_at, "scan_usages_by_location", true)
+                .expect("cold non-discovery reads stay bounded"),
+            accepted_at + crate::mcp_common::COLD_WORKSPACE_REQUEST_BUDGET
+        );
+        assert_eq!(
+            mcp_request_deadline(accepted_at, "search_symbols", false)
+                .expect("warm discovery is bounded by the default budget"),
+            accepted_at + crate::mcp_common::DEFAULT_INTERACTIVE_REQUEST_BUDGET
+        );
     }
 }
 

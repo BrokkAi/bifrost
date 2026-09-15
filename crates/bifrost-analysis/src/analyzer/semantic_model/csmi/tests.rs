@@ -7,12 +7,12 @@ use crate::analyzer::semantic_model::{
     AuthoredSummaryOutput, AuthoredSummaryTransfer, CatalogCoordinate, CatalogOptions,
     CompilerOptions, Completeness, ConditionalTypeRefinementFact,
     ConditionalTypeRefinementsPayload, DecodeLimits, ImplicitOperation, Locator, MemberKind,
-    ProcedureSummaryTargetKey, RuntimeSourceForm, RuntimeStaticKey,
+    ProcedureSummaryTargetKey, RuntimeContractAuthorization, RuntimeSourceForm, RuntimeStaticKey,
     SemanticModelActivationEvidence, SemanticModelActivationRequest,
     SemanticModelResolutionOutcome, SemanticPackCatalog, SessionPackSource, SessionPackSourceKind,
     SummaryValueTransfer, SummaryValueTransferKind, SummaryValueTransferOperation,
     TypeCopySemantics, TypeFact, TypeKind, TypeValueSemantics, Visibility, compile_pack,
-    decode_shard, resolve_active_semantic_models,
+    decide_runtime_contract_activation, decode_shard, resolve_active_semantic_models,
 };
 use semver::Version;
 use serde_json::{Value, json};
@@ -41,6 +41,7 @@ const VALID_CPP_COPY_CONSTRUCTOR: &[u8] = include_bytes!(
     "../../../../../../schemas/csmi/0.1/profiles/cpp/0.1/fixtures/valid/copy-constructor.json"
 );
 const VALID_RUNTIME_VALUES: &[u8] = include_bytes!("profiles/runtime-values.fixture.json");
+const VALID_RUNTIME_CONTRACTS: &[u8] = include_bytes!("profiles/runtime-values-v2.fixture.json");
 const DECLARATIONS_JSON: &[u8] =
     include_bytes!("../../../../testdata/semantic-model-packs/declarations-v1.json");
 const GENERATOR_RULES_JSON: &[u8] =
@@ -278,6 +279,214 @@ where
         },
         resources,
     )
+}
+
+fn runtime_contract_profile_support() -> CsmiVocabularySupport {
+    CsmiVocabularySupport::support(
+        CSMI_RUNTIME_VALUES_PROFILE_ID,
+        CSMI_RUNTIME_CONTRACTS_PROFILE_VERSION,
+        CSMI_RUNTIME_CONTRACTS_PROFILE_SCHEMA,
+    )
+}
+
+fn runtime_contract_fixture_pack() -> CsmiLogicalPack {
+    let semantic_bytes = canonical_json_bytes(VALID_RUNTIME_CONTRACTS)
+        .expect("runtime-contract fixture canonicalizes");
+    let path = "models/runtime-contracts.csmi.json".to_owned();
+    let resources = InMemoryCsmiResourceResolver::new([(path.clone(), semantic_bytes.clone())])
+        .expect("runtime-contract fixture resource path is valid");
+    CsmiLogicalPack::new(
+        CsmiPackManifest {
+            document_type: "pack-manifest".to_owned(),
+            schema: CSMI_SCHEMA_URI.to_owned(),
+            pack_format_version: CSMI_PACK_FORMAT_VERSION.to_owned(),
+            assembler: CsmiProducerIdentity {
+                identifier: "https://example.org/tools/csmi-pack".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+            license: "Apache-2.0".to_owned(),
+            created_at: None,
+            resources: vec![CsmiResourceDescriptor {
+                path,
+                role: CsmiResourceRole::SemanticDocument,
+                media_type: CSMI_SEMANTIC_DOCUMENT_MEDIA_TYPE.to_owned(),
+                size: semantic_bytes.len() as u64,
+                digest: CsmiContentDigest {
+                    algorithm: CsmiContentDigestAlgorithm::Sha256,
+                    value: sha256_hex(&semantic_bytes),
+                },
+                license: None,
+                schema_identifier: None,
+                license_reference: None,
+            }],
+            derived_from: Vec::new(),
+        },
+        resources,
+    )
+}
+
+#[test]
+fn runtime_contracts_fixture_imports_compiles_decodes_exports_and_reimports() {
+    let support = runtime_contract_profile_support();
+    let fixture = runtime_contract_fixture_pack();
+    let semantic_bytes = fixture
+        .resources
+        .get("models/runtime-contracts.csmi.json")
+        .expect("fixture resource exists");
+    let validation = validate_csmi_document(semantic_bytes, &support);
+    assert!(
+        validation.valid(),
+        "runtime-contract fixture diagnostics: {:#?}",
+        validation.diagnostics
+    );
+    assert!(validation.interpretable);
+
+    let imported = import_logical_csmi_pack_for_language(
+        &fixture,
+        &support,
+        &CompilerOptions::default(),
+        "javascript",
+    )
+    .expect("runtime-contract fixture imports");
+    assert_eq!(imported.pack.language, "javascript");
+    assert_eq!(imported.pack.ecosystem, "npm");
+    let carrier = imported.pack.shards[0]
+        .runtime_contracts
+        .as_ref()
+        .expect("typed five-family payload is retained");
+    carrier
+        .validate()
+        .expect("typed payload and retained envelope validate together");
+    assert_eq!(carrier.payload.contracts.len(), 1);
+    assert_eq!(carrier.payload.targets.len(), 1);
+    assert_eq!(carrier.payload.activations.len(), 1);
+    assert_eq!(carrier.payload.bindings.len(), 1);
+    assert_eq!(carrier.payload.observations.len(), 1);
+    assert!(carrier.envelope.is_some());
+
+    let activation = &carrier.payload.activations[0];
+    let unknown = decide_runtime_contract_activation(
+        carrier,
+        &activation.activation_id,
+        &RuntimeContractAuthorization::default(),
+    )
+    .expect("activation decision is deterministic");
+    assert_eq!(
+        unknown.outcome,
+        super::super::RuntimeContractActivationOutcome::ReviewRequired
+    );
+    let policy = &activation.policy;
+    let review = &activation.reviews[0];
+    let authorized = decide_runtime_contract_activation(
+        carrier,
+        &activation.activation_id,
+        &RuntimeContractAuthorization {
+            accepted_policy_digests: vec![
+                crate::analyzer::semantic_model::runtime_contract_digest(policy)
+                    .expect("policy canonicalizes"),
+            ],
+            accepted_review_digests: vec![
+                crate::analyzer::semantic_model::runtime_contract_digest(review)
+                    .expect("review canonicalizes"),
+            ],
+        },
+    )
+    .expect("authorized activation decision is deterministic");
+    assert_eq!(
+        authorized.outcome,
+        super::super::RuntimeContractActivationOutcome::Matched
+    );
+    assert_eq!(authorized.selected_ids, vec!["node-env-portable"]);
+
+    let compiled = imported
+        .compile(&CompilerOptions::default())
+        .expect("runtime-contract fixture compiles");
+    assert_eq!(compiled.manifest.schema_version, 4);
+    let decoded = decode_shard(
+        &compiled.shards[0].descriptor,
+        &compiled.shards[0].bytes,
+        &DecodeLimits::default(),
+    )
+    .expect("compiled runtime-contract shard decodes");
+    let mut normalized_carrier = carrier.clone();
+    super::super::normalize_runtime_contract_payload(&mut normalized_carrier.payload).unwrap();
+    super::super::normalize_runtime_contract_envelope(
+        normalized_carrier.envelope.as_mut().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(decoded.runtime_contracts(), Some(&normalized_carrier));
+
+    let exported = export_runtime_contracts_csmi_pack(&compiled, &CsmiExportOptions::default())
+        .expect("portable runtime-contract fixture exports without artifact evidence");
+    let reimported = import_logical_csmi_pack_for_language(
+        &exported,
+        &support,
+        &CompilerOptions::default(),
+        "javascript",
+    )
+    .expect("exported runtime-contract fixture reimports");
+    let recompiled = reimported.compile(&CompilerOptions::default()).unwrap();
+    let redecoded = decode_shard(
+        &recompiled.shards[0].descriptor,
+        &recompiled.shards[0].bytes,
+        &DecodeLimits::default(),
+    )
+    .unwrap();
+    // The enclosing pack identity includes the assembler and resource path,
+    // which may change on export. The portable evidence must stay identical.
+    assert_eq!(redecoded.runtime_contracts(), decoded.runtime_contracts());
+}
+
+#[test]
+fn runtime_contract_compilation_is_invariant_to_fact_and_nested_set_order() {
+    let support = runtime_contract_profile_support();
+    let imported = import_logical_csmi_pack_for_language(
+        &runtime_contract_fixture_pack(),
+        &support,
+        &CompilerOptions::default(),
+        "javascript",
+    )
+    .expect("runtime-contract fixture imports");
+    let baseline = imported
+        .compile(&CompilerOptions::default())
+        .expect("baseline runtime-contract fixture compiles");
+
+    let mut reordered = imported.pack.clone();
+    let carrier = reordered.shards[0]
+        .runtime_contracts
+        .as_mut()
+        .expect("typed runtime-contract payload exists");
+    carrier.payload.contracts.reverse();
+    carrier.payload.targets.reverse();
+    carrier.payload.activations.reverse();
+    carrier.payload.bindings.reverse();
+    carrier.payload.observations.reverse();
+    carrier.payload.contracts[0].definition.languages.reverse();
+    carrier.payload.contracts[0]
+        .definition
+        .assumptions
+        .reverse();
+    carrier.payload.contracts[0]
+        .definition
+        .context
+        .platform
+        .reverse();
+    carrier.payload.activations[0].candidate_ids.reverse();
+    carrier.payload.activations[0].reviews.reverse();
+    carrier
+        .envelope
+        .as_mut()
+        .expect("retained runtime-contract envelope exists")["semanticModels"][0]["extensionFacts"]
+        .as_array_mut()
+        .expect("extension facts are an array")
+        .reverse();
+    let reordered = compile_pack(&reordered, &CompilerOptions::default())
+        .expect("reordered runtime-contract fixture compiles");
+    assert_eq!(
+        baseline.shards[0].descriptor.semantic_sha256,
+        reordered.shards[0].descriptor.semantic_sha256,
+        "fact and schema-declared set order does not alter the compiled semantic digest"
+    );
 }
 
 #[test]
@@ -1167,6 +1376,7 @@ fn authored_exact_pack() -> AuthoredSemanticModelPack {
             }],
         },
         runtime_values: None,
+        runtime_contracts: None,
         collection_flows: None,
         deferred_yields: None,
         conditional_type_refinements: None,

@@ -7,7 +7,7 @@ use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 use super::{CatalogError, CatalogOpenMode};
 
 pub(super) const CATALOG_DB_FILE_NAME: &str = "catalog.db";
-pub(super) const CURRENT_CATALOG_VERSION: i64 = 6;
+pub(super) const CURRENT_CATALOG_VERSION: i64 = 7;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const INITIALIZATION_RETRY_BACKOFF: Duration = Duration::from_millis(5);
 const INITIALIZATION_RETRY_MAX_BACKOFF: Duration = Duration::from_millis(100);
@@ -23,6 +23,9 @@ const EXTRACTION_GAPS_SQL: &str =
     include_str!("../../../../migrations/semantic-pack-catalog/0005-extraction-gaps.sql");
 const EXTRACTION_SOURCE_ENTRIES_SQL: &str =
     include_str!("../../../../migrations/semantic-pack-catalog/0006-extraction-source-entries.sql");
+const ACQUISITION_ABSENCE_RECEIPTS_SQL: &str = include_str!(
+    "../../../../migrations/semantic-pack-catalog/0007-acquisition-absence-receipts.sql"
+);
 
 pub(super) fn open(root: &Path, mode: CatalogOpenMode) -> Result<Connection, CatalogError> {
     // The catalog is the other database a Bifrost process can open first, and
@@ -216,6 +219,13 @@ fn migrate(connection: &mut Connection, mode: CatalogOpenMode) -> Result<(), Cat
             .execute_batch(EXTRACTION_SOURCE_ENTRIES_SQL)
             .map_err(|error| {
                 CatalogError::sqlite("apply extraction-source-entry migration", error)
+            })?;
+    }
+    if locked_version <= 6 {
+        transaction
+            .execute_batch(ACQUISITION_ABSENCE_RECEIPTS_SQL)
+            .map_err(|error| {
+                CatalogError::sqlite("apply acquisition-absence-receipt migration", error)
             })?;
     }
     transaction

@@ -37,6 +37,7 @@ pub(crate) fn resolve_policy_schema_version(
 pub enum RqlpDocumentKind {
     Policy,
     Endpoint,
+    EndpointSet,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -66,6 +67,12 @@ impl DocumentOwners {
         let bit = match kind {
             RqlpDocumentKind::Policy => Self::POLICY_BIT,
             RqlpDocumentKind::Endpoint => Self::ENDPOINT_BIT,
+            // Endpoint-set authoring uses the policy taint/flow vocabulary;
+            // its selected kind supplies the analysis discriminator while it
+            // is decoded. Keeping this bit on the policy side lets the
+            // existing taint entry descriptors apply without duplicating all
+            // of their applicability metadata.
+            RqlpDocumentKind::EndpointSet => Self::POLICY_BIT | Self::ENDPOINT_BIT,
         };
         self.0 & bit != 0
     }
@@ -164,7 +171,7 @@ impl OwnerApplicability {
             return false;
         }
         match document {
-            RqlpDocumentKind::Endpoint => true,
+            RqlpDocumentKind::Endpoint | RqlpDocumentKind::EndpointSet => true,
             RqlpDocumentKind::Policy => match analysis {
                 Some(kind) => self.analyses.contains(kind),
                 None => false,
@@ -243,6 +250,8 @@ macro_rules! policy_records {
 policy_records! {
     Policy { labels: ["policy"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ALL, signature: "(policy [:schema-version N] :id ID :name NAME :message MESSAGE :severity SEVERITY :analysis ANALYSIS ...)", description: "Define one executable static-analysis policy." }
     Endpoint { labels: ["endpoint"], layout: KeywordPairs, owner: OwnerApplicability::ENDPOINT, signature: "(endpoint [:schema-version N] :id ID :name NAME :display-name TEXT :role source|sink ...)", description: "Define one diagnostic-neutral reusable source or sink endpoint." }
+    EndpointSetDocument { labels: ["endpoint-set-document"], layout: KeywordPairs, owner: OwnerApplicability::ENDPOINT, signature: "(endpoint-set-document [:schema-version N] :kind KIND [:language LANGUAGE] [:rql-schema-version N] :set (endpoint-set ...))", description: "Define one standalone typed endpoint-set document for nested policy imports." }
+    EndpointSetFile { labels: ["endpoint-set-file"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TAINT_OR_FLOW, signature: "(endpoint-set-file :path \"workspace-relative.rqlp\" [:sha256 HEX])", description: "Reference one nested typed endpoint-set document by workspace-relative path." }
     Analysis { labels: ["analysis"], layout: Mixed, owner: OwnerApplicability::POLICY_ALL, signature: "(analysis :type match|taint|typestate|assertion|flow ...)", description: "Select and configure exactly one policy analysis kind." }
     Bind { labels: ["bind"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(bind :name NAME :query SELECTOR)", description: "Bind one named typed row relation from a CodeQuery." }
     Join { labels: ["join"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(join :left NAME :right NAME [:kind inner|semi|anti] :on ((LEFT RIGHT)...))", description: "Join two named row relations by registered equal-typed fields." }
@@ -394,7 +403,7 @@ pub enum PolicyRecordContext {
     TaintExternalModels,
     /// Persistence-store entries (#2693). Stores compose only local
     /// `store-write`/`store-read` entries; catalog and match inclusion is a
-    /// validation error in this context.
+    /// validation error in this context, while typed file imports are valid.
     TaintStores,
     /// Generic value-flow origin entries (#2436).
     FlowOrigins,
@@ -419,9 +428,10 @@ pub enum FieldContextApplicability {
     TransformsOnly,
     TaintExternalModelsOnly,
     TaintStoresOnly,
+    TaintEndpointSetsOnly,
     TaintSourceOrSinkOnly,
     /// The taint set contexts that may compose catalog endpoint sets. Stores
-    /// are policy-local only, so `:include-sets` is rejected there.
+    /// reject `:include-sets` but may import typed endpoint-set documents.
     TaintCatalogSetsOnly,
     FlowOriginsOnly,
     FlowObservationsOnly,
@@ -446,6 +456,19 @@ impl FieldContextApplicability {
                 matches!(context, PolicyRecordContext::TaintExternalModels)
             }
             Self::TaintStoresOnly => matches!(context, PolicyRecordContext::TaintStores),
+            Self::TaintEndpointSetsOnly => matches!(
+                context,
+                PolicyRecordContext::TaintSources
+                    | PolicyRecordContext::TaintSinks
+                    | PolicyRecordContext::TaintSanitizers
+                    | PolicyRecordContext::TaintEntryPoints
+                    | PolicyRecordContext::Transforms
+                    | PolicyRecordContext::TaintExternalModels
+                    | PolicyRecordContext::TaintStores
+                    | PolicyRecordContext::FlowOrigins
+                    | PolicyRecordContext::FlowObservations
+                    | PolicyRecordContext::FlowKills
+            ),
             Self::TaintSourceOrSinkOnly => matches!(
                 context,
                 PolicyRecordContext::TaintSources | PolicyRecordContext::TaintSinks
@@ -529,6 +552,7 @@ macro_rules! value_shapes {
                     Self::GeneratedRelation => Some(AtomDomain::GeneratedRelation),
                     Self::Severity | Self::FixedOrUnratedSeverity => Some(AtomDomain::Severity),
                     Self::EndpointRole => Some(AtomDomain::EndpointRole),
+                    Self::EndpointSetKind => Some(AtomDomain::EndpointSetKind),
                     Self::EndpointBinding | Self::PolicyPort | Self::TypestateBinding => {
                         Some(AtomDomain::Port)
                     }
@@ -627,6 +651,7 @@ macro_rules! value_shapes {
                     | Self::Strings
                     | Self::CatalogRefs
                     | Self::MatchEndpointSets
+                    | Self::EndpointSetFileRefs
                     | Self::EndpointRefs
                     | Self::SourceEntries
                     | Self::SinkEntries
@@ -694,6 +719,7 @@ macro_rules! value_shapes {
                         PolicyRecord::SinkSemantics,
                     ],
                     Self::TaintEndpointSet => &[PolicyRecord::EndpointSet],
+                    Self::EndpointSetFileRefs => &[PolicyRecord::EndpointSetFile],
                     Self::MatchEndpointSet | Self::MatchEndpointSets => &[
                         PolicyRecord::MatchDirectory,
                         PolicyRecord::MatchEndpoints,
@@ -839,6 +865,7 @@ macro_rules! value_shapes {
                     | Self::Sha256
                     | Self::NonNegativeInteger
                     | Self::PositiveInteger
+                    | Self::EndpointSetKind
                     | Self::AnalysisType
                     | Self::RqlQuery
                     | Self::GeneratedRelation
@@ -907,6 +934,7 @@ value_shapes! {
     NonNegativeInteger => "a non-negative integer",
     PositiveInteger => "a positive integer",
     AnalysisType => "match, taint, typestate, assertion, or flow",
+    EndpointSetKind => "one typed taint or value-flow endpoint-set kind",
     CaptureName => "an RQL capture name bound by the subject selector",
     OccurrenceRole => "one occurrence role from the analyzer registry",
     ExpectedOccurrence => "declaration, reference, binding, or none",
@@ -952,6 +980,7 @@ value_shapes! {
     UnmodeledCallBehavior => "paranoid, optimistic, or require-model",
     UnknownVerdict => "abstain, warn-unreliable, fail-closed, or treat-may-as-finding",
     TaintEndpointSet => "an endpoint-set record",
+    EndpointSetFileRefs => "endpoint-set-file dependency records",
     MatchEndpointSet => "a match-directory or match-endpoints record",
     CategoryPredicate => "an exact any or all category predicate",
     EndpointPredicate => "a categories or endpoints predicate",
@@ -1110,6 +1139,9 @@ macro_rules! policy_field_context {
     (TaintStoresOnly) => {
         FieldContextApplicability::TaintStoresOnly
     };
+    (TaintEndpointSetsOnly) => {
+        FieldContextApplicability::TaintEndpointSetsOnly
+    };
     (TaintSourceOrSinkOnly) => {
         FieldContextApplicability::TaintSourceOrSinkOnly
     };
@@ -1167,6 +1199,14 @@ policy_fields! {
     EndpointBinding { record: Endpoint, labels: ["binding"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: EndpointBinding, owner: OwnerApplicability::ENDPOINT, signature: ":binding matched-value|receiver|return-value|(result :index N)|(argument ...)", description: "Bind the selected matched value, receiver, singular return, indexed normal result, or argument." }
     EndpointTaint { record: Endpoint, labels: ["taint"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: EndpointSemantics, owner: OwnerApplicability::ENDPOINT, signature: ":taint (source-semantics ...)|(sink-semantics ...)", description: "Optionally attach role-compatible taint semantics." }
     EndpointSupersedes { record: Endpoint, labels: ["supersedes"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SET_64, shape: EndpointIds, owner: OwnerApplicability::ENDPOINT, signature: ":supersedes [ENDPOINT-ID...]", description: "Declare explicit same-event dominance edges." }
+
+    EndpointSetDocumentSchemaVersion { record: EndpointSetDocument, labels: ["schema-version"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: SchemaVersion, owner: OwnerApplicability::ENDPOINT, signature: ":schema-version N", description: "Pin the standalone endpoint-set document version exactly." }
+    EndpointSetDocumentKind { record: EndpointSetDocument, labels: ["kind"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: EndpointSetKind, owner: OwnerApplicability::ENDPOINT, signature: ":kind sources|sinks|sanitizers|entry-points|transforms|external-models|stores|origins|observations|kills|flow-transforms", description: "Declare the exact entry family accepted by this standalone document." }
+    EndpointSetDocumentLanguage { record: EndpointSetDocument, labels: ["language"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: SelectorLanguages, owner: OwnerApplicability::ENDPOINT, signature: ":language LANGUAGE", description: "Provide one inherited analyzer language default for selectors in this document." }
+    EndpointSetDocumentRqlSchemaVersion { record: EndpointSetDocument, labels: ["rql-schema-version"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: SchemaVersion, owner: OwnerApplicability::ENDPOINT, signature: ":rql-schema-version N", description: "Provide one inherited RQL schema version default for selectors in this document." }
+    EndpointSetDocumentSet { record: EndpointSetDocument, labels: ["set"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: TaintEndpointSet, owner: OwnerApplicability::ENDPOINT, signature: ":set (endpoint-set ...)", description: "Provide the typed endpoint-set contents." }
+    EndpointSetFilePath { record: EndpointSetFile, labels: ["path"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: WorkspacePath, owner: OwnerApplicability::POLICY_TAINT_OR_FLOW, signature: ":path \"workspace-relative.rqlp\"", description: "Name one workspace-relative endpoint-set document." }
+    EndpointSetFileSha256 { record: EndpointSetFile, labels: ["sha256"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: Sha256, owner: OwnerApplicability::POLICY_TAINT_OR_FLOW, signature: ":sha256 \"64-lower-hex\"", description: "Optionally pin the imported endpoint-set semantic content hash." }
 
     AnalysisType { record: Analysis, labels: ["type"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: AnalysisType, owner: OwnerApplicability::POLICY_ALL, signature: ":type match|taint|typestate|assertion|flow", description: "Select the analysis variant; fields are never inferred from their presence." }
     AnalysisSubject { record: Analysis, labels: ["subject"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: Selector, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":subject (rql ...)|(rql-file ...)", description: "Select the subject nodes each specialized assertion is evaluated at; required with :asserts." }
@@ -1243,8 +1283,9 @@ policy_fields! {
     WitnessMaxSteps { record: Witness, labels: ["max-steps"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: NonNegativeInteger, owner: OwnerApplicability::POLICY_ALL, signature: ":max-steps N", description: "Bound retained steps in one witness." }
     WitnessMaxBytes { record: Witness, labels: ["max-bytes"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: NonNegativeInteger, owner: OwnerApplicability::POLICY_ALL, signature: ":max-bytes N", description: "Bound encoded bytes in one witness." }
 
-    EndpointSetIncludeSets { record: EndpointSet, labels: ["include-sets"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: ValueMultiplicity::set(0, 64), shape: CatalogRefs, owner: OwnerApplicability::POLICY_TAINT, context: TaintCatalogSetsOnly, signature: ":include-sets [(catalog ...)...]", description: "Include explicitly registered catalog endpoint sets; a store set composes only local entries and rejects this field." }
+    EndpointSetIncludeSets { record: EndpointSet, labels: ["include-sets"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: ValueMultiplicity::set(0, 64), shape: CatalogRefs, owner: OwnerApplicability::POLICY_TAINT, context: TaintCatalogSetsOnly, signature: ":include-sets [(catalog ...)...]", description: "Include explicitly registered catalog endpoint sets; store sets reject this field but may import typed files." }
     EndpointSetIncludeMatches { record: EndpointSet, labels: ["include-matches"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: ValueMultiplicity::set(0, 64), shape: MatchEndpointSets, owner: OwnerApplicability::POLICY_TAINT, context: TaintSourceOrSinkOnly, signature: ":include-matches [(match-directory ...)|(match-endpoints ...)...]", description: "Include explicitly selected source or sink endpoint leaves; other taint set kinds reject this field." }
+    EndpointSetIncludeFiles { record: EndpointSet, labels: ["include-files"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: ValueMultiplicity::set(0, 64), shape: EndpointSetFileRefs, owner: OwnerApplicability::POLICY_TAINT_OR_FLOW, context: TaintEndpointSetsOnly, signature: ":include-files [(endpoint-set-file :path \"workspace-relative.rqlp\" [:sha256 HEX])...]", description: "Include nested typed endpoint-set documents with optional semantic content pins." }
     EndpointSetSourceEntries { record: EndpointSet, labels: ["entries"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SET_256, shape: SourceEntries, owner: OwnerApplicability::POLICY_TAINT, context: TaintSourcesOnly, signature: ":entries [(source ...)...]", description: "Add bounded policy-local source entries." }
     EndpointSetSinkEntries { record: EndpointSet, labels: ["entries"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SET_256, shape: SinkEntries, owner: OwnerApplicability::POLICY_TAINT, context: TaintSinksOnly, signature: ":entries [(sink ...)...]", description: "Add bounded policy-local sink entries." }
     EndpointSetSanitizerEntries { record: EndpointSet, labels: ["entries"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SET_256, shape: SanitizerEntries, owner: OwnerApplicability::POLICY_TAINT, context: TaintSanitizersOnly, signature: ":entries [(sanitizer ...)...]", description: "Add bounded policy-local sanitizer entries." }
@@ -1575,6 +1616,7 @@ pub enum AtomDomain {
     GeneratedRelation,
     Severity,
     EndpointRole,
+    EndpointSetKind,
     Port,
     CallPort,
     TaintMode,
@@ -1696,6 +1738,17 @@ atom_values! {
     SeverityError { domain: Severity, spellings: ["error"], owner: OwnerApplicability::POLICY_ALL, description: "Report at error level." }
     EndpointSource { domain: EndpointRole, spellings: ["source"], owner: OwnerApplicability::BOTH, description: "The endpoint introduces or identifies a tracked value." }
     EndpointSink { domain: EndpointRole, spellings: ["sink"], owner: OwnerApplicability::BOTH, description: "The endpoint consumes or observes a tracked value." }
+    EndpointSetSources { domain: EndpointSetKind, spellings: ["sources"], owner: OwnerApplicability::POLICY_TAINT_OR_FLOW, description: "A standalone source endpoint set." }
+    EndpointSetSinks { domain: EndpointSetKind, spellings: ["sinks"], owner: OwnerApplicability::POLICY_TAINT_OR_FLOW, description: "A standalone sink endpoint set." }
+    EndpointSetSanitizers { domain: EndpointSetKind, spellings: ["sanitizers"], owner: OwnerApplicability::POLICY_TAINT_OR_FLOW, description: "A standalone sanitizer endpoint set." }
+    EndpointSetEntryPoints { domain: EndpointSetKind, spellings: ["entry-points"], owner: OwnerApplicability::POLICY_TAINT, description: "A standalone entry-point endpoint set." }
+    EndpointSetTransforms { domain: EndpointSetKind, spellings: ["transforms"], owner: OwnerApplicability::POLICY_TAINT_OR_FLOW, description: "A standalone taint transform endpoint set." }
+    EndpointSetExternalModels { domain: EndpointSetKind, spellings: ["external-models"], owner: OwnerApplicability::POLICY_TAINT, description: "A standalone external-model endpoint set." }
+    EndpointSetStores { domain: EndpointSetKind, spellings: ["stores"], owner: OwnerApplicability::POLICY_TAINT, description: "A standalone store endpoint set." }
+    EndpointSetOrigins { domain: EndpointSetKind, spellings: ["origins"], owner: OwnerApplicability::POLICY_FLOW, description: "A standalone value-flow origin endpoint set." }
+    EndpointSetObservations { domain: EndpointSetKind, spellings: ["observations"], owner: OwnerApplicability::POLICY_FLOW, description: "A standalone value-flow observation endpoint set." }
+    EndpointSetKills { domain: EndpointSetKind, spellings: ["kills"], owner: OwnerApplicability::POLICY_FLOW, description: "A standalone value-flow kill endpoint set." }
+    EndpointSetFlowTransforms { domain: EndpointSetKind, spellings: ["flow-transforms"], owner: OwnerApplicability::POLICY_FLOW, description: "A standalone value-flow transform endpoint set." }
     PortMatchedValue { domain: Port, spellings: ["matched-value"], owner: OwnerApplicability::BOTH, description: "Bind the location-bearing value selected directly by non-call RQL." }
     PortReceiver { domain: Port, spellings: ["receiver"], owner: OwnerApplicability::BOTH, description: "Bind the call receiver." }
     PortReturnValue { domain: Port, spellings: ["return-value"], owner: OwnerApplicability::BOTH, description: "Bind the normal return value." }

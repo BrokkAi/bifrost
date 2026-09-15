@@ -1709,3 +1709,67 @@ fn runtime_keyed_store_gaps_are_not_read_discharges() {
         assert_eq!(stores, 2);
     }
 }
+/// #3352: the runtime oracle joins a keyed read to its structural seed
+/// through the `ast_identity` of the load result's source mapping. Only
+/// `member_expression` nodes are structural facts, so the mapping anchored at
+/// the query's candidate anchor must be the one carrying that identity: the
+/// terminal load for a dot read, and the container load for a subscript read.
+/// Local `const` initializers must preserve this exactly as return positions
+/// do.
+#[test]
+fn const_initializer_runtime_loads_keep_the_structural_identity_the_oracle_joins_on() {
+    let source = "function read() {\
+                  \n  const dot = process.env.DFB_INPUT;\
+                  \n  const bracket = process.env['DFB_INPUT'];\
+                  \n  const indexed = process.argv[2];\
+                  \n}";
+
+    for procedures in [
+        lower_javascript_parts(source),
+        lower_typescript_source(source),
+    ] {
+        let procedure = procedures
+            .into_iter()
+            .find(|procedure| procedure.kind == ProcedureKind::Function)
+            .expect("function procedure must be lowered");
+        let mut identity_anchors: Vec<&str> = Vec::new();
+        for point in &procedure.points {
+            for event in &point.events {
+                let SemanticEffect::MemoryLoad { result, .. } = event.effect else {
+                    continue;
+                };
+                let value = &procedure.values[result.index()];
+                let mapping = &procedure.source_mappings[value.source.index()];
+                let span = mapping.locator.anchor().span();
+                let anchored = &source[span.start_byte() as usize..span.end_byte() as usize];
+                if anchored == "process.env.DFB_INPUT" {
+                    // Dot read: the terminal load anchors the full member
+                    // expression fact the query joins on.
+                    assert!(
+                        mapping.ast_identity.is_some(),
+                        "const-held dot load must retain its AST identity"
+                    );
+                    identity_anchors.push(anchored);
+                } else if anchored == "process.env" || anchored == "process.argv" {
+                    // Subscript reads: the container load anchors the
+                    // member_expression fact the query joins on.
+                    assert!(
+                        mapping.ast_identity.is_some(),
+                        "const-held subscript container `{anchored}` must retain its AST identity"
+                    );
+                    identity_anchors.push(anchored);
+                } else {
+                    // Subscript terminals anchor spans that are not structural
+                    // facts; the oracle must never depend on their identity.
+                    assert!(mapping.ast_identity.is_none());
+                }
+            }
+        }
+        for expected in ["process.env.DFB_INPUT", "process.env", "process.argv"] {
+            assert!(
+                identity_anchors.contains(&expected),
+                "expected an identity-bearing load anchored at `{expected}`, got {identity_anchors:?}"
+            );
+        }
+    }
+}

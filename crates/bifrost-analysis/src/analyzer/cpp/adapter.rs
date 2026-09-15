@@ -11,7 +11,8 @@ use crate::profiling;
 use brokk_bifrost_core::analyzer::tree_walk::ParentIndex;
 use brokk_bifrost_cpp::adapter::{
     CPP_COGNITIVE_CONFIG, CPP_FILE_EXTENSION, cpp_extract_call_receiver, cpp_projections_differ,
-    parse_cpp_c_reading, parse_cpp_file, parse_cpp_file_with_ancestry,
+    parse_cpp_c_reading_with_orphaned_namespaces, parse_cpp_file,
+    parse_cpp_file_with_ancestry_and_orphaned_namespaces,
 };
 use brokk_bifrost_cpp::imports::{claimable_include_demand, included_claimable_files};
 use brokk_bifrost_cpp::queries::CPP_QUERY_DIRECTORY;
@@ -144,7 +145,15 @@ impl LanguageAdapter for CppAdapter {
         // One index over this tree serves both readings: the parent relation is
         // a property of the tree, and it costs a hash entry per node.
         let ancestry = ParentIndex::new(root);
-        let primary = parse_cpp_file_with_ancestry(file, source, root, &ancestry);
+        let orphaned_namespaces =
+            brokk_bifrost_cpp::graph::resolver::OrphanedNamespaceScopeIndex::build(root, source);
+        let primary = parse_cpp_file_with_ancestry_and_orphaned_namespaces(
+            file,
+            source,
+            root,
+            &ancestry,
+            &orphaned_namespaces,
+        );
         // The span covers only the second reading, so the counter answers what
         // the second reading costs rather than what parsing C++ costs. Started
         // before the translation-unit exit so the file count stays "every file
@@ -154,7 +163,14 @@ impl LanguageAdapter for CppAdapter {
             record_additional_projection(Language::Cpp, started, 0);
             return (primary, Vec::new());
         }
-        let c_reading = parse_cpp_c_reading(file, source, root, &ancestry, &primary);
+        let c_reading = parse_cpp_c_reading_with_orphaned_namespaces(
+            file,
+            source,
+            root,
+            &ancestry,
+            &primary,
+            &orphaned_namespaces,
+        );
         let differs = cpp_projections_differ(&primary, &c_reading);
         record_additional_projection(Language::Cpp, started, usize::from(differs));
         if !differs {

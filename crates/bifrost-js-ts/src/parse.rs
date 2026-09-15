@@ -4,10 +4,13 @@
 //! Both languages choose their grammar by file path -- `.tsx` and `.jsx` need
 //! `LANGUAGE_TSX`, `.ts` needs `LANGUAGE_TYPESCRIPT`, and the rest of
 //! JavaScript needs `tree_sitter_javascript` -- and the decision itself is core
-//! ([`LanguageDialect::for_path`]). `.jsx` joined the TSX side in #3322:
-//! tree-sitter-javascript cannot parse a reserved word as a JSX attribute name,
-//! and one `<div class="x">` costs the whole rest of the file. Before the
-//! extraction this was `js_ts_tree_sitter_language_for_file` in
+//! ([`LanguageDialect::for_path`]). `.jsx` joined the TSX side in #3322 because
+//! upstream tree-sitter-javascript could not parse a reserved word as a JSX
+//! attribute name, and one `<div class="x">` cost the whole rest of the file.
+//! #3342 repairs the `.js` side with Brokk's JavaScript grammar instead of
+//! switching it to TSX, which misreads ordinary JavaScript such as `await
+//! using` declarations. Before the extraction this was
+//! `js_ts_tree_sitter_language_for_file` in
 //! `analyzer/usages/parsed_tree.rs`, a JS/TS-named free function in a framework
 //! file that routed the same question through the analysis-side grammar
 //! registry; all eight of its call sites moved here, so it is answered directly

@@ -1,0 +1,1403 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://csmi.brokk.ai/schema/profiles/runtime-values/0.2/schema.json",
+  "title": "CSMI portable runtime contracts 0.2 payloads",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/contract"
+    },
+    {
+      "$ref": "#/$defs/target"
+    },
+    {
+      "$ref": "#/$defs/activation"
+    },
+    {
+      "$ref": "#/$defs/binding"
+    },
+    {
+      "$ref": "#/$defs/observation"
+    }
+  ],
+  "$defs": {
+    "id": {
+      "type": "string",
+      "pattern": "^[A-Za-z][A-Za-z0-9._-]*$"
+    },
+    "sha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "uri": {
+      "type": "string",
+      "format": "uri",
+      "pattern": "^[A-Za-z][A-Za-z0-9+.-]*:"
+    },
+    "text": {
+      "type": "string",
+      "minLength": 1
+    },
+    "scheme": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "identifier",
+        "version"
+      ],
+      "properties": {
+        "identifier": {
+          "type": "string",
+          "format": "uri",
+          "pattern": "^[A-Za-z][A-Za-z0-9+.-]*:"
+        },
+        "version": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "producer",
+        "method",
+        "inputsDigest"
+      ],
+      "properties": {
+        "producer": {
+          "type": "string",
+          "format": "uri",
+          "pattern": "^[A-Za-z][A-Za-z0-9+.-]*:"
+        },
+        "method": {
+          "type": "string",
+          "minLength": 1
+        },
+        "inputsDigest": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      }
+    },
+    "resource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "resource",
+        "resourceDigest"
+      ],
+      "properties": {
+        "resource": {
+          "type": "string",
+          "format": "uri",
+          "pattern": "^[A-Za-z][A-Za-z0-9+.-]*:"
+        },
+        "resourceDigest": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      }
+    },
+    "range": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "resource",
+        "resourceDigest",
+        "startByte",
+        "endByte"
+      ],
+      "properties": {
+        "resource": {
+          "type": "string",
+          "format": "uri",
+          "pattern": "^[A-Za-z][A-Za-z0-9+.-]*:"
+        },
+        "resourceDigest": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "startByte": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "endByte": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        }
+      }
+    },
+    "identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "scheme",
+        "ownerDigest",
+        "locatorDigest",
+        "kind"
+      ],
+      "properties": {
+        "scheme": {
+          "$ref": "#/$defs/scheme"
+        },
+        "ownerDigest": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "locatorDigest": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "kind": {
+          "enum": [
+            "scope",
+            "value",
+            "operation",
+            "point",
+            "invocation",
+            "realm",
+            "store"
+          ]
+        }
+      }
+    },
+    "coverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status"
+      ],
+      "properties": {
+        "status": {
+          "enum": [
+            "complete",
+            "partial",
+            "unknown"
+          ]
+        },
+        "limitations": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "activation-missing",
+              "activation-conflict",
+              "activation-unsupported",
+              "target-unknown",
+              "review-missing",
+              "inventory-incomplete",
+              "lexical-binding-indeterminate",
+              "rebinding-indeterminate",
+              "mutation-incomplete",
+              "lookup-incomplete",
+              "materialization-incomplete",
+              "exception-behavior-indeterminate",
+              "initialization-incomplete",
+              "dynamic-key",
+              "unsupported-key",
+              "cancelled",
+              "budget-exhausted",
+              "stale-evidence",
+              "equality-unknown",
+              "sharing-unknown",
+              "coverage-limited"
+            ]
+          },
+          "minItems": 1,
+          "uniqueItems": true
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "complete"
+              }
+            }
+          },
+          "then": {
+            "not": {
+              "required": [
+                "limitations"
+              ]
+            }
+          },
+          "else": {
+            "required": [
+              "limitations"
+            ]
+          }
+        }
+      ]
+    },
+    "artifactDigest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "algorithm",
+        "coverage",
+        "value"
+      ],
+      "properties": {
+        "algorithm": {
+          "enum": [
+            "sha-256",
+            "sha-384",
+            "sha-512"
+          ]
+        },
+        "coverage": {
+          "type": "string",
+          "minLength": 1
+        },
+        "canonicalization": {
+          "type": "string",
+          "format": "uri",
+          "pattern": "^[A-Za-z][A-Za-z0-9+.-]*:"
+        },
+        "value": {
+          "type": "string",
+          "pattern": "^[0-9a-f]+$"
+        }
+      }
+    },
+    "selector": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "purl"
+      ],
+      "properties": {
+        "purl": {
+          "type": "string",
+          "pattern": "^pkg:"
+        },
+        "versionRange": {
+          "type": "string",
+          "pattern": "^vers:"
+        },
+        "digests": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/artifactDigest"
+          },
+          "minItems": 1,
+          "uniqueItems": true
+        }
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "purl": {
+              "pattern": "^pkg:[^?#]+@[^?#]+(?:\\?[^#]+)?$"
+            }
+          },
+          "not": {
+            "required": [
+              "versionRange"
+            ]
+          }
+        },
+        {
+          "required": [
+            "versionRange"
+          ],
+          "properties": {
+            "purl": {
+              "pattern": "^pkg:[^@?#]+(?:\\?[^#]+)?$"
+            }
+          }
+        }
+      ]
+    },
+    "context": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "scheme",
+        "platform",
+        "architecture",
+        "realm",
+        "moduleMode",
+        "launchMode",
+        "initializationBoundary"
+      ],
+      "properties": {
+        "scheme": {
+          "$ref": "#/$defs/scheme"
+        },
+        "platform": {
+          "type": "string",
+          "minLength": 1
+        },
+        "architecture": {
+          "type": "string",
+          "minLength": 1
+        },
+        "realm": {
+          "type": "string",
+          "minLength": 1
+        },
+        "moduleMode": {
+          "type": "string",
+          "minLength": 1
+        },
+        "launchMode": {
+          "type": "string",
+          "minLength": 1
+        },
+        "initializationBoundary": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "constraints": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "scheme",
+        "platform",
+        "architecture",
+        "realm",
+        "moduleMode",
+        "launchMode",
+        "initializationBoundary"
+      ],
+      "properties": {
+        "scheme": {
+          "$ref": "#/$defs/scheme"
+        },
+        "platform": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "minItems": 1,
+          "uniqueItems": true
+        },
+        "architecture": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "minItems": 1,
+          "uniqueItems": true
+        },
+        "realm": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "minItems": 1,
+          "uniqueItems": true
+        },
+        "moduleMode": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "minItems": 1,
+          "uniqueItems": true
+        },
+        "launchMode": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "minItems": 1,
+          "uniqueItems": true
+        },
+        "initializationBoundary": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "minItems": 1,
+          "uniqueItems": true
+        }
+      }
+    },
+    "surface": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "root",
+        "container"
+      ],
+      "properties": {
+        "root": {
+          "type": "string",
+          "format": "uri",
+          "pattern": "^[A-Za-z][A-Za-z0-9+.-]*:"
+        },
+        "container": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "origin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "keys",
+        "origin"
+      ],
+      "properties": {
+        "keys": {
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "kind"
+              ],
+              "properties": {
+                "kind": {
+                  "const": "all-properties"
+                }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "kind",
+                "minimum",
+                "maximum"
+              ],
+              "properties": {
+                "kind": {
+                  "const": "index-range"
+                },
+                "minimum": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 4294967294
+                },
+                "maximum": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 4294967294
+                }
+              }
+            }
+          ]
+        },
+        "origin": {
+          "enum": [
+            "external-environment",
+            "application-argument",
+            "executable-path",
+            "entry-path",
+            "unknown"
+          ]
+        }
+      }
+    },
+    "behavior": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "keyDomain",
+        "lookup",
+        "presentValue",
+        "absent",
+        "keyEquality",
+        "read",
+        "write",
+        "delete",
+        "initialOrigins",
+        "coverage"
+      ],
+      "properties": {
+        "keyDomain": {
+          "enum": [
+            "static-property",
+            "static-index"
+          ]
+        },
+        "lookup": {
+          "enum": [
+            "own-value",
+            "mapping-entry"
+          ]
+        },
+        "presentValue": {
+          "const": "string"
+        },
+        "absent": {
+          "enum": [
+            "undefined",
+            "exception"
+          ]
+        },
+        "keyEquality": {
+          "$ref": "#/$defs/scheme"
+        },
+        "read": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "exceptions",
+            "materialization"
+          ],
+          "properties": {
+            "exceptions": {
+              "enum": [
+                "nonthrowing",
+                "may-throw",
+                "unknown"
+              ]
+            },
+            "materialization": {
+              "enum": [
+                "eager",
+                "lazy",
+                "host-defined",
+                "unknown"
+              ]
+            }
+          }
+        },
+        "write": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "conversion",
+            "normal",
+            "exceptional"
+          ],
+          "properties": {
+            "conversion": {
+              "enum": [
+                "identity",
+                "string-conversion",
+                "requires-contract",
+                "unknown"
+              ]
+            },
+            "normal": {
+              "enum": [
+                "store-converted-value",
+                "unknown"
+              ]
+            },
+            "exceptional": {
+              "enum": [
+                "unchanged",
+                "may-mutate",
+                "unknown"
+              ]
+            }
+          }
+        },
+        "delete": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "normal",
+            "exceptional"
+          ],
+          "properties": {
+            "normal": {
+              "enum": [
+                "remove-entry",
+                "unknown"
+              ]
+            },
+            "exceptional": {
+              "enum": [
+                "unchanged",
+                "may-mutate",
+                "unknown"
+              ]
+            }
+          }
+        },
+        "initialOrigins": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/origin"
+          },
+          "minItems": 1,
+          "uniqueItems": true
+        },
+        "coverage": {
+          "$ref": "#/$defs/coverage"
+        }
+      }
+    },
+    "applicability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "basis",
+        "selectors"
+      ],
+      "properties": {
+        "basis": {
+          "enum": [
+            "portable",
+            "artifact-specific"
+          ]
+        },
+        "selectors": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/selector"
+          },
+          "minItems": 1,
+          "uniqueItems": true
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "basis": {
+                "const": "portable"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "selectors": {
+                "items": {
+                  "not": {
+                    "required": [
+                      "digests"
+                    ]
+                  }
+                }
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "selectors": {
+                "items": {
+                  "required": [
+                    "digests"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "contractDefinition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "identifier",
+        "version",
+        "applicability",
+        "context",
+        "surface",
+        "languages",
+        "assumptions",
+        "behavior"
+      ],
+      "properties": {
+        "identifier": {
+          "type": "string",
+          "format": "uri",
+          "pattern": "^[A-Za-z][A-Za-z0-9+.-]*:"
+        },
+        "version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "applicability": {
+          "$ref": "#/$defs/applicability"
+        },
+        "context": {
+          "$ref": "#/$defs/constraints"
+        },
+        "surface": {
+          "$ref": "#/$defs/surface"
+        },
+        "languages": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "minItems": 1,
+          "uniqueItems": true
+        },
+        "assumptions": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "format": "uri",
+            "pattern": "^[A-Za-z][A-Za-z0-9+.-]*:"
+          },
+          "minItems": 0,
+          "uniqueItems": true
+        },
+        "behavior": {
+          "$ref": "#/$defs/behavior"
+        }
+      }
+    },
+    "contract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "contractId",
+        "definition",
+        "contractDigest",
+        "evidence"
+      ],
+      "properties": {
+        "kind": {
+          "const": "runtime-contract"
+        },
+        "contractId": {
+          "type": "string",
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]*$"
+        },
+        "definition": {
+          "$ref": "#/$defs/contractDefinition"
+        },
+        "contractDigest": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "evidence": {
+          "$ref": "#/$defs/evidence"
+        }
+      }
+    },
+    "targetDefinition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "partition",
+        "resources",
+        "basis",
+        "context",
+        "assumptions",
+        "evidence",
+        "coverage"
+      ],
+      "properties": {
+        "partition": {
+          "type": "string",
+          "format": "uri",
+          "pattern": "^[A-Za-z][A-Za-z0-9+.-]*:"
+        },
+        "resources": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/resource"
+          },
+          "minItems": 1,
+          "uniqueItems": true
+        },
+        "basis": {
+          "enum": [
+            "declared-target",
+            "deployment-observation",
+            "unknown"
+          ]
+        },
+        "runtime": {
+          "$ref": "#/$defs/selector"
+        },
+        "context": {
+          "$ref": "#/$defs/context"
+        },
+        "assumptions": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "format": "uri",
+            "pattern": "^[A-Za-z][A-Za-z0-9+.-]*:"
+          },
+          "minItems": 0,
+          "uniqueItems": true
+        },
+        "evidence": {
+          "$ref": "#/$defs/evidence"
+        },
+        "coverage": {
+          "$ref": "#/$defs/coverage"
+        }
+      }
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "targetId",
+        "definition",
+        "targetDigest"
+      ],
+      "properties": {
+        "kind": {
+          "const": "runtime-target"
+        },
+        "targetId": {
+          "type": "string",
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]*$"
+        },
+        "definition": {
+          "$ref": "#/$defs/targetDefinition"
+        },
+        "targetDigest": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      }
+    },
+    "review": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contractDigest",
+        "targetDigest",
+        "purpose",
+        "reviewer",
+        "decision",
+        "evidence"
+      ],
+      "properties": {
+        "contractDigest": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "targetDigest": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "purpose": {
+          "type": "string",
+          "format": "uri",
+          "pattern": "^[A-Za-z][A-Za-z0-9+.-]*:"
+        },
+        "reviewer": {
+          "type": "string",
+          "format": "uri",
+          "pattern": "^[A-Za-z][A-Za-z0-9+.-]*:"
+        },
+        "decision": {
+          "enum": [
+            "approved",
+            "denied",
+            "unknown"
+          ]
+        },
+        "evidence": {
+          "$ref": "#/$defs/evidence"
+        }
+      }
+    },
+    "policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "identifier",
+        "version",
+        "inputsDigest",
+        "trustedReviewers",
+        "purpose"
+      ],
+      "properties": {
+        "identifier": {
+          "type": "string",
+          "format": "uri",
+          "pattern": "^[A-Za-z][A-Za-z0-9+.-]*:"
+        },
+        "version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "inputsDigest": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "trustedReviewers": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "format": "uri",
+            "pattern": "^[A-Za-z][A-Za-z0-9+.-]*:"
+          },
+          "minItems": 0,
+          "uniqueItems": true
+        },
+        "purpose": {
+          "type": "string",
+          "format": "uri",
+          "pattern": "^[A-Za-z][A-Za-z0-9+.-]*:"
+        }
+      }
+    },
+    "activation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "activationId",
+        "targetId",
+        "surface",
+        "candidateIds",
+        "candidateCoverage",
+        "disabledIds",
+        "reviews",
+        "policy",
+        "outcome",
+        "selectedIds",
+        "activationDigest"
+      ],
+      "properties": {
+        "kind": {
+          "const": "runtime-activation"
+        },
+        "activationId": {
+          "type": "string",
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]*$"
+        },
+        "targetId": {
+          "type": "string",
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]*$"
+        },
+        "surface": {
+          "$ref": "#/$defs/surface"
+        },
+        "candidateIds": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Za-z][A-Za-z0-9._-]*$"
+          },
+          "minItems": 0,
+          "uniqueItems": true
+        },
+        "candidateCoverage": {
+          "$ref": "#/$defs/coverage"
+        },
+        "disabledIds": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Za-z][A-Za-z0-9._-]*$"
+          },
+          "minItems": 0,
+          "uniqueItems": true
+        },
+        "reviews": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/review"
+          },
+          "minItems": 0,
+          "uniqueItems": true
+        },
+        "policy": {
+          "$ref": "#/$defs/policy"
+        },
+        "outcome": {
+          "enum": [
+            "matched",
+            "not-matched",
+            "indeterminate",
+            "conflict",
+            "unsupported",
+            "review-required",
+            "disabled"
+          ]
+        },
+        "selectedIds": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Za-z][A-Za-z0-9._-]*$"
+          },
+          "minItems": 0,
+          "uniqueItems": true
+        },
+        "activationDigest": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      }
+    },
+    "binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "bindingId",
+        "activationId",
+        "activationDigest",
+        "contractId",
+        "language",
+        "source",
+        "scope",
+        "root",
+        "container",
+        "lexicalBinding",
+        "rebinding",
+        "outcome",
+        "evidence",
+        "coverage"
+      ],
+      "properties": {
+        "kind": {
+          "const": "runtime-binding"
+        },
+        "bindingId": {
+          "type": "string",
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]*$"
+        },
+        "activationId": {
+          "type": "string",
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]*$"
+        },
+        "activationDigest": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "contractId": {
+          "type": "string",
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]*$"
+        },
+        "language": {
+          "type": "string",
+          "minLength": 1
+        },
+        "source": {
+          "$ref": "#/$defs/range"
+        },
+        "scope": {
+          "$ref": "#/$defs/identity"
+        },
+        "root": {
+          "$ref": "#/$defs/identity"
+        },
+        "container": {
+          "$ref": "#/$defs/identity"
+        },
+        "lexicalBinding": {
+          "enum": [
+            "absent",
+            "present",
+            "indeterminate"
+          ]
+        },
+        "rebinding": {
+          "enum": [
+            "excluded",
+            "present",
+            "indeterminate"
+          ]
+        },
+        "outcome": {
+          "enum": [
+            "exact",
+            "excluded",
+            "indeterminate",
+            "unsupported"
+          ]
+        },
+        "evidence": {
+          "$ref": "#/$defs/evidence"
+        },
+        "coverage": {
+          "$ref": "#/$defs/coverage"
+        }
+      }
+    },
+    "key": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "value"
+          ],
+          "properties": {
+            "kind": {
+              "const": "property"
+            },
+            "value": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "value"
+          ],
+          "properties": {
+            "kind": {
+              "const": "index"
+            },
+            "value": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967294
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ],
+          "properties": {
+            "kind": {
+              "enum": [
+                "dynamic",
+                "unsupported"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "store": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "invocation",
+        "realm",
+        "container",
+        "backing",
+        "relationship",
+        "evidence"
+      ],
+      "properties": {
+        "invocation": {
+          "$ref": "#/$defs/identity"
+        },
+        "realm": {
+          "$ref": "#/$defs/identity"
+        },
+        "container": {
+          "$ref": "#/$defs/identity"
+        },
+        "backing": {
+          "$ref": "#/$defs/identity"
+        },
+        "copiedFrom": {
+          "$ref": "#/$defs/identity"
+        },
+        "copyPoint": {
+          "$ref": "#/$defs/identity"
+        },
+        "relationship": {
+          "enum": [
+            "isolated",
+            "copied",
+            "shared",
+            "unknown"
+          ]
+        },
+        "evidence": {
+          "$ref": "#/$defs/evidence"
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "relationship": { "const": "copied" } } },
+          "then": { "required": ["copiedFrom", "copyPoint"] },
+          "else": { "not": { "anyOf": [{ "required": ["copiedFrom"] }, { "required": ["copyPoint"] }] } }
+        }
+      ]
+    },
+    "proof": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "initialization",
+        "dependencies",
+        "mutation",
+        "lookup",
+        "materialization",
+        "normal",
+        "exceptional",
+        "keyNormalization",
+        "closureDigest",
+        "evidence"
+      ],
+      "properties": {
+        "keyNormalization": {
+          "enum": ["exact", "unknown"]
+        },
+        "initialization": {
+          "enum": [
+            "closed",
+            "open",
+            "unknown"
+          ]
+        },
+        "dependencies": {
+          "enum": [
+            "closed",
+            "open",
+            "unknown"
+          ]
+        },
+        "mutation": {
+          "enum": [
+            "pristine",
+            "written",
+            "deleted",
+            "unknown"
+          ]
+        },
+        "lookup": {
+          "enum": [
+            "own-present",
+            "absent-no-fallback",
+            "mapping-present",
+            "mapping-absent",
+            "inherited",
+            "accessor",
+            "proxy",
+            "unknown"
+          ]
+        },
+        "materialization": {
+          "enum": [
+            "resolved",
+            "unresolved"
+          ]
+        },
+        "normal": {
+          "enum": [
+            "exact",
+            "indeterminate",
+            "unreachable"
+          ]
+        },
+        "exceptional": {
+          "enum": [
+            "excluded",
+            "modeled",
+            "unknown"
+          ]
+        },
+        "closureDigest": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "evidence": {
+          "$ref": "#/$defs/evidence"
+        }
+      }
+    },
+    "observation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "observationId",
+        "bindingId",
+        "key",
+        "sourceForm",
+        "source",
+        "baseValue",
+        "loadOperation",
+        "resultValue",
+        "point",
+        "phase",
+        "store",
+        "origin",
+        "proof",
+        "coverage"
+      ],
+      "properties": {
+        "storageKey": {
+          "$ref": "#/$defs/key"
+        },
+        "kind": {
+          "const": "runtime-observation"
+        },
+        "observationId": {
+          "type": "string",
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]*$"
+        },
+        "bindingId": {
+          "type": "string",
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]*$"
+        },
+        "key": {
+          "$ref": "#/$defs/key"
+        },
+        "sourceForm": {
+          "enum": [
+            "dot",
+            "bracket-string",
+            "bracket-number",
+            "mapping",
+            "unsupported"
+          ]
+        },
+        "source": {
+          "$ref": "#/$defs/range"
+        },
+        "baseValue": {
+          "$ref": "#/$defs/identity"
+        },
+        "loadOperation": {
+          "$ref": "#/$defs/identity"
+        },
+        "resultValue": {
+          "$ref": "#/$defs/identity"
+        },
+        "point": {
+          "$ref": "#/$defs/identity"
+        },
+        "phase": {
+          "enum": [
+            "before-effects",
+            "after-effects",
+            "exceptional"
+          ]
+        },
+        "store": {
+          "$ref": "#/$defs/store"
+        },
+        "origin": {
+          "enum": [
+            "initial-if-present",
+            "written",
+            "deleted",
+            "absent",
+            "unknown"
+          ]
+        },
+        "proof": {
+          "$ref": "#/$defs/proof"
+        },
+        "coverage": {
+          "$ref": "#/$defs/coverage"
+        }
+      }
+    }
+  }
+}

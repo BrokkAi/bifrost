@@ -98,6 +98,8 @@ pub struct CompiledShard {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) runtime_values: Option<RuntimeValuesPayload>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) runtime_contracts: Option<RuntimeContractsPayload>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) collection_flows: Option<CollectionFlowsPayload>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) deferred_yields: Option<DeferredYieldsPayload>,
@@ -122,6 +124,11 @@ impl CompiledShard {
                 self.runtime_values
                     .as_ref()
                     .map_or(0, RuntimeValuesPayload::record_count),
+            )
+            .saturating_add(
+                self.runtime_contracts
+                    .as_ref()
+                    .map_or(0, RuntimeContractsPayload::record_count),
             )
             .saturating_add(
                 self.collection_flows
@@ -174,6 +181,10 @@ impl CompiledShard {
 
     pub fn runtime_values(&self) -> Option<&RuntimeValuesPayload> {
         self.runtime_values.as_ref()
+    }
+
+    pub fn runtime_contracts(&self) -> Option<&RuntimeContractsPayload> {
+        self.runtime_contracts.as_ref()
     }
 
     pub fn collection_flows(&self) -> Option<&CollectionFlowsPayload> {
@@ -461,7 +472,7 @@ pub enum CompiledSummaryInput {
     Parameter { ordinal: u32 },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CompiledSummaryOutput {
     NormalReturn {},
@@ -607,9 +618,28 @@ pub enum CompiledConcurrencyEffect {
     TaskJoin {
         group: CompiledSummaryInput,
     },
+    /// One `sync.Once.Do` call: `callable` runs at most once per `once`
+    /// object, and the completion of that single execution synchronizes
+    /// before the return of every `Do` on the same object.
+    ///
+    /// The contract is the `sync.Once` package documentation together with
+    /// the Go memory model's "the return of a call of `f` from `once.Do(f)`
+    /// is synchronized before the return of any call of `once.Do(f)`". The
+    /// package documentation's panic clause is part of the same completion:
+    /// a panicking `f` is still considered to have returned, so later calls
+    /// of `Do` return without calling `f`. This is not a mutex and not an
+    /// unconditional spawn: the callable is conditional on the object's
+    /// completion state, and the effect itself carries the completion
+    /// barrier that publishes it.
+    OnceDo {
+        once: CompiledSummaryInput,
+        callable: CompiledSummaryInput,
+    },
     LockAcquire {
         lock: CompiledSummaryInput,
         mode: CompiledLockMode,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        condition: Option<CompiledLockCondition>,
     },
     LockRelease {
         lock: CompiledSummaryInput,
@@ -629,6 +659,32 @@ pub enum CompiledConcurrencyEffect {
         location: CompiledSummaryInput,
         operation: CompiledAtomicOperation,
     },
+    /// Associate the condition variable named by `condition` with `lock`.
+    ///
+    /// `condition` is the constructed object, so the association is published
+    /// to the *result* of the construction call and consumed by every later
+    /// `CondWait`/`CondNotify` on the same object.
+    CondBind {
+        condition: CompiledSummaryOutput,
+        lock: CompiledSummaryInput,
+    },
+    /// Release the associated locker, suspend the task, and re-acquire it.
+    CondWait {
+        condition: CompiledSummaryInput,
+    },
+    /// Wake one or every suspended waiter without claiming one exists.
+    CondNotify {
+        condition: CompiledSummaryInput,
+        waiters: CompiledCondWaiters,
+    },
+}
+
+/// How many suspended waiters one notification can resume.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompiledCondWaiters {
+    One,
+    All,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -636,6 +692,12 @@ pub enum CompiledConcurrencyEffect {
 pub enum CompiledLockMode {
     Shared,
     Exclusive,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompiledLockCondition {
+    CallResultTrue,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -711,6 +773,8 @@ struct WireCompiledShard {
     safety: Safety,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     runtime_values: Option<RuntimeValuesPayload>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    runtime_contracts: Option<RuntimeContractsPayload>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     collection_flows: Option<CollectionFlowsPayload>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1099,6 +1163,7 @@ fn compiled_from_wire(wire: WireCompiledShard) -> CompiledShard {
         completeness: wire.completeness,
         safety: wire.safety,
         runtime_values: wire.runtime_values,
+        runtime_contracts: wire.runtime_contracts,
         collection_flows: wire.collection_flows,
         deferred_yields: wire.deferred_yields,
         conditional_type_refinements: wire.conditional_type_refinements,
@@ -1263,6 +1328,8 @@ pub(crate) fn semantic_digest(shard: &CompiledShard) -> Result<String, ArtifactE
         #[serde(skip_serializing_if = "Option::is_none")]
         runtime_values: &'a Option<RuntimeValuesPayload>,
         #[serde(skip_serializing_if = "Option::is_none")]
+        runtime_contracts: &'a Option<RuntimeContractsPayload>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         collection_flows: &'a Option<CollectionFlowsPayload>,
         #[serde(skip_serializing_if = "Option::is_none")]
         deferred_yields: &'a Option<DeferredYieldsPayload>,
@@ -1283,6 +1350,7 @@ pub(crate) fn semantic_digest(shard: &CompiledShard) -> Result<String, ArtifactE
         completeness: shard.completeness,
         safety: &shard.safety,
         runtime_values: &shard.runtime_values,
+        runtime_contracts: &shard.runtime_contracts,
         collection_flows: &shard.collection_flows,
         deferred_yields: &shard.deferred_yields,
         conditional_type_refinements: &shard.conditional_type_refinements,
@@ -1615,6 +1683,7 @@ fn authored_pack_from_wire(shard: &WireCompiledShard) -> AuthoredSemanticModelPa
             activation: shard.activation.clone(),
             payload: authored_payload_from_compiled(&shard.payload),
             runtime_values: shard.runtime_values.clone(),
+            runtime_contracts: shard.runtime_contracts.clone(),
             collection_flows: shard.collection_flows.clone(),
             deferred_yields: shard.deferred_yields.clone(),
             conditional_type_refinements: shard.conditional_type_refinements.clone(),
@@ -1958,15 +2027,24 @@ fn authored_concurrency_effect_from_compiled(
         CompiledConcurrencyEffect::TaskJoin { group } => AuthoredConcurrencyEffect::TaskJoin {
             group: authored_summary_input_from_compiled(group),
         },
-        CompiledConcurrencyEffect::LockAcquire { lock, mode } => {
-            AuthoredConcurrencyEffect::LockAcquire {
-                lock: authored_summary_input_from_compiled(lock),
-                mode: match mode {
-                    CompiledLockMode::Shared => AuthoredLockMode::Shared,
-                    CompiledLockMode::Exclusive => AuthoredLockMode::Exclusive,
-                },
-            }
-        }
+        CompiledConcurrencyEffect::OnceDo { once, callable } => AuthoredConcurrencyEffect::OnceDo {
+            once: authored_summary_input_from_compiled(once),
+            callable: authored_summary_input_from_compiled(callable),
+        },
+        CompiledConcurrencyEffect::LockAcquire {
+            lock,
+            mode,
+            condition,
+        } => AuthoredConcurrencyEffect::LockAcquire {
+            lock: authored_summary_input_from_compiled(lock),
+            mode: match mode {
+                CompiledLockMode::Shared => AuthoredLockMode::Shared,
+                CompiledLockMode::Exclusive => AuthoredLockMode::Exclusive,
+            },
+            condition: condition.map(|condition| match condition {
+                CompiledLockCondition::CallResultTrue => AuthoredLockCondition::CallResultTrue,
+            }),
+        },
         CompiledConcurrencyEffect::LockRelease { lock, mode } => {
             AuthoredConcurrencyEffect::LockRelease {
                 lock: authored_summary_input_from_compiled(lock),
@@ -2005,6 +2083,24 @@ fn authored_concurrency_effect_from_compiled(
                 }
             },
         },
+        CompiledConcurrencyEffect::CondBind { condition, lock } => {
+            AuthoredConcurrencyEffect::CondBind {
+                condition: authored_summary_output_from_compiled(condition),
+                lock: authored_summary_input_from_compiled(lock),
+            }
+        }
+        CompiledConcurrencyEffect::CondWait { condition } => AuthoredConcurrencyEffect::CondWait {
+            condition: authored_summary_input_from_compiled(condition),
+        },
+        CompiledConcurrencyEffect::CondNotify { condition, waiters } => {
+            AuthoredConcurrencyEffect::CondNotify {
+                condition: authored_summary_input_from_compiled(condition),
+                waiters: match waiters {
+                    CompiledCondWaiters::One => AuthoredCondWaiters::One,
+                    CompiledCondWaiters::All => AuthoredCondWaiters::All,
+                },
+            }
+        }
     }
 }
 
@@ -3018,15 +3114,20 @@ mod tests {
         let lock = AuthoredConcurrencyEffect::LockAcquire {
             lock: AuthoredSummaryInput::Receiver {},
             mode: AuthoredLockMode::Exclusive,
+            condition: Some(AuthoredLockCondition::CallResultTrue),
         };
         let atomic = AuthoredConcurrencyEffect::Atomic {
             location: AuthoredSummaryInput::Parameter { ordinal: 0 },
             operation: AuthoredAtomicOperation::ReadModifyWrite,
         };
         let unsupported = AuthoredConcurrencyEffect::Unsupported {
-            protocol: "sync.Once.Do".to_owned(),
+            protocol: "sync.Cond".to_owned(),
         };
-        let mut expected = vec![spawn.clone(), lock, atomic, unsupported];
+        let once = AuthoredConcurrencyEffect::OnceDo {
+            once: AuthoredSummaryInput::Receiver {},
+            callable: AuthoredSummaryInput::Parameter { ordinal: 0 },
+        };
+        let mut expected = vec![spawn.clone(), lock, atomic, unsupported, once];
         expected.sort_by_cached_key(|effect| canonical_json(effect).unwrap());
         let compiled =
             compile_pack(&with_effects(expected.clone()), &CompilerOptions::default()).unwrap();
@@ -3067,6 +3168,20 @@ mod tests {
                     protocol: " ".to_owned(),
                 }],
                 "summary.invalid_unsupported_concurrency_protocol",
+            ),
+            (
+                vec![AuthoredConcurrencyEffect::OnceDo {
+                    once: AuthoredSummaryInput::Receiver {},
+                    callable: AuthoredSummaryInput::Receiver {},
+                }],
+                "summary.invalid_once_callable",
+            ),
+            (
+                vec![AuthoredConcurrencyEffect::OnceDo {
+                    once: AuthoredSummaryInput::Parameter { ordinal: 0 },
+                    callable: AuthoredSummaryInput::Parameter { ordinal: 0 },
+                }],
+                "summary.conflicting_concurrency_effect",
             ),
         ] {
             let diagnostics =

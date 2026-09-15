@@ -21,20 +21,22 @@ use crate::dataflow::{
     ExternalSemanticSummarySet, ExternalSummaryCompatibilityKey, ExternalSummaryContentHash,
     ExternalSummaryModelId, ExternalSummaryOrigin, ExternalSummarySetError, ExternalSummaryTarget,
     ProcedureSummaryIdentity, ProcedureSummaryKey, SemanticProcedureSummary, SummaryCompleteness,
-    SummaryConcurrencyAccessPath, SummaryConcurrencyAtomicOperation, SummaryConcurrencyEffect,
-    SummaryConcurrencyEffectKind, SummaryConcurrencyLockMode, SummaryConcurrencyLockOperation,
-    SummaryConcurrencySubjectIdentity, SummaryConcurrencyTargetCoverage, SummaryDependencyKey,
-    SummaryDimension, SummaryDimensionClaim, SummaryDimensionStatus, SummaryEffect,
-    SummaryEffectKey, SummaryEventKey, SummaryEvidence, SummaryExit, SummaryExitKind,
-    SummaryIncompleteReason, SummaryLocationKey, SummaryOrigin, SummaryPort, SummaryRecursiveEdge,
+    SummaryConcurrencyAccessPath, SummaryConcurrencyAtomicOperation, SummaryConcurrencyCondWaiters,
+    SummaryConcurrencyEffect, SummaryConcurrencyEffectKind, SummaryConcurrencyLockMode,
+    SummaryConcurrencyLockOperation, SummaryConcurrencySubjectIdentity,
+    SummaryConcurrencyTargetCoverage, SummaryDependencyKey, SummaryDimension,
+    SummaryDimensionClaim, SummaryDimensionStatus, SummaryEffect, SummaryEffectKey,
+    SummaryEventKey, SummaryEvidence, SummaryExit, SummaryExitKind, SummaryIncompleteReason,
+    SummaryLocationKey, SummaryLockAcquisition, SummaryOrigin, SummaryPort, SummaryRecursiveEdge,
     SummaryRecursiveGroupKey, SummaryTransfer, SummaryValidationError,
 };
 use crate::hash::{HashMap, HashSet, map_with_capacity};
 
 use brokk_bifrost_analysis::analyzer::semantic_model::{
-    CompiledAtomicOperation, CompiledConcurrencyEffect, CompiledLockMode, CompiledProcedureSummary,
-    CompiledProcedureTarget, CompiledSummaryEffect, CompiledSummaryExitKind, CompiledSummaryInput,
-    CompiledSummaryLocationKind, CompiledSummaryOutput, CompiledSummaryTransfer, Completeness,
+    CompiledAtomicOperation, CompiledConcurrencyEffect, CompiledCondWaiters, CompiledLockCondition,
+    CompiledLockMode, CompiledProcedureSummary, CompiledProcedureTarget, CompiledSummaryEffect,
+    CompiledSummaryExitKind, CompiledSummaryInput, CompiledSummaryLocationKind,
+    CompiledSummaryOutput, CompiledSummaryTransfer, Completeness,
     PROCEDURE_SUMMARY_CONTRACT_VERSION, ProcedureSummaryMatch, ProcedureSummaryMemberKey,
     ResolvedActiveSemanticModels, SemanticModelMatchDisposition,
 };
@@ -938,7 +940,9 @@ fn build_summary_set(
                     .iter()
                     .enumerate()
                     .map(|(ordinal, effect)| {
-                        lower_concurrency_effect(summary, binding, ordinal, effect, &evidence)
+                        lower_concurrency_effect(
+                            summary, binding, &locations, ordinal, effect, &evidence,
+                        )
                     })
                     .collect::<Result<Vec<_>, _>>()?,
             );
@@ -1187,6 +1191,7 @@ fn lower_effect(
 fn lower_concurrency_effect(
     summary: &CompiledProcedureSummary,
     binding: &ExactProcedureSummaryTargetBinding,
+    locations: &HashMap<&str, (CompiledSummaryLocationKind, SummaryLocationKey)>,
     ordinal: usize,
     effect: &CompiledConcurrencyEffect,
     evidence: &SummaryEvidence,
@@ -1229,7 +1234,15 @@ fn lower_concurrency_effect(
                 identity: identity(group),
             },
         },
-        CompiledConcurrencyEffect::LockAcquire { lock, mode }
+        CompiledConcurrencyEffect::OnceDo { once, callable } => {
+            SummaryConcurrencyEffectKind::OnceDo {
+                once: path(once)?,
+                identity: identity(once),
+                callable: crate::dataflow::SummaryConcurrencyCallable::Boundary(lower(callable)?),
+                target_coverage: SummaryConcurrencyTargetCoverage::Exhaustive,
+            }
+        }
+        CompiledConcurrencyEffect::LockAcquire { lock, mode, .. }
         | CompiledConcurrencyEffect::LockRelease { lock, mode } => {
             SummaryConcurrencyEffectKind::Lock {
                 lock: path(lock)?,
@@ -1246,6 +1259,13 @@ fn lower_concurrency_effect(
                 mode: match mode {
                     CompiledLockMode::Shared => SummaryConcurrencyLockMode::Shared,
                     CompiledLockMode::Exclusive => SummaryConcurrencyLockMode::Exclusive,
+                },
+                acquisition: match effect {
+                    CompiledConcurrencyEffect::LockAcquire {
+                        condition: Some(CompiledLockCondition::CallResultTrue),
+                        ..
+                    } => SummaryLockAcquisition::CallResultTrue,
+                    _ => SummaryLockAcquisition::Unconditional,
                 },
             }
         }
@@ -1281,6 +1301,28 @@ fn lower_concurrency_effect(
                 }
             },
         },
+        CompiledConcurrencyEffect::CondBind { condition, lock } => {
+            SummaryConcurrencyEffectKind::CondBind {
+                condition: SummaryConcurrencyAccessPath::port(lower_output(
+                    summary, binding, locations, condition,
+                )?),
+                lock: path(lock)?,
+            }
+        }
+        CompiledConcurrencyEffect::CondWait { condition } => {
+            SummaryConcurrencyEffectKind::CondWait {
+                condition: path(condition)?,
+            }
+        }
+        CompiledConcurrencyEffect::CondNotify { condition, waiters } => {
+            SummaryConcurrencyEffectKind::CondNotify {
+                condition: path(condition)?,
+                waiters: match waiters {
+                    CompiledCondWaiters::One => SummaryConcurrencyCondWaiters::One,
+                    CompiledCondWaiters::All => SummaryConcurrencyCondWaiters::All,
+                },
+            }
+        }
     };
     Ok(SummaryEffect::new(
         SummaryEffectKey::Concurrency(SummaryConcurrencyEffect::modeled(event, effect)),

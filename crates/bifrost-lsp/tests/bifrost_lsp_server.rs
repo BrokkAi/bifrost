@@ -2138,6 +2138,93 @@ fn bifrost_lsp_server_derives_policy_identity_from_configured_root() {
 }
 
 #[test]
+fn bifrost_lsp_server_runs_policy_with_imported_typed_store_set() {
+    let temp = TempDir::new().expect("workspace tempdir");
+    let root = temp.path().canonicalize().expect("canonical root");
+    fs::create_dir_all(root.join("policies")).expect("create policies directory");
+    fs::create_dir_all(root.join(".bifrost/endpoint-sets/stores"))
+        .expect("create endpoint-set directory");
+    fs::write(
+        root.join("App.java"),
+        r#"final class Store {
+    static void put(String key, String value) { }
+    static String get(String key) { return ""; }
+}
+final class App {
+    static String source() { return "tainted"; }
+    static void sink(String value) { }
+    static void writeSide() { Store.put("k", source()); }
+    static void readSide() { sink(Store.get("k")); }
+}
+"#,
+    )
+    .expect("write Java fixture");
+    fs::write(
+        root.join(".bifrost/endpoint-sets/stores/application-db.rqlp"),
+        r#"(endpoint-set-document
+  :schema-version 1 :kind stores :language java :rql-schema-version 1
+  :set (endpoint-set :entries [
+    (store-write :id put-primary
+      :selector (rql :schema-version 1 (language java (call :callee (name "put"))))
+      :store primary :key (argument :index 0) :input (argument :index 1))
+    (store-read :id get-primary
+      :selector (rql :schema-version 1 (language java (call :callee (name "get"))))
+      :store primary :key (argument :index 0) :output return-value)]))"#,
+    )
+    .expect("write endpoint-set fixture");
+    let policy_path = root.join("policies/imported-store.rqlp");
+    fs::write(&policy_path, "").expect("write policy placeholder");
+    let source = r#"(policy
+  :schema-version 1 :id "test.issue-3355.lsp" :name "Imported store"
+  :message "tainted data reaches a sink through the imported store" :severity warning
+  :analysis (analysis :type taint :mode may
+    :sources (endpoint-set :entries [
+      (source :id input :display-name "input" :categories [input.user]
+        :selector (rql :schema-version 1 (language java (call :callee (name "source") :arity 0)))
+        :bind return-value :labels [untrusted])])
+    :sinks (endpoint-set :entries [
+      (sink :id sink :display-name "sink" :categories [data.sensitive]
+        :selector (rql :schema-version 1 (language java (call :callee (name "sink") :arity 1)))
+        :dangerous-operand (argument :index 0) :accepts [untrusted])])
+    :stores (endpoint-set :include-files [
+      (endpoint-set-file :path ".bifrost/endpoint-sets/stores/application-db.rqlp")])))"#;
+    let mut server = LspServer::start(&root);
+    let response = server.request(
+        "bifrost/runPolicy",
+        json!({
+            "documentUri": uri_for(&policy_path),
+            "evaluationDate": "2026-09-14",
+            "source": source,
+        }),
+    );
+    assert!(response["error"].is_null(), "{response}");
+    let report = &response["result"]["report"];
+    assert_eq!(
+        report["runs"][0]["completion"]["type"], "complete",
+        "{report}"
+    );
+    assert_eq!(
+        report["runs"][0]["findings"].as_array().map(Vec::len),
+        Some(1),
+        "{report}"
+    );
+    let dependencies = report["rules"][0]["endpoint_set_dependencies"]
+        .as_array()
+        .unwrap_or_else(|| panic!("missing endpoint-set provenance: {report}"));
+    assert_eq!(dependencies.len(), 1, "{report}");
+    assert_eq!(
+        dependencies[0]["source"],
+        ".bifrost/endpoint-sets/stores/application-db.rqlp"
+    );
+    assert_eq!(
+        dependencies[0]["entries"].as_array().map(Vec::len),
+        Some(2),
+        "{report}"
+    );
+    server.shutdown();
+}
+
+#[test]
 fn bifrost_lsp_server_returns_multi_root_finding_paths_in_report_coordinates() {
     let temp = TempDir::new().expect("tempdir");
     let parent = temp.path().canonicalize().expect("canonical root");

@@ -5,9 +5,9 @@ use super::ir::{
     ConfigurationFactsSeed, ConfigurationNodeKindFilter, ConfigurationRouteSegmentFilter,
     ControlRelationFilter, DeclarationStateFilter, DecoratorBindingFilter, EdgeFilter,
     ExportFilter, ExportSeed, FlowRelationFilter, GenerationSiteFilter, GenerationSiteSeed,
-    HierarchyTraversal, OccurrenceFilter, OccurrenceSeed, PathSeed, Pattern, QueryPathScope,
-    QueryStep, ResultContractFailureUseFilter, RewritePathFilter, ScopeFilter, ScopeSeed,
-    StateEventFilter, StringPredicate, UNATTRIBUTED_TIER_LABEL,
+    HierarchyTraversal, KeyedReadKeySelector, OccurrenceFilter, OccurrenceSeed, PathSeed, Pattern,
+    QueryPathScope, QueryStep, ResultContractFailureUseFilter, RewritePathFilter, ScopeFilter,
+    ScopeSeed, StateEventFilter, StringPredicate, UNATTRIBUTED_TIER_LABEL,
 };
 use super::schema::{
     CallTraversalCompleteness, QueryStepField, configuration_member_role_label,
@@ -26,6 +26,10 @@ impl CodeQuery {
         let Value::Object(mut object) = self.to_canonical_query_plan_json() else {
             unreachable!("canonical query plans are JSON objects");
         };
+        object.insert(
+            "schema_version".to_string(),
+            json!(self.schema_version.to_string()),
+        );
         object.insert("limit".to_string(), json!(self.limit));
         object.insert(
             "result_detail".to_string(),
@@ -42,6 +46,8 @@ impl CodeQuery {
     ///
     /// Policy selectors use this projection because policy evaluation owns its
     /// result budget and detail level independently of the authored selector.
+    /// The version stays numeric in this semantic projection to preserve policy
+    /// identity independently of the string version used by the JSON frontend.
     pub fn to_canonical_query_plan_json(&self) -> Value {
         let mut object = plan_to_json(&self.plan);
         object.insert("schema_version".to_string(), json!(self.schema_version));
@@ -1140,11 +1146,26 @@ fn query_step_to_json(step: &QueryStep) -> Value {
             object.insert("runtime".to_string(), json!(filter.runtime));
             object.insert("global".to_string(), json!(filter.global));
             object.insert("container".to_string(), json!(filter.container));
-            if let Some(property) = &filter.property {
-                object.insert("property".to_string(), json!(property));
-            }
-            if let Some(index) = filter.index {
-                object.insert("index".to_string(), json!(index));
+            match filter.key.as_ref() {
+                Some(KeyedReadKeySelector::ExactProperty(property)) => {
+                    object.insert("property".to_string(), json!(property));
+                }
+                Some(KeyedReadKeySelector::ExactIndex(index)) => {
+                    object.insert("index".to_string(), json!(index));
+                }
+                Some(KeyedReadKeySelector::StaticProperty) => {
+                    object.insert("key_kind".to_string(), json!("static-property"));
+                }
+                Some(KeyedReadKeySelector::StaticIndexRange { min, max }) => {
+                    object.insert("key_kind".to_string(), json!("static-index"));
+                    if let Some(min) = min {
+                        object.insert("index_min".to_string(), json!(min));
+                    }
+                    if let Some(max) = max {
+                        object.insert("index_max".to_string(), json!(max));
+                    }
+                }
+                None => {}
             }
             if filter.pristine_input {
                 object.insert("source_origin".to_string(), json!("pristine_input"));

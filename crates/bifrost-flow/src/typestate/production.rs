@@ -53,7 +53,7 @@ use crate::analyzer::semantic::{
 };
 use crate::concurrency::{
     ConcurrencyAnswer, ConcurrencyAtomicOperation, ConcurrencyLockMode, ConcurrencyProvider,
-    ConcurrencySubjectIdentity, ResolvedConcurrencyEffect,
+    ConcurrencySubjectIdentity, ResolvedConcurrencyEffect, ResolvedLockAcquisition,
 };
 use crate::dataflow::{
     DataflowRequest, ProcedureSummaryIdentity, ProcedureSummaryKey,
@@ -64,10 +64,10 @@ use crate::dataflow::{
     SummaryConcurrencyExecutionCardinality, SummaryConcurrencyLockMode,
     SummaryConcurrencyLockOperation, SummaryConcurrencySourceWitness,
     SummaryConcurrencySubjectIdentity, SummaryContextKey, SummaryDependencyKey, SummaryEffect,
-    SummaryEffectKey, SummaryEventKey, SummaryEvidence, SummaryLocationKey, SummaryOrigin,
-    SummaryPort, SummaryPublicationError, SummaryPublicationOutcome, SummaryReadObserver,
-    SummaryRecursiveEdge, SummaryRecursiveGroupKey, SummaryRepositoryLimits, SummarySchemaVersion,
-    SummarySemanticsVersion, SummaryValidationError,
+    SummaryEffectKey, SummaryEventKey, SummaryEvidence, SummaryLocationKey, SummaryLockAcquisition,
+    SummaryOrigin, SummaryPort, SummaryPublicationError, SummaryPublicationOutcome,
+    SummaryReadObserver, SummaryRecursiveEdge, SummaryRecursiveGroupKey, SummaryRepositoryLimits,
+    SummarySchemaVersion, SummarySemanticsVersion, SummaryValidationError,
 };
 use crate::hash::HashMap;
 
@@ -79,7 +79,7 @@ use super::{
     solve_typestate_with_reusable_summaries, solve_typestate_with_summaries,
 };
 
-const PRODUCTION_SUMMARY_SEMANTICS: &[u8] = b"bifrost-production-semantic-summary-v20";
+const PRODUCTION_SUMMARY_SEMANTICS: &[u8] = b"bifrost-production-semantic-summary-v21";
 const EMPTY_CALL_CONTEXT: &[u8] = b"bifrost-production-empty-call-context-v1";
 const PRODUCTION_ICFG_BEHAVIOR_DOMAIN: &[u8] = b"bifrost-production-icfg-behavior-v2";
 const PRODUCTION_PUBLICATION_BEHAVIOR_DOMAIN: &[u8] = b"bifrost-production-publication-behavior-v1";
@@ -1727,6 +1727,26 @@ fn project_modeled_call_effects(
     };
     let mut stable = Vec::with_capacity(modeled.len());
     for effect in modeled {
+        if matches!(
+            effect,
+            ResolvedConcurrencyEffect::LockAcquire {
+                acquisition: ResolvedLockAcquisition::CallResultTrue,
+                ..
+            }
+        ) && !summary_returns_identify_call_result(procedure, call)
+        {
+            // A summary boundary may carry the try-acquire condition only when
+            // its own normal result is exactly the guarded call's result.
+            // Otherwise the condition would describe a result it does not
+            // name; keep the open boundary visible instead.
+            let open = SummaryConcurrencyEffectKind::Unsupported {
+                protocol: "try-acquire:summary return does not identify the call result".into(),
+            };
+            if !stable.contains(&open) {
+                stable.push(open);
+            }
+            continue;
+        }
         if let ResolvedConcurrencyEffect::TaskSpawn {
             callable,
             targets,
@@ -1786,6 +1806,52 @@ fn project_modeled_call_effects(
             stable.push(kind);
             continue;
         }
+        if let ResolvedConcurrencyEffect::OnceDo {
+            once,
+            callable,
+            targets,
+        } = &effect
+        {
+            let recovered = crate::concurrency::source_callable_targets(procedure, *callable);
+            if !matches!(recovered, ConcurrencyAnswer::Proven(ref recovered) if recovered == targets)
+            {
+                return Ok(());
+            }
+            let ordinals = call
+                .arguments
+                .iter()
+                .enumerate()
+                .filter_map(|(ordinal, argument)| (argument.value == *callable).then_some(ordinal))
+                .collect::<Vec<_>>();
+            let [ordinal] = ordinals.as_slice() else {
+                return Ok(());
+            };
+            let DirectConcurrencyPath::Boundary(once_path) =
+                direct_concurrency_modeled_subject_path(
+                    procedure, call, once.value, provider, request,
+                )?
+            else {
+                return Ok(());
+            };
+            let kind = SummaryConcurrencyEffectKind::OnceDo {
+                once: once_path,
+                identity: match once.identity {
+                    ConcurrencySubjectIdentity::Value => SummaryConcurrencySubjectIdentity::Value,
+                    ConcurrencySubjectIdentity::Backing => {
+                        SummaryConcurrencySubjectIdentity::Backing
+                    }
+                },
+                callable: crate::dataflow::SummaryConcurrencyCallable::SourceArgument(
+                    u32::try_from(*ordinal).expect("validated call argument ordinal fits u32"),
+                ),
+                target_coverage: crate::dataflow::SummaryConcurrencyTargetCoverage::Exhaustive,
+            };
+            if stable.contains(&kind) {
+                return Ok(());
+            }
+            stable.push(kind);
+            continue;
+        }
         let subject = match &effect {
             ResolvedConcurrencyEffect::LockAcquire { lock, .. }
             | ResolvedConcurrencyEffect::LockRelease { lock, .. } => lock,
@@ -1798,6 +1864,12 @@ fn project_modeled_call_effects(
             {
                 location
             }
+            // The condition's own object identity crosses the boundary, so a
+            // wrapper that waits on a parameter keeps the protocol semantics.
+            // A `CondBind` condition is a construction result rather than an
+            // input subject and is bound live at its own call site instead.
+            ResolvedConcurrencyEffect::CondWait { condition }
+            | ResolvedConcurrencyEffect::CondNotify { condition, .. } => condition,
             _ => return Ok(()),
         };
         let DirectConcurrencyPath::Boundary(path) = direct_concurrency_modeled_subject_path(
@@ -1843,19 +1915,57 @@ fn project_modeled_call_effects(
                     identity,
                 }
             }
-            ResolvedConcurrencyEffect::LockAcquire { mode, .. }
-            | ResolvedConcurrencyEffect::LockRelease { mode, .. } => {
+            ResolvedConcurrencyEffect::LockAcquire {
+                mode, acquisition, ..
+            } => {
+                let acquisition = match acquisition {
+                    ResolvedLockAcquisition::Unconditional => SummaryLockAcquisition::Unconditional,
+                    ResolvedLockAcquisition::CallResultTrue => {
+                        SummaryLockAcquisition::CallResultTrue
+                    }
+                    // Provider answers are raw model answers; a bound or
+                    // unestablished condition never reaches projection.
+                    ResolvedLockAcquisition::OnResultTrue { .. }
+                    | ResolvedLockAcquisition::Unestablished => {
+                        unreachable!("provider answers carry unresolved acquisitions")
+                    }
+                };
                 SummaryConcurrencyEffectKind::Lock {
                     lock: path,
                     identity,
-                    operation: if matches!(effect, ResolvedConcurrencyEffect::LockAcquire { .. }) {
-                        SummaryConcurrencyLockOperation::Acquire
-                    } else {
-                        SummaryConcurrencyLockOperation::Release
-                    },
+                    operation: SummaryConcurrencyLockOperation::Acquire,
                     mode: match mode {
                         ConcurrencyLockMode::Shared => SummaryConcurrencyLockMode::Shared,
                         ConcurrencyLockMode::Exclusive => SummaryConcurrencyLockMode::Exclusive,
+                    },
+                    acquisition,
+                }
+            }
+            ResolvedConcurrencyEffect::LockRelease { mode, .. } => {
+                SummaryConcurrencyEffectKind::Lock {
+                    lock: path,
+                    identity,
+                    operation: SummaryConcurrencyLockOperation::Release,
+                    mode: match mode {
+                        ConcurrencyLockMode::Shared => SummaryConcurrencyLockMode::Shared,
+                        ConcurrencyLockMode::Exclusive => SummaryConcurrencyLockMode::Exclusive,
+                    },
+                    acquisition: SummaryLockAcquisition::Unconditional,
+                }
+            }
+            ResolvedConcurrencyEffect::CondWait { .. } => {
+                SummaryConcurrencyEffectKind::CondWait { condition: path }
+            }
+            ResolvedConcurrencyEffect::CondNotify { waiters, .. } => {
+                SummaryConcurrencyEffectKind::CondNotify {
+                    condition: path,
+                    waiters: match waiters {
+                        crate::concurrency::ConcurrencyCondWaiters::One => {
+                            crate::dataflow::SummaryConcurrencyCondWaiters::One
+                        }
+                        crate::concurrency::ConcurrencyCondWaiters::All => {
+                            crate::dataflow::SummaryConcurrencyCondWaiters::All
+                        }
                     },
                 }
             }
@@ -1911,6 +2021,49 @@ fn project_modeled_call_effects(
             .map(|kind| direct_concurrency_effect(procedure, call.source, event_ordinal, kind)),
     );
     Ok(())
+}
+
+/// Whether the procedure's normal returns all carry exactly the modeled call's
+/// result, so the call's try-acquire condition can transfer to the summary's
+/// own boundary result (issue #3369).
+///
+/// The lowerer states the identification as an exact return value flow whose
+/// source is the call's result and whose target is the returned value of a
+/// `ProcedureReturn` row. Every return value must be reached by such a flow,
+/// and no return flow may carry another source: a constant, a second
+/// expression, or a value reaching the return through storage breaks the
+/// identification and keeps the summary boundary open instead of moving the
+/// condition onto a result it does not describe.
+pub(crate) fn summary_returns_identify_call_result(
+    procedure: &ProcedureHandle,
+    call: &crate::analyzer::semantic::SemanticCallSite,
+) -> bool {
+    let Some(result) = call.result else {
+        return false;
+    };
+    let semantics = procedure.semantics();
+    let mut flows = Vec::new();
+    let mut returned_values = Vec::new();
+    for point in semantics.points() {
+        for event in &point.events {
+            match event.effect {
+                SemanticEffect::ValueFlow {
+                    kind: ValueFlowKind::Return,
+                    source,
+                    target,
+                } => flows.push((source, target)),
+                SemanticEffect::ProcedureReturn { value: Some(value) } => {
+                    returned_values.push(value)
+                }
+                _ => {}
+            }
+        }
+    }
+    !flows.is_empty()
+        && flows.iter().all(|(source, _)| *source == result)
+        && returned_values
+            .iter()
+            .all(|value| flows.iter().any(|(_, target)| target == value))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

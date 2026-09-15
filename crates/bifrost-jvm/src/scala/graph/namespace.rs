@@ -1,14 +1,22 @@
 use brokk_bifrost_core::analyzer::CodeUnit;
+use brokk_bifrost_core::analyzer::tree_walk::ParentIndex;
 use brokk_bifrost_core::hash::HashSet;
 use tree_sitter::Node;
 
 pub fn scala_type_reference_is_singleton(node: Node<'_>) -> bool {
+    scala_type_reference_is_singleton_with_parents(node, &ParentIndex::unindexed())
+}
+
+pub fn scala_type_reference_is_singleton_with_parents<'tree>(
+    node: Node<'tree>,
+    parents: &ParentIndex<'tree>,
+) -> bool {
     let mut current = Some(node);
     while let Some(candidate) = current {
         if candidate.kind() == "singleton_type" {
             return true;
         }
-        current = candidate.parent().filter(|parent| {
+        current = parents.parent(candidate).filter(|parent| {
             matches!(
                 parent.kind(),
                 "singleton_type" | "stable_type_identifier" | "generic_type"
@@ -22,8 +30,15 @@ pub fn scala_type_reference_is_singleton(node: Node<'_>) -> bool {
 /// which owns it. Type-argument nodes interrupt this walk, so `T` in
 /// `Outer[T]` remains its own lookup while `Outer.Member` is considered as one
 /// qualified path.
-pub fn scala_qualified_type_root(mut node: Node<'_>) -> Node<'_> {
-    while let Some(parent) = node.parent().filter(|parent| {
+pub fn scala_qualified_type_root(node: Node<'_>) -> Node<'_> {
+    scala_qualified_type_root_with_parents(node, &ParentIndex::unindexed())
+}
+
+pub fn scala_qualified_type_root_with_parents<'tree>(
+    mut node: Node<'tree>,
+    parents: &ParentIndex<'tree>,
+) -> Node<'tree> {
+    while let Some(parent) = parents.parent(node).filter(|parent| {
         matches!(
             parent.kind(),
             "stable_type_identifier"
@@ -279,7 +294,22 @@ pub fn scala_nearest_unindexed_type_binding<'tree>(
     reference: Node<'tree>,
     root_name: &str,
 ) -> Option<ScalaUnindexedTypeBinding<'tree>> {
-    nearest_unindexed_type_binding_details(source, reference, root_name).map(|(binding, _)| binding)
+    scala_nearest_unindexed_type_binding_with_parents(
+        source,
+        reference,
+        root_name,
+        &ParentIndex::unindexed(),
+    )
+}
+
+pub fn scala_nearest_unindexed_type_binding_with_parents<'tree>(
+    source: &str,
+    reference: Node<'tree>,
+    root_name: &str,
+    parents: &ParentIndex<'tree>,
+) -> Option<ScalaUnindexedTypeBinding<'tree>> {
+    nearest_unindexed_type_binding_details(source, reference, root_name, parents)
+        .map(|(binding, _)| binding)
 }
 
 /// Owner of the nearest authoritative unindexed type binding for `root_name`.
@@ -292,7 +322,12 @@ pub fn scala_nearest_unindexed_type_owner<'tree>(
     reference: Node<'tree>,
     root_name: &str,
 ) -> Option<Node<'tree>> {
-    match nearest_unindexed_type_binding_details(source, reference, root_name) {
+    match nearest_unindexed_type_binding_details(
+        source,
+        reference,
+        root_name,
+        &ParentIndex::unindexed(),
+    ) {
         Some((ScalaUnindexedTypeBinding::Authoritative, owner)) => Some(owner),
         _ => None,
     }
@@ -302,6 +337,7 @@ fn nearest_unindexed_type_binding_details<'tree>(
     source: &str,
     reference: Node<'tree>,
     root_name: &str,
+    parents: &ParentIndex<'tree>,
 ) -> Option<(ScalaUnindexedTypeBinding<'tree>, Node<'tree>)> {
     if root_name.is_empty() {
         return None;
@@ -322,7 +358,8 @@ fn nearest_unindexed_type_binding_details<'tree>(
         }
 
         if node.kind() == "template_body"
-            && let Some(instance) = scala_anonymous_instance_for_template(node)
+            && let Some(instance) =
+                scala_anonymous_instance_for_template_with_parents(node, parents)
         {
             let mut cursor = node.walk();
             let matches = node
@@ -350,7 +387,7 @@ fn nearest_unindexed_type_binding_details<'tree>(
                 }
                 [owner, ..] => Some((ScalaUnindexedTypeBinding::Authoritative, *owner)),
                 [] => {
-                    current = node.parent();
+                    current = parents.parent(node);
                     continue;
                 }
             };
@@ -371,18 +408,25 @@ fn nearest_unindexed_type_binding_details<'tree>(
                 return Some((ScalaUnindexedTypeBinding::Authoritative, owner));
             }
         }
-        current = node.parent();
+        current = parents.parent(node);
     }
     None
 }
 
 pub fn scala_anonymous_instance_for_template<'tree>(template: Node<'tree>) -> Option<Node<'tree>> {
-    let parent = template.parent()?;
+    scala_anonymous_instance_for_template_with_parents(template, &ParentIndex::unindexed())
+}
+
+pub fn scala_anonymous_instance_for_template_with_parents<'tree>(
+    template: Node<'tree>,
+    parents: &ParentIndex<'tree>,
+) -> Option<Node<'tree>> {
+    let parent = parents.parent(template)?;
     if parent.kind() == "instance_expression" {
         return Some(parent);
     }
-    parent
-        .parent()
+    parents
+        .parent(parent)
         .filter(|grandparent| grandparent.kind() == "instance_expression")
 }
 

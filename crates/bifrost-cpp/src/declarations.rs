@@ -2764,11 +2764,22 @@ fn recover_embedded_function_like_export_classes(
     }
 
     let mut nodes = Vec::new();
+    let mut class_tokens = Vec::new();
     let mut stack = vec![node];
     while let Some(current) = stack.pop() {
         nodes.push(current);
+        // An error subtree without an anonymous class token cannot contain
+        // a recoverable class head. Detect that before sorting or resolving
+        // kind-id tables; the grammar spelling matches all aliased symbol ids.
+        if !current.is_named() && current.kind() == "class" {
+            class_tokens.push(current);
+        }
         push_children_reversed(current, &mut stack);
     }
+    if class_tokens.is_empty() {
+        return Vec::new();
+    }
+    class_tokens.sort_unstable_by_key(|child| (child.start_byte(), child.end_byte()));
     nodes.sort_unstable_by_key(|child| (child.start_byte(), child.end_byte()));
 
     // The scans below ask the same handful of kind questions once per node of
@@ -2785,11 +2796,8 @@ fn recover_embedded_function_like_export_classes(
     let field_initializer_kind = NodeKindIds::new(&language, "field_initializer");
 
     let mut recovered = Vec::new();
-    for class_token in nodes
-        .iter()
-        .copied()
-        .filter(|child| !child.is_named() && class_kind.matches(*child))
-    {
+    for class_token in class_tokens {
+        debug_assert!(class_kind.matches(class_token));
         let row = class_token.start_position().row;
         // The head after the `class` token reads `MACRO(args) macros... name
         // [final] : bases`. The macro is the first identifier, a function-like
@@ -3739,7 +3747,7 @@ pub struct CppVisitor<'a> {
     /// displaced by parse recovery (issues #1537 and #3087). The parsed
     /// ancestors can stop short or extend past their true closes; see
     /// [`CppVisitor::recovered_namespace_scope`].
-    pub orphaned_namespaces: OrphanedNamespaceScopeIndex,
+    pub orphaned_namespaces: &'a OrphanedNamespaceScopeIndex,
     /// Owned reparses waiting for the outer work loop. Partitioning another
     /// swallowed class in a tail must not grow the Rust call stack.
     pub partitioned_regions: Vec<(Tree, std::ops::Range<usize>, ScopeInfo)>,
@@ -17257,7 +17265,7 @@ namespace internal {
             c_tag_semantics: false,
             recovered_class_sibling_scopes: HashMap::default(),
             consumed_fragment_regions: Vec::new(),
-            orphaned_namespaces: index,
+            orphaned_namespaces: &index,
             partitioned_regions: Vec::new(),
             namespace_forward_scans: HashMap::default(),
             field_owners: None,

@@ -3,7 +3,7 @@ use crate::scala::supertypes::scala_type_lookup_segments;
 use crate::scala::wildcard_imports::scala_package_prefixes_at;
 use brokk_bifrost_core::analyzer::CodeUnit;
 use brokk_bifrost_core::analyzer::model::{CallableArity, ImportInfo};
-use brokk_bifrost_core::analyzer::tree_walk::subtree_contains;
+use brokk_bifrost_core::analyzer::tree_walk::{ParentIndex, subtree_contains};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 use tree_sitter::{Node, Parser};
 
@@ -841,10 +841,18 @@ fn is_scala_variable_pattern_name(node: Node<'_>, source: &str) -> bool {
 /// Comparing node identities matters when a binder intentionally has the same
 /// spelling as a qualifier in its own type annotation.
 pub fn is_scala_case_pattern_binder(node: Node<'_>, source: &str) -> bool {
+    is_scala_case_pattern_binder_with_parents(node, source, &ParentIndex::unindexed())
+}
+
+pub fn is_scala_case_pattern_binder_with_parents<'tree>(
+    node: Node<'tree>,
+    source: &str,
+    parents: &ParentIndex<'tree>,
+) -> bool {
     if !matches!(node.kind(), "identifier" | "operator_identifier") {
         return false;
     }
-    let mut current = node.parent();
+    let mut current = parents.parent(node);
     while let Some(parent) = current {
         if parent.kind() == "case_clause" {
             return parent
@@ -859,7 +867,7 @@ pub fn is_scala_case_pattern_binder(node: Node<'_>, source: &str) -> bool {
                         .any(|binder| binder.id() == node.id())
                 });
         }
-        current = parent.parent();
+        current = parents.parent(parent);
     }
     false
 }
@@ -1439,12 +1447,20 @@ pub fn qualified_stable_type_reference<'tree>(
     node: Node<'tree>,
     source: &str,
 ) -> Option<ScalaQualifiedStableTypeReference<'tree>> {
+    qualified_stable_type_reference_with_parents(node, source, &ParentIndex::unindexed())
+}
+
+pub fn qualified_stable_type_reference_with_parents<'tree>(
+    node: Node<'tree>,
+    source: &str,
+    parents: &ParentIndex<'tree>,
+) -> Option<ScalaQualifiedStableTypeReference<'tree>> {
     let (expression, role, segments) = if let Some((expression, role, segments)) =
-        qualified_stable_type_expression_role(node, source)
+        qualified_stable_type_expression_role(node, source, parents)
     {
         (expression, role, segments)
     } else {
-        qualified_stable_term_application(node, source)?
+        qualified_stable_term_application(node, source, parents)?
     };
     if segments.len() <= 1 {
         return None;
@@ -1460,8 +1476,9 @@ pub fn qualified_stable_type_reference<'tree>(
 fn qualified_stable_term_application<'tree>(
     node: Node<'tree>,
     source: &str,
+    parents: &ParentIndex<'tree>,
 ) -> Option<(Node<'tree>, ScalaQualifiedStableTypeRole, Vec<String>)> {
-    let mut expression = node.parent()?;
+    let mut expression = parents.parent(node)?;
     if expression.kind() != "field_expression"
         || expression.child_by_field_name("field") != Some(node)
     {
@@ -1487,13 +1504,13 @@ fn qualified_stable_term_application<'tree>(
         return None;
     }
 
-    if expression.parent().is_some_and(|parent| {
+    if parents.parent(expression).is_some_and(|parent| {
         parent.kind() == "generic_function"
             && parent.child_by_field_name("function") == Some(expression)
     }) {
-        expression = expression.parent()?;
+        expression = parents.parent(expression)?;
     }
-    let call = expression.parent()?;
+    let call = parents.parent(expression)?;
     if call.kind() != "call_expression" || call.child_by_field_name("function") != Some(expression)
     {
         return None;
@@ -1504,18 +1521,19 @@ fn qualified_stable_term_application<'tree>(
 fn qualified_stable_type_expression_role<'tree>(
     node: Node<'tree>,
     source: &str,
+    parents: &ParentIndex<'tree>,
 ) -> Option<(Node<'tree>, ScalaQualifiedStableTypeRole, Vec<String>)> {
     let mut expression;
-    let segments = if let Some(mut stable) = node
-        .parent()
+    let segments = if let Some(mut stable) = parents
+        .parent(node)
         .filter(|parent| parent.kind() == "stable_type_identifier")
     {
         let mut cursor = stable.walk();
         if stable.named_children(&mut cursor).last() != Some(node) {
             return None;
         }
-        while let Some(parent) = stable
-            .parent()
+        while let Some(parent) = parents
+            .parent(stable)
             .filter(|parent| parent.kind() == "stable_type_identifier")
         {
             let mut cursor = parent.walk();
@@ -1527,14 +1545,14 @@ fn qualified_stable_type_expression_role<'tree>(
         expression = stable;
         scala_type_lookup_segments(stable, source)
     } else {
-        let stable = node
-            .parent()
+        let stable = parents
+            .parent(node)
             .filter(|parent| parent.kind() == "stable_identifier")?;
-        let reference = stable_identifier_reference(node, source)?;
+        let reference = stable_identifier_reference_with_parents(node, source, parents)?;
         expression = stable;
         reference.segments
     };
-    while let Some(parent) = expression.parent().filter(|parent| {
+    while let Some(parent) = parents.parent(expression).filter(|parent| {
         matches!(
             parent.kind(),
             "generic_type" | "applied_constructor_type" | "annotated_type" | "type"
@@ -1542,8 +1560,8 @@ fn qualified_stable_type_expression_role<'tree>(
     }) {
         expression = parent;
     }
-    let role = expression
-        .parent()
+    let role = parents
+        .parent(expression)
         .map(|parent| {
             if parent.kind() == "call_expression"
                 && parent.child_by_field_name("function") == Some(expression)
@@ -1592,7 +1610,14 @@ pub fn is_stable_type_qualifier(node: Node<'_>) -> bool {
 }
 
 pub fn is_extractor_reference(node: Node<'_>) -> bool {
-    let Some(parent) = node.parent() else {
+    is_extractor_reference_with_parents(node, &ParentIndex::unindexed())
+}
+
+pub fn is_extractor_reference_with_parents<'tree>(
+    node: Node<'tree>,
+    parents: &ParentIndex<'tree>,
+) -> bool {
+    let Some(parent) = parents.parent(node) else {
         return false;
     };
     if parent.kind() == "case_class_pattern" {
@@ -1613,7 +1638,7 @@ pub fn is_extractor_reference(node: Node<'_>) -> bool {
                         && node.end_byte() <= pattern.end_byte()
                 });
         }
-        current = ancestor.parent();
+        current = parents.parent(ancestor);
     }
     false
 }
@@ -1625,14 +1650,21 @@ pub fn is_infix_pattern_operator(node: Node<'_>) -> bool {
 }
 
 pub fn is_call_function_reference(node: Node<'_>) -> bool {
+    is_call_function_reference_with_parents(node, &ParentIndex::unindexed())
+}
+
+pub fn is_call_function_reference_with_parents<'tree>(
+    node: Node<'tree>,
+    parents: &ParentIndex<'tree>,
+) -> bool {
     let mut expression = node;
-    if let Some(generic) = expression.parent().filter(|parent| {
+    if let Some(generic) = parents.parent(expression).filter(|parent| {
         parent.kind() == "generic_function"
             && parent.child_by_field_name("function") == Some(expression)
     }) {
         expression = generic;
     }
-    expression.parent().is_some_and(|parent| {
+    parents.parent(expression).is_some_and(|parent| {
         parent.kind() == "call_expression"
             && parent.child_by_field_name("function") == Some(expression)
     })
@@ -1728,11 +1760,19 @@ pub fn stable_identifier_reference<'tree>(
     node: Node<'tree>,
     source: &str,
 ) -> Option<ScalaStableIdentifierReference> {
-    let mut expression = node
-        .parent()
+    stable_identifier_reference_with_parents(node, source, &ParentIndex::unindexed())
+}
+
+pub fn stable_identifier_reference_with_parents<'tree>(
+    node: Node<'tree>,
+    source: &str,
+    parents: &ParentIndex<'tree>,
+) -> Option<ScalaStableIdentifierReference> {
+    let mut expression = parents
+        .parent(node)
         .filter(|parent| parent.kind() == "stable_identifier")?;
-    while let Some(parent) = expression
-        .parent()
+    while let Some(parent) = parents
+        .parent(expression)
         .filter(|parent| parent.kind() == "stable_identifier")
     {
         expression = parent;
@@ -1979,7 +2019,14 @@ pub fn has_ancestor_kind(node: Node<'_>, kind: &str) -> bool {
 }
 
 pub fn field_expression_for_member(node: Node<'_>) -> Option<Node<'_>> {
-    let parent = node.parent()?;
+    field_expression_for_member_with_parents(node, &ParentIndex::unindexed())
+}
+
+pub fn field_expression_for_member_with_parents<'tree>(
+    node: Node<'tree>,
+    parents: &ParentIndex<'tree>,
+) -> Option<Node<'tree>> {
+    let parent = parents.parent(node)?;
     if parent.kind() == "field_expression" && parent.child_by_field_name("field") == Some(node) {
         Some(parent)
     } else {
@@ -2023,15 +2070,29 @@ pub fn stable_type_qualifier(node: Node<'_>, source: &str) -> Option<String> {
 }
 
 pub fn call_arities_for_reference(node: Node<'_>) -> Option<Vec<usize>> {
-    call_site_shape_for_reference(node)
+    call_arities_for_reference_with_parents(node, &ParentIndex::unindexed())
+}
+
+pub fn call_arities_for_reference_with_parents<'tree>(
+    node: Node<'tree>,
+    parents: &ParentIndex<'tree>,
+) -> Option<Vec<usize>> {
+    call_site_shape_for_reference_with_parents(node, parents)
         .map(|shape| shape.lists.into_iter().map(|list| list.arity).collect())
 }
 
 pub fn call_site_shape_for_reference(node: Node<'_>) -> Option<ScalaCallSiteShape> {
+    call_site_shape_for_reference_with_parents(node, &ParentIndex::unindexed())
+}
+
+pub fn call_site_shape_for_reference_with_parents<'tree>(
+    node: Node<'tree>,
+    parents: &ParentIndex<'tree>,
+) -> Option<ScalaCallSiteShape> {
     // Qualified extractor types may wrap the focused terminal in stable and
     // applied type nodes before reaching the case-class pattern.
     let mut pattern_type = node;
-    while let Some(parent) = pattern_type.parent().filter(|parent| {
+    while let Some(parent) = parents.parent(pattern_type).filter(|parent| {
         if parent.kind() == "stable_type_identifier" {
             let mut cursor = parent.walk();
             return parent.named_children(&mut cursor).last() == Some(pattern_type);
@@ -2043,7 +2104,7 @@ pub fn call_site_shape_for_reference(node: Node<'_>) -> Option<ScalaCallSiteShap
     }) {
         pattern_type = parent;
     }
-    if let Some(parent) = pattern_type.parent().filter(|parent| {
+    if let Some(parent) = parents.parent(pattern_type).filter(|parent| {
         parent.kind() == "case_class_pattern"
             && parent.child_by_field_name("type") == Some(pattern_type)
     }) {
@@ -2057,7 +2118,7 @@ pub fn call_site_shape_for_reference(node: Node<'_>) -> Option<ScalaCallSiteShap
             .count();
         return Some(ScalaCallSiteShape::ordinary(&[arity]));
     }
-    let parent = node.parent()?;
+    let parent = parents.parent(node)?;
     if parent.kind() == "infix_pattern" && parent.child_by_field_name("operator") == Some(node) {
         return Some(ScalaCallSiteShape::ordinary(&[1]));
     }
@@ -2074,10 +2135,10 @@ pub fn call_site_shape_for_reference(node: Node<'_>) -> Option<ScalaCallSiteShap
             type_arguments_only: false,
         });
     }
-    let mut expression = field_expression_for_member(node).unwrap_or(node);
+    let mut expression = field_expression_for_member_with_parents(node, parents).unwrap_or(node);
     let mut leading_literal_argument_types = None;
     let mut type_arguments_only = false;
-    while let Some(generic) = expression.parent().filter(|generic| {
+    while let Some(generic) = parents.parent(expression).filter(|generic| {
         (generic.kind() == "generic_function"
             && generic.child_by_field_name("function") == Some(expression))
             || (generic.kind() == "generic_type"
@@ -2093,7 +2154,7 @@ pub fn call_site_shape_for_reference(node: Node<'_>) -> Option<ScalaCallSiteShap
     // off a `compound_type`. It is still a constructor application of `C`, so
     // its arguments are this reference's call-site shape (#1857). The same
     // node spells a parent constructor in an `extends` clause.
-    if let Some(applied) = expression.parent().filter(|parent| {
+    if let Some(applied) = parents.parent(expression).filter(|parent| {
         parent.kind() == "applied_constructor_type" && parent.named_child(0) == Some(expression)
     }) {
         let mut cursor = applied.walk();
@@ -2109,8 +2170,8 @@ pub fn call_site_shape_for_reference(node: Node<'_>) -> Option<ScalaCallSiteShap
         }
         expression = applied;
     }
-    if let Some(instance) = expression
-        .parent()
+    if let Some(instance) = parents
+        .parent(expression)
         .filter(|parent| parent.kind() == "instance_expression")
     {
         let arguments = instance.child_by_field_name("arguments").or_else(|| {
@@ -2135,7 +2196,7 @@ pub fn call_site_shape_for_reference(node: Node<'_>) -> Option<ScalaCallSiteShap
         }
         expression = instance;
     }
-    while let Some(call) = expression.parent() {
+    while let Some(call) = parents.parent(expression) {
         if call.kind() != "call_expression"
             || call.child_by_field_name("function") != Some(expression)
         {
@@ -2601,17 +2662,24 @@ pub fn is_recovered_membership_reference(node: Node<'_>) -> bool {
 }
 
 pub fn named_argument_invocation_owner(node: Node<'_>) -> Option<Node<'_>> {
-    let assignment = node.parent()?;
+    named_argument_invocation_owner_with_parents(node, &ParentIndex::unindexed())
+}
+
+pub fn named_argument_invocation_owner_with_parents<'tree>(
+    node: Node<'tree>,
+    parents: &ParentIndex<'tree>,
+) -> Option<Node<'tree>> {
+    let assignment = parents.parent(node)?;
     if assignment.kind() != "assignment_expression"
         || assignment.child_by_field_name("left") != Some(node)
     {
         return None;
     }
-    let arguments = assignment.parent()?;
+    let arguments = parents.parent(assignment)?;
     if arguments.kind() != "arguments" {
         return None;
     }
-    let invocation = arguments.parent()?;
+    let invocation = parents.parent(arguments)?;
     match invocation.kind() {
         "call_expression" => invocation.child_by_field_name("function"),
         "instance_expression" => {
@@ -2680,11 +2748,18 @@ pub fn terminal_invocation_owner_name(node: Node<'_>) -> Option<Node<'_>> {
 /// innermost template to the outermost. This includes local templates that the
 /// analyzer does not publish as global declarations.
 pub fn enclosing_template_declarations(node: Node<'_>) -> Vec<Node<'_>> {
+    enclosing_template_declarations_with_parents(node, &ParentIndex::unindexed())
+}
+
+pub fn enclosing_template_declarations_with_parents<'tree>(
+    node: Node<'tree>,
+    parents: &ParentIndex<'tree>,
+) -> Vec<Node<'tree>> {
     let mut declarations = Vec::new();
     let mut current = node;
-    while let Some(parent) = current.parent() {
+    while let Some(parent) = parents.parent(current) {
         if matches!(parent.kind(), "template_body" | "enum_body")
-            && let Some(declaration) = parent.parent()
+            && let Some(declaration) = parents.parent(parent)
             && matches!(
                 declaration.kind(),
                 "class_definition"
@@ -2839,6 +2914,96 @@ pub fn is_declaration_name(node: Node<'_>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn indexed_syntax_matches_native_parent_lookups() {
+        let source = r#"package sample
+object Outer {
+  case class Item(value: Int)
+  class Inner {
+    def run[A](value: A)(using context: Context): A = value
+    val result = run[Int](value = 1)(using context)
+    val selected: Outer.Item = Outer.Item(1)
+    val matched = selected match {
+      case Outer.Item(value) => value
+      case other: Outer.Item => other.value
+    }
+  }
+}
+"#;
+        let mut parser = Parser::new();
+        parser
+            .set_language(&crate::scala::language::LANGUAGE.into())
+            .expect("Scala grammar");
+        let tree = parser.parse(source, None).expect("Scala tree");
+        assert!(
+            !tree.root_node().has_error(),
+            "{}",
+            tree.root_node().to_sexp()
+        );
+        let parents = ParentIndex::new(tree.root_node());
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            assert_eq!(
+                is_scala_case_pattern_binder_with_parents(node, source, &parents),
+                is_scala_case_pattern_binder(node, source),
+                "case binder at {node:?}"
+            );
+            assert_eq!(
+                qualified_stable_type_reference_with_parents(node, source, &parents)
+                    .map(|reference| (reference.segments, reference.expression, reference.role)),
+                qualified_stable_type_reference(node, source).map(|reference| (
+                    reference.segments,
+                    reference.expression,
+                    reference.role
+                )),
+                "qualified type at {node:?}"
+            );
+            assert_eq!(
+                stable_identifier_reference_with_parents(node, source, &parents)
+                    .map(|reference| reference.segments),
+                stable_identifier_reference(node, source).map(|reference| reference.segments),
+                "stable identifier at {node:?}"
+            );
+            assert_eq!(
+                is_extractor_reference_with_parents(node, &parents),
+                is_extractor_reference(node),
+                "extractor at {node:?}"
+            );
+            assert_eq!(
+                is_call_function_reference_with_parents(node, &parents),
+                is_call_function_reference(node),
+                "call function at {node:?}"
+            );
+            assert_eq!(
+                field_expression_for_member_with_parents(node, &parents),
+                field_expression_for_member(node),
+                "field expression at {node:?}"
+            );
+            assert_eq!(
+                call_site_shape_for_reference_with_parents(node, &parents),
+                call_site_shape_for_reference(node),
+                "call shape at {node:?}"
+            );
+            assert_eq!(
+                call_arities_for_reference_with_parents(node, &parents),
+                call_arities_for_reference(node),
+                "call arities at {node:?}"
+            );
+            assert_eq!(
+                named_argument_invocation_owner_with_parents(node, &parents),
+                named_argument_invocation_owner(node),
+                "named argument at {node:?}"
+            );
+            assert_eq!(
+                enclosing_template_declarations_with_parents(node, &parents),
+                enclosing_template_declarations(node),
+                "enclosing templates at {node:?}"
+            );
+            let mut cursor = node.walk();
+            stack.extend(node.children(&mut cursor));
+        }
+    }
 
     fn explicit(arity: usize) -> ScalaCallableParameterList {
         ScalaCallableParameterList {

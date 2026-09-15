@@ -370,12 +370,12 @@ mod tests {
                 RelationalInput {
                     binding: site,
                     rows: &site_rows,
-                    coverage: RelationCoverage::Exhaustive,
+                    coverage: RelationCoverage::exhaustive(),
                 },
                 RelationalInput {
                     binding: candidate,
                     rows: &one_candidate,
-                    coverage: RelationCoverage::Exhaustive,
+                    coverage: RelationCoverage::exhaustive(),
                 },
             ],
             None,
@@ -390,12 +390,12 @@ mod tests {
                 RelationalInput {
                     binding: site,
                     rows: &site_rows,
-                    coverage: RelationCoverage::Exhaustive,
+                    coverage: RelationCoverage::exhaustive(),
                 },
                 RelationalInput {
                     binding: candidate,
                     rows: &two_candidates,
-                    coverage: RelationCoverage::Exhaustive,
+                    coverage: RelationCoverage::exhaustive(),
                 },
             ],
             None,
@@ -410,7 +410,7 @@ mod tests {
                 RelationalInput {
                     binding: site,
                     rows: &site_rows,
-                    coverage: RelationCoverage::Exhaustive,
+                    coverage: RelationCoverage::exhaustive(),
                 },
                 RelationalInput {
                     binding: candidate,
@@ -571,12 +571,12 @@ mod tests {
                 RelationalInput {
                     binding: &plan.bindings[0].name,
                     rows: &argument_rows,
-                    coverage: RelationCoverage::Exhaustive,
+                    coverage: RelationCoverage::exhaustive(),
                 },
                 RelationalInput {
                     binding: &plan.bindings[1].name,
                     rows: &parameter_rows,
-                    coverage: RelationCoverage::Exhaustive,
+                    coverage: RelationCoverage::exhaustive(),
                 },
             ],
             None,
@@ -671,12 +671,12 @@ mod tests {
                 RelationalInput {
                     binding: &plan.bindings[0].name,
                     rows: &site_rows,
-                    coverage: RelationCoverage::Exhaustive,
+                    coverage: RelationCoverage::exhaustive(),
                 },
                 RelationalInput {
                     binding: &plan.bindings[1].name,
                     rows: &candidates,
-                    coverage: RelationCoverage::Exhaustive,
+                    coverage: RelationCoverage::exhaustive(),
                 },
             ],
             None,

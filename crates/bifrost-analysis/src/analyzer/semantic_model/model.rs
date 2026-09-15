@@ -9,8 +9,8 @@ use serde::{Deserialize, Serialize};
 
 /// The schema version every producer writes and every compiled artifact this
 /// build mints. Version three adds [`AmbientUseRole`] to `TypeFact` and
-/// `MemberFact`.
-pub const SEMANTIC_MODEL_SCHEMA_VERSION: u32 = 3;
+/// `MemberFact`; version four adds the portable runtime-contract companion.
+pub const SEMANTIC_MODEL_SCHEMA_VERSION: u32 = 4;
 /// The schema versions a reader accepts.
 ///
 /// Packs reject unknown fields and every object is explicitly tagged, so a
@@ -20,9 +20,12 @@ pub const SEMANTIC_MODEL_SCHEMA_VERSION: u32 = 3;
 /// pack or release asset keeps loading here until its producer regenerates it
 /// on the normal cadence. A version-two pack carries no `ambient_use` fact, so
 /// it answers "unreviewed" for every declaration, which is what absence means.
-pub const SEMANTIC_MODEL_SUPPORTED_SCHEMA_VERSIONS: &[u32] = &[2, 3];
+pub const SEMANTIC_MODEL_SUPPORTED_SCHEMA_VERSIONS: &[u32] = &[2, 3, 4];
 /// The lowest schema version whose packs may carry an `ambient_use` fact.
 pub const AMBIENT_USE_MIN_SCHEMA_VERSION: u32 = 3;
+/// The lowest native artifact schema that can carry the runtime-contracts 0.2
+/// companion. Older compiled artifacts deliberately keep their wire shape.
+pub const RUNTIME_CONTRACTS_MIN_SCHEMA_VERSION: u32 = 4;
 pub const PROCEDURE_SUMMARY_CONTRACT_VERSION: u32 = 1;
 pub const MAX_PROCEDURE_SUMMARY_ORDINAL: u32 = 65_535;
 pub const MAX_PROCEDURE_SUMMARY_LOCATIONS: usize = 65_536;
@@ -90,6 +93,102 @@ pub struct RuntimeValuesPayload {
     pub binding_evidence: Vec<RuntimeGlobalBindingEvidence>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub observations: Vec<KeyedReadObservation>,
+}
+
+/// Native companion for the CSMI runtime-values 0.2 vocabulary. The full
+/// five-family payload is retained so import/export can round-trip records
+/// and outer applicability selectors without projecting them into the older
+/// four-family model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeContractsPayload {
+    pub payload: crate::analyzer::semantic_model::runtime_contracts::RuntimeContractsPayloadV2,
+    /// The CSMI semantic model envelope is retained verbatim at this boundary
+    /// by the import adapter when a native consumer needs lossless re-export.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<serde_json::Value>")]
+    pub envelope: Option<serde_json::Value>,
+}
+
+impl RuntimeContractsPayload {
+    pub fn record_count(&self) -> usize {
+        self.payload.record_count()
+    }
+    pub fn contracts(
+        &self,
+    ) -> &crate::analyzer::semantic_model::runtime_contracts::RuntimeContractsPayloadV2 {
+        &self.payload
+    }
+
+    /// Validate the retained wire envelope and its typed five-family
+    /// projection before a consumer evaluates an activation. The envelope is
+    /// part of the authorization boundary: validating only the native records
+    /// would allow a caller to mutate a typed payload without rechecking the
+    /// producer's complete CSMI applicability and joins.
+    pub fn validate(
+        &self,
+    ) -> Result<(), Vec<crate::analyzer::semantic_model::csmi::CsmiDiagnostic>> {
+        let Some(envelope) = &self.envelope else {
+            return Err(vec![
+                crate::analyzer::semantic_model::csmi::CsmiDiagnostic::error(
+                    "runtime_contracts.envelope_missing",
+                    "$.envelope",
+                    "runtime-contracts 0.2 requires the retained CSMI semantic-model envelope",
+                ),
+            ]);
+        };
+        if self.payload.is_empty() {
+            return Err(vec![
+                crate::analyzer::semantic_model::csmi::CsmiDiagnostic::error(
+                    "runtime_contracts.empty",
+                    "$.payload",
+                    "runtime-contracts payload must contain at least one record",
+                ),
+            ]);
+        }
+        let bytes = serde_json::to_vec(envelope).map_err(|error| {
+            vec![
+                crate::analyzer::semantic_model::csmi::CsmiDiagnostic::error(
+                    "runtime_contracts.envelope_invalid",
+                    "$.envelope",
+                    error.to_string(),
+                ),
+            ]
+        })?;
+        let support = crate::analyzer::semantic_model::csmi::CsmiVocabularySupport::support(
+            RUNTIME_VALUES_VOCABULARY,
+            crate::analyzer::semantic_model::runtime_contracts::RUNTIME_VALUES_V2_VERSION,
+            crate::analyzer::semantic_model::runtime_contracts::RUNTIME_VALUES_V2_SCHEMA,
+        );
+        let validation =
+            crate::analyzer::semantic_model::csmi::validate_csmi_document(&bytes, &support);
+        if !validation.valid() {
+            return Err(validation.diagnostics);
+        }
+        let matches = crate::analyzer::semantic_model::runtime_contract_envelope_matches(
+            &self.payload,
+            envelope,
+        )
+        .map_err(|error| {
+            vec![
+                crate::analyzer::semantic_model::csmi::CsmiDiagnostic::error(
+                    "runtime_contracts.envelope_invalid",
+                    "$.envelope",
+                    error.to_string(),
+                ),
+            ]
+        })?;
+        if !matches {
+            return Err(vec![
+                crate::analyzer::semantic_model::csmi::CsmiDiagnostic::error(
+                    "runtime_contracts.envelope_mismatch",
+                    "$.envelope",
+                    "native runtime-contract records conflict with the retained CSMI envelope",
+                ),
+            ]);
+        }
+        Ok(())
+    }
 }
 
 /// Typed native companion for the CSMI collection-flow vocabulary. Collection
@@ -600,7 +699,7 @@ pub enum RuntimeExceptionOutcome {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AuthoredSemanticModelPack {
-    #[schemars(range(min = 2, max = 3))]
+    #[schemars(range(min = 2, max = 4))]
     pub schema_version: u32,
     pub pack_id: String,
     pub version: String,
@@ -1030,6 +1129,8 @@ pub struct AuthoredShard {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_values: Option<RuntimeValuesPayload>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_contracts: Option<RuntimeContractsPayload>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub collection_flows: Option<CollectionFlowsPayload>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deferred_yields: Option<DeferredYieldsPayload>,
@@ -1406,7 +1507,9 @@ pub enum AuthoredSummaryInput {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AuthoredSummaryOutput {
     NormalReturn {},
@@ -1585,9 +1688,33 @@ pub enum AuthoredConcurrencyEffect {
     TaskJoin {
         group: AuthoredSummaryInput,
     },
+    /// One `sync.Once.Do` call. `once` names the object whose completion
+    /// state guards the callable, and `callable` names the callback that runs
+    /// at most once per object. The completion of that single execution
+    /// synchronizes before the return of every `Do` on the same object,
+    /// including a panic exit, which the package documentation treats as a
+    /// return.
+    OnceDo {
+        once: AuthoredSummaryInput,
+        callable: AuthoredSummaryInput,
+    },
     LockAcquire {
         lock: AuthoredSummaryInput,
         mode: AuthoredLockMode,
+        /// The acquisition condition this modeled call establishes itself.
+        ///
+        /// `None` is the plain blocking acquire (`sync.Mutex.Lock`): the lock is
+        /// held on every path that reaches the call's continuation. `call_result_true`
+        /// is the try-acquire contract (`sync.Mutex.TryLock`, `sync.RWMutex.TryLock`,
+        /// `sync.RWMutex.TryRLock`): the call either acquires the receiver lock in
+        /// `mode` and reports `true`, or acquires nothing and reports `false`, so
+        /// the acquisition is an event on the paths where the call's boolean
+        /// result is established true and no event on the paths where it is
+        /// established false or never consumed. Per the Go memory model, the
+        /// successful acquire synchronizes with the matching release and the
+        /// failed call publishes nothing.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        condition: Option<AuthoredLockCondition>,
     },
     LockRelease {
         lock: AuthoredSummaryInput,
@@ -1607,6 +1734,35 @@ pub enum AuthoredConcurrencyEffect {
         location: AuthoredSummaryInput,
         operation: AuthoredAtomicOperation,
     },
+    /// Bind one condition variable to the locker it waits on.
+    ///
+    /// Go's `sync.NewCond(l)` stores `l` in the exported `Cond.L` field for the
+    /// lifetime of the condition variable. `Wait` releases exactly that locker,
+    /// suspends, and re-acquires it before returning, so the association is
+    /// stated once at construction and consumed by every later protocol effect.
+    CondBind {
+        condition: AuthoredSummaryOutput,
+        lock: AuthoredSummaryInput,
+    },
+    /// `(*sync.Cond).Wait`: release the associated locker, suspend, re-acquire.
+    CondWait {
+        condition: AuthoredSummaryInput,
+    },
+    /// `(*sync.Cond).Signal` / `Broadcast`: wake one or every suspended waiter.
+    CondNotify {
+        condition: AuthoredSummaryInput,
+        waiters: AuthoredCondWaiters,
+    },
+}
+
+/// How many suspended waiters one notification can resume.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthoredCondWaiters {
+    One,
+    All,
 }
 
 #[derive(
@@ -1616,6 +1772,22 @@ pub enum AuthoredConcurrencyEffect {
 pub enum AuthoredLockMode {
     Shared,
     Exclusive,
+}
+
+/// The acquisition condition a lock-acquire summary call establishes by its own
+/// result (issue #3369).
+///
+/// The only modeled condition is the try-acquire contract: the call acquires
+/// the receiver lock exactly when it reports `true`. Consumers must bind the
+/// condition through structured branch facts about the call's result, never
+/// through the method spelling, and must keep the failed and unconsumed paths
+/// acquisition free.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthoredLockCondition {
+    CallResultTrue,
 }
 
 #[derive(

@@ -24,10 +24,10 @@ use super::super::{
     PolicySuppressionDecision, PolicySuppressionMatchState, PolicySuppressionOrphanState,
     PolicySuppressionPolicyHashState, PolicySuppressionReview, PolicySuppressionTemporalState,
     ProofMetadata, ProofReason, ResolvedEndpointDependency, ResolvedEndpointIdentity,
-    ResolvedEndpointManifestEntry, ResolvedEndpointSelectorSchemas, ResolvedMatchDirectoryManifest,
-    ResolvedPrecedenceEdge, ResolvedTypestateTerminal, SchemaVersionOrigin,
-    SchemaVersionResolution, StableSemanticIdentity, TaintSourceEvidence, TaintSystemEntry,
-    TaintTrustBoundary, TypestateViolationEvidence,
+    ResolvedEndpointManifestEntry, ResolvedEndpointSelectorSchemas, ResolvedEndpointSetDependency,
+    ResolvedMatchDirectoryManifest, ResolvedPrecedenceEdge, ResolvedTypestateTerminal,
+    SchemaVersionOrigin, SchemaVersionResolution, StableSemanticIdentity, TaintSourceEvidence,
+    TaintSystemEntry, TaintTrustBoundary, TypestateViolationEvidence,
 };
 
 use super::{
@@ -995,6 +995,13 @@ fn write_rule_detail<W: Write>(
             write_match_directory_manifest(output, manifest)?;
         }
     }
+    if rule.endpoint_set_dependencies().is_empty() {
+        writeln!(output, "  endpoint-set dependencies: none").map_err(map_io_error)?;
+    } else {
+        for dependency in rule.endpoint_set_dependencies() {
+            write_endpoint_set_dependency(output, dependency)?;
+        }
+    }
     if rule.precedence_manifest().edges.is_empty() {
         writeln!(output, "  precedence: none").map_err(map_io_error)?;
     } else {
@@ -1225,6 +1232,13 @@ fn write_endpoint_origin<W: Write>(
             escape_terminal_text(source.as_str()),
         )
         .map_err(map_io_error)?,
+        EndpointOrigin::EndpointSetFile { path, source } => write!(
+            output,
+            "endpoint-set file {} from {}",
+            escape_terminal_text(path.as_str()),
+            escape_terminal_text(source.as_str()),
+        )
+        .map_err(map_io_error)?,
     }
     writeln!(output).map_err(map_io_error)
 }
@@ -1246,6 +1260,28 @@ fn write_match_directory_manifest<W: Write>(
     write_category_predicate(output, "    categories", manifest.categories())?;
     for selected in manifest.selected() {
         write_manifest_entry(output, selected)?;
+    }
+    Ok(())
+}
+
+fn write_endpoint_set_dependency<W: Write>(
+    output: &mut BoundedWriter<W>,
+    dependency: &ResolvedEndpointSetDependency,
+) -> Result<(), PolicyRenderError> {
+    writeln!(
+        output,
+        "  endpoint-set dependency {} (hash {})",
+        escape_terminal_text(dependency.source().as_str()),
+        dependency.semantic_hash(),
+    )
+    .map_err(map_io_error)?;
+    for entry in dependency.entries() {
+        writeln!(
+            output,
+            "    entry: {}",
+            escape_terminal_text(entry.as_str()),
+        )
+        .map_err(map_io_error)?;
     }
     Ok(())
 }
@@ -2797,6 +2833,25 @@ fn write_run_obligation<W: Write>(
     .map_err(map_io_error)?;
     if let Some(key) = obligation.group_key() {
         write!(output, " key {}", escape_terminal_text(key)).map_err(map_io_error)?;
+    }
+    // The partitions are what make an analysis-backed obligation addressable:
+    // the reasons say a solve did not finish, and these say which one.
+    for (index, partition) in obligation.partitions().iter().enumerate() {
+        write!(
+            output,
+            "{} {} {}",
+            if index == 0 {
+                " in analysis partition"
+            } else {
+                ","
+            },
+            escape_terminal_text(partition.family()),
+            escape_terminal_text(partition.root()),
+        )
+        .map_err(map_io_error)?;
+    }
+    if obligation.partitions_truncated() {
+        write!(output, ", ...").map_err(map_io_error)?;
     }
     write!(output, ": {} (", obligation.kind().as_str()).map_err(map_io_error)?;
     for (index, reason) in obligation.reasons().iter().enumerate() {

@@ -493,6 +493,11 @@ pub struct JsTsRuntimeRead {
     pub range: Range,
     pub root_range: Range,
     pub container_range: Range,
+    /// The structured query seed that represents this access. Dot-member
+    /// reads are field accesses themselves; a subscript read is represented
+    /// by its statically resolved container field so it does not require
+    /// mapping every subscript expression to the field-access kind.
+    pub candidate_anchor: Range,
     pub key_range: Range,
     pub lexical_resolution: JsTsRuntimeRootResolution,
     pub mutation: JsTsRuntimeMutationEvidence,
@@ -1690,6 +1695,11 @@ pub fn extract_js_ts_runtime_reads(
                 range: node_source_range(node),
                 root_range: node_source_range(path_root),
                 container_range: node_source_range(container.node),
+                candidate_anchor: if node.kind() == "subscript_expression" {
+                    node_source_range(container.node)
+                } else {
+                    node_source_range(node)
+                },
                 key_range: key.key_range,
                 lexical_resolution,
                 mutation,
@@ -3217,6 +3227,32 @@ mod tests {
                 .count(),
             0
         );
+    }
+
+    #[test]
+    fn runtime_reads_use_container_anchor_for_static_subscript_properties() {
+        let source = "process.env['CONFIG_TOKEN']; process.env.REMOTE_DIRECTORY;";
+        let tree = parse_javascript(source);
+        let facts = extract_js_ts_runtime_reads(tree.root_node(), source, 32);
+        let bracket = facts
+            .reads
+            .iter()
+            .find(|read| read.access == JsTsRuntimeAccessKey::Property("CONFIG_TOKEN".into()))
+            .expect("bracket property read");
+        assert_eq!(
+            &source[bracket.range.start_byte..bracket.range.end_byte],
+            "process.env['CONFIG_TOKEN']"
+        );
+        assert_eq!(
+            &source[bracket.candidate_anchor.start_byte..bracket.candidate_anchor.end_byte],
+            "process.env"
+        );
+        let dot = facts
+            .reads
+            .iter()
+            .find(|read| read.access == JsTsRuntimeAccessKey::Property("REMOTE_DIRECTORY".into()))
+            .expect("dot property read");
+        assert_eq!(dot.candidate_anchor, dot.range);
     }
 
     #[test]

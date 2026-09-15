@@ -114,6 +114,11 @@ pub struct SearchSymbolPatternBatch {
     /// the whole disjunction unconditionally true and is stored as `None`
     /// instead.
     required_literals: Option<Vec<Vec<String>>>,
+    /// Request patterns that are neither valid regex nor a translatable glob.
+    /// Reported to the caller instead of silently matching nothing: a dropped
+    /// pattern turns "your syntax is wrong" into "the workspace has no such
+    /// symbols", which is a false negative about the code (#3279).
+    invalid_patterns: Vec<String>,
     complete: bool,
 }
 
@@ -126,6 +131,7 @@ impl SearchSymbolPatternBatch {
         let mut compiled_patterns = Vec::new();
         let mut compiled_regexes = Vec::new();
         let mut required_literals = Vec::new();
+        let mut invalid_patterns = Vec::new();
         for pattern in &patterns {
             if cancellation.is_some_and(crate::CancellationToken::is_cancelled) {
                 return Self {
@@ -133,16 +139,20 @@ impl SearchSymbolPatternBatch {
                     auto_quote,
                     compiled: None,
                     required_literals: None,
+                    invalid_patterns: Vec::new(),
                     complete: false,
                 };
             }
+            let raw_pattern = pattern.clone();
             let pattern = normalize_search_pattern(pattern, auto_quote);
-            if let Ok(compiled) = RegexBuilder::new(&pattern).case_insensitive(true).build() {
-                // Extract from the normalized pattern, which is the exact text
-                // the authoritative matcher compiled.
-                required_literals.push(required_storage_literals(&pattern));
-                compiled_patterns.push(pattern);
+            if let Some((effective_pattern, compiled)) = compile_search_pattern(&pattern) {
+                // Literals are extracted from the effective pattern, which is
+                // the exact text the authoritative matcher compiled.
+                required_literals.push(required_storage_literals(&effective_pattern));
+                compiled_patterns.push(effective_pattern);
                 compiled_regexes.push(compiled);
+            } else {
+                invalid_patterns.push(raw_pattern);
             }
         }
 
@@ -152,6 +162,7 @@ impl SearchSymbolPatternBatch {
                 auto_quote,
                 compiled: None,
                 required_literals: None,
+                invalid_patterns: Vec::new(),
                 complete: false,
             };
         }
@@ -176,6 +187,7 @@ impl SearchSymbolPatternBatch {
             auto_quote,
             compiled,
             required_literals,
+            invalid_patterns,
             complete: true,
         }
     }
@@ -190,6 +202,19 @@ impl SearchSymbolPatternBatch {
 
     pub fn complete(&self) -> bool {
         self.complete
+    }
+
+    /// The request patterns that could not be interpreted at all, verbatim as
+    /// requested and in request order. Empty when every pattern compiled.
+    pub fn invalid_patterns(&self) -> &[String] {
+        &self.invalid_patterns
+    }
+
+    /// Whether at least one pattern compiled. A batch with patterns but no
+    /// compiled matcher can only match nothing; callers use this to skip the
+    /// storage scan and answer from the invalid-pattern report instead.
+    pub fn has_compiled_patterns(&self) -> bool {
+        self.compiled.is_some()
     }
 
     pub fn is_match(&self, value: &str) -> bool {
@@ -501,6 +526,39 @@ fn normalize_search_pattern(pattern: &str, auto_quote: bool) -> String {
     } else {
         escape_sigil_anchors(pattern)
     }
+}
+
+/// Compile one normalized search pattern, falling back to glob wildcards when
+/// it is not a valid regular expression.
+///
+/// A leading `*` (as in `*Language*`) never compiles as a regex -- a
+/// repetition operator with nothing to repeat -- and the glob spelling is the
+/// one callers reach for first, so a pattern that fails as a regex and carries
+/// `*` or `?` is reinterpreted as a glob: `*` matches any run of characters,
+/// `?` matches exactly one, and every other character is literal. Returns the
+/// pattern text that compiled (the normalized regex, or its glob translation)
+/// with the compiled regex, or `None` when neither interpretation is valid and
+/// the pattern must be reported instead of silently matching nothing (#3279).
+fn compile_search_pattern(normalized: &str) -> Option<(String, Regex)> {
+    if let Ok(compiled) = RegexBuilder::new(normalized).case_insensitive(true).build() {
+        return Some((normalized.to_string(), compiled));
+    }
+    if !normalized.contains('*') && !normalized.contains('?') {
+        return None;
+    }
+    let mut translated = String::with_capacity(normalized.len() * 2);
+    for character in normalized.chars() {
+        match character {
+            '*' => translated.push_str(".*"),
+            '?' => translated.push('.'),
+            other => translated.push_str(&regex::escape(&other.to_string())),
+        }
+    }
+    let compiled = RegexBuilder::new(&translated)
+        .case_insensitive(true)
+        .build()
+        .ok()?;
+    Some((translated, compiled))
 }
 
 /// Escape anchor metacharacters only where they form part of an identifier token.
@@ -3131,5 +3189,57 @@ mod required_literal_tests {
             batch.required_storage_literals(),
             Some([vec!["valueflow".to_string()]].as_slice())
         );
+    }
+
+    /// #3279: `*Language*` is the spelling callers reach for first and is not
+    /// valid regex (a leading repetition operator has nothing to repeat), so it
+    /// must fall back to glob semantics -- containment -- instead of silently
+    /// matching nothing. The translated pattern keeps its required literal so
+    /// the storage prefilter still applies.
+    #[test]
+    fn leading_wildcard_patterns_compile_as_glob_containment() {
+        let batch = SearchSymbolPatternBatch::compile(
+            vec!["*Language*".to_string(), "*Query*Domain*".to_string()],
+            false,
+            None,
+        );
+
+        assert!(batch.complete());
+        assert!(batch.invalid_patterns().is_empty());
+        assert!(batch.is_match("bifrost_core::Language"));
+        assert!(batch.is_match("crates::rql::QueryEvaluationDomain"));
+        assert!(!batch.is_match("crates::rql::Lantern"));
+        assert_eq!(
+            batch.required_storage_literals(),
+            Some(
+                [
+                    vec!["language".to_string()],
+                    vec!["domain".to_string(), "query".to_string()],
+                ]
+                .as_slice()
+            )
+        );
+    }
+
+    /// A pattern that is neither valid regex nor carries glob wildcards cannot
+    /// be interpreted at all. It must be reported, not dropped: a dropped
+    /// pattern answers "no such symbols" about a request that was malformed.
+    #[test]
+    fn uninterpretable_patterns_are_reported_not_dropped() {
+        let batch = SearchSymbolPatternBatch::compile(
+            vec!["foo(bar".to_string(), "Language".to_string()],
+            false,
+            None,
+        );
+
+        assert_eq!(batch.invalid_patterns(), ["foo(bar".to_string()].as_slice());
+        assert!(batch.has_compiled_patterns());
+        assert!(batch.is_match("app::LanguageTool"));
+        assert!(!batch.is_match("app::foo(bar"));
+
+        let all_invalid =
+            SearchSymbolPatternBatch::compile(vec!["foo(bar".to_string()], false, None);
+        assert!(!all_invalid.has_compiled_patterns());
+        assert_eq!(all_invalid.invalid_patterns().len(), 1);
     }
 }

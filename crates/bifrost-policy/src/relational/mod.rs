@@ -27,6 +27,7 @@ mod occurrence;
 mod validate;
 
 pub use coverage::{
+    CoverageExtent, CoveragePartition, CoverageRoot, MAX_COVERAGE_PARTITION_ROOTS,
     MAX_RETAINED_RELATIONAL_OBLIGATIONS, RelationCoverage, RelationalInput, RelationalObligation,
     RelationalObligationKind,
 };

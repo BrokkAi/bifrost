@@ -82,6 +82,7 @@ pub(crate) fn resolved_policy_to_json(
     catalogs: &[ResolvedCatalogIdentity],
     endpoints: &[ResolvedEndpointDependency],
     match_manifests: &[ResolvedMatchDirectoryManifest],
+    endpoint_set_dependencies: &[ResolvedEndpointSetDependency],
     precedence: &PolicyPrecedenceManifest,
 ) -> Result<Value, LoadedModelError> {
     let mut value = RqlpDocument::Policy {
@@ -182,6 +183,16 @@ pub(crate) fn resolved_policy_to_json(
         "match_manifests".to_string(),
         Value::Array(sorted_manifests(match_manifests)?),
     );
+    // Endpoint-set source paths are provenance only. The sorted content hashes
+    // make imported meaning part of policy identity while keeping equivalent
+    // source layouts and workspace locations semantically interchangeable.
+    let endpoint_set_hashes = sorted_endpoint_set_hashes(endpoint_set_dependencies);
+    if !endpoint_set_hashes.is_empty() {
+        object.insert(
+            "endpoint_set_dependencies".to_string(),
+            Value::Array(endpoint_set_hashes),
+        );
+    }
     object.insert("precedence".to_string(), precedence_to_json(precedence));
     let mut locator_resolutions = super::locator::resolved_locator_metadata(definition)
         .into_iter()
@@ -238,6 +249,7 @@ pub(crate) fn loaded_policy_to_json(policy: &LoadedPolicy) -> Result<Value, Load
         policy.catalogs(),
         policy.endpoint_dependencies(),
         policy.match_directory_manifests(),
+        policy.endpoint_set_dependencies(),
         policy.precedence_manifest(),
     )
 }
@@ -730,6 +742,19 @@ fn sorted_manifests(
     }
     manifests.dedup_by(|left, right| left.0 == right.0);
     Ok(manifests.into_iter().map(|(_, value)| value).collect())
+}
+
+fn sorted_endpoint_set_hashes(dependencies: &[ResolvedEndpointSetDependency]) -> Vec<Value> {
+    let mut hashes = dependencies
+        .iter()
+        .map(|dependency| dependency.semantic_hash)
+        .collect::<Vec<_>>();
+    hashes.sort();
+    hashes.dedup();
+    hashes
+        .into_iter()
+        .map(|hash| Value::String(hash.to_string()))
+        .collect()
 }
 
 pub(crate) fn resolved_selector_to_json(selector: &ResolvedPolicySelector) -> Value {

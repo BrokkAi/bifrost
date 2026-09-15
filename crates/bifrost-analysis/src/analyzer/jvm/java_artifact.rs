@@ -3,10 +3,10 @@ use crate::analyzer::semantic_model::{
     ArtifactProducerLimits, ArtifactProduction, ArtifactProductionRequest, AuthoredPayload,
     AuthoredSemanticModelPack, AuthoredShard, BoundedProducerDiagnostics, Completeness,
     ExactArtifact, ExternalArtifactKind, ExternalArtifactPackProducer, HierarchyFact,
-    HierarchyKind, Locator, MemberFact, MemberIdentity, MemberKind, Parameter, Producer,
-    ProducerDiagnostic, ProducerDiagnosticSeverity, Signature, TypeFact, TypeIdentity, TypeKind,
-    TypeRef, Visibility, WildcardVariance, carried_source_paths, member_declaration_id,
-    read_exact_artifact_while, type_declaration_id,
+    HierarchyKind, Locator, MemberFact, MemberIdentity, MemberKind, Parameter,
+    ParameterPassingMode, Producer, ProducerDiagnostic, ProducerDiagnosticSeverity, Signature,
+    TypeFact, TypeIdentity, TypeKind, TypeRef, Visibility, WildcardVariance, carried_source_paths,
+    member_declaration_id, read_exact_artifact_while, type_declaration_id,
 };
 use crate::analyzer::tree_walk::named_children_iter;
 use crate::hash::{HashMap, HashSet};
@@ -523,6 +523,7 @@ fn finish_production(
             relations: Vec::new(),
         },
         runtime_values: None,
+        runtime_contracts: None,
         collection_flows: None,
         deferred_yields: None,
         conditional_type_refinements: None,
@@ -580,6 +581,7 @@ pub(super) fn java_api_facts(
             );
             break;
         }
+        let owner_name = declaration.name.clone();
         let type_id = type_ids
             .get(&declaration.name)
             .expect("parsed Java type receives an id")
@@ -604,7 +606,7 @@ pub(super) fn java_api_facts(
             guard: None,
             locator: declaration.locator,
         });
-        for member in declaration.members {
+        for mut member in declaration.members {
             if types.len().saturating_add(members.len()) >= max_records {
                 diagnostics.warning(
                     "limit.records",
@@ -642,6 +644,29 @@ pub(super) fn java_api_facts(
                     .as_ref()
                     .and_then(|signature| signature.returns.as_ref()),
             });
+            let aliases = curated_jdk_member_ids(
+                &owner_name,
+                member.member_kind,
+                member.is_static,
+                &member.name,
+                &parameter_types,
+            )
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+            if let (Some(formal_name), Some(signature)) = (
+                curated_jdk_formal_name(
+                    &owner_name,
+                    member.member_kind,
+                    member.is_static,
+                    &member.name,
+                    &parameter_types,
+                ),
+                member.signature.as_mut(),
+            ) {
+                debug_assert_eq!(signature.parameters.len(), 1);
+                signature.parameters[0].name = Some(formal_name.to_owned());
+            }
             members.push(MemberFact {
                 ambient_use: None,
                 id,
@@ -669,13 +694,57 @@ pub(super) fn java_api_facts(
                 receiver: None,
                 extension_receiver: None,
                 extension_receiver_constraints: Vec::new(),
-                aliases: Vec::new(),
+                aliases,
                 guard: None,
                 locator: member.locator,
             });
         }
     }
     (types, members)
+}
+
+fn curated_jdk_formal_name(
+    owner: &str,
+    kind: MemberKind,
+    is_static: bool,
+    name: &str,
+    parameter_types: &[TypeRef],
+) -> Option<&'static str> {
+    match curated_jdk_member_ids(owner, kind, is_static, name, parameter_types)? {
+        "member.system.getenv-string" => Some("name"),
+        "member.runtime.exec-string" => Some("command"),
+        "member.statement.execute" => Some("sql"),
+        _ => unreachable!("reviewed JDK member IDs have reviewed formal names"),
+    }
+}
+
+fn curated_jdk_member_ids(
+    owner: &str,
+    kind: MemberKind,
+    is_static: bool,
+    name: &str,
+    parameter_types: &[TypeRef],
+) -> Option<&'static str> {
+    if kind != MemberKind::Method || parameter_types.len() != 1 {
+        return None;
+    }
+    let TypeRef::Named {
+        name: parameter_type,
+        arguments,
+        ..
+    } = &parameter_types[0]
+    else {
+        return None;
+    };
+    if !arguments.is_empty() || parameter_type != "java.lang.String" {
+        return None;
+    }
+    match (owner, is_static, name) {
+        ("java.lang.System", true, "getenv") => Some("member.system.getenv-string"),
+        ("java.lang.Runtime", false, "exec") => Some("member.runtime.exec-string"),
+        ("java.sql.Statement", false, "execute") => Some("member.statement.execute"),
+        _ => None,
+    }
 }
 
 pub(super) fn source_api_types(
@@ -1320,7 +1389,7 @@ fn source_parameters(
             r#type,
             optional: false,
             variadic: parameter.kind() == "spread_parameter",
-            passing_mode: Default::default(),
+            passing_mode: ParameterPassingMode::PositionalOnly,
         });
     }
     Some(result)
@@ -2306,7 +2375,7 @@ fn class_method_member(
             r#type,
             optional: false,
             variadic: flags.contains(MethodFlags::ACC_VARARGS) && index + 1 == parameter_count,
-            passing_mode: Default::default(),
+            passing_mode: ParameterPassingMode::PositionalOnly,
         })
         .collect();
     let constructor = binary_name == "<init>";
@@ -2759,6 +2828,55 @@ mod tests {
         "package fixture.api; public record Pair(String name, int count) {}\n";
     const FLAVOR_SOURCE: &str = "package fixture.api; public enum Flavor { VANILLA }\n";
     const DOLLAR_SOURCE: &str = "package fixture.api; public class Dollar$Type { public Dollar$Type self() { return this; } }\n";
+
+    #[test]
+    fn curated_jdk_member_identity_requires_exact_owner_receiver_and_string_overload() {
+        let string = named_type("java.lang.String".to_owned());
+        let string_array = TypeRef::Array {
+            element: Box::new(string.clone()),
+        };
+
+        assert_eq!(
+            curated_jdk_member_ids(
+                "java.lang.System",
+                MemberKind::Method,
+                true,
+                "getenv",
+                std::slice::from_ref(&string),
+            ),
+            Some("member.system.getenv-string")
+        );
+        assert_eq!(
+            curated_jdk_formal_name(
+                "java.lang.Runtime",
+                MemberKind::Method,
+                false,
+                "exec",
+                std::slice::from_ref(&string),
+            ),
+            Some("command")
+        );
+        assert_eq!(
+            curated_jdk_member_ids(
+                "java.lang.Runtime",
+                MemberKind::Method,
+                false,
+                "exec",
+                &[string_array],
+            ),
+            None
+        );
+        assert_eq!(
+            curated_jdk_member_ids(
+                "fixture.Runtime",
+                MemberKind::Method,
+                false,
+                "exec",
+                &[string],
+            ),
+            None
+        );
+    }
 
     struct JavaFixture {
         _temp: tempfile::TempDir,

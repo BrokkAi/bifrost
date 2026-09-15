@@ -46,6 +46,9 @@ use tree_sitter::Node;
 
 use crate::java::declarations::{collect_type_identifiers, java_package_fq, parse_tree};
 use crate::java::imports::{import_package, non_static_import_path, static_import_path};
+use crate::java::resolution::{
+    JavaImportInventory, JavaImportSplitGap, prove_java_single_type_import,
+};
 use crate::proof::JvmRetainedExternalIndex;
 
 /// The package whose types every Java file sees without importing them.
@@ -451,9 +454,14 @@ pub fn resolve_java_forward_type_name_candidates(
     file: &ProjectFile,
     raw_name: &str,
 ) -> Vec<CodeUnit> {
-    resolve_java_type_name_with(source, token, file, raw_name, |fqn| {
-        forward_source_type_by_fqn(source, file, fqn)
-    })
+    let classes_at = |fqn: &str| forward_source_classes_by_fqn(source, file, fqn);
+    resolve_java_type_name_with(
+        source,
+        token,
+        file,
+        raw_name,
+        java_import_inventory(source, &classes_at),
+    )
 }
 
 /// Resolve a source type while a usage query already owns the complete
@@ -491,18 +499,13 @@ pub fn resolve_java_usage_type_name_in(
     file: &ProjectFile,
     raw_name: &str,
 ) -> Option<CodeUnit> {
+    let classes_at = lookup_classes_at(index, |_| true);
     unique_candidate(resolve_java_type_name_with(
         source,
         token,
         file,
         raw_name,
-        |fqn| {
-            index
-                .fqn(fqn)
-                .iter()
-                .find(|unit| unit.is_class() && unit.fq_name() == fqn)
-                .cloned()
-        },
+        java_import_inventory(source, &classes_at),
     ))
 }
 
@@ -623,31 +626,73 @@ pub fn resolve_java_type_name_candidates_in_realm(
     file: &ProjectFile,
     raw_name: &str,
 ) -> Vec<CodeUnit> {
-    resolve_java_type_name_with(source, token, file, raw_name, |fqn| {
+    let classes_at = lookup_classes_at(index, |unit| !unit.is_synthetic());
+    resolve_java_type_name_with(
+        source,
+        token,
+        file,
+        raw_name,
+        java_import_inventory(source, &classes_at),
+    )
+}
+
+/// The classes one bounded definition lookup holds under a rendered name.
+///
+/// The filter runs inside the lookup so a caller that excludes synthetic
+/// declarations excludes them from every tier the walk below reads, exactly as
+/// the single-candidate closure it replaces did.
+fn lookup_classes_at<'a>(
+    index: &'a dyn BoundedDefinitionLookup,
+    keep: impl Fn(&CodeUnit) -> bool + 'a,
+) -> impl Fn(&str) -> Vec<CodeUnit> + 'a {
+    move |fqn: &str| {
         index
             .fqn(fqn)
-            .iter()
-            .find(|unit| unit.is_class() && unit.fq_name() == fqn && !unit.is_synthetic())
-            .cloned()
-    })
+            .into_iter()
+            .filter(|unit| unit.is_class() && unit.fq_name() == fqn && keep(unit))
+            .collect()
+    }
+}
+
+/// The import-split inventory a Java resolution reads from `classes_at`.
+///
+/// Closing an alternative package-prefix split claims that a package holds no
+/// top-level type under a name, which only an index that covers every
+/// declaration of its scope can say. A bounded, budgeted or suppressed index
+/// answers with what it found, and the proof then keeps every alternative
+/// split open instead of promoting one reading of the rendered name.
+fn java_import_inventory<'a>(
+    source: &dyn JavaSource,
+    classes_at: &'a dyn Fn(&str) -> Vec<CodeUnit>,
+) -> JavaImportInventory<'a> {
+    if source.has_complete_symbol_lookup_index() {
+        JavaImportInventory::exhaustive(classes_at)
+    } else {
+        JavaImportInventory::partial(classes_at)
+    }
 }
 
 /// Walk Java's type-name tiers and return every candidate the deciding
 /// tier produced.
 ///
 /// Every tier but one is unique by construction, so the result is almost
-/// always zero or one unit. The exception is the on-demand tier: two
-/// wildcard imports can both supply the simple name, and a selection
-/// through that tier is then not provably unique. All peers are returned
-/// so the caller can report the ambiguity, mirroring what
+/// always zero or one unit. The exceptions are the single-type import tier,
+/// where [`prove_java_single_type_import`] keeps every distinct reading of a
+/// package-prefix split that it cannot close, and the on-demand tier, where two
+/// wildcard imports can both supply the simple name. All peers are returned so
+/// the caller can report the ambiguity, mirroring what
 /// `resolve_external_imports` already expresses for external targets by
 /// refusing to pick one (issue #1602).
+///
+/// `inventory` is the declaration index every tier reads. It carries whether
+/// an empty answer proves absence, which is what lets the import tier close an
+/// alternative split; see [`JavaImportInventory`].
 pub fn resolve_java_type_name_with(
     source: &dyn JavaSource,
     token: QueryToken<'_>,
     file: &ProjectFile,
     raw_name: &str,
-    mut source_type_by_fqn: impl FnMut(&str) -> Option<CodeUnit>,
+    inventory: JavaImportInventory<'_>,
 ) -> Vec<CodeUnit> {
     let normalized = raw_name.trim();
     if normalized.is_empty() {
@@ -655,7 +700,7 @@ pub fn resolve_java_type_name_with(
     }
 
     if normalized.contains('.')
-        && let Some(unit) = source_type_by_fqn(normalized)
+        && let Some(unit) = inventory.classes_at(normalized).into_iter().next()
     {
         return vec![unit];
     }
@@ -672,18 +717,27 @@ pub fn resolve_java_type_name_with(
             continue;
         };
         // A matching single-type import constrains this name even when its
-        // declaration is outside the indexed workspace.
+        // declaration is outside the indexed workspace. The path's
+        // package-prefix splits decide which declaration it means: a proven
+        // split answers with its top-level type, and an unproven one keeps
+        // every reading as a peer (issue #1602) instead of promoting whichever
+        // declaration the rendered lookup listed first.
         if normalized == imported_name {
-            let unit = source_type_by_fqn(&import_path.render_segments("."));
-            source.trace_explicit_import_win(file, normalized, unit.as_ref(), &imports);
-            return unit.into_iter().collect();
+            let proof = prove_java_single_type_import(&import_path.segments, inventory);
+            source.trace_explicit_import_win(
+                file,
+                normalized,
+                proof.single_target().as_ref(),
+                &imports,
+            );
+            return proof.targets();
         }
         if let Some(rest) = normalized
             .strip_prefix(imported_name)
             .and_then(|rest| rest.strip_prefix('.'))
         {
             let nested_fqn = format!("{}.{rest}", import_path.render_segments("."));
-            let unit = source_type_by_fqn(&nested_fqn);
+            let unit = inventory.classes_at(&nested_fqn).into_iter().next();
             source.trace_explicit_import_win(file, normalized, unit.as_ref(), &imports);
             return unit.into_iter().collect();
         }
@@ -698,7 +752,7 @@ pub fn resolve_java_type_name_with(
             continue;
         }
         let fqn = format!("{}.{normalized}", import_path.render_segments("."));
-        if let Some(unit) = source_type_by_fqn(&fqn)
+        if let Some(unit) = inventory.classes_at(&fqn).into_iter().next()
             && !wildcard_candidates.contains(&unit)
         {
             wildcard_candidates.push(unit);
@@ -714,11 +768,15 @@ pub fn resolve_java_type_name_with(
     }
 
     let same_package_fqn = java_same_package_fqn(source, file, normalized);
-    let unit = source_type_by_fqn(&same_package_fqn).or_else(|| {
-        java_file_is_in_default_package(source, file)
-            .then(|| source_type_by_fqn(normalized))
-            .flatten()
-    });
+    let unit = inventory
+        .classes_at(&same_package_fqn)
+        .into_iter()
+        .next()
+        .or_else(|| {
+            java_file_is_in_default_package(source, file)
+                .then(|| inventory.classes_at(normalized).into_iter().next())
+                .flatten()
+        });
     if let Some(unit) = unit.as_ref() {
         source.trace_type_name_tier(
             normalized,
@@ -802,29 +860,35 @@ pub fn java_type_name_candidate_fqns(
     candidates
 }
 
-/// The declaration a forward type-name tier means by `fqn`, seen from `file`.
+/// Every class the forward index holds under `fqn`, seen from `file`.
 ///
 /// A mirrored source tree indexes one fully qualified name more than once, and
 /// which row comes back first is a store-order accident. The referring file
 /// decides: when that file declares `fqn` itself, its own copy is the one the
 /// compilation unit sees, so a supertype named from inside it anchors on the
 /// same physical declaration the descendant index already anchors on
-/// (`same_source_hierarchy_identity`, #2045).
-fn forward_source_type_by_fqn(
+/// (`same_source_hierarchy_identity`, #2045). It leads the list; the rest stay
+/// behind it for the import-split proof, which needs every reading of a name
+/// rather than the tier's one pick.
+fn forward_source_classes_by_fqn(
     source: &dyn JavaSource,
     file: &ProjectFile,
     fqn: &str,
-) -> Option<CodeUnit> {
-    let candidates = source
+) -> Vec<CodeUnit> {
+    let mut candidates = source
         .forward_definition_fqn(fqn)
         .into_iter()
         .filter(|unit| unit.is_class() && unit.fq_name() == fqn)
         .collect::<Vec<_>>();
+    // The referring file decides: when that file declares `fqn` itself, its
+    // own copy is the one the compilation unit sees, so a supertype named from
+    // inside it anchors on the same physical declaration the descendant index
+    // already anchors on (`same_source_hierarchy_identity`, #2045). Every other
+    // candidate stays behind it, in index order, for the import-split proof.
+    if let Some(index) = candidates.iter().position(|unit| unit.source() == file) {
+        candidates.swap(0, index);
+    }
     candidates
-        .iter()
-        .find(|unit| unit.source() == file)
-        .or_else(|| candidates.first())
-        .cloned()
 }
 
 /// The single answer of a candidate set, or `None` when the set is empty or
@@ -930,6 +994,36 @@ fn usage_source_type_by_fqn_in(
 // Import resolution
 // ---------------------------------------------------------------------------
 
+/// The package-prefix split gap of the single-type import that binds
+/// `raw_name` in `file`, or `None` when no such import exists or its split is
+/// proven.
+///
+/// This is the strict telemetry half of the proof: a caller that already has
+/// the declaration the name resolves to still needs to know that the route to
+/// it was not *proven*, because an alternative split that the inventory cannot
+/// close may hold a different declaration.
+pub fn java_single_type_import_gap(
+    source: &dyn JavaSource,
+    token: QueryToken<'_>,
+    index: &dyn BoundedDefinitionLookup,
+    file: &ProjectFile,
+    raw_name: &str,
+) -> Option<JavaImportSplitGap> {
+    let normalized = raw_name.trim();
+    if normalized.is_empty() {
+        return None;
+    }
+    let imports = source.import_info_of(token, file);
+    let path = imports.iter().find_map(|import| {
+        (!import.is_wildcard)
+            .then(|| non_static_import_path(import))
+            .flatten()
+            .filter(|_| import.identifier.as_deref() == Some(normalized))
+    })?;
+    let classes_at = lookup_classes_at(index, |_| true);
+    prove_java_single_type_import(&path.segments, java_import_inventory(source, &classes_at)).gap()
+}
+
 /// The uncached half of the analyzer's `resolve_imports`: the simple names a
 /// file's imports bind, resolved to workspace declarations.
 pub fn resolve_java_import_infos(
@@ -941,6 +1035,8 @@ pub fn resolve_java_import_infos(
     let mut wildcard_resolved = HashMap::<String, CodeUnit>::default();
 
     source.with_usage_definitions(token, &mut |definitions| {
+        let classes_at = lookup_classes_at(definitions, |_| true);
+        let inventory = java_import_inventory(source, &classes_at);
         for import in imports {
             let Some(import_path) = non_static_import_path(import) else {
                 continue;
@@ -948,8 +1044,11 @@ pub fn resolve_java_import_infos(
             if import.is_wildcard {
                 continue;
             }
+            // The split proof decides which declaration the path means. Its
+            // first target is the legacy tier's one answer when no split is
+            // proven, and the exact top-level type when one is.
             if let Some(code_unit) =
-                usage_source_type_by_fqn_in(definitions, &import_path.render_segments("."))
+                prove_java_single_type_import(&import_path.segments, inventory).single_target()
             {
                 resolved.insert(code_unit.identifier().to_string(), code_unit);
             }

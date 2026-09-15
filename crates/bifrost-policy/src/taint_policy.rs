@@ -859,6 +859,7 @@ pub(crate) struct TaintPolicyCompiler<'a> {
     /// on every taint run so a raw report says what the policy's endpoint
     /// selectors actually matched in this workspace (#2659).
     bound_endpoints: BoundEndpointCounts,
+    store_key_metrics: StoreKeyMetrics,
     /// Whether an endpoint was selected through an authored override contract.
     /// This caps a clean result; it never upgrades an incomplete solve.
     authored_selector_summary: bool,
@@ -869,6 +870,19 @@ pub(crate) struct TaintPolicyCompiler<'a> {
 struct BoundEndpointCounts {
     sources: usize,
     sinks: usize,
+}
+
+/// Counts refer to declared key operands, including reads and writes. They
+/// expose the precision opportunity without interpreting a missing finding
+/// as proof that a previous finding was a false positive.
+#[derive(Debug, Default)]
+struct StoreKeyMetrics {
+    operands: u64,
+    direct_literals: u64,
+    recovered: u64,
+    unproven: u64,
+    budget_hits: u64,
+    work: u64,
 }
 
 /// Which endpoint set(s) of one taint policy bound no location at all (#2659).
@@ -1527,6 +1541,7 @@ impl<'a> TaintPolicyCompiler<'a> {
             refused_sites: Vec::new(),
             named_actuals: HashMap::new(),
             bound_endpoints: BoundEndpointCounts::default(),
+            store_key_metrics: StoreKeyMetrics::default(),
             authored_selector_summary: false,
         }
     }
@@ -1553,6 +1568,26 @@ impl<'a> TaintPolicyCompiler<'a> {
         // relation without re-running the policy (#2659).
         let mut work = self.selectors.work_report("taint");
         record_compile_metrics(&mut work, self.bound_endpoints);
+        for (name, value) in [
+            ("taint.store_key_operands", self.store_key_metrics.operands),
+            (
+                "taint.store_key_direct_literals",
+                self.store_key_metrics.direct_literals,
+            ),
+            (
+                "taint.store_key_recovered",
+                self.store_key_metrics.recovered,
+            ),
+            ("taint.store_key_unproven", self.store_key_metrics.unproven),
+            (
+                "taint.store_key_budget_hits",
+                self.store_key_metrics.budget_hits,
+            ),
+            ("taint.store_key_work", self.store_key_metrics.work),
+        ] {
+            increment_work_metric(&mut work, name, PolicyWorkUnit::Count, value)
+                .expect("bounded store-key metrics fit the taint work report");
+        }
         match compiled {
             Ok(compiled) => Ok(TaintPolicyCompilation::Plans {
                 roots: compiled,
@@ -2693,30 +2728,98 @@ impl<'a> TaintPolicyCompiler<'a> {
         }
     }
 
-    /// A key identity is proven only for a plain, escape-free string literal
-    /// argument: the literal's content bytes, read through the semantic
-    /// value's exact source mapping, are the identity. Anything else joins.
+    /// Resolve the key before the selected invocation, independently of the
+    /// value port's phase (a store read binds its output after the call).
     fn resolve_key_dimension(
         &mut self,
         resolved: &ResolvedTaintValue,
         port: &PolicyPort,
     ) -> Result<TaintStoreDimension, TaintPolicyCompileError> {
+        self.store_key_metrics.operands += 1;
         let Some(value) = self.store_dimension_value(resolved, port)? else {
+            self.store_key_metrics.unproven += 1;
             return Ok(TaintStoreDimension::Unproven);
         };
-        let procedure = resolved.point.procedure();
-        let semantics = procedure.semantics();
-        let Some(semantic_value) = semantics.value(value.id()) else {
-            return Ok(TaintStoreDimension::Unproven);
-        };
-        if !semantic_value.kind.is_constant() {
+        let direct = self.literal_key_dimension(&value);
+        if matches!(direct, TaintStoreDimension::Proven(_)) {
+            self.store_key_metrics.direct_literals += 1;
+            return Ok(direct);
+        }
+        let procedure = value.procedure();
+        let call = resolved
+            .call
+            .as_ref()
+            .expect("a selected store operand has a call");
+        let mut limits =
+            brokk_bifrost_analysis::analyzer::semantic::LocalConstantOriginLimits::default();
+        limits.max_work = limits
+            .max_work
+            .min(self.selectors.semantic_remaining().nested_entries);
+        limits.max_source_bytes = limits
+            .max_source_bytes
+            .min(self.selectors.semantic_remaining().source_bytes);
+        let origins = brokk_bifrost_analysis::analyzer::semantic::derive_local_constant_origins(
+            self.selectors.workspace(),
+            procedure,
+            value.id(),
+            call.id(),
+            limits,
+            self.selectors.cancellation(),
+        );
+        self.store_key_metrics.work += origins.work as u64;
+        if origins.cancelled {
+            return Err(TaintPolicyCompileError::QueryIncomplete {
+                completion: CodeQueryCompletion::Cancelled,
+                detail: "store key origin analysis was cancelled".to_owned(),
+            });
+        }
+        if self
+            .selectors
+            .semantic_budget_mut()
+            .charge(SemanticWork {
+                nested_entries: origins.work,
+                source_bytes: origins.source_bytes,
+                ..SemanticWork::default()
+            })
+            .is_err()
+        {
+            self.store_key_metrics.budget_hits += 1;
+            self.store_key_metrics.unproven += 1;
             return Ok(TaintStoreDimension::Unproven);
         }
-        let Some(mapping) = semantics.source_mapping(semantic_value.source) else {
+        self.store_key_metrics.budget_hits += u64::from(origins.budget_exhausted);
+        let Some(roots) = origins.roots else {
+            self.store_key_metrics.unproven += 1;
             return Ok(TaintStoreDimension::Unproven);
         };
+        let mut digests = Vec::with_capacity(roots.len());
+        for root in roots {
+            let root = procedure
+                .value_handle(root)
+                .expect("validated constant origin");
+            let TaintStoreDimension::Proven(digest) = self.literal_key_dimension(&root) else {
+                self.store_key_metrics.unproven += 1;
+                return Ok(TaintStoreDimension::Unproven);
+            };
+            digests.push(digest);
+        }
+        self.store_key_metrics.recovered += 1;
+        Ok(TaintStoreDimension::proven_set(digests))
+    }
+
+    /// Hash the existing exact literal representation. Origin analysis returns
+    /// semantic values, and never synthesizes or parses a replacement token.
+    fn literal_key_dimension(&self, value: &ValueHandle) -> TaintStoreDimension {
+        let semantics = value.procedure().semantics();
+        let semantic_value = semantics.value(value.id()).expect("validated key value");
+        if !semantic_value.kind.is_constant() {
+            return TaintStoreDimension::Unproven;
+        }
+        let mapping = semantics
+            .source_mapping(semantic_value.source)
+            .expect("validated key source mapping");
         if mapping.kind != SourceMappingKind::Exact {
-            return Ok(TaintStoreDimension::Unproven);
+            return TaintStoreDimension::Unproven;
         }
         let span = mapping.locator.anchor().span();
         let file = ProjectFile::new(
@@ -2729,12 +2832,12 @@ impl<'a> TaintPolicyCompiler<'a> {
             mapping.locator.path().as_path(),
         );
         let Some(source) = self.selectors.workspace().analyzer().indexed_source(&file) else {
-            return Ok(TaintStoreDimension::Unproven);
+            return TaintStoreDimension::Unproven;
         };
         let Some(token) = source.get(span.start_byte() as usize..span.end_byte() as usize) else {
-            return Ok(TaintStoreDimension::Unproven);
+            return TaintStoreDimension::Unproven;
         };
-        Ok(string_literal_key_identity(token))
+        string_literal_key_identity(token)
     }
 
     /// Bind one external-model selector row to the exact semantic calls it

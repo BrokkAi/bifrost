@@ -15,25 +15,28 @@ mod model;
 mod overlay;
 mod producer;
 mod runtime;
+mod runtime_contract_activation;
+mod runtime_contracts;
 mod source;
 mod validate;
 
 pub use artifact::{
     ArtifactEncoding, ArtifactError, CompiledAtomicOperation, CompiledClassDecoratorIdentity,
-    CompiledClassDecoratorKeyword, CompiledConcurrencyEffect, CompiledConditionalIndirectWrite,
-    CompiledConditionalResultRefinement, CompiledDeclaredEffect, CompiledDeclaredEffectCertainty,
-    CompiledDeclaredEffectTiming, CompiledIndirectWriteTarget, CompiledLockMode,
-    CompiledNormalReturnRefinement, CompiledNormalReturnTypeRefinement,
-    CompiledOperationPrecondition, CompiledPackManifest, CompiledPayload,
-    CompiledPredicateProofEffect, CompiledProcedureSummary, CompiledProcedureTarget,
-    CompiledResultContract, CompiledResultMemberContract, CompiledResultPredicate,
-    CompiledSemanticModelPack, CompiledShard, CompiledShardArtifact, CompiledShardDescriptor,
-    CompiledSummaryEffect, CompiledSummaryExitKind, CompiledSummaryInput, CompiledSummaryLocation,
-    CompiledSummaryLocationKind, CompiledSummaryMoveInvalidation, CompiledSummaryOutput,
-    CompiledSummaryTransfer, CompiledSummaryValuePreservation, CompiledSummaryValueTransfer,
-    CompiledSummaryValueTransferKind, CompiledSummaryValueTransferLimitation,
-    CompiledSummaryValueTransferLimitationKind, CompiledSummaryValueTransferOperation,
-    DecodeLimits, PayloadKind, decode_manifest, decode_shard, decode_shard_for_manifest,
+    CompiledClassDecoratorKeyword, CompiledConcurrencyEffect, CompiledCondWaiters,
+    CompiledConditionalIndirectWrite, CompiledConditionalResultRefinement, CompiledDeclaredEffect,
+    CompiledDeclaredEffectCertainty, CompiledDeclaredEffectTiming, CompiledIndirectWriteTarget,
+    CompiledLockCondition, CompiledLockMode, CompiledNormalReturnRefinement,
+    CompiledNormalReturnTypeRefinement, CompiledOperationPrecondition, CompiledPackManifest,
+    CompiledPayload, CompiledPredicateProofEffect, CompiledProcedureSummary,
+    CompiledProcedureTarget, CompiledResultContract, CompiledResultMemberContract,
+    CompiledResultPredicate, CompiledSemanticModelPack, CompiledShard, CompiledShardArtifact,
+    CompiledShardDescriptor, CompiledSummaryEffect, CompiledSummaryExitKind, CompiledSummaryInput,
+    CompiledSummaryLocation, CompiledSummaryLocationKind, CompiledSummaryMoveInvalidation,
+    CompiledSummaryOutput, CompiledSummaryTransfer, CompiledSummaryValuePreservation,
+    CompiledSummaryValueTransfer, CompiledSummaryValueTransferKind,
+    CompiledSummaryValueTransferLimitation, CompiledSummaryValueTransferLimitationKind,
+    CompiledSummaryValueTransferOperation, DecodeLimits, PayloadKind, decode_manifest,
+    decode_shard, decode_shard_for_manifest,
 };
 pub use authoring::*;
 pub use catalog::*;
@@ -51,6 +54,8 @@ pub use producer::{
     read_exact_artifact, read_exact_source_set,
 };
 pub use runtime::*;
+pub use runtime_contract_activation::*;
+pub use runtime_contracts::*;
 pub use source::SourceFormat;
 pub(crate) use validate::is_canonical_relative_path;
 pub use validate::{Diagnostic, DiagnosticSeverity};

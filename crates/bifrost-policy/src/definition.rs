@@ -24,6 +24,8 @@ use brokk_bifrost_rql::structural::{
     BoundaryStatus, OwnerRelation, PrecedenceTier, RouteHopKind, SiteClass,
 };
 
+use super::identity::EndpointSetSemanticHash;
+
 pub const POLICY_DOCUMENT_SCHEMA_VERSION: u32 = 1;
 
 /// The one resolved-selector path an assertion policy registers. Kept beside
@@ -60,6 +62,12 @@ pub enum RqlpDocument {
     },
     Endpoint {
         definition: Box<MatchEndpointDefinition>,
+    },
+    /// A reusable, typed set of taint or value-flow entries. Unlike a policy
+    /// this document has no policy metadata; its kind is the type contract
+    /// that tells an importer which entry records are legal.
+    EndpointSet {
+        definition: Box<EndpointSetDocument>,
     },
 }
 
@@ -1631,12 +1639,16 @@ pub struct TaintPolicySpec {
     pub entry_points: TaintEndpointSet<TaintEntryPointSpec>,
     pub transforms: TaintEndpointSet<TaintTransformSpec>,
     pub external_models: TaintEndpointSet<TaintExternalModelSpec>,
-    /// Policy-local persistence-store write declarations. Stores compose only
-    /// from local entries, so they are plain vectors rather than composable
-    /// endpoint sets.
+    /// Persistence-store write declarations. Store entries remain plain
+    /// vectors because their key/instance contract is solver-facing; typed
+    /// endpoint-set imports are carried by `store_include_files` below.
     pub store_writes: Vec<TaintStoreWriteSpec>,
-    /// Policy-local persistence-store read declarations.
+    /// Persistence-store read declarations.
     pub store_reads: Vec<TaintStoreReadSpec>,
+    /// File-backed store entries. Stores keep their write/read vectors for
+    /// the evaluator's existing boundary model, so their composable imports
+    /// live beside those vectors instead of changing the solver-facing shape.
+    pub store_include_files: Vec<EndpointSetFileRef>,
     pub finding_combinations: Vec<FindingCombinationSpec>,
 }
 
@@ -1644,6 +1656,7 @@ pub struct TaintPolicySpec {
 pub struct TaintEndpointSet<T> {
     pub include_sets: Vec<CatalogRef>,
     pub include_matches: Vec<MatchEndpointSetRef>,
+    pub include_files: Vec<EndpointSetFileRef>,
     pub entries: Vec<T>,
 }
 
@@ -1652,9 +1665,77 @@ impl<T> Default for TaintEndpointSet<T> {
         Self {
             include_sets: Vec::new(),
             include_matches: Vec::new(),
+            include_files: Vec::new(),
             entries: Vec::new(),
         }
     }
+}
+
+/// The entry family of one standalone endpoint-set document. The explicit
+/// flow-transform variant is intentional: taint and flow transforms have the
+/// same shape today but different semantics and must not become interchangeable
+/// by a name-only import.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EndpointSetKind {
+    Sources,
+    Sinks,
+    Sanitizers,
+    EntryPoints,
+    Transforms,
+    ExternalModels,
+    Stores,
+    Origins,
+    Observations,
+    Kills,
+    FlowTransforms,
+}
+
+impl EndpointSetKind {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Sources => "sources",
+            Self::Sinks => "sinks",
+            Self::Sanitizers => "sanitizers",
+            Self::EntryPoints => "entry-points",
+            Self::Transforms => "transforms",
+            Self::ExternalModels => "external-models",
+            Self::Stores => "stores",
+            Self::Origins => "origins",
+            Self::Observations => "observations",
+            Self::Kills => "kills",
+            Self::FlowTransforms => "flow-transforms",
+        }
+    }
+
+    pub const fn is_flow(self) -> bool {
+        matches!(
+            self,
+            Self::Origins | Self::Observations | Self::Kills | Self::FlowTransforms
+        )
+    }
+}
+
+/// Standalone document metadata and one typed set. The spec is intentionally
+/// the existing `TaintPolicySpec` shape so composition can consume an
+/// imported document after selecting only the kind-owned field.
+#[derive(Debug, Clone)]
+pub struct EndpointSetDocument {
+    pub schema_version: PolicySchemaVersion,
+    pub kind: EndpointSetKind,
+    pub spec: TaintPolicySpec,
+}
+
+/// One workspace-relative endpoint-set dependency and its optional content
+/// pin. Source ranges remain in `PolicySourceMapEntry` so equality and
+/// canonical projections stay independent of editor offsets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EndpointSetFileRef {
+    pub path: WorkspaceRelativePath,
+    pub sha256: Option<EndpointSetSemanticHash>,
+    /// Byte range of the authored reference. This survives normalization and
+    /// lets the loader report an error at the original import edge after
+    /// imported entries have been sorted or nested.
+    pub range: Range<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

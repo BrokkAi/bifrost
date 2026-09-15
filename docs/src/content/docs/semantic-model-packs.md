@@ -324,12 +324,12 @@ rules failed closed, so production emitted neither rule.
 ## Version and extension rules
 
 Every source pack must contain a `schema_version` this build supports, which is
-`2` or `3`. The field is mandatory: omitted, zero, and unsupported versions fail
+`2`, `3`, or `4`. The field is mandatory: omitted, zero, and unsupported versions fail
 instead of falling back. Every object rejects unknown fields, and every variant
 is explicitly tagged. A schema addition takes a new version number and a new
 checked-in schema rather than silently widening a number that already shipped.
 
-Producers write `3`. Reading a set of versions rather than one exact number is
+Producers write `4`. Reading a set of versions rather than one exact number is
 what lets an installed version-two pack or release asset keep loading across the
 bump and be regenerated on its producer's normal cadence. A field a version
 introduces is rejected in a pack that declares an earlier version, so a pack that
@@ -338,11 +338,17 @@ an older reader accepts by its number is one that older reader can also parse:
 additive field.
 
 The machine-readable contract is
-[`schemas/semantic-model-pack-v3.schema.json`](https://github.com/BrokkAi/bifrost/blob/master/schemas/semantic-model-pack-v3.schema.json).
+[`schemas/semantic-model-pack-v4.schema.json`](https://github.com/BrokkAi/bifrost/blob/master/schemas/semantic-model-pack-v4.schema.json).
 It is generated from `AuthoredSemanticModelPack`; a repository test requires
 the checked-in bytes to match the Rust-derived schema exactly.
 [`schemas/semantic-model-pack-v2.schema.json`](https://github.com/BrokkAi/bifrost/blob/master/schemas/semantic-model-pack-v2.schema.json)
-stays checked in as the frozen description of a version-two pack.
+and the version-three schema stay checked in as frozen descriptions.
+
+Version four adds the `runtime_contracts` companion for CSMI runtime-values 0.2.
+It retains the five fact families and their semantic-document envelope. Packs
+declaring an older schema cannot carry this companion. Importing a contract
+does not establish deployment identity, consumer review, or a native runtime
+load; those remain separate evidence requirements.
 
 ### Version three: contextual declaration roles
 

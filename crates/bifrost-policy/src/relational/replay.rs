@@ -254,8 +254,9 @@ fn materialize(
         id,
         binding,
         state.limits.max_source_rows,
-        RelationCoverage::Exhaustive,
+        RelationCoverage::exhaustive(),
         Vec::new(),
+        CoveragePartition::query_scope(),
         UnknownInputEvidence::default(),
         &HashMap::from([(binding.as_str(), &input)]),
         &referenced_columns(plan),
@@ -283,7 +284,7 @@ fn replay_chain(
         if left.tuples.is_empty() {
             let empty = ReplayInput {
                 rows: Vec::new(),
-                coverage: RelationCoverage::Exhaustive,
+                coverage: RelationCoverage::exhaustive(),
             };
             let right_relation = materialize(plan, *right, &empty, state)?;
             left = evaluate_join(&left, &right_relation, *kind, on, state)?;
@@ -327,6 +328,7 @@ fn replay_chain(
                 tuples,
                 coverage: left.coverage.clone(),
                 witness_reasons: left.witness_reasons.clone(),
+                witness_partition: left.witness_partition.clone(),
                 unknown_inputs: left.unknown_inputs.clone(),
             };
             let mut joined = evaluate_join(&scoped_left, &right_relation, *kind, on, state)?;
