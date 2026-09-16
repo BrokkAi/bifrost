@@ -16,9 +16,9 @@ use crate::analyzer::semantic::{
 use crate::analyzer::semantic_model::{
     ActiveSemanticModelSnapshot, CompiledAtomicOperation, CompiledConcurrencyEffect,
     CompiledCondWaiters, CompiledLockCondition, CompiledLockMode, CompiledSummaryInput,
-    CompiledSummaryOutput, Completeness, ProcedureSummaryDeclarationKey, ProcedureSummaryMemberKey,
-    SemanticModelMatchDisposition, SemanticModelMemberTargetDisposition,
-    SemanticModelOverlayDisposition, TypeKind, Visibility,
+    CompiledSummaryOutput, CompiledSyncMapOperation, CompiledTaskSpawnCondition, Completeness,
+    ProcedureSummaryDeclarationKey, ProcedureSummaryMemberKey, SemanticModelMatchDisposition,
+    SemanticModelMemberTargetDisposition, SemanticModelOverlayDisposition, TypeKind, Visibility,
 };
 use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 use brokk_bifrost_core::analyzer::model::{Language, LanguageDialect, StructuredImportPathKind};
@@ -26,8 +26,9 @@ use brokk_bifrost_flow::concurrency::{
     CanonicalConcurrencyLocation, ConcurrencyAnswer, ConcurrencyAtomicOperation,
     ConcurrencyCondWaiters, ConcurrencyEscape, ConcurrencyLockMode, ConcurrencyObjectCardinality,
     ConcurrencyOpenReason, ConcurrencyOwnership, ConcurrencyProvider, ConcurrencySubjectIdentity,
-    ConcurrentAccessConflict, ResolvedConcurrencyEffect, ResolvedConcurrencyLocation,
-    ResolvedConcurrencySubject, ResolvedLockAcquisition, ResolvedMemberDeclaration,
+    ConcurrencySyncMapOperation, ConcurrentAccessConflict, ResolvedConcurrencyEffect,
+    ResolvedConcurrencyLocation, ResolvedConcurrencySubject, ResolvedLockAcquisition,
+    ResolvedMemberDeclaration, ResolvedTaskSpawnCondition, ResolvedTimerStopOutcome,
     field_step_selector,
 };
 use brokk_bifrost_flow::typestate::TypestateObjectKey;
@@ -693,6 +694,28 @@ impl<'a> WorkspaceConcurrencyProvider<'a> {
         })
     }
 
+    /// Whether a complete reviewed `testing.T.Parallel` model is active
+    /// (issue #3383). A `Run` join is conditional on the absence of
+    /// `Parallel` in the callback, so binding `Run` without `Parallel`
+    /// would read every parallel callback as sequential and hide its races.
+    fn subtest_parallel_model_is_active(&self) -> bool {
+        let Some(active) = self.active_models.as_ref() else {
+            return false;
+        };
+        active
+            .active_models()
+            .procedure_summaries_for_member(ProcedureSummaryMemberKey::new(
+                "go",
+                "testing.T",
+                "Parallel",
+                true,
+                0,
+            ))
+            .records
+            .iter()
+            .any(|record| record.record.completeness == Completeness::Complete)
+    }
+
     fn bind_effect(
         &self,
         call: &CallSiteHandle,
@@ -748,7 +771,12 @@ impl<'a> WorkspaceConcurrencyProvider<'a> {
                     protocol.clone().into_boxed_str(),
                 )],
             },
-            CompiledConcurrencyEffect::TaskSpawn { callable, group } => {
+            CompiledConcurrencyEffect::TaskSpawn {
+                callable,
+                group,
+                condition,
+                timer,
+            } => {
                 let (targets, mut reasons) = Self::callback_targets(call, callable).into_parts();
                 let group = if let Some(group) = group {
                     match self.canonical_actual(call, group, request)? {
@@ -781,6 +809,40 @@ impl<'a> WorkspaceConcurrencyProvider<'a> {
                 } else {
                     None
                 };
+                // The timer is the spawn call's own result, so it is resolved
+                // from the exact result ordinal rather than from an input
+                // port, exactly like a constructed condition variable.
+                let timer = if let Some(timer) = timer {
+                    match self.canonical_call_result(call, timer, request)? {
+                        ConcurrencyAnswer::Proven(Some(timer)) => Some(timer),
+                        ConcurrencyAnswer::Proven(None) => {
+                            reasons.push(ConcurrencyOpenReason::UnknownLocation);
+                            None
+                        }
+                        ConcurrencyAnswer::Open {
+                            partial: Some(timer),
+                            reasons: timer_reasons,
+                        } => {
+                            assert_eq!(
+                                timer.reasons, timer_reasons,
+                                "an open task timer retains every identity reason"
+                            );
+                            reasons.extend(timer_reasons.into_iter().filter(|reason| {
+                                *reason == ConcurrencyOpenReason::BudgetExhausted
+                            }));
+                            Some(timer)
+                        }
+                        ConcurrencyAnswer::Open {
+                            partial: None,
+                            reasons: timer_reasons,
+                        } => {
+                            reasons.extend(timer_reasons);
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
                 let effect = (!targets.is_empty()).then(|| {
                     let row = call
                         .procedure()
@@ -793,6 +855,13 @@ impl<'a> WorkspaceConcurrencyProvider<'a> {
                         callable,
                         targets,
                         group,
+                        condition: match condition {
+                            Some(CompiledTaskSpawnCondition::CallResultTrue) => {
+                                ResolvedTaskSpawnCondition::CallResultTrue
+                            }
+                            None => ResolvedTaskSpawnCondition::Unconditional,
+                        },
+                        timer,
                     }
                 });
                 if reasons.is_empty() {
@@ -843,6 +912,130 @@ impl<'a> WorkspaceConcurrencyProvider<'a> {
                     } => {
                         reasons.extend(open);
                         ConcurrencyAnswer::Open { partial, reasons }
+                    }
+                }
+            }
+            CompiledConcurrencyEffect::SubtestRun { callable, group } => {
+                if !self.subtest_parallel_model_is_active() {
+                    return Ok(ConcurrencyAnswer::Open {
+                        partial: None,
+                        reasons: vec![ConcurrencyOpenReason::UnsupportedSynchronization(
+                            "subtest Run is modeled but Parallel is not".into(),
+                        )],
+                    });
+                }
+                let (targets, mut reasons) = Self::callback_targets(call, callable).into_parts();
+                let group =
+                    match self.canonical_actual(call, group, request)? {
+                        ConcurrencyAnswer::Proven(Some(group)) => Some(group),
+                        ConcurrencyAnswer::Proven(None) => {
+                            reasons.push(ConcurrencyOpenReason::UnknownLocation);
+                            None
+                        }
+                        ConcurrencyAnswer::Open {
+                            partial: Some(group),
+                            reasons: group_reasons,
+                        } => {
+                            assert_eq!(
+                                group.reasons, group_reasons,
+                                "an open subtest group retains every identity reason"
+                            );
+                            reasons.extend(group_reasons.into_iter().filter(|reason| {
+                                *reason == ConcurrencyOpenReason::BudgetExhausted
+                            }));
+                            Some(group)
+                        }
+                        ConcurrencyAnswer::Open {
+                            partial: None,
+                            reasons: group_reasons,
+                        } => {
+                            reasons.extend(group_reasons);
+                            None
+                        }
+                    };
+                let effect = match (group, targets.is_empty()) {
+                    (Some(group), false) => {
+                        let row = call
+                            .procedure()
+                            .semantics()
+                            .call_site(call.id())
+                            .expect("owned modeled call");
+                        let callable = Self::actual_input(row, callable)
+                            .expect("callback targets require an actual callable value");
+                        Some(ResolvedConcurrencyEffect::SubtestRun {
+                            callable,
+                            targets,
+                            group,
+                        })
+                    }
+                    _ => None,
+                };
+                if reasons.is_empty() {
+                    ConcurrencyAnswer::Proven(effect)
+                } else {
+                    ConcurrencyAnswer::Open {
+                        partial: effect,
+                        reasons,
+                    }
+                }
+            }
+            CompiledConcurrencyEffect::SubtestParallel { receiver } => location(
+                self.canonical_actual(call, receiver, request)?,
+                &|receiver| ResolvedConcurrencyEffect::SubtestParallel { receiver },
+            ),
+            CompiledConcurrencyEffect::SubtestCleanup { callable, group } => {
+                let (targets, mut reasons) = Self::callback_targets(call, callable).into_parts();
+                let group =
+                    match self.canonical_actual(call, group, request)? {
+                        ConcurrencyAnswer::Proven(Some(group)) => Some(group),
+                        ConcurrencyAnswer::Proven(None) => {
+                            reasons.push(ConcurrencyOpenReason::UnknownLocation);
+                            None
+                        }
+                        ConcurrencyAnswer::Open {
+                            partial: Some(group),
+                            reasons: group_reasons,
+                        } => {
+                            assert_eq!(
+                                group.reasons, group_reasons,
+                                "an open cleanup group retains every identity reason"
+                            );
+                            reasons.extend(group_reasons.into_iter().filter(|reason| {
+                                *reason == ConcurrencyOpenReason::BudgetExhausted
+                            }));
+                            Some(group)
+                        }
+                        ConcurrencyAnswer::Open {
+                            partial: None,
+                            reasons: group_reasons,
+                        } => {
+                            reasons.extend(group_reasons);
+                            None
+                        }
+                    };
+                let effect = match (group, targets.is_empty()) {
+                    (Some(group), false) => {
+                        let row = call
+                            .procedure()
+                            .semantics()
+                            .call_site(call.id())
+                            .expect("owned modeled call");
+                        let callable = Self::actual_input(row, callable)
+                            .expect("callback targets require an actual callable value");
+                        Some(ResolvedConcurrencyEffect::SubtestCleanup {
+                            callable,
+                            targets,
+                            group,
+                        })
+                    }
+                    _ => None,
+                };
+                if reasons.is_empty() {
+                    ConcurrencyAnswer::Proven(effect)
+                } else {
+                    ConcurrencyAnswer::Open {
+                        partial: effect,
+                        reasons,
                     }
                 }
             }
@@ -929,6 +1122,19 @@ impl<'a> WorkspaceConcurrencyProvider<'a> {
                     }
                 }
             }
+            CompiledConcurrencyEffect::TimerStop { timer } => {
+                location(self.canonical_actual(call, timer, request)?, &|timer| {
+                    ResolvedConcurrencyEffect::TimerStop {
+                        timer,
+                        outcome: ResolvedTimerStopOutcome::CallResultTrue,
+                    }
+                })
+            }
+            CompiledConcurrencyEffect::TimerReset { timer } => {
+                location(self.canonical_actual(call, timer, request)?, &|timer| {
+                    ResolvedConcurrencyEffect::TimerReset { timer }
+                })
+            }
             CompiledConcurrencyEffect::CondWait { condition } => location(
                 self.canonical_actual(call, condition, request)?,
                 &|condition| ResolvedConcurrencyEffect::CondWait { condition },
@@ -943,6 +1149,77 @@ impl<'a> WorkspaceConcurrencyProvider<'a> {
                     },
                 },
             ),
+            CompiledConcurrencyEffect::SyncMap {
+                map,
+                key,
+                operation,
+            } => {
+                // The map subject must resolve one canonical object; a key
+                // may resolve none -- its entry identity comes from the exact
+                // constant or storage the solver traces, and an unresolved
+                // key states its own typed boundary instead of a location gap.
+                let (map_subject, mut reasons) =
+                    self.canonical_actual(call, map, request)?.into_parts();
+                let row = call
+                    .procedure()
+                    .semantics()
+                    .call_site(call.id())
+                    .expect("owned modeled call");
+                let key_subject = key
+                    .as_ref()
+                    .map(|key| {
+                        let key_value = Self::actual_input(row, key).ok_or_else(|| {
+                            SemanticProviderError::internal("sync.Map key input is unavailable")
+                        })?;
+                        let (key_canonical, key_reasons) = self
+                            .canonical_value_at(
+                                call.procedure(),
+                                row.point,
+                                key_value,
+                                ObservationPhase::AfterEffects,
+                                request,
+                            )?
+                            .into_parts();
+                        reasons.extend(key_reasons);
+                        Ok::<_, SemanticProviderError>(ResolvedConcurrencySubject {
+                            value: key_value,
+                            canonical: key_canonical,
+                            reasons: Vec::new(),
+                            identity: ConcurrencySubjectIdentity::Value,
+                        })
+                    })
+                    .transpose()?;
+                let Some(map_subject) = map_subject else {
+                    if reasons.is_empty() {
+                        reasons.push(ConcurrencyOpenReason::UnknownLocation);
+                    }
+                    return Ok(ConcurrencyAnswer::Open {
+                        partial: None,
+                        reasons,
+                    });
+                };
+                let operation = sync_map_operation(*operation);
+                let effect = ResolvedConcurrencyEffect::SyncMap {
+                    map: map_subject,
+                    key: key_subject,
+                    key_constant: None,
+                    operation,
+                    write: operation.write_outcome(),
+                    observe: operation.observe_outcome(),
+                };
+                let global_reasons = reasons
+                    .into_iter()
+                    .filter(|reason| *reason == ConcurrencyOpenReason::BudgetExhausted)
+                    .collect::<Vec<_>>();
+                if global_reasons.is_empty() {
+                    ConcurrencyAnswer::Proven(Some(effect))
+                } else {
+                    ConcurrencyAnswer::Open {
+                        partial: Some(effect),
+                        reasons: global_reasons,
+                    }
+                }
+            }
         })
     }
 
@@ -2380,6 +2657,21 @@ fn atomic_operation(operation: CompiledAtomicOperation) -> ConcurrencyAtomicOper
         CompiledAtomicOperation::Load => ConcurrencyAtomicOperation::Load,
         CompiledAtomicOperation::Store => ConcurrencyAtomicOperation::Store,
         CompiledAtomicOperation::ReadModifyWrite => ConcurrencyAtomicOperation::ReadModifyWrite,
+    }
+}
+
+fn sync_map_operation(operation: CompiledSyncMapOperation) -> ConcurrencySyncMapOperation {
+    match operation {
+        CompiledSyncMapOperation::Store => ConcurrencySyncMapOperation::Store,
+        CompiledSyncMapOperation::Delete => ConcurrencySyncMapOperation::Delete,
+        CompiledSyncMapOperation::Clear => ConcurrencySyncMapOperation::Clear,
+        CompiledSyncMapOperation::Load => ConcurrencySyncMapOperation::Load,
+        CompiledSyncMapOperation::Range => ConcurrencySyncMapOperation::Range,
+        CompiledSyncMapOperation::LoadOrStore => ConcurrencySyncMapOperation::LoadOrStore,
+        CompiledSyncMapOperation::LoadAndDelete => ConcurrencySyncMapOperation::LoadAndDelete,
+        CompiledSyncMapOperation::Swap => ConcurrencySyncMapOperation::Swap,
+        CompiledSyncMapOperation::CompareAndSwap => ConcurrencySyncMapOperation::CompareAndSwap,
+        CompiledSyncMapOperation::CompareAndDelete => ConcurrencySyncMapOperation::CompareAndDelete,
     }
 }
 

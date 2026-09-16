@@ -39,6 +39,7 @@ pub mod read_ledger;
 pub mod read_verification;
 pub mod reference_candidates;
 pub(crate) mod relational_frontier;
+pub mod resolution;
 mod ruby;
 mod rust;
 pub(crate) use rust::crate_identity::RustOverlayCrates;

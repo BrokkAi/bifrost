@@ -31,7 +31,9 @@ use super::loading::{
     PolicyDocumentLoadError, SelectorLoadError, enumerate_endpoint_directory,
     load_endpoint_closure, read_rqlp_document, resolve_parsed_selector,
 };
-use super::locator::{resolve_policy_definition_locators, resolve_selector_locators};
+use super::locator::{
+    LocatorResolution, resolve_policy_definition_locators, resolve_selector_locators,
+};
 use super::resolved::*;
 use super::source::{
     MAX_RQLP_SOURCE_BYTES, ParsedRqlpDocument, PolicySourceError, PolicySourceIdentity,
@@ -353,7 +355,11 @@ impl PolicyRegistry {
             read_rqlp_document(root, relative_path.as_ref())?
         };
         let (_, document, parsed) = loaded.into_parts();
-        self.finish_policy_registration(parsed, document.source().as_bytes(), None)
+        self.finish_policy_registration(
+            parsed,
+            document.source().as_bytes(),
+            LocatorResolution::Required,
+        )
     }
 
     /// Load one workspace policy after the host has prepared the analyzer
@@ -372,7 +378,11 @@ impl PolicyRegistry {
             read_rqlp_document(root, relative_path.as_ref())?
         };
         let (_, document, parsed) = loaded.into_parts();
-        self.finish_policy_registration(parsed, document.source().as_bytes(), Some(analyzer))
+        self.finish_policy_registration(
+            parsed,
+            document.source().as_bytes(),
+            LocatorResolution::Analyzer(analyzer),
+        )
     }
 
     pub fn register_policy_bytes(
@@ -382,7 +392,7 @@ impl PolicyRegistry {
     ) -> Result<&LoadedPolicy, PolicyRegistryError> {
         validate_policy_source_identity(&identity)?;
         let parsed = parse_policy_bytes(identity, bytes)?;
-        self.finish_policy_registration(parsed, bytes, None)
+        self.finish_policy_registration(parsed, bytes, LocatorResolution::Required)
     }
 
     /// Register one policy after the host has prepared the analyzer snapshot
@@ -395,7 +405,25 @@ impl PolicyRegistry {
     ) -> Result<&LoadedPolicy, PolicyRegistryError> {
         validate_policy_source_identity(&identity)?;
         let parsed = parse_policy_bytes(identity, bytes)?;
-        self.finish_policy_registration(parsed, bytes, Some(analyzer))
+        self.finish_policy_registration(parsed, bytes, LocatorResolution::Analyzer(analyzer))
+    }
+
+    /// Register one built-in-style policy before any workspace model exists.
+    ///
+    /// Qualified call and receiver locators stay in the loaded plan instead of
+    /// failing the analyzer-free boundary. A host that later holds the pinned
+    /// active semantic-model snapshot resolves them once with
+    /// [`PolicyRegistry::register_policy_bytes_with_analyzer`]. The loaded
+    /// policy's semantic hash is the deterministic authored identity; the
+    /// resolved identity is minted only by the analyzer-backed boundary.
+    pub fn register_policy_bytes_deferred(
+        &mut self,
+        identity: PolicySourceIdentity,
+        bytes: &[u8],
+    ) -> Result<&LoadedPolicy, PolicyRegistryError> {
+        validate_policy_source_identity(&identity)?;
+        let parsed = parse_policy_bytes(identity, bytes)?;
+        self.finish_policy_registration(parsed, bytes, LocatorResolution::Deferred)
     }
 
     pub fn load_endpoint_path(
@@ -410,7 +438,11 @@ impl PolicyRegistry {
             read_rqlp_document(root, relative_path.as_ref())?
         };
         let (_, document, parsed) = loaded.into_parts();
-        self.finish_endpoint_registration(parsed, document.source().as_bytes(), None)
+        self.finish_endpoint_registration(
+            parsed,
+            document.source().as_bytes(),
+            LocatorResolution::Required,
+        )
     }
 
     pub fn register_endpoint_bytes(
@@ -420,7 +452,7 @@ impl PolicyRegistry {
     ) -> Result<&LoadedEndpoint, PolicyRegistryError> {
         validate_policy_source_identity(&identity)?;
         let parsed = parse_policy_bytes(identity, bytes)?;
-        self.finish_endpoint_registration(parsed, bytes, None)
+        self.finish_endpoint_registration(parsed, bytes, LocatorResolution::Required)
     }
 
     /// Register one endpoint after the host has prepared the analyzer snapshot
@@ -433,7 +465,7 @@ impl PolicyRegistry {
     ) -> Result<&LoadedEndpoint, PolicyRegistryError> {
         validate_policy_source_identity(&identity)?;
         let parsed = parse_policy_bytes(identity, bytes)?;
-        self.finish_endpoint_registration(parsed, bytes, Some(analyzer))
+        self.finish_endpoint_registration(parsed, bytes, LocatorResolution::Analyzer(analyzer))
     }
 
     pub fn policies(&self) -> impl ExactSizeIterator<Item = &LoadedPolicy> {
@@ -487,10 +519,10 @@ impl PolicyRegistry {
         &mut self,
         parsed: ParsedRqlpDocument,
         source_bytes: &[u8],
-        analyzer: Option<&dyn IAnalyzer>,
+        locators: LocatorResolution<'_>,
     ) -> Result<&LoadedEndpoint, PolicyRegistryError> {
         let closure =
-            load_endpoint_closure(self.workspace_root.as_ref(), parsed, source_bytes, analyzer)?;
+            load_endpoint_closure(self.workspace_root.as_ref(), parsed, source_bytes, locators)?;
         let (loaded, _, retained_bytes) = closure.into_parts();
         let endpoint_id = loaded.definition().id.clone();
         if self.endpoints.contains_key(&endpoint_id) {
@@ -527,7 +559,7 @@ impl PolicyRegistry {
         &mut self,
         parsed: ParsedRqlpDocument,
         source_bytes: &[u8],
-        analyzer: Option<&dyn IAnalyzer>,
+        locators: LocatorResolution<'_>,
     ) -> Result<&LoadedPolicy, PolicyRegistryError> {
         self.check_cancellation()?;
         let mut definition = match parsed.document() {
@@ -555,8 +587,8 @@ impl PolicyRegistry {
         }
 
         let imports =
-            self.close_endpoint_sets(&parsed, &mut definition, source_bytes.len(), analyzer)?;
-        let build = self.build_policy(&parsed, definition, source_bytes, analyzer, &imports)?;
+            self.close_endpoint_sets(&parsed, &mut definition, source_bytes.len(), locators)?;
+        let build = self.build_policy(&parsed, definition, source_bytes, locators, &imports)?;
         let attempted_endpoints = self
             .retained_endpoint_slots
             .checked_add(build.endpoint_slots)
@@ -605,10 +637,10 @@ impl PolicyRegistry {
         parsed: &ParsedRqlpDocument,
         mut definition: PolicyDefinition,
         source_bytes: &[u8],
-        analyzer: Option<&dyn IAnalyzer>,
+        locators: LocatorResolution<'_>,
         imports: &EndpointSetClosure,
     ) -> Result<PolicyBuild, PolicyRegistryError> {
-        resolve_policy_definition_locators(&mut definition, analyzer)?;
+        resolve_policy_definition_locators(&mut definition, locators)?;
         let mut retained_bytes = imports.retained_bytes;
         self.ensure_local_retained_bytes(retained_bytes)?;
         let mut fixed_selectors = BTreeMap::new();
@@ -628,7 +660,7 @@ impl PolicyRegistry {
                                 path,
                                 query,
                                 &mut retained_bytes,
-                                analyzer,
+                                locators,
                             )?;
                             insert_selector(&mut fixed_selectors, selector)?;
                         }
@@ -639,7 +671,7 @@ impl PolicyRegistry {
                             path,
                             &spec.subject,
                             &mut retained_bytes,
-                            analyzer,
+                            locators,
                         )?;
                         insert_selector(&mut fixed_selectors, selector)?;
                     }
@@ -659,7 +691,7 @@ impl PolicyRegistry {
                         path,
                         &spec.selector,
                         &mut retained_bytes,
-                        analyzer,
+                        locators,
                     )?;
                     insert_selector(&mut fixed_selectors, selector)?;
                     (
@@ -687,7 +719,7 @@ impl PolicyRegistry {
                         &mut dependency_selectors,
                         &mut candidate_dependencies,
                         &mut retained_bytes,
-                        analyzer,
+                        locators,
                         imports,
                     )?;
                     self.build_catalog_taint_inputs(
@@ -696,14 +728,14 @@ impl PolicyRegistry {
                         &mut dependency_selectors,
                         &mut candidate_dependencies,
                         &mut retained_bytes,
-                        analyzer,
+                        locators,
                     )?;
                     let uses = taint_match_uses(spec)?;
                     let match_inputs = self.build_match_inputs(
                         &uses,
                         &mut dependency_selectors,
                         &mut retained_bytes,
-                        analyzer,
+                        locators,
                     )?;
                     candidate_dependencies.extend(match_inputs.dependencies);
                     self.validate_candidate_endpoint_count(
@@ -742,14 +774,14 @@ impl PolicyRegistry {
                         &mut dependency_selectors,
                         &mut candidate_dependencies,
                         &mut retained_bytes,
-                        analyzer,
+                        locators,
                     )?;
                     let uses = typestate_match_uses(spec)?;
                     let match_inputs = self.build_match_inputs(
                         &uses,
                         &mut dependency_selectors,
                         &mut retained_bytes,
-                        analyzer,
+                        locators,
                     )?;
                     candidate_dependencies.extend(match_inputs.dependencies);
                     self.validate_candidate_endpoint_count(&candidate_dependencies, 0)?;
@@ -839,7 +871,7 @@ impl PolicyRegistry {
         dependency_selectors: &mut BTreeMap<PolicySelectorPath, ResolvedPolicySelector>,
         dependencies: &mut Vec<ResolvedEndpointDependency>,
         retained_bytes: &mut usize,
-        analyzer: Option<&dyn IAnalyzer>,
+        locators: LocatorResolution<'_>,
         imports: &EndpointSetClosure,
     ) -> Result<(), PolicyRegistryError> {
         for source in &spec.sources.entries {
@@ -854,7 +886,7 @@ impl PolicyRegistry {
                 path,
                 &source.selector,
                 retained_bytes,
-                analyzer,
+                locators,
                 imports,
             )?;
             let identity = ResolvedEndpointIdentity::Local {
@@ -897,7 +929,7 @@ impl PolicyRegistry {
                 path,
                 &sink.selector,
                 retained_bytes,
-                analyzer,
+                locators,
                 imports,
             )?;
             let identity = ResolvedEndpointIdentity::Local {
@@ -947,7 +979,7 @@ impl PolicyRegistry {
                 path,
                 &entry_point.selector,
                 retained_bytes,
-                analyzer,
+                locators,
                 imports,
             )?;
             let identity = ResolvedEndpointIdentity::Local {
@@ -1015,7 +1047,7 @@ impl PolicyRegistry {
                 path,
                 authored,
                 retained_bytes,
-                analyzer,
+                locators,
                 imports,
             )?;
             insert_selector(fixed_selectors, selector)?;
@@ -1030,7 +1062,7 @@ impl PolicyRegistry {
         dependency_selectors: &mut BTreeMap<PolicySelectorPath, ResolvedPolicySelector>,
         dependencies: &mut Vec<ResolvedEndpointDependency>,
         retained_bytes: &mut usize,
-        analyzer: Option<&dyn IAnalyzer>,
+        locators: LocatorResolution<'_>,
     ) -> Result<(), PolicyRegistryError> {
         // Catalog storage is independently bounded, but each loaded policy
         // clones the selected typed definitions and queries. Charge one full
@@ -1056,7 +1088,7 @@ impl PolicyRegistry {
         for reference in &spec.sources.include_sets {
             let catalog = self.catalogs.resolve(reference)?;
             for source in &catalog.definition().sources {
-                let (identity, selector) = catalog_selector(catalog, &source.id, analyzer)?;
+                let (identity, selector) = catalog_selector(catalog, &source.id, locators)?;
                 let dependency = ResolvedEndpointDependency::from_composed_model(
                     ResolvedEndpointIdentity::Catalog {
                         catalog: identity.clone(),
@@ -1086,7 +1118,7 @@ impl PolicyRegistry {
         for reference in &spec.sinks.include_sets {
             let catalog = self.catalogs.resolve(reference)?;
             for sink in &catalog.definition().sinks {
-                let (identity, selector) = catalog_selector(catalog, &sink.id, analyzer)?;
+                let (identity, selector) = catalog_selector(catalog, &sink.id, locators)?;
                 let dependency = ResolvedEndpointDependency::from_composed_model(
                     ResolvedEndpointIdentity::Catalog {
                         catalog: identity.clone(),
@@ -1125,7 +1157,7 @@ impl PolicyRegistry {
                     .collect()
             },
             fixed_selectors,
-            analyzer,
+            locators,
         )?;
         self.resolve_catalog_auxiliary_selectors(
             &spec.transforms.include_sets,
@@ -1138,7 +1170,7 @@ impl PolicyRegistry {
                     .collect()
             },
             fixed_selectors,
-            analyzer,
+            locators,
         )?;
         self.resolve_catalog_auxiliary_selectors(
             &spec.external_models.include_sets,
@@ -1151,7 +1183,7 @@ impl PolicyRegistry {
                     .collect()
             },
             fixed_selectors,
-            analyzer,
+            locators,
         )?;
         Ok(())
     }
@@ -1163,7 +1195,7 @@ impl PolicyRegistry {
             &'a RegisteredTaintCatalog,
         ) -> Vec<(&'a TaintEntryId, &'a PolicySelector)>,
         selectors: &mut BTreeMap<PolicySelectorPath, ResolvedPolicySelector>,
-        analyzer: Option<&dyn IAnalyzer>,
+        locators: LocatorResolution<'_>,
     ) -> Result<(), PolicyRegistryError> {
         for reference in references {
             let catalog = self.catalogs.resolve(reference)?;
@@ -1181,7 +1213,7 @@ impl PolicyRegistry {
                     SelectorOrigin::Catalog {
                         catalog: identity.clone(),
                     },
-                    analyzer,
+                    locators,
                 )?;
                 insert_selector(selectors, selector)?;
             }
@@ -1199,7 +1231,7 @@ impl PolicyRegistry {
         dependency_selectors: &mut BTreeMap<PolicySelectorPath, ResolvedPolicySelector>,
         dependencies: &mut Vec<ResolvedEndpointDependency>,
         retained_bytes: &mut usize,
-        analyzer: Option<&dyn IAnalyzer>,
+        locators: LocatorResolution<'_>,
     ) -> Result<(), PolicyRegistryError> {
         for subject in &spec.subjects.entries {
             let base = format!(
@@ -1208,7 +1240,7 @@ impl PolicyRegistry {
             );
             let path = selector_path(format!("{base}/selector"))?;
             let selector =
-                self.resolve_selector(parsed, path, &subject.selector, retained_bytes, analyzer)?;
+                self.resolve_selector(parsed, path, &subject.selector, retained_bytes, locators)?;
             let dependency = ResolvedEndpointDependency::from_composed_model(
                 ResolvedEndpointIdentity::Local {
                     policy_id: definition.metadata.id.clone(),
@@ -1240,7 +1272,7 @@ impl PolicyRegistry {
                     pointer_segment(event.id.as_str())
                 ))?;
                 let selector =
-                    self.resolve_selector(parsed, path, selector, retained_bytes, analyzer)?;
+                    self.resolve_selector(parsed, path, selector, retained_bytes, locators)?;
                 insert_selector(fixed_selectors, selector)?;
             }
         }
@@ -1252,7 +1284,7 @@ impl PolicyRegistry {
         uses: &[MatchUse],
         dependency_selectors: &mut BTreeMap<PolicySelectorPath, ResolvedPolicySelector>,
         retained_bytes: &mut usize,
-        analyzer: Option<&dyn IAnalyzer>,
+        locators: LocatorResolution<'_>,
     ) -> Result<MatchBuild, PolicyRegistryError> {
         let directory_count = uses
             .iter()
@@ -1281,7 +1313,7 @@ impl PolicyRegistry {
             if directories.contains_key(&key) {
                 continue;
             }
-            let closure = self.load_directory_closure(&key, usage, retained_bytes, analyzer)?;
+            let closure = self.load_directory_closure(&key, usage, retained_bytes, locators)?;
             candidate_count = candidate_count
                 .checked_add(closure.endpoints.len())
                 .ok_or(PolicyRegistryError::EndpointCountOverflow)?;
@@ -1414,7 +1446,7 @@ impl PolicyRegistry {
         key: &DirectoryCacheKey,
         first_usage: &MatchUse,
         retained_bytes: &mut usize,
-        analyzer: Option<&dyn IAnalyzer>,
+        locators: LocatorResolution<'_>,
     ) -> Result<DirectoryClosure, PolicyRegistryError> {
         let root = self
             .workspace_root
@@ -1434,7 +1466,7 @@ impl PolicyRegistry {
         for source in directory.into_entries() {
             let (_, document, parsed) = source.into_parts();
             let closure =
-                load_endpoint_closure(Some(root), parsed, document.source().as_bytes(), analyzer)?;
+                load_endpoint_closure(Some(root), parsed, document.source().as_bytes(), locators)?;
             let (endpoint, _, retained) = closure.into_parts();
             transient_bytes = transient_bytes
                 .checked_add(retained)
@@ -1478,14 +1510,14 @@ impl PolicyRegistry {
         path: PolicySelectorPath,
         authored: &PolicySelector,
         retained_bytes: &mut usize,
-        analyzer: Option<&dyn IAnalyzer>,
+        locators: LocatorResolution<'_>,
     ) -> Result<ResolvedPolicySelector, PolicyRegistryError> {
         let loaded = resolve_parsed_selector(
             self.workspace_root.as_ref(),
             parsed,
             path,
             authored,
-            analyzer,
+            locators,
         )?;
         if let Some(reference) = loaded.referenced.as_ref() {
             self.charge_local(retained_bytes, reference.document().source().len())?;
@@ -1686,10 +1718,10 @@ fn inline_selector(
     path: PolicySelectorPath,
     authored: &PolicySelector,
     origin: SelectorOrigin,
-    analyzer: Option<&dyn IAnalyzer>,
+    locators: LocatorResolution<'_>,
 ) -> Result<ResolvedPolicySelector, PolicyRegistryError> {
     let mut authored = authored.clone();
-    resolve_selector_locators(&mut authored, analyzer)?;
+    resolve_selector_locators(&mut authored, locators)?;
     let PolicySelector::Inline {
         schema,
         query,
@@ -1705,7 +1737,7 @@ fn inline_selector(
 fn catalog_selector(
     catalog: &RegisteredTaintCatalog,
     entry_id: &TaintEntryId,
-    analyzer: Option<&dyn IAnalyzer>,
+    locators: LocatorResolution<'_>,
 ) -> Result<(ResolvedCatalogIdentity, ResolvedPolicySelector), PolicyRegistryError> {
     let identity = resolved_catalog_identity(catalog)?;
     let entry = catalog
@@ -1738,7 +1770,7 @@ fn catalog_selector(
         SelectorOrigin::Catalog {
             catalog: identity.clone(),
         },
-        analyzer,
+        locators,
     )?;
     Ok((identity, selector))
 }

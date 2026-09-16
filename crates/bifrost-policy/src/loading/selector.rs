@@ -4,10 +4,10 @@ use std::fmt;
 use std::ops::Range;
 use std::path::Path;
 
+use crate::locator::LocatorResolution;
 use crate::{
     LoadedModelError, PolicySelector, PolicySelectorPath, ResolvedPolicySelector, SelectorOrigin,
 };
-use brokk_bifrost_analysis::analyzer::IAnalyzer;
 use brokk_bifrost_analysis::schema_version::{SchemaVersionOrigin, SchemaVersionResolution};
 use brokk_bifrost_analysis::workspace_document::{
     WorkspaceDocument, WorkspaceDocumentError, WorkspaceRoot, read_workspace_document,
@@ -73,7 +73,7 @@ pub(crate) fn resolve_parsed_selector(
     parsed: &ParsedRqlpDocument,
     selector_path: PolicySelectorPath,
     selector: &PolicySelector,
-    analyzer: Option<&dyn IAnalyzer>,
+    locators: LocatorResolution<'_>,
 ) -> Result<ResolvedSelectorLoad, SelectorLoadError> {
     match selector {
         PolicySelector::Inline {
@@ -119,7 +119,7 @@ pub(crate) fn resolve_parsed_selector(
             super::super::locator::resolve_query_locators(
                 &mut referenced.query,
                 &mut resolved_locators,
-                analyzer,
+                locators,
             )?;
             let selector = ResolvedPolicySelector::try_new_with_locators(
                 selector_path,

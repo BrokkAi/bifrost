@@ -1886,7 +1886,9 @@ fn classify_stored_value(
             continue;
         }
         match &row.kind {
-            SemanticValueKind::Constant | SemanticValueKind::Boolean(_) => {
+            SemanticValueKind::Constant
+            | SemanticValueKind::ConstantString(_)
+            | SemanticValueKind::Boolean(_) => {
                 classified.observe_seed(
                     adapter.constant_class(workspace, procedure, row),
                     &file,

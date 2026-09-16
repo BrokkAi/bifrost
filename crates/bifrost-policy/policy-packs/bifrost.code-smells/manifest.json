@@ -1,14 +1,15 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "id": "bifrost.code-smells",
-  "version": "2.11.0",
+  "version": "2.13.0",
   "name": "Bifrost code smells",
   "description": "Curated structured RQLP checks for bug-prone and potentially expensive source patterns.",
   "policies": [
     {
       "path": "policies/dynamic-evaluation.rqlp",
       "id": "bifrost.correctness.dynamic-evaluation",
-      "semantic_hash": "455fca5f51f3291329d71adaa89b4c5e478df8a869272e633b6cd138afe54fb3",
+      "authored_hash": "455fca5f51f3291329d71adaa89b4c5e478df8a869272e633b6cd138afe54fb3",
+      "resolved_semantic_hash": "455fca5f51f3291329d71adaa89b4c5e478df8a869272e633b6cd138afe54fb3",
       "category": "correctness",
       "supported_languages": [
         "python",
@@ -25,7 +26,8 @@
     {
       "path": "policies/unsafe-deserialization.rqlp",
       "id": "bifrost.correctness.unsafe-deserialization",
-      "semantic_hash": "04fe7a69f28ebc3d702bf909b01b29bad3def6fe5d6072351337fcd17c0ed867",
+      "authored_hash": "04fe7a69f28ebc3d702bf909b01b29bad3def6fe5d6072351337fcd17c0ed867",
+      "resolved_semantic_hash": "04fe7a69f28ebc3d702bf909b01b29bad3def6fe5d6072351337fcd17c0ed867",
       "category": "correctness",
       "supported_languages": [
         "python"
@@ -40,7 +42,8 @@
     {
       "path": "policies/python-absent-member.rqlp",
       "id": "bifrost.correctness.python-absent-member",
-      "semantic_hash": "0018b743fcf3cd82084af3ae2cdd6f8f59573934ed5f1d33297827911b113287",
+      "authored_hash": "0018b743fcf3cd82084af3ae2cdd6f8f59573934ed5f1d33297827911b113287",
+      "resolved_semantic_hash": "0018b743fcf3cd82084af3ae2cdd6f8f59573934ed5f1d33297827911b113287",
       "category": "correctness",
       "supported_languages": ["python"],
       "required_capabilities": [
@@ -54,7 +57,8 @@
     {
       "path": "policies/go-data-race.rqlp",
       "id": "bifrost.correctness.go-data-race",
-      "semantic_hash": "eb5432400ec0b5edecfb9a1f6485f6a29bb5ce8fb67a878c92c27e127cb22ed5",
+      "authored_hash": "e43f20f8a2379c6a571ccd52f369888ad5e0d335a3a49c4e7fa42cb919a6f145",
+      "resolved_semantic_hash": "e43f20f8a2379c6a571ccd52f369888ad5e0d335a3a49c4e7fa42cb919a6f145",
       "category": "correctness",
       "supported_languages": [
         "go"
@@ -73,7 +77,8 @@
     {
       "path": "policies/go-nil-dereference.rqlp",
       "id": "bifrost.correctness.go-nil-dereference",
-      "semantic_hash": "e933fbff9821bbcc4883af11a2532440d2de04d75ab7784ff1b51d73e2184896",
+      "authored_hash": "e933fbff9821bbcc4883af11a2532440d2de04d75ab7784ff1b51d73e2184896",
+      "resolved_semantic_hash": "e933fbff9821bbcc4883af11a2532440d2de04d75ab7784ff1b51d73e2184896",
       "category": "correctness",
       "supported_languages": [
         "go"
@@ -95,7 +100,8 @@
     {
       "path": "policies/go-wrong-error-on-failure-path.rqlp",
       "id": "bifrost.correctness.go-wrong-error-on-failure-path",
-      "semantic_hash": "2e83c5bd2b4ad34ec4d9b5c1919c233728a231cb04ffa83deae4b7e67447b869",
+      "authored_hash": "2e83c5bd2b4ad34ec4d9b5c1919c233728a231cb04ffa83deae4b7e67447b869",
+      "resolved_semantic_hash": "2e83c5bd2b4ad34ec4d9b5c1919c233728a231cb04ffa83deae4b7e67447b869",
       "category": "correctness",
       "supported_languages": [
         "go"
@@ -114,7 +120,8 @@
     {
       "path": "policies/loop-invariant-sort.rqlp",
       "id": "bifrost.performance.loop-invariant-sort",
-      "semantic_hash": "933ab0a333030b76e26fdc97b8139797a6d388fa258cabc9f7fdb50d1222fcf1",
+      "authored_hash": "933ab0a333030b76e26fdc97b8139797a6d388fa258cabc9f7fdb50d1222fcf1",
+      "resolved_semantic_hash": "933ab0a333030b76e26fdc97b8139797a6d388fa258cabc9f7fdb50d1222fcf1",
       "category": "performance",
       "supported_languages": [
         "rust",
@@ -136,7 +143,8 @@
     {
       "path": "policies/regex-compile-in-loop.rqlp",
       "id": "bifrost.performance.regex-compile-in-loop",
-      "semantic_hash": "c7347566fe5db86bf385d136b9585da5be6f8e3e8f4ef57922aadd22b306b165",
+      "authored_hash": "c7347566fe5db86bf385d136b9585da5be6f8e3e8f4ef57922aadd22b306b165",
+      "resolved_semantic_hash": "c7347566fe5db86bf385d136b9585da5be6f8e3e8f4ef57922aadd22b306b165",
       "category": "performance",
       "supported_languages": [
         "python",
@@ -158,7 +166,8 @@
     {
       "path": "policies/file-read-in-loop.rqlp",
       "id": "bifrost.performance.file-read-in-loop",
-      "semantic_hash": "4f0b625d3cdef7c80700d6e72e997428321ec4afacc99fe89a246169a4acb3f1",
+      "authored_hash": "4f0b625d3cdef7c80700d6e72e997428321ec4afacc99fe89a246169a4acb3f1",
+      "resolved_semantic_hash": "4f0b625d3cdef7c80700d6e72e997428321ec4afacc99fe89a246169a4acb3f1",
       "category": "performance",
       "supported_languages": [
         "python",
@@ -180,7 +189,8 @@
     {
       "path": "policies/serialization-in-loop.rqlp",
       "id": "bifrost.performance.serialization-in-loop",
-      "semantic_hash": "aa047adba257c80f10812f857e4fd647344dab04d60ba1935f2fc4b13bf2e74c",
+      "authored_hash": "aa047adba257c80f10812f857e4fd647344dab04d60ba1935f2fc4b13bf2e74c",
+      "resolved_semantic_hash": "aa047adba257c80f10812f857e4fd647344dab04d60ba1935f2fc4b13bf2e74c",
       "category": "performance",
       "supported_languages": [
         "python",
@@ -202,7 +212,8 @@
     {
       "path": "policies/parsing-in-loop.rqlp",
       "id": "bifrost.performance.parsing-in-loop",
-      "semantic_hash": "1b5b748be4794ffb11a0924d228346c63403dc4e4dfade76ed93655f5cd469c4",
+      "authored_hash": "1b5b748be4794ffb11a0924d228346c63403dc4e4dfade76ed93655f5cd469c4",
+      "resolved_semantic_hash": "1b5b748be4794ffb11a0924d228346c63403dc4e4dfade76ed93655f5cd469c4",
       "category": "performance",
       "supported_languages": [
         "python",
@@ -224,7 +235,8 @@
     {
       "path": "policies/database-call-in-loop.rqlp",
       "id": "bifrost.performance.database-call-in-loop",
-      "semantic_hash": "f184707c0021d42dde7e6c4a77985a3854e5b7db970ec30ff109856ebd74da21",
+      "authored_hash": "f184707c0021d42dde7e6c4a77985a3854e5b7db970ec30ff109856ebd74da21",
+      "resolved_semantic_hash": "f184707c0021d42dde7e6c4a77985a3854e5b7db970ec30ff109856ebd74da21",
       "category": "performance",
       "supported_languages": [
         "python",
@@ -245,7 +257,8 @@
     {
       "path": "policies/network-call-in-loop.rqlp",
       "id": "bifrost.performance.network-call-in-loop",
-      "semantic_hash": "b48032b76b82c4c449aa2d2fa45aff95b36350314e4cbcefd6f4ed86de47cd83",
+      "authored_hash": "b48032b76b82c4c449aa2d2fa45aff95b36350314e4cbcefd6f4ed86de47cd83",
+      "resolved_semantic_hash": "b48032b76b82c4c449aa2d2fa45aff95b36350314e4cbcefd6f4ed86de47cd83",
       "category": "performance",
       "supported_languages": [
         "python",
@@ -267,7 +280,8 @@
     {
       "path": "policies/subprocess-in-loop.rqlp",
       "id": "bifrost.performance.subprocess-in-loop",
-      "semantic_hash": "0c264195a730138def1054723dffb3ec40ad13a0bc7c3bb7b74b72ea5996fd37",
+      "authored_hash": "0c264195a730138def1054723dffb3ec40ad13a0bc7c3bb7b74b72ea5996fd37",
+      "resolved_semantic_hash": "0c264195a730138def1054723dffb3ec40ad13a0bc7c3bb7b74b72ea5996fd37",
       "category": "performance",
       "supported_languages": [
         "python",
@@ -288,7 +302,8 @@
     {
       "path": "policies/sleep-in-loop.rqlp",
       "id": "bifrost.performance.sleep-in-loop",
-      "semantic_hash": "16b1be4131f57ee9dff8c34d8a083241bbfbd0992cc0a6e215e9b142d7e551ab",
+      "authored_hash": "16b1be4131f57ee9dff8c34d8a083241bbfbd0992cc0a6e215e9b142d7e551ab",
+      "resolved_semantic_hash": "16b1be4131f57ee9dff8c34d8a083241bbfbd0992cc0a6e215e9b142d7e551ab",
       "category": "performance",
       "supported_languages": [
         "python",
@@ -308,7 +323,8 @@
     {
       "path": "policies/expensive-operation-in-nested-loop.rqlp",
       "id": "bifrost.performance.expensive-operation-in-nested-loop",
-      "semantic_hash": "2bf75d3cc91deae0675196ee82c530b82f96096430aeafa2a2642faf7583bbc5",
+      "authored_hash": "2bf75d3cc91deae0675196ee82c530b82f96096430aeafa2a2642faf7583bbc5",
+      "resolved_semantic_hash": "2bf75d3cc91deae0675196ee82c530b82f96096430aeafa2a2642faf7583bbc5",
       "category": "performance",
       "supported_languages": [
         "python",
@@ -330,7 +346,8 @@
     {
       "path": "policies/rayon-in-blocking-lazy-init.rqlp",
       "id": "bifrost.correctness.rayon-in-blocking-lazy-init",
-      "semantic_hash": "498af02f7cc9183b55ce0efb3059c87f7cefd17ee87caa83ef5302e4878712a8",
+      "authored_hash": "498af02f7cc9183b55ce0efb3059c87f7cefd17ee87caa83ef5302e4878712a8",
+      "resolved_semantic_hash": "498af02f7cc9183b55ce0efb3059c87f7cefd17ee87caa83ef5302e4878712a8",
       "category": "correctness",
       "supported_languages": [
         "rust"

@@ -533,6 +533,9 @@ fn write_value(writer: &mut dyn fmt::Write, value: &SemanticValue) -> fmt::Resul
         SemanticValueKind::UnsignedInteger(value) => {
             write!(writer, " :unsigned-value {value}")?;
         }
+        SemanticValueKind::ConstantString(payload) => {
+            write!(writer, " :constant-string {}", quoted(payload))?;
+        }
         SemanticValueKind::Local
         | SemanticValueKind::Receiver { .. }
         | SemanticValueKind::Return

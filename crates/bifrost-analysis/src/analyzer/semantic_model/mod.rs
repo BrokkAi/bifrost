@@ -35,8 +35,9 @@ pub use artifact::{
     CompiledSummaryOutput, CompiledSummaryTransfer, CompiledSummaryValuePreservation,
     CompiledSummaryValueTransfer, CompiledSummaryValueTransferKind,
     CompiledSummaryValueTransferLimitation, CompiledSummaryValueTransferLimitationKind,
-    CompiledSummaryValueTransferOperation, DecodeLimits, PayloadKind, decode_manifest,
-    decode_shard, decode_shard_for_manifest,
+    CompiledSummaryValueTransferOperation, CompiledSyncMapOperation, CompiledTaskSpawnCondition,
+    DecodeLimits, PayloadKind, decode_manifest, decode_shard, decode_shard_for_manifest,
+    decode_validated_shard_for_manifest, validate_manifest_inventory,
 };
 pub use authoring::*;
 pub use catalog::*;

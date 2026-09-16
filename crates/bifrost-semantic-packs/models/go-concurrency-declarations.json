@@ -727,6 +727,26 @@
             "locator": { "kind": "artifact", "path": "src/time/sleep.go", "symbol": "time.Timer.Stop" }
           },
           {
+            "id": "member.ad262050e1892ca0cfefa1eb48f5bd50aed3de28f7d2c7893cbbe6d9be1e25ae",
+            "owner": "type.2fd0aa06a7ead591780725343ef0ad1392e76f63c7759ee4578483f9badf438f",
+            "name": "Reset",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": false,
+            "is_virtual": false,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                { "name": "d", "type": { "kind": "declared", "id": "type.093f2445cc8f7389a5299fa7e7d70ae8fadd6fa2291af0d0b16069cc3433b19f", "arguments": [], "nullable": false }, "optional": false, "variadic": false }
+              ],
+              "returns": { "kind": "named", "name": "bool", "arguments": [], "nullable": false }
+            },
+            "receiver": { "pointer": true },
+            "aliases": [],
+            "locator": { "kind": "artifact", "path": "src/time/sleep.go", "symbol": "time.Timer.Reset" }
+          },
+          {
             "id": "member.348968f2fd5d260bd64344016c8075efec0787aeea2760759e5168da502c9f92",
             "owner": "type.0e5eb8274d8a136652db26087e21a5a350ee36c3b7d9c47f2ffca11ec56d98e0",
             "name": "AfterFunc",

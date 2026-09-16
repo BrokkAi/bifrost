@@ -26,7 +26,7 @@ use brokk_bifrost_js_ts::syntax::{
 use brokk_bifrost_js_ts::ts_owners::ts_unwrap_expression;
 
 const JAVASCRIPT_ADAPTER_VERSION: &[u8] = b"javascript-value-semantics-v17";
-const TYPESCRIPT_ADAPTER_VERSION: &[u8] = b"typescript-value-semantics-v20";
+const TYPESCRIPT_ADAPTER_VERSION: &[u8] = b"typescript-value-semantics-v21";
 
 #[derive(Debug, Clone, Copy)]
 enum JsTsSemanticFlavor {

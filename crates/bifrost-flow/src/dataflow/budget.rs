@@ -27,17 +27,10 @@ define_work_dimensions! {
     pub struct SolverWork;
     all: pub [17];
     InternedFacts => interned_facts = 100_000,
-    // Fact-only propagation charges these four coupled lanes together: each
-    // retained program-point/fact state is reached through evaluated transfer
-    // rows and their canonical outputs. Keep one finite envelope for the
-    // relation instead of letting a lower sibling lane reject work already
-    // admitted by the others. Eight million completes the source-dense Python
-    // procedures in the repository policy scan while the independent fact,
-    // summary, coverage, witness, and retained-output bounds remain unchanged.
-    ReachedStates => reached_states = 8_000_000,
-    FlowEvaluations => flow_evaluations = 8_000_000,
-    CallbackRows => callback_rows = 8_000_000,
-    PropagatedOutputs => propagated_outputs = 8_000_000,
+    ReachedStates => reached_states = 1_000_000,
+    FlowEvaluations => flow_evaluations = 4_000_000,
+    CallbackRows => callback_rows = 4_000_000,
+    PropagatedOutputs => propagated_outputs = 4_000_000,
     EndSummaries => end_summaries = 1_000_000,
     IncomingCalls => incoming_calls = 1_000_000,
     ProviderMaterializations => provider_materializations = 100_000,

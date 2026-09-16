@@ -1137,6 +1137,35 @@ payload:
           certainty: possible
 ```
 
+## Reviewed Node runtime packs
+
+The embedded registry ships reviewed Node runtime packs for JavaScript
+and TypeScript: a runtime-values pack per language modeling the `process`
+global exposure with `env` static-property and `argv` static-index
+keyed-read behaviors, and a child-process summaries pack modeling the
+exact `execSync(command)` member. TSX workspaces use the TypeScript
+packs.
+
+Runtime-values activation is a layered contract. An exposure authored as
+`enabled` is intrinsically eligible within its model; it never bypasses
+pack activation. Every shipped pack sets `safety.review_required`, so
+activation additionally needs exact host-supplied evidence -- language,
+npm ecosystem, the exact Node artifact coordinates and digest, and the
+reviewed profile configuration -- plus an explicit compatible `enable`
+control naming the pack id. The activation report retains that enable
+decision, and published endpoints retain the exposure, behavior, and
+active-model-set identities.
+
+Authored packs carry no binding evidence or observations. Only
+workspace-derived analyzer evidence can authoritatively describe lexical
+bindings, writes, keyed loads, and observation identity in a particular
+workspace, so the production evaluator joins the authored exposure and
+behavior records with the workspace's own syntax and executable-semantic
+facts. Lexically bound roots are conclusively excluded; reassignment,
+dynamic keys, unsupported runtimes and profiles, and incomplete analysis
+stay typed incomplete. Configuration documents can neither activate nor
+intersect the code runtime-value domain.
+
 ## Canonical artifacts and digests
 
 Compilation expands defaults, sorts semantic sets by stable ID, preserves

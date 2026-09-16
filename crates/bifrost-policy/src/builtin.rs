@@ -1,17 +1,38 @@
+//! The shipped built-in policy catalog and its post-activation resolution.
+//!
+//! Built-in packs are embedded sources rather than workspace files, so the
+//! catalog boundary has no analyzer. Since issue #3316 a built-in policy may
+//! name a semantic-model callable by its qualified name (`subprocess.run`).
+//! That name is preserved unresolved here and resolved exactly once, after
+//! workspace activation, against the pinned active semantic-model snapshot.
+//!
+//! The two identities are deliberately separate. `authored_hash` is the
+//! deterministic catalog/package identity of the authored plan, computed with
+//! qualified locators still unresolved, and it is what a catalog listing
+//! reports before any workspace exists. `resolved_semantic_hash` is the
+//! executable identity and exists only after every qualified locator resolved
+//! against an active model, where the active pack identity and provenance are
+//! part of the resolved plan's meaning. A source hash is never a substitute
+//! for either, and the two are never interchangeable.
+
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::sync::{Arc, OnceLock};
 
+use brokk_bifrost_analysis::analyzer::IAnalyzer;
+use brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelProvenance;
 use serde::{Deserialize, Serialize};
 
+use super::locator::is_qualified_locator_code;
 use super::{
-    CatalogRegistryLimits, PolicyId, PolicyRegistry, PolicyRegistryLimits, PolicySourceIdentity,
+    CatalogRegistryLimits, LoadedPolicy, PolicyId, PolicyRegistry, PolicyRegistryError,
+    PolicyRegistryLimits, PolicySemanticHash, PolicySourceIdentity, ResolvedPolicyLocator,
     TaintCatalogRegistry,
 };
 
 pub const CODE_SMELLS_PACK_ID: &str = "bifrost.code-smells";
 pub const SECURITY_PACK_ID: &str = "bifrost.security";
-const BUILT_IN_MANIFEST_SCHEMA_VERSION: u32 = 1;
+const BUILT_IN_MANIFEST_SCHEMA_VERSION: u32 = 2;
 
 const CODE_SMELLS_MANIFEST_SOURCE: &str =
     include_str!("../policy-packs/bifrost.code-smells/manifest.json");
@@ -142,12 +163,23 @@ pub struct BuiltInPolicyCatalogManifest {
     pub packs: Vec<BuiltInPolicyPackManifest>,
 }
 
+/// One built-in policy entry under the schema-v2 identity contract.
+///
+/// `authored_hash` is always present: it is the deterministic identity of the
+/// authored plan with qualified semantic-model locators preserved, so a
+/// catalog listing is stable before any workspace exists. `resolved_semantic_hash`
+/// is present only when the authored source resolves without a model, in which
+/// case the two identities are recorded separately and both are verified. A
+/// policy with a deferred qualified locator leaves the field absent; its
+/// executable identity is minted after activation by
+/// [`SelectedBuiltInPolicy::resolve`] and is never pinned to the authored hash.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BuiltInPolicyManifestEntry {
     pub path: String,
     pub id: String,
-    pub semantic_hash: String,
+    pub authored_hash: String,
+    pub resolved_semantic_hash: Option<String>,
     pub category: String,
     pub supported_languages: Vec<String>,
     pub required_capabilities: Vec<String>,
@@ -168,167 +200,325 @@ impl BuiltInPolicySelection {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct SelectedBuiltInPolicy {
-    manifest: &'static BuiltInPolicyManifestEntry,
-    source: &'static str,
-    pack_id: &'static str,
+/// One built-in-style pack: a manifest document plus its embedded `.rqlp`
+/// sources. The shipped catalog is built from these, and a host that embeds
+/// its own reviewed pack uses the same construction so both obtain the same
+/// authored identity and post-activation resolution contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbeddedPolicyPack {
+    manifest: String,
+    sources: Vec<(String, String)>,
 }
 
-impl SelectedBuiltInPolicy {
-    pub fn manifest(self) -> &'static BuiltInPolicyManifestEntry {
+impl EmbeddedPolicyPack {
+    pub fn new(manifest: impl Into<String>) -> Self {
+        Self {
+            manifest: manifest.into(),
+            sources: Vec::new(),
+        }
+    }
+
+    pub fn with_source(mut self, path: impl Into<String>, source: impl Into<String>) -> Self {
+        self.sources.push((path.into(), source.into()));
+        self
+    }
+
+    pub fn manifest(&self) -> &str {
+        &self.manifest
+    }
+
+    pub fn sources(&self) -> &[(String, String)] {
+        &self.sources
+    }
+}
+
+/// One selected built-in policy before workspace activation.
+#[derive(Debug, Clone, Copy)]
+pub struct SelectedBuiltInPolicy<'a> {
+    manifest: &'a BuiltInPolicyManifestEntry,
+    source: &'a str,
+    pack_id: &'a str,
+}
+
+impl<'a> SelectedBuiltInPolicy<'a> {
+    pub fn manifest(self) -> &'a BuiltInPolicyManifestEntry {
         self.manifest
     }
 
-    pub fn source(self) -> &'static str {
+    pub fn source(self) -> &'a str {
         self.source
     }
 
-    pub fn pack_id(self) -> &'static str {
+    pub fn pack_id(self) -> &'a str {
         self.pack_id
+    }
+
+    /// The deterministic pre-activation catalog identity of this entry.
+    pub fn authored_hash(self) -> &'a str {
+        &self.manifest.authored_hash
+    }
+
+    /// The checked-in executable identity, recorded only when the source
+    /// resolves without an analyzer. A deferred entry returns `None` here and
+    /// receives its identity from [`Self::resolve`] after activation.
+    pub fn recorded_resolved_semantic_hash(self) -> Option<&'a str> {
+        self.manifest.resolved_semantic_hash.as_deref()
     }
 
     pub fn source_identity(self) -> PolicySourceIdentity {
         PolicySourceIdentity::new(format!("builtin:{}/{}", self.pack_id, self.manifest.path))
+    }
+
+    /// Resolve every deferred qualified locator against the pinned analyzer
+    /// snapshot and mint the executable identity.
+    ///
+    /// The resolved plan comes from the same registry boundary that loads a
+    /// workspace policy with an analyzer, so a built-in policy and a directly
+    /// registered policy with identical sources close to identical plans and
+    /// identical semantic hashes. A failure keeps its typed locator diagnostic
+    /// code. A resolution that no longer matches the checked-in executable
+    /// identity is a changed model family and is refused rather than silently
+    /// accepted, and a location that resolves only partially, ambiguously, or
+    /// through a conflicting overlay keeps the loader's own typed rejection.
+    pub fn resolve(
+        self,
+        analyzer: &dyn IAnalyzer,
+    ) -> Result<ResolvedBuiltInPolicy<'a>, BuiltInPolicyError> {
+        let catalogs = Arc::new(TaintCatalogRegistry::new_without_workspace(
+            CatalogRegistryLimits::default(),
+        ));
+        let mut registry =
+            PolicyRegistry::new_without_workspace(catalogs, PolicyRegistryLimits::default());
+        let loaded = registry
+            .register_policy_bytes_with_analyzer(
+                self.source_identity(),
+                self.source.as_bytes(),
+                analyzer,
+            )
+            .map_err(|error| self.resolution_error(error))?;
+        let resolved_semantic_hash = loaded.semantic_hash();
+        if let Some(recorded) = self.recorded_resolved_semantic_hash()
+            && recorded != resolved_semantic_hash.to_string()
+        {
+            return Err(BuiltInPolicyError::with_code(
+                CHANGED_FAMILY_CODE,
+                format!(
+                    "built-in policy `{}` resolved to semantic hash `{resolved_semantic_hash}` \
+                     but the manifest records `{recorded}`; the active model family changed",
+                    self.manifest.id
+                ),
+            ));
+        }
+        Ok(ResolvedBuiltInPolicy {
+            selected: self,
+            loaded: loaded.clone(),
+            resolved_semantic_hash,
+        })
+    }
+
+    fn resolution_error(self, error: PolicyRegistryError) -> BuiltInPolicyError {
+        match error {
+            PolicyRegistryError::Source(source) => BuiltInPolicyError::with_code(
+                source.diagnostic.code,
+                format!(
+                    "built-in policy `{}` could not resolve its qualified locators against the \
+                     active semantic-model snapshot: {}",
+                    self.manifest.id, source.diagnostic.message
+                ),
+            ),
+            other => BuiltInPolicyError::with_code(
+                LOCATOR_RESOLUTION_CODE,
+                format!(
+                    "built-in policy `{}` failed to load after workspace activation: {other}",
+                    self.manifest.id
+                ),
+            ),
+        }
+    }
+}
+
+const LOCATOR_RESOLUTION_CODE: &str = "built-in-policy-locator-resolution-failed";
+const CHANGED_FAMILY_CODE: &str = "built-in-policy-changed-model-family";
+
+/// One built-in policy after every deferred locator resolved against the
+/// pinned active semantic-model snapshot.
+#[derive(Debug, Clone)]
+pub struct ResolvedBuiltInPolicy<'a> {
+    selected: SelectedBuiltInPolicy<'a>,
+    loaded: LoadedPolicy,
+    resolved_semantic_hash: PolicySemanticHash,
+}
+
+impl<'a> ResolvedBuiltInPolicy<'a> {
+    pub fn selected(&self) -> SelectedBuiltInPolicy<'a> {
+        self.selected
+    }
+
+    /// The deterministic catalog identity, unchanged by activation.
+    pub fn authored_hash(&self) -> &str {
+        self.selected.authored_hash()
+    }
+
+    /// The executable identity. It varies with the active model family and
+    /// provenance that resolved the deferred locators.
+    pub const fn resolved_semantic_hash(&self) -> PolicySemanticHash {
+        self.resolved_semantic_hash
+    }
+
+    /// The fully resolved policy plan and its resolved locator metadata.
+    pub fn loaded(&self) -> &LoadedPolicy {
+        &self.loaded
+    }
+
+    /// The resolved call and receiver locators, including the active
+    /// semantic-model pack identity and provenance that affected resolution.
+    pub fn resolved_locators(&self) -> impl Iterator<Item = &ResolvedPolicyLocator> {
+        self.loaded
+            .resolved_selectors()
+            .iter()
+            .flat_map(|selector| selector.resolved_locators.iter())
+    }
+
+    pub fn locator_provenance(&self) -> impl Iterator<Item = &SemanticModelProvenance> {
+        self.resolved_locators()
+            .filter_map(|locator| locator.provenance.as_ref())
+    }
+
+    pub fn to_canonical_semantic_json(&self) -> serde_json::Value {
+        self.loaded.to_canonical_semantic_json()
     }
 }
 
 #[derive(Debug)]
 pub struct BuiltInPolicyCatalog {
     document: BuiltInPolicyCatalogManifest,
-    source_by_policy_id: HashMap<String, &'static str>,
+    source_by_policy_id: HashMap<String, String>,
     digest: String,
 }
 
 impl BuiltInPolicyCatalog {
+    /// Build the shipped catalog from the checked-in embedded packs.
     fn load() -> Result<Self, BuiltInPolicyError> {
-        let mut packs = Vec::with_capacity(EMBEDDED_POLICY_PACK_SOURCES.len());
-        let expected_pack_ids = EMBEDDED_POLICY_PACK_SOURCES
+        let packs = EMBEDDED_POLICY_PACK_SOURCES
             .iter()
-            .map(|(pack_id, _)| *pack_id)
-            .collect::<BTreeSet<_>>();
-        let source_pack_ids = EMBEDDED_POLICY_SOURCES
-            .iter()
-            .map(|(pack_id, _)| *pack_id)
-            .collect::<BTreeSet<_>>();
-        if expected_pack_ids != source_pack_ids {
-            return Err(BuiltInPolicyError::new(
-                "built-in manifest and source tables must register the same pack ids",
-            ));
-        }
-        for &(pack_id, manifest_source) in EMBEDDED_POLICY_PACK_SOURCES {
-            let manifest = serde_json::from_str::<BuiltInPolicyPackManifest>(manifest_source)
+            .map(|(pack_id, manifest_source)| {
+                let sources = EMBEDDED_POLICY_SOURCES
+                    .iter()
+                    .find(|(embedded_id, _)| embedded_id == pack_id)
+                    .map(|(_, sources)| *sources)
+                    .unwrap_or_else(|| {
+                        panic!("pack `{pack_id}` has a manifest but no embedded source table")
+                    });
+                sources.iter().fold(
+                    EmbeddedPolicyPack::new(*manifest_source),
+                    |pack, (path, source)| pack.with_source(*path, *source),
+                )
+            })
+            .collect();
+        Self::from_embedded_packs(packs)
+    }
+
+    /// Build a catalog from embedded packs at the built-in identity boundary.
+    ///
+    /// Every source is first closed with qualified locators preserved, which
+    /// yields the deterministic `authored_hash`. A source that also closes
+    /// without an analyzer records its executable identity as
+    /// `resolved_semantic_hash`; a source with a deferred locator must leave
+    /// that field absent, because its executable meaning depends on the
+    /// workspace's pinned active model.
+    pub fn from_embedded_packs(packs: Vec<EmbeddedPolicyPack>) -> Result<Self, BuiltInPolicyError> {
+        let mut parsed = Vec::with_capacity(packs.len());
+        let mut pack_ids = HashSet::new();
+        for pack in packs {
+            let manifest = serde_json::from_str::<BuiltInPolicyPackManifest>(pack.manifest())
                 .map_err(|error| {
-                    BuiltInPolicyError::new(format!(
-                        "invalid built-in manifest `{pack_id}`: {error}"
-                    ))
+                    BuiltInPolicyError::new(format!("invalid built-in manifest: {error}"))
                 })?;
             validate_manifest_shape(&manifest)?;
-            if manifest.id != pack_id {
+            if !pack_ids.insert(manifest.id.clone()) {
                 return Err(BuiltInPolicyError::new(format!(
-                    "built-in manifest file registers `{pack_id}` but declares id `{}`",
+                    "built-in manifest id `{}` is declared more than once",
                     manifest.id
                 )));
             }
-            let sources = EMBEDDED_POLICY_SOURCES
-                .iter()
-                .find(|(embedded_id, _)| *embedded_id == pack_id)
-                .map(|(_, sources)| *sources)
-                .expect("pack source table and manifest table have the same IDs");
             let manifest_paths = manifest
                 .policies
                 .iter()
                 .map(|entry| entry.path.as_str())
                 .collect::<BTreeSet<_>>();
-            let embedded_paths = sources
+            let embedded_paths = pack
+                .sources()
                 .iter()
-                .map(|(path, _)| *path)
+                .map(|(path, _)| path.as_str())
                 .collect::<BTreeSet<_>>();
             if manifest_paths != embedded_paths {
                 return Err(BuiltInPolicyError::new(format!(
-                    "built-in manifest `{pack_id}` paths do not exactly match embedded policy sources"
+                    "built-in manifest `{}` paths do not exactly match embedded policy sources",
+                    manifest.id
                 )));
             }
-            packs.push(manifest);
+            parsed.push((manifest, pack));
         }
         let document = BuiltInPolicyCatalogManifest {
             schema_version: BUILT_IN_MANIFEST_SCHEMA_VERSION,
-            packs,
+            packs: parsed
+                .iter()
+                .map(|(manifest, _)| manifest.clone())
+                .collect(),
         };
 
-        let catalogs = Arc::new(TaintCatalogRegistry::new_without_workspace(
-            CatalogRegistryLimits::default(),
-        ));
-        let mut registry =
-            PolicyRegistry::new_without_workspace(catalogs, PolicyRegistryLimits::default());
-        let mut observed = HashMap::new();
-        for (pack, entry) in document.packs.iter().flat_map(|pack| {
-            EMBEDDED_POLICY_SOURCES
-                .iter()
-                .find(|(id, _)| id == &pack.id)
-                .map(|(_, sources)| sources.iter().map(move |entry| (pack, entry)))
-                .into_iter()
-                .flatten()
-        }) {
-            let source = entry.1;
-            let identity = PolicySourceIdentity::new(format!("builtin:{}/{}", pack.id, entry.0));
-            let loaded = registry
-                .register_policy_bytes(identity, source.as_bytes())
-                .map_err(|error| {
-                    BuiltInPolicyError::new(format!(
-                        "failed to load built-in policy `{}`: {error}",
-                        entry.0
-                    ))
-                })?;
-            observed.insert(
-                (pack.id.as_str(), entry.0),
-                (
-                    loaded.definition().metadata.id.as_str().to_owned(),
-                    loaded.semantic_hash().to_string(),
-                ),
-            );
-        }
-
-        let total_policy_count = document.packs.iter().map(|pack| pack.policies.len()).sum();
-        let mut source_by_policy_id = HashMap::with_capacity(total_policy_count);
-        for manifest in &document.packs {
-            let sources = EMBEDDED_POLICY_SOURCES
-                .iter()
-                .find(|(pack_id, _)| pack_id == &manifest.id)
-                .map(|(_, sources)| *sources)
-                .expect("catalog packs exactly match embedded sources");
-            for entry in sources {
-                let (observed_id, observed_hash) = &observed[&(manifest.id.as_str(), entry.0)];
-                let recorded_id = manifest
+        let mut source_by_policy_id = HashMap::new();
+        for (manifest, pack) in &parsed {
+            for (path, source) in pack.sources() {
+                let identity =
+                    PolicySourceIdentity::new(format!("builtin:{}/{}", manifest.id, path));
+                let entry = manifest
                     .policies
                     .iter()
-                    .find(|record| record.path == entry.0)
-                    .map(|record| record.id.as_str())
+                    .find(|entry| &entry.path == path)
                     .expect("manifest paths exactly match embedded sources");
-                let recorded_hash = manifest
-                    .policies
-                    .iter()
-                    .find(|record| record.path == entry.0)
-                    .map(|record| record.semantic_hash.as_str())
-                    .expect("manifest paths exactly match embedded sources");
-                if observed_id != recorded_id {
+                let authored_hash = authored_identity(&identity, source)?;
+                if authored_hash != entry.authored_hash {
                     return Err(BuiltInPolicyError::new(format!(
-                        "built-in policy `{}` declares id `{observed_id}` but the manifest records `{recorded_id}`",
-                        entry.0
+                        "built-in policy `{path}` has authored hash `{authored_hash}` but the \
+                         manifest records `{}`",
+                        entry.authored_hash
                     )));
                 }
-                if observed_hash != recorded_hash {
+                match resolved_identity(&identity, source) {
+                    Ok(resolved_hash) => {
+                        if let Some(recorded) = &entry.resolved_semantic_hash
+                            && recorded != &resolved_hash
+                        {
+                            return Err(BuiltInPolicyError::new(format!(
+                                "built-in policy `{path}` resolves to `{resolved_hash}` but the \
+                                 manifest records `{recorded}`"
+                            )));
+                        }
+                    }
+                    Err(rejection) if is_deferred_rejection(&rejection) => {
+                        if entry.resolved_semantic_hash.is_some() {
+                            return Err(BuiltInPolicyError::new(format!(
+                                "built-in policy `{path}` defers a qualified locator and cannot \
+                                 record a resolved semantic hash before activation"
+                            )));
+                        }
+                    }
+                    Err(rejection) => {
+                        return Err(BuiltInPolicyError::new(format!(
+                            "failed to load built-in policy `{path}`: {rejection}"
+                        )));
+                    }
+                }
+                if source_by_policy_id
+                    .insert(entry.id.clone(), source.clone())
+                    .is_some()
+                {
                     return Err(BuiltInPolicyError::new(format!(
-                        "built-in policy `{}` has semantic hash `{observed_hash}` but the manifest records `{recorded_hash}`",
-                        entry.0
+                        "built-in policy id `{}` is declared by more than one pack",
+                        entry.id
                     )));
                 }
-                if source_by_policy_id.contains_key(observed_id.as_str()) {
-                    return Err(BuiltInPolicyError::new(format!(
-                        "built-in policy id `{observed_id}` is declared by more than one pack"
-                    )));
-                }
-                source_by_policy_id.insert(observed_id.to_string(), entry.1);
             }
         }
 
@@ -383,10 +573,10 @@ impl BuiltInPolicyCatalog {
     /// nothing. So `packs = [p]` with `policy_ids = [i]` runs the single
     /// policy `i` inside `p`, never the whole pack (issue 2923). Output keeps
     /// catalog order, which reports and digests depend on.
-    pub fn select(
-        &'static self,
+    pub fn select<'a>(
+        &'a self,
         selection: &BuiltInPolicySelection,
-    ) -> Result<Vec<SelectedBuiltInPolicy>, BuiltInPolicyError> {
+    ) -> Result<Vec<SelectedBuiltInPolicy<'a>>, BuiltInPolicyError> {
         // A caller that names no built-in selector asks for no built-in
         // policy; the whole catalog is requested by naming its packs.
         if selection.is_empty() {
@@ -439,7 +629,7 @@ impl BuiltInPolicyCatalog {
             })
             .map(|(pack, entry)| SelectedBuiltInPolicy {
                 manifest: entry,
-                source: self.source_by_policy_id[entry.id.as_str()],
+                source: self.source_by_policy_id[entry.id.as_str()].as_str(),
                 pack_id: pack.id.as_str(),
             })
             .collect::<Vec<_>>();
@@ -452,6 +642,52 @@ impl BuiltInPolicyCatalog {
             )));
         }
         Ok(selected)
+    }
+}
+
+/// The deterministic authored identity: close the policy with every qualified
+/// locator preserved, so the qualified name stays in the plan.
+fn authored_identity(
+    identity: &PolicySourceIdentity,
+    source: &str,
+) -> Result<String, BuiltInPolicyError> {
+    let catalogs = Arc::new(TaintCatalogRegistry::new_without_workspace(
+        CatalogRegistryLimits::default(),
+    ));
+    let mut registry =
+        PolicyRegistry::new_without_workspace(catalogs, PolicyRegistryLimits::default());
+    let loaded = registry
+        .register_policy_bytes_deferred(identity.clone(), source.as_bytes())
+        .map_err(|error| {
+            BuiltInPolicyError::new(format!(
+                "failed to load built-in policy `{identity}`: {error}"
+            ))
+        })?;
+    Ok(loaded.semantic_hash().to_string())
+}
+
+/// The analyzer-free executable identity, available only when the source
+/// carries no deferred locator. The error keeps the typed locator diagnostic.
+fn resolved_identity(
+    identity: &PolicySourceIdentity,
+    source: &str,
+) -> Result<String, PolicyRegistryError> {
+    let catalogs = Arc::new(TaintCatalogRegistry::new_without_workspace(
+        CatalogRegistryLimits::default(),
+    ));
+    let mut registry =
+        PolicyRegistry::new_without_workspace(catalogs, PolicyRegistryLimits::default());
+    registry
+        .register_policy_bytes(identity.clone(), source.as_bytes())
+        .map(|loaded| loaded.semantic_hash().to_string())
+}
+
+/// Whether an analyzer-free registration failed only because a qualified
+/// locator needs an active model. Every other failure is an authoring defect.
+fn is_deferred_rejection(error: &PolicyRegistryError) -> bool {
+    match error {
+        PolicyRegistryError::Source(source) => is_qualified_locator_code(source.diagnostic.code),
+        _ => false,
     }
 }
 
@@ -488,16 +724,9 @@ fn validate_manifest_shape(manifest: &BuiltInPolicyPackManifest) -> Result<(), B
                 entry.id
             )));
         }
-        if entry.semantic_hash.len() != 64
-            || !entry
-                .semantic_hash
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-        {
-            return Err(BuiltInPolicyError::new(format!(
-                "built-in policy `{}` must record a lowercase 64-digit semantic hash",
-                entry.id
-            )));
+        validate_sha256_field(&entry.id, "authored_hash", &entry.authored_hash)?;
+        if let Some(resolved) = &entry.resolved_semantic_hash {
+            validate_sha256_field(&entry.id, "resolved_semantic_hash", resolved)?;
         }
         let id = PolicyId::new(&entry.id).map_err(|error| {
             BuiltInPolicyError::new(format!(
@@ -526,6 +755,23 @@ fn validate_manifest_shape(manifest: &BuiltInPolicyPackManifest) -> Result<(), B
     Ok(())
 }
 
+fn validate_sha256_field(
+    policy_id: &str,
+    field: &str,
+    value: &str,
+) -> Result<(), BuiltInPolicyError> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(BuiltInPolicyError::new(format!(
+            "built-in policy `{policy_id}` must record a lowercase 64-digit {field}"
+        )));
+    }
+    Ok(())
+}
+
 pub fn built_in_policy_catalog() -> Result<&'static BuiltInPolicyCatalog, BuiltInPolicyError> {
     if let Some(catalog) = BUILT_IN_CATALOG.get() {
         return Ok(catalog);
@@ -536,14 +782,32 @@ pub fn built_in_policy_catalog() -> Result<&'static BuiltInPolicyCatalog, BuiltI
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BuiltInPolicyError {
+    code: &'static str,
     message: String,
 }
 
 impl BuiltInPolicyError {
+    const CATALOG_CODE: &'static str = "built-in-policy-catalog-invalid";
+
     fn new(message: impl Into<String>) -> Self {
         Self {
+            code: Self::CATALOG_CODE,
             message: message.into(),
         }
+    }
+
+    fn with_code(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+
+    /// The typed diagnostic code. Locator failures keep the code raised by the
+    /// loaded-policy boundary, such as `qualified-call-locator-inactive-model`
+    /// or `qualified-call-locator-ambiguous`.
+    pub const fn code(&self) -> &'static str {
+        self.code
     }
 }
 
@@ -554,7 +818,6 @@ impl fmt::Display for BuiltInPolicyError {
 }
 
 impl std::error::Error for BuiltInPolicyError {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -566,26 +829,35 @@ mod tests {
     #[test]
     #[ignore = "prints hashes while intentionally updating the checked-in manifest"]
     fn print_computed_semantic_hashes() {
-        let catalogs = Arc::new(TaintCatalogRegistry::new_without_workspace(
-            CatalogRegistryLimits::default(),
-        ));
-        let mut registry =
-            PolicyRegistry::new_without_workspace(catalogs, PolicyRegistryLimits::default());
         for (pack_id, entry) in EMBEDDED_POLICY_SOURCES
             .iter()
             .flat_map(|(pack_id, sources)| sources.iter().map(move |entry| (*pack_id, *entry)))
         {
             let source = entry.1;
-            let policy = registry
-                .register_policy_bytes(
-                    PolicySourceIdentity::new(format!("builtin:{}/{}", pack_id, entry.0)),
-                    source.as_bytes(),
-                )
-                .expect("load policy");
+            let identity = PolicySourceIdentity::new(format!("builtin:{}/{}", pack_id, entry.0));
+            let catalogs = Arc::new(TaintCatalogRegistry::new_without_workspace(
+                CatalogRegistryLimits::default(),
+            ));
+            let mut registry =
+                PolicyRegistry::new_without_workspace(catalogs, PolicyRegistryLimits::default());
+            let authored = registry
+                .register_policy_bytes_deferred(identity.clone(), source.as_bytes())
+                .expect("authored identity");
+            let catalogs = Arc::new(TaintCatalogRegistry::new_without_workspace(
+                CatalogRegistryLimits::default(),
+            ));
+            let mut registry =
+                PolicyRegistry::new_without_workspace(catalogs, PolicyRegistryLimits::default());
+            let resolved = registry.register_policy_bytes(identity, source.as_bytes());
+            let resolved = match resolved {
+                Ok(policy) => policy.semantic_hash().to_string(),
+                Err(error) => format!("deferred({error})"),
+            };
             println!(
-                "{} {}",
-                policy.definition().metadata.id,
-                policy.semantic_hash()
+                "{} authored_hash={} resolved_semantic_hash={}",
+                authored.definition().metadata.id,
+                authored.semantic_hash(),
+                resolved,
             );
         }
     }
@@ -632,6 +904,178 @@ mod tests {
             security[0].source_identity().as_str(),
             "builtin:bifrost.security/policies/jvm/servlet-parameter-to-jdbc.rqlp"
         );
+    }
+
+    /// A built-in-style policy whose only call target is a qualified
+    /// semantic-model locator, so the analyzer-free boundary cannot close it.
+    const DEFERRED_QUALIFIED_POLICY: &str = r#"(policy
+      :schema-version 1
+      :id "test.issue-3316.deferred"
+      :name "Deferred qualified call locator"
+      :message "M"
+      :severity warning
+      :analysis (analysis
+        :type assertion
+        (bind :name finding
+          :query (rql :schema-version 1
+            (resolved-call :resolves-to "subprocess.run" :proof exact
+              (call-bindings (call-shape (call :callee (name "run")))))))
+        (group :name by-call :by (finding.id)
+          (aggregate :name violations :op count))
+        (assert :group by-call :value violations :cardinality (exactly 0))))"#;
+
+    /// A built-in-style policy with no qualified locator at all.
+    const LOCATOR_FREE_POLICY: &str = r#"(policy
+      :schema-version 1
+      :id "test.issue-3316.locator-free"
+      :name "Locator-free policy"
+      :message "M"
+      :severity warning
+      :analysis (analysis :type match :selector (rql :schema-version 1 (name "run"))))"#;
+
+    fn pack_manifest(
+        authored_hash: &str,
+        resolved_semantic_hash: Option<&str>,
+        path: &str,
+        policy_id: &str,
+    ) -> String {
+        let resolved = match resolved_semantic_hash {
+            Some(hash) => format!("\"{hash}\""),
+            None => "null".to_owned(),
+        };
+        format!(
+            r#"{{
+  "schema_version": 2,
+  "id": "test.issue-3316",
+  "version": "1.0.0",
+  "name": "Issue 3316 fixture",
+  "description": "Built-in-style deferred locator fixture.",
+  "policies": [
+    {{
+      "path": "{path}",
+      "id": "{policy_id}",
+      "authored_hash": "{authored_hash}",
+      "resolved_semantic_hash": {resolved},
+      "category": "correctness",
+      "supported_languages": ["python"],
+      "required_capabilities": ["exact-call-target"],
+      "severity_rationale": "fixture",
+      "remediation": "fixture"
+    }}
+  ]
+}}"#
+        )
+    }
+
+    fn deferred_catalog(
+        resolved_semantic_hash: Option<&str>,
+    ) -> Result<BuiltInPolicyCatalog, BuiltInPolicyError> {
+        let identity = PolicySourceIdentity::new("builtin:test.issue-3316/policies/deferred.rqlp");
+        let authored = authored_identity(&identity, DEFERRED_QUALIFIED_POLICY)?;
+        BuiltInPolicyCatalog::from_embedded_packs(vec![
+            EmbeddedPolicyPack::new(pack_manifest(
+                &authored,
+                resolved_semantic_hash,
+                "policies/deferred.rqlp",
+                "test.issue-3316.deferred",
+            ))
+            .with_source("policies/deferred.rqlp", DEFERRED_QUALIFIED_POLICY),
+        ])
+    }
+
+    #[test]
+    fn a_deferred_qualified_locator_keeps_a_deterministic_authored_identity() {
+        let identity = PolicySourceIdentity::new("builtin:test.issue-3316/policies/deferred.rqlp");
+        let authored = authored_identity(&identity, DEFERRED_QUALIFIED_POLICY)
+            .expect("the authored boundary preserves the qualified locator");
+        let rejection = resolved_identity(&identity, DEFERRED_QUALIFIED_POLICY)
+            .expect_err("the analyzer-free boundary cannot close the locator");
+        let PolicyRegistryError::Source(source) = rejection else {
+            panic!("expected a typed source diagnostic");
+        };
+        assert_eq!(source.diagnostic.code, "qualified-call-locator-incomplete");
+        assert!(is_deferred_rejection(&PolicyRegistryError::Source(source)));
+
+        let catalog = deferred_catalog(None).expect("the deferred entry loads");
+        let selected = catalog
+            .select(&BuiltInPolicySelection {
+                policy_ids: vec!["test.issue-3316.deferred".to_owned()],
+                ..BuiltInPolicySelection::default()
+            })
+            .expect("select the deferred policy");
+        let [selected] = selected.as_slice() else {
+            panic!("one deferred policy is selected");
+        };
+        assert_eq!(selected.authored_hash(), authored);
+        assert_eq!(selected.recorded_resolved_semantic_hash(), None);
+        assert!(
+            selected
+                .source()
+                .contains(":resolves-to \"subprocess.run\"")
+        );
+
+        // Listing is deterministic before activation: two independent builds
+        // agree on the document and the package digest.
+        let rebuilt = deferred_catalog(None).expect("the deferred entry loads again");
+        assert_eq!(catalog.document(), rebuilt.document());
+        assert_eq!(catalog.digest(), rebuilt.digest());
+    }
+
+    #[test]
+    fn a_locator_free_source_records_both_identities_separately() {
+        let identity = PolicySourceIdentity::new("builtin:test.issue-3316/policies/plain.rqlp");
+        let authored =
+            authored_identity(&identity, LOCATOR_FREE_POLICY).expect("authored identity");
+        let resolved =
+            resolved_identity(&identity, LOCATOR_FREE_POLICY).expect("resolved identity");
+        assert_eq!(authored, resolved);
+        let catalog = BuiltInPolicyCatalog::from_embedded_packs(vec![
+            EmbeddedPolicyPack::new(pack_manifest(
+                &authored,
+                Some(&resolved),
+                "policies/plain.rqlp",
+                "test.issue-3316.locator-free",
+            ))
+            .with_source("policies/plain.rqlp", LOCATOR_FREE_POLICY),
+        ])
+        .expect("both identities match");
+        let selected = catalog
+            .select(&BuiltInPolicySelection {
+                policy_ids: vec!["test.issue-3316.locator-free".to_owned()],
+                ..BuiltInPolicySelection::default()
+            })
+            .expect("select the locator-free policy");
+        assert_eq!(
+            selected[0].recorded_resolved_semantic_hash(),
+            Some(resolved.as_str())
+        );
+    }
+
+    #[test]
+    fn a_deferred_entry_cannot_pin_a_resolved_semantic_hash() {
+        let error = deferred_catalog(Some(&"a".repeat(64)))
+            .expect_err("a deferred locator has no pre-activation resolved identity");
+        assert!(
+            error
+                .to_string()
+                .contains("cannot record a resolved semantic hash"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_wrong_authored_hash_is_refused() {
+        let error = BuiltInPolicyCatalog::from_embedded_packs(vec![
+            EmbeddedPolicyPack::new(pack_manifest(
+                &"0".repeat(64),
+                None,
+                "policies/deferred.rqlp",
+                "test.issue-3316.deferred",
+            ))
+            .with_source("policies/deferred.rqlp", DEFERRED_QUALIFIED_POLICY),
+        ])
+        .expect_err("a stale authored hash is a catalog defect");
+        assert!(error.to_string().contains("authored hash"), "{error}");
     }
 
     fn selected_ids(selection: &BuiltInPolicySelection) -> Result<Vec<String>, String> {

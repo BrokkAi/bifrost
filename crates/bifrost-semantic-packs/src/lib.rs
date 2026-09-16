@@ -149,6 +149,18 @@ const NODE_CHILD_PROCESS_JAVASCRIPT_DECLARATION_SHARDS: &[&[u8]] = &[include_byt
 const NODE_CHILD_PROCESS_TYPESCRIPT_DECLARATION_SHARDS: &[&[u8]] = &[include_bytes!(
     "../embedded/node-child-process-typescript-declarations/shards/declarations.child-process-exec-sync.json"
 )];
+const NODE_CHILD_PROCESS_JAVASCRIPT_SUMMARY_SHARDS: &[&[u8]] = &[include_bytes!(
+    "../embedded/node-child-process-javascript-summaries/shards/summaries.child-process-exec-sync.json"
+)];
+const NODE_CHILD_PROCESS_TYPESCRIPT_SUMMARY_SHARDS: &[&[u8]] = &[include_bytes!(
+    "../embedded/node-child-process-typescript-summaries/shards/summaries.child-process-exec-sync.json"
+)];
+const NODE_RUNTIME_VALUES_JAVASCRIPT_SHARDS: &[&[u8]] = &[include_bytes!(
+    "../embedded/node-runtime-values-javascript/shards/runtime.node-process-values.deflate"
+)];
+const NODE_RUNTIME_VALUES_TYPESCRIPT_SHARDS: &[&[u8]] = &[include_bytes!(
+    "../embedded/node-runtime-values-typescript/shards/runtime.node-process-values.deflate"
+)];
 const NODE_BUFFER_JAVASCRIPT_DECLARATION_SHARDS: &[&[u8]] = &[include_bytes!(
     "../embedded/node-buffer-javascript-declarations/shards/declarations.buffer.deflate"
 )];
@@ -214,7 +226,8 @@ const GO_STDLIB_TESTING_SHARDS: &[&[u8]] = &[
 const GO_CONCURRENCY_SHARDS: &[&[u8]] = &[
     include_bytes!("../embedded/go-concurrency/shards/go.concurrency.errgroup.deflate"),
     include_bytes!("../embedded/go-concurrency/shards/go.concurrency.sync.deflate"),
-    include_bytes!("../embedded/go-concurrency/shards/go.concurrency.time.json"),
+    include_bytes!("../embedded/go-concurrency/shards/go.concurrency.testing.deflate"),
+    include_bytes!("../embedded/go-concurrency/shards/go.concurrency.time.deflate"),
 ];
 const GO_CONCURRENCY_DECLARATION_SHARDS: &[&[u8]] = &[
     include_bytes!(
@@ -224,7 +237,7 @@ const GO_CONCURRENCY_DECLARATION_SHARDS: &[&[u8]] = &[
         "../embedded/go-concurrency-declarations/shards/go.concurrency.sync.declarations.deflate"
     ),
     include_bytes!(
-        "../embedded/go-concurrency-declarations/shards/go.concurrency.time.declarations.json"
+        "../embedded/go-concurrency-declarations/shards/go.concurrency.time.declarations.deflate"
     ),
 ];
 const GO_STDLIB_SYNC_ATOMIC_SHARDS: &[&[u8]] = &[include_bytes!(
@@ -271,6 +284,26 @@ const BIFROST_EMBEDDED_PACK_ENTRIES: &[EmbeddedSemanticPack<'static>] = &[
         "bifrost.node-child-process-typescript-declarations@0.2.0",
         include_bytes!("../embedded/node-child-process-typescript-declarations/manifest.json"),
         NODE_CHILD_PROCESS_TYPESCRIPT_DECLARATION_SHARDS,
+    ),
+    EmbeddedSemanticPack::new(
+        "bifrost.node-child-process-javascript-summaries@0.1.0",
+        include_bytes!("../embedded/node-child-process-javascript-summaries/manifest.json"),
+        NODE_CHILD_PROCESS_JAVASCRIPT_SUMMARY_SHARDS,
+    ),
+    EmbeddedSemanticPack::new(
+        "bifrost.node-child-process-typescript-summaries@0.1.0",
+        include_bytes!("../embedded/node-child-process-typescript-summaries/manifest.json"),
+        NODE_CHILD_PROCESS_TYPESCRIPT_SUMMARY_SHARDS,
+    ),
+    EmbeddedSemanticPack::new(
+        "bifrost.node-runtime-values-javascript@0.1.0",
+        include_bytes!("../embedded/node-runtime-values-javascript/manifest.json"),
+        NODE_RUNTIME_VALUES_JAVASCRIPT_SHARDS,
+    ),
+    EmbeddedSemanticPack::new(
+        "bifrost.node-runtime-values-typescript@0.1.0",
+        include_bytes!("../embedded/node-runtime-values-typescript/manifest.json"),
+        NODE_RUNTIME_VALUES_TYPESCRIPT_SHARDS,
     ),
     EmbeddedSemanticPack::new(
         "bifrost.node-buffer-javascript-declarations@0.1.0",
@@ -363,12 +396,12 @@ const BIFROST_EMBEDDED_PACK_ENTRIES: &[EmbeddedSemanticPack<'static>] = &[
         GO_STDLIB_PATH_FILEPATH_SHARDS,
     ),
     EmbeddedSemanticPack::new(
-        "bifrost.go.stdlib.testing@1.0.0",
+        "bifrost.go.stdlib.testing@1.1.0",
         include_bytes!("../embedded/go-stdlib-testing/manifest.json"),
         GO_STDLIB_TESTING_SHARDS,
     ),
     EmbeddedSemanticPack::new(
-        "bifrost.go.concurrency@1.1.0",
+        "bifrost.go.concurrency@1.3.0",
         include_bytes!("../embedded/go-concurrency/manifest.json"),
         GO_CONCURRENCY_SHARDS,
     ),
@@ -482,13 +515,13 @@ mod tests {
         CompiledNormalReturnRefinement, CompiledOperationPrecondition,
         CompiledPredicateProofEffect, CompiledResultMemberContract, CompiledResultPredicate,
         CompiledSummaryEffect, CompiledSummaryExitKind, CompiledSummaryInput,
-        CompiledSummaryOutput, CompiledSummaryTransfer, CompilerOptions, Completeness,
-        DependencyDiscoveryOutcome, DependencyPackLimits, DurablePackSource, DurablePackSourceKind,
-        Locator, MemberIdentity, MemberKind, ProcedureSummaryMemberKey,
-        SemanticModelActivationEvidence, SemanticModelActivationRequest,
-        SemanticModelMatchDisposition, SemanticModelRuntimeLimits, SemanticModelRuntimeOutcome,
-        SemanticPackSelectorQuery, SourceFormat, TypeIdentity, TypeKind, TypeRef,
-        acquire_active_semantic_models, compile_source, member_declaration_id,
+        CompiledSummaryOutput, CompiledSummaryTransfer, CompiledSyncMapOperation,
+        CompiledTaskSpawnCondition, CompilerOptions, Completeness, DependencyDiscoveryOutcome,
+        DependencyPackLimits, DurablePackSource, DurablePackSourceKind, Locator, MemberIdentity,
+        MemberKind, ProcedureSummaryMemberKey, SemanticModelActivationEvidence,
+        SemanticModelActivationRequest, SemanticModelMatchDisposition, SemanticModelRuntimeLimits,
+        SemanticModelRuntimeOutcome, SemanticPackSelectorQuery, SourceFormat, TypeIdentity,
+        TypeKind, TypeRef, acquire_active_semantic_models, compile_source, member_declaration_id,
         prepare_compatible_installed_semantic_packs, type_declaration_id,
     };
     use brokk_bifrost_analysis::analyzer::usages::call_relations::CallRelationLimits;
@@ -670,11 +703,36 @@ mod tests {
             .payload()
             .procedure_summaries()
             .expect("the Go time shard carries procedure summaries");
+        assert_eq!(time.len(), 3);
         assert!(time.iter().any(|summary| {
             summary.id == "time.after-func"
                 && matches!(
                     summary.concurrency_effects.as_slice(),
-                    [CompiledConcurrencyEffect::TaskSpawn { .. }]
+                    [CompiledConcurrencyEffect::TaskSpawn {
+                        callable,
+                        group: None,
+                        condition: None,
+                        timer: Some(CompiledSummaryOutput::IndexedNormalReturn { ordinal: 0 }),
+                    }]
+                    if callable == &CompiledSummaryInput::Parameter { ordinal: 1 }
+                )
+        }));
+        assert!(time.iter().any(|summary| {
+            summary.id == "time.timer.stop"
+                && summary.ordinary_heap_unchanged
+                && matches!(
+                    summary.concurrency_effects.as_slice(),
+                    [CompiledConcurrencyEffect::TimerStop { timer }]
+                        if timer == &CompiledSummaryInput::Receiver {}
+                )
+        }));
+        assert!(time.iter().any(|summary| {
+            summary.id == "time.timer.reset"
+                && summary.ordinary_heap_unchanged
+                && matches!(
+                    summary.concurrency_effects.as_slice(),
+                    [CompiledConcurrencyEffect::TimerReset { timer }]
+                        if timer == &CompiledSummaryInput::Receiver {}
                 )
         }));
         assert!(summaries.iter().any(|summary| {
@@ -684,7 +742,9 @@ mod tests {
                     [CompiledConcurrencyEffect::TaskSpawn { .. }]
                 )
         }));
-        let mut unsupported_sync_protocols = summaries
+        // Every sync.Map operation is a reviewed `sync_map` entry operation,
+        // so no unsupported protocol boundary remains in the shipped pack.
+        let unsupported_sync_protocols = summaries
             .iter()
             .flat_map(|summary| &summary.concurrency_effects)
             .filter_map(|effect| match effect {
@@ -692,9 +752,29 @@ mod tests {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        unsupported_sync_protocols.sort_unstable();
-        unsupported_sync_protocols.dedup();
-        assert_eq!(unsupported_sync_protocols, ["sync.Map"]);
+        assert!(unsupported_sync_protocols.is_empty());
+        assert!(summaries.iter().any(|summary| {
+            summary.id == "sync.map.load"
+                && matches!(
+                    summary.concurrency_effects.as_slice(),
+                    [CompiledConcurrencyEffect::SyncMap {
+                        map: CompiledSummaryInput::Receiver {},
+                        key: Some(CompiledSummaryInput::Parameter { ordinal: 0 }),
+                        operation: CompiledSyncMapOperation::Load,
+                    }]
+                )
+        }));
+        assert!(summaries.iter().any(|summary| {
+            summary.id == "sync.map.clear"
+                && matches!(
+                    summary.concurrency_effects.as_slice(),
+                    [CompiledConcurrencyEffect::SyncMap {
+                        map: CompiledSummaryInput::Receiver {},
+                        key: None,
+                        operation: CompiledSyncMapOperation::Clear,
+                    }]
+                )
+        }));
         assert!(summaries.iter().any(|summary| {
             summary.id == "sync.cond.new"
                 && matches!(
@@ -794,10 +874,80 @@ mod tests {
             summary.id == "errgroup.group.try-go"
                 && matches!(
                     summary.concurrency_effects.as_slice(),
-                    [
-                        CompiledConcurrencyEffect::TaskSpawn { .. },
-                        CompiledConcurrencyEffect::Unsupported { protocol },
-                    ] if protocol == "errgroup.Group.TryGo"
+                    [CompiledConcurrencyEffect::TaskSpawn {
+                        callable,
+                        group,
+                        condition,
+                        timer,
+                    }] if callable == &CompiledSummaryInput::Parameter { ordinal: 0 }
+                        && group == &Some(CompiledSummaryInput::Receiver {})
+                        && condition == &Some(CompiledTaskSpawnCondition::CallResultTrue)
+                        && timer.is_none()
+                )
+        }));
+        assert!(
+            !errgroup
+                .iter()
+                .any(
+                    |summary| summary.concurrency_effects.iter().any(|effect| matches!(
+                        effect,
+                        CompiledConcurrencyEffect::Unsupported { protocol }
+                            if protocol == "errgroup.Group.TryGo"
+                    ))
+                ),
+            "the conditional spawn replaces the old unsupported TryGo boundary"
+        );
+
+        let testing = concurrency
+            .shards
+            .iter()
+            .find(|shard| shard.descriptor.shard_id == "go.concurrency.testing")
+            .expect("the Go concurrency pack carries its testing shard");
+        let testing = decode_shard_for_manifest(
+            &concurrency.manifest,
+            &testing.descriptor,
+            &testing.bytes,
+            &DecodeLimits::default(),
+        )
+        .expect("the Go testing shard decodes");
+        let testing = testing
+            .payload()
+            .procedure_summaries()
+            .expect("the Go testing shard carries procedure summaries");
+        assert_eq!(testing.len(), 3);
+        assert!(testing.iter().any(|summary| {
+            summary.id == "testing.t.run"
+                && summary.target.has_receiver
+                && summary.target.parameter_count == 2
+                && summary.completeness == Completeness::Complete
+                && matches!(
+                    summary.concurrency_effects.as_slice(),
+                    [CompiledConcurrencyEffect::SubtestRun { callable, group }]
+                        if callable == &CompiledSummaryInput::Parameter { ordinal: 1 }
+                            && group == &CompiledSummaryInput::Receiver {}
+                )
+        }));
+        assert!(testing.iter().any(|summary| {
+            summary.id == "testing.t.parallel"
+                && summary.target.has_receiver
+                && summary.target.parameter_count == 0
+                && summary.completeness == Completeness::Complete
+                && matches!(
+                    summary.concurrency_effects.as_slice(),
+                    [CompiledConcurrencyEffect::SubtestParallel { receiver }]
+                        if receiver == &CompiledSummaryInput::Receiver {}
+                )
+        }));
+        assert!(testing.iter().any(|summary| {
+            summary.id == "testing.t.cleanup"
+                && summary.target.has_receiver
+                && summary.target.parameter_count == 1
+                && summary.completeness == Completeness::Complete
+                && matches!(
+                    summary.concurrency_effects.as_slice(),
+                    [CompiledConcurrencyEffect::SubtestCleanup { callable, group }]
+                        if callable == &CompiledSummaryInput::Parameter { ordinal: 0 }
+                            && group == &CompiledSummaryInput::Receiver {}
                 )
         }));
         assert!(summaries.iter().any(|summary| {
@@ -879,7 +1029,7 @@ mod tests {
             declaration_member_count += members.len();
         }
         assert_eq!(declaration_type_count, 16);
-        assert_eq!(declaration_member_count, 38);
+        assert_eq!(declaration_member_count, 39);
 
         let time_declarations = concurrency_declarations
             .shards
@@ -899,7 +1049,7 @@ mod tests {
             .expect("the Go time declaration shard carries declaration facts");
         assert!(relations.is_empty());
         assert_eq!(time_types.len(), 4);
-        assert_eq!(time_members.len(), 4);
+        assert_eq!(time_members.len(), 5);
         let time_module = time_types
             .iter()
             .find(|fact| fact.name == "time")
@@ -970,6 +1120,34 @@ mod tests {
         );
         assert!(matches!(
             stop.signature.as_ref().and_then(|signature| signature.returns.as_ref()),
+            Some(TypeRef::Named { name, arguments, nullable })
+                if name == "bool" && arguments.is_empty() && !nullable
+        ));
+
+        let reset = time_members
+            .iter()
+            .find(|member| member.name == "Reset")
+            .expect("time.Timer.Reset is declared");
+        assert_eq!(reset.owner, timer_type.id);
+        assert_eq!(
+            reset.receiver.as_ref().map(|receiver| receiver.pointer),
+            Some(true)
+        );
+        let reset_signature = reset
+            .signature
+            .as_ref()
+            .expect("time.Timer.Reset has a signature");
+        assert!(matches!(
+            reset_signature.parameters.as_slice(),
+            [parameter]
+                if matches!(
+                    &parameter.r#type,
+                    TypeRef::Declared { id, arguments, nullable }
+                        if id == &duration_type.id && arguments.is_empty() && !nullable
+                )
+        ));
+        assert!(matches!(
+            reset_signature.returns.as_ref(),
             Some(TypeRef::Named { name, arguments, nullable })
                 if name == "bool" && arguments.is_empty() && !nullable
         ));
@@ -2929,7 +3107,7 @@ func packageAlias() {
         let pack = BIFROST_EMBEDDED_PACKS
             .packs()
             .iter()
-            .find(|pack| pack.source_id() == "bifrost.go.stdlib.testing@1.0.0")
+            .find(|pack| pack.source_id() == "bifrost.go.stdlib.testing@1.1.0")
             .expect("the Go testing pack ships")
             .decode(&DecodeLimits::default())
             .expect("the Go testing pack decodes");
@@ -2964,7 +3142,7 @@ func packageAlias() {
                 .iter()
                 .all(|fact| !matches!(fact.name.as_str(), "testing.common" | "testing.TB"))
         );
-        assert_eq!(members.len(), 18);
+        assert_eq!(members.len(), 21);
         let method_names = ["FailNow", "Fatal", "Fatalf", "Skip", "Skipf", "SkipNow"];
         for owner in ["type.testing.t", "type.testing.b", "type.testing.f"] {
             for method in method_names {
@@ -2977,6 +3155,29 @@ func packageAlias() {
                     "one pointer-receiver fact for {owner}.{method}: {matching:#?}"
                 );
             }
+        }
+        // The subtest protocol binds through exact `testing.T` declarations
+        // only; `B` and `F` share no `Run`/`Parallel`/`Cleanup` behavior.
+        let subtest_methods = [("Run", 2), ("Parallel", 0), ("Cleanup", 1)];
+        for (method, parameter_count) in subtest_methods {
+            let matching = members
+                .iter()
+                .filter(|fact| fact.owner == "type.testing.t" && fact.name == method)
+                .collect::<Vec<_>>();
+            let [fact] = matching.as_slice() else {
+                panic!("one fact for type.testing.t.{method}: {matching:#?}");
+            };
+            assert!(
+                fact.receiver.is_some_and(|receiver| receiver.pointer),
+                "one pointer-receiver fact for type.testing.t.{method}: {fact:#?}"
+            );
+            assert_eq!(
+                fact.signature
+                    .as_ref()
+                    .map(|signature| signature.parameters.len()),
+                Some(parameter_count),
+                "reviewed arity for type.testing.t.{method}: {fact:#?}"
+            );
         }
 
         let summaries = shards

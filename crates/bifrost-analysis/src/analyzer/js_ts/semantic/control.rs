@@ -1317,7 +1317,31 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     .child_by_field_name("expression")
                     .or_else(|| first_named_child(node));
                 if let Some(value) = value {
-                    self.push_chain_expression(stack, value, entry, next, scope, chain_skip);
+                    // These wrappers have no runtime effect: the operand's
+                    // value is this node's value, exactly as parentheses do.
+                    // Unlike parentheses, they do not end a continuous
+                    // optional chain, so the incoming skip still propagates.
+                    let terminal = self.point(builder, node, Vec::new())?;
+                    let inner =
+                        self.expression_value(builder, value, expression_value_kind(value))?;
+                    self.append_effect(
+                        builder,
+                        terminal,
+                        SemanticEffect::ValueFlow {
+                            kind: ValueFlowKind::Local,
+                            source: inner,
+                            target: result,
+                        },
+                    )?;
+                    self.edge(builder, terminal, next)?;
+                    self.push_chain_expression(
+                        stack,
+                        value,
+                        entry,
+                        EdgeTarget::normal(terminal),
+                        scope,
+                        chain_skip,
+                    );
                     Ok(())
                 } else {
                     self.edge(builder, entry, next)

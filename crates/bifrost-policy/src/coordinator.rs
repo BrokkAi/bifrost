@@ -975,6 +975,59 @@ pub fn workspace_snapshot_deadline_outcome_with_preflight(
     )
 }
 
+/// Deadline outcome for a run whose budget expired while its diff base was
+/// being materialized, built, or evaluated.
+///
+/// The phase is named in the report so a caller can tell a base it never
+/// reached from one that was evaluated and found unreliable: the latter
+/// degrades gating with `DiffBaseUnreliable` and still evaluates the head,
+/// while this outcome says the budget ended the run and every policy is
+/// pending. Nothing of the head ran, so `runs` is empty and the report carries
+/// no diff review at all.
+#[allow(clippy::too_many_arguments)]
+fn diff_base_deadline_outcome(
+    options: &PolicyEvaluationOptions,
+    batch_budget: PolicyBatchBudget,
+    suppression_sources: Vec<PolicySuppressionSourceState>,
+    scope_document_state: PolicyScopeDocumentState,
+    registration_elapsed: Duration,
+    preparation_elapsed: Duration,
+    diff_base_elapsed: Duration,
+    pending_policy_ids: Vec<PolicyId>,
+    revision: &str,
+) -> Result<PolicyBatchOutcome, PolicyCoordinatorError> {
+    let diagnostic = report_diagnostic(
+        PolicyReportDiagnosticCode::DiffBaseDeadlineExceeded,
+        format!(
+            "the request-wide time budget expired while the diff base `{revision}` was being \
+             evaluated; no policy was evaluated against the head"
+        ),
+        None,
+        None,
+        Vec::new(),
+    )?;
+    deadline_before_evaluation_outcome(
+        options,
+        batch_budget,
+        suppression_sources,
+        scope_document_state,
+        vec![
+            PolicyStageTiming::from_duration(
+                PolicyExecutionStage::PolicyRegistration,
+                registration_elapsed,
+            ),
+            PolicyStageTiming::from_duration(
+                PolicyExecutionStage::PolicyPreparation,
+                preparation_elapsed,
+            ),
+            PolicyStageTiming::from_duration(PolicyExecutionStage::DiffBase, diff_base_elapsed),
+        ],
+        PolicyExecutionStage::DiffBase,
+        pending_policy_ids,
+        Some(diagnostic),
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn deadline_before_evaluation_outcome(
     options: &PolicyEvaluationOptions,
@@ -2495,6 +2548,7 @@ fn evaluate_prepared_policy_inputs(
         );
     }
     let evaluation_started = Instant::now();
+    let mut diff_base_elapsed = std::time::Duration::ZERO;
     // The base evaluates before the head loop: its units must exist before the
     // head can verify and reuse them, and the runnable policy set that filters
     // its inputs is known as soon as registration is done.
@@ -2520,6 +2574,7 @@ fn evaluate_prepared_policy_inputs(
                     WorkspaceUnitInputs::of(head, icfg_active_semantic_model_snapshot.as_deref()),
                 )
             });
+            let diff_base_started = Instant::now();
             // An earlier run may have evaluated this exact base already. When
             // it did, its units are the base's own answer and replaying them
             // costs no export, no build and no execution.
@@ -2534,9 +2589,9 @@ fn evaluate_prepared_policy_inputs(
                 ),
                 _ => None,
             };
-            match reused {
-                Some(outcome) => Some(outcome),
-                None => Some(evaluate_policy_diff_baseline(
+            let phase = match reused {
+                Some(outcome) => DiffBaselinePhase::Evaluated(Box::new(outcome)),
+                None => evaluate_policy_diff_baseline(
                     root,
                     workspace,
                     revision,
@@ -2548,8 +2603,32 @@ fn evaluate_prepared_policy_inputs(
                     evaluation_key,
                     unit_store.as_ref(),
                     cancellation,
-                )?),
+                )?,
+            };
+            diff_base_elapsed = diff_base_started.elapsed();
+            let outcome = match phase {
+                DiffBaselinePhase::Evaluated(outcome) => Some(*outcome),
+                DiffBaselinePhase::DeadlineReached => None,
+            };
+            // A budget that expired anywhere in the phase -- inside the base
+            // work or while replaying a persisted base -- ends the run here
+            // rather than buying a head loop under a spent budget. Nothing of
+            // the head ran, so the run is honestly incomplete instead of a
+            // full-gating run whose base merely looked unreliable.
+            if outcome.is_none() || policy_deadline_reached(cancellation)? {
+                return diff_base_deadline_outcome(
+                    options,
+                    batch_budget,
+                    suppression_sources.clone(),
+                    scope_document_state,
+                    registration_elapsed,
+                    preparation_elapsed,
+                    diff_base_elapsed,
+                    evaluation_policy_ids,
+                    revision,
+                );
             }
+            outcome
         }
         None => None,
     };
@@ -3050,24 +3129,37 @@ fn evaluate_prepared_policy_inputs(
     // They enter the canonical report only on a deadline, where elapsed time
     // is the reason the run stopped; a successful report stays byte-identical
     // across invocations (#2611).
-    let stage_attribution = vec![
-        PolicyStageTiming::from_duration(
-            PolicyExecutionStage::PolicyRegistration,
-            registration_elapsed,
-        ),
-        PolicyStageTiming::from_duration(
-            PolicyExecutionStage::PolicyPreparation,
-            preparation_elapsed,
-        ),
-        PolicyStageTiming::from_duration(
-            PolicyExecutionStage::PolicyEvaluation,
-            evaluation_elapsed,
-        ),
-        PolicyStageTiming::from_duration(
-            PolicyExecutionStage::ReportConstruction,
-            report_started.elapsed(),
-        ),
-    ];
+    //
+    // The diff-base phase is its own stage rather than part of
+    // policy evaluation. A diff-scoped run spends its export, base build and
+    // base evaluation there before a single head policy runs, and billing that
+    // to `policy_evaluation` is what left #3351 unable to say which phase
+    // consumed the request budget. The stage is present only when a diff base
+    // was requested, and the evaluation stage keeps the head loop's own time so
+    // the stages still sum to the run's elapsed time.
+    let mut stage_attribution = Vec::with_capacity(5);
+    stage_attribution.push(PolicyStageTiming::from_duration(
+        PolicyExecutionStage::PolicyRegistration,
+        registration_elapsed,
+    ));
+    stage_attribution.push(PolicyStageTiming::from_duration(
+        PolicyExecutionStage::PolicyPreparation,
+        preparation_elapsed,
+    ));
+    if options.diff_base().is_some() {
+        stage_attribution.push(PolicyStageTiming::from_duration(
+            PolicyExecutionStage::DiffBase,
+            diff_base_elapsed,
+        ));
+    }
+    stage_attribution.push(PolicyStageTiming::from_duration(
+        PolicyExecutionStage::PolicyEvaluation,
+        evaluation_elapsed.saturating_sub(diff_base_elapsed),
+    ));
+    stage_attribution.push(PolicyStageTiming::from_duration(
+        PolicyExecutionStage::ReportConstruction,
+        report_started.elapsed(),
+    ));
     if let Some(terminal_stage) = deadline_stage {
         let stage_timings = stage_attribution.clone();
         let total_elapsed_ms = stage_timings.iter().fold(0_u64, |total, timing| {
@@ -3414,6 +3506,19 @@ fn build_diff_base_workspace(
     Ok((base, config))
 }
 
+/// How one diff-base phase ended.
+///
+/// A phase that ran out of budget is not the same answer as a base whose
+/// evaluation was unreliable: the former ends the run with every policy
+/// pending, while the latter degrades the join to full gating and still
+/// evaluates the head against it. The evaluated outcome is boxed because it
+/// carries the base's identity map and the changed-fact set while the deadline
+/// arm carries nothing.
+enum DiffBaselinePhase {
+    Evaluated(Box<PolicyDiffBaselineOutcome>),
+    DeadlineReached,
+}
+
 /// Materialize the base revision and evaluate the head's policy sources
 /// against it, collecting the strong finding identities and the base run's
 /// reliability verdict.
@@ -3421,7 +3526,10 @@ fn build_diff_base_workspace(
 /// An unresolvable revision or a workspace outside a git repository is an
 /// error: an unresolvable base is an unreliable diff request, never a silent
 /// full run. An unreliable base *evaluation* instead degrades, so a broken
-/// base cannot mask new findings.
+/// base cannot mask new findings. A request whose budget expires mid-phase
+/// stops the phase: the export, the base build and the base evaluation are
+/// each checked, so a spent budget never buys another whole-revision build or
+/// a head evaluation the caller cannot wait for.
 #[allow(clippy::too_many_arguments)]
 fn evaluate_policy_diff_baseline(
     head_root: &Path,
@@ -3435,22 +3543,37 @@ fn evaluate_policy_diff_baseline(
     evaluation_key: Option<PolicyEvaluationRowKey>,
     unit_store: Option<&BatchUnitStore>,
     cancellation: Option<&CancellationToken>,
-) -> Result<PolicyDiffBaselineOutcome, PolicyCoordinatorError> {
-    let export = export_revision(head_root, revision).map_err(|error| {
-        PolicyCoordinatorError::new(format!(
-            "failed to materialize diff base `{revision}`: {error}"
-        ))
-    })?;
+) -> Result<DiffBaselinePhase, PolicyCoordinatorError> {
+    if policy_deadline_reached(cancellation)? {
+        return Ok(DiffBaselinePhase::DeadlineReached);
+    }
+    // The diff-base phase can spend minutes on a large repository before a
+    // single head policy runs, so its work publishes the request phase a
+    // budgeted host reports: a request cut short here says which phase it was
+    // in instead of naming the tool (issue #3170), and a progress-capable
+    // client watches the phase move (issue #3351).
+    let phase_token = cancellation.cloned().unwrap_or_default();
+    let export = {
+        let _phase = phase_token.enter_phase(format!("materializing the diff base `{revision}`"));
+        export_revision(head_root, revision).map_err(|error| {
+            PolicyCoordinatorError::new(format!(
+                "failed to materialize diff base `{revision}`: {error}"
+            ))
+        })?
+    };
     if base_inputs.is_empty() {
-        return Ok(PolicyDiffBaselineOutcome::without_units(PolicyDiffBaseline {
-            requested_revision: revision.to_string(),
-            resolved_commit: export.commit_id().to_string(),
-            identities: HashMap::new(),
-            unreliable_detail: Some(
-                "the head evaluation has no runnable policy, so the base revision was not evaluated"
-                    .to_string(),
-            ),
-        }));
+        return Ok(DiffBaselinePhase::Evaluated(Box::new(
+            PolicyDiffBaselineOutcome::without_units(PolicyDiffBaseline {
+                requested_revision: revision.to_string(),
+                resolved_commit: export.commit_id().to_string(),
+                identities: HashMap::new(),
+                unreliable_detail: Some(
+                    "the head evaluation has no runnable policy, so the base revision was not \
+                     evaluated"
+                        .to_string(),
+                ),
+            }),
+        )));
     }
     // A runnable policy is what puts an input in `base_inputs`, and a runnable
     // policy needed an analyzer snapshot to close over, so a base with anything
@@ -3458,17 +3581,24 @@ fn evaluate_policy_diff_baseline(
     let head_workspace = head_workspace
         .expect("a runnable policy input implies the head analyzer workspace that closed it");
     let uncancelled = CancellationToken::default();
-    let (base, base_analyzer_config) = build_diff_base_workspace(
-        &export,
-        head_root,
-        head_workspace,
-        cancellation.unwrap_or(&uncancelled),
-    )
-    .map_err(|error| {
-        PolicyCoordinatorError::new(format!(
-            "failed to build the diff base analyzer for `{revision}`: {error}"
-        ))
-    })?;
+    let (base, base_analyzer_config) = {
+        let _phase =
+            phase_token.enter_phase(format!("building the diff base analyzer for `{revision}`"));
+        build_diff_base_workspace(
+            &export,
+            head_root,
+            head_workspace,
+            cancellation.unwrap_or(&uncancelled),
+        )
+        .map_err(|error| {
+            PolicyCoordinatorError::new(format!(
+                "failed to build the diff base analyzer for `{revision}`: {error}"
+            ))
+        })?
+    };
+    if policy_deadline_reached(cancellation)? {
+        return Ok(DiffBaselinePhase::DeadlineReached);
+    }
     // The base activates the packs its own committed document names and the
     // reviewed semantic models its own tree checks in, the same way it loads
     // its own committed suppressions (#1868, #2493). Both sides of the
@@ -3495,8 +3625,8 @@ fn evaluate_policy_diff_baseline(
             },
             cancellation.unwrap_or(&uncancelled),
         ) {
-            return Ok(PolicyDiffBaselineOutcome::without_units(
-                PolicyDiffBaseline {
+            return Ok(DiffBaselinePhase::Evaluated(Box::new(
+                PolicyDiffBaselineOutcome::without_units(PolicyDiffBaseline {
                     requested_revision: revision.to_string(),
                     resolved_commit: export.commit_id().to_string(),
                     identities: HashMap::new(),
@@ -3504,8 +3634,8 @@ fn evaluate_policy_diff_baseline(
                         "base pack activation failed, so base findings would misstate the configured \
                      external surface: {error}"
                     )),
-                },
-            ));
+                }),
+            )));
         }
     }
     // The base run needs raw identities only: no diff base (which would
@@ -3537,32 +3667,41 @@ fn evaluate_policy_diff_baseline(
         )),
         _ => None,
     };
-    let outcome = evaluate_policy_inputs_with_limits(
-        export.root(),
-        &base_inputs,
-        &base_options,
-        batch_budget,
-        registry_limits,
-        Some(base.workspace()),
-        None,
-        None,
-        None,
-        base_incremental.as_ref(),
-        cancellation,
-    )?;
+    let outcome = {
+        let _phase = phase_token.enter_phase(format!("evaluating the diff base `{revision}`"));
+        evaluate_policy_inputs_with_limits(
+            export.root(),
+            &base_inputs,
+            &base_options,
+            batch_budget,
+            registry_limits,
+            Some(base.workspace()),
+            None,
+            None,
+            None,
+            base_incremental.as_ref(),
+            cancellation,
+        )?
+    };
+    // A base evaluation that stopped on the budget answers nothing about the
+    // base: the head must not run, and its empty identity map must never be
+    // mistaken for a base that was evaluated and found unreliable.
+    if policy_deadline_reached(cancellation)? {
+        return Ok(DiffBaselinePhase::DeadlineReached);
+    }
     let report = outcome.report();
     if outcome.exit_status() == POLICY_EXIT_UNRELIABLE {
         // An unreliable base classified nothing, so nothing it published may
         // be reused: the head must not verify units against a base whose own
         // evaluation the run refuses to trust.
-        return Ok(PolicyDiffBaselineOutcome::without_units(
-            PolicyDiffBaseline {
+        return Ok(DiffBaselinePhase::Evaluated(Box::new(
+            PolicyDiffBaselineOutcome::without_units(PolicyDiffBaseline {
                 requested_revision: revision.to_string(),
                 resolved_commit: export.commit_id().to_string(),
                 identities: HashMap::new(),
                 unreliable_detail: Some(diff_base_unreliable_detail(report)),
-            },
-        ));
+            }),
+        )));
     }
     let mut identities: HashMap<PolicyId, HashSet<PolicyFindingId>> = HashMap::new();
     for run in report.runs() {
@@ -3595,17 +3734,19 @@ fn evaluate_policy_diff_baseline(
                     policies,
                 )
             });
-    Ok(PolicyDiffBaselineOutcome {
-        baseline: PolicyDiffBaseline {
-            requested_revision: revision.to_string(),
-            resolved_commit: export.commit_id().to_string(),
-            identities,
-            unreliable_detail: None,
+    Ok(DiffBaselinePhase::Evaluated(Box::new(
+        PolicyDiffBaselineOutcome {
+            baseline: PolicyDiffBaseline {
+                requested_revision: revision.to_string(),
+                resolved_commit: export.commit_id().to_string(),
+                identities,
+                unreliable_detail: None,
+            },
+            changed,
+            publication,
+            state: IncrementalBaseState::Evaluated,
         },
-        changed,
-        publication,
-        state: IncrementalBaseState::Evaluated,
-    })
+    )))
 }
 
 /// What this base evaluation records for a later run to substitute for
@@ -6943,6 +7084,161 @@ mod tests {
                 .iter()
                 .flat_map(PolicyRun::findings)
                 .all(|finding| finding.diff().is_none())
+        );
+    }
+
+    /// Issue #3351: a diff-scoped request whose budget expires while the base
+    /// revision is being materialized, built, or evaluated must return the
+    /// canonical deadline report, never a base-unreliable degradation.
+    ///
+    /// The coordinator's cancellation checks are counted rather than timed, so
+    /// this sweeps every check index the fixture can reach. Before the fix a
+    /// spent budget inside the diff-base phase bought the rest of the phase and
+    /// a head evaluation: the base's empty identity set joined as `unreliable`,
+    /// gating degraded to a full run, and the report carried a head run whose
+    /// findings were computed under a cancelled token. That is exactly the
+    /// shape the second assertion rejects; the first pins the honest answer for
+    /// the checks that land in the phase itself.
+    #[test]
+    fn issue_3351_a_spent_budget_in_the_diff_base_leaves_every_policy_pending() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        init_git_workspace(workspace.path());
+        fs::write(
+            workspace.path().join("app.ts"),
+            "export function target() {}\n",
+        )
+        .expect("source fixture");
+        write_policy(
+            workspace.path(),
+            "policies/diff.rqlp",
+            &match_policy("test.diff", "Diff test"),
+        );
+        commit_everything(workspace.path(), "base");
+        let project: Arc<dyn Project> =
+            Arc::new(FilesystemProject::new(workspace.path()).expect("head project"));
+        let head = WorkspaceAnalyzer::build_persisted(project, owned_policy_analyzer_config())
+            .expect("head analyzer");
+        let gating_date = PolicyEvaluationDate::from_ymd(2026, 7, 27).expect("fixed test date");
+        let diff_options = PolicyEvaluationOptions::new(gating_date)
+            .with_fail_on(PolicyFailOn::Warning)
+            .with_diff_base("HEAD".to_string());
+        let paths = [PathBuf::from("policies/diff.rqlp")];
+        let policy_id = PolicyId::new("test.diff").expect("fixture policy id");
+        let mut diff_base_deadlines = 0;
+
+        for checks in 1..=48 {
+            let cancellation = CancellationToken::timeout_after_checks_for_test(checks);
+            let outcome = evaluate_policy_files_with_analyzer(
+                workspace.path(),
+                &paths,
+                &head,
+                &brokk_bifrost_flow::FlowWorkspaceState::new(),
+                &diff_options,
+                Some(&cancellation),
+            )
+            .unwrap_or_else(|error| panic!("checks={checks}: {error}"));
+            let execution = outcome.report().execution();
+            if execution.terminal_stage() == Some(PolicyExecutionStage::DiffBase) {
+                diff_base_deadlines += 1;
+                assert_eq!(
+                    execution.termination(),
+                    Some(PolicyExecutionTermination::DeadlineExceeded),
+                    "checks={checks}"
+                );
+                assert!(
+                    outcome.report().runs().is_empty(),
+                    "checks={checks}: no head policy ran, so no run may be reported"
+                );
+                assert!(
+                    outcome.report().diff().is_none(),
+                    "checks={checks}: a base that never finished evaluating has no join to report"
+                );
+                assert!(
+                    outcome
+                        .report()
+                        .diagnostics()
+                        .iter()
+                        .any(|diagnostic| diagnostic.code()
+                            == PolicyReportDiagnosticCode::DiffBaseDeadlineExceeded),
+                    "checks={checks}: the deadline names the phase it stopped"
+                );
+                assert_eq!(
+                    execution.pending_policy_ids(),
+                    std::slice::from_ref(&policy_id),
+                    "checks={checks}"
+                );
+                assert!(
+                    execution.completed_policy_ids().is_empty()
+                        && execution.active_policy_id().is_none(),
+                    "checks={checks}"
+                );
+                assert!(
+                    execution
+                        .stage_timings()
+                        .iter()
+                        .any(|timing| timing.stage() == PolicyExecutionStage::DiffBase),
+                    "checks={checks}: the phase that spent the budget is attributed"
+                );
+            }
+            assert!(
+                !(execution.termination().is_some()
+                    && outcome.report().diff().is_some_and(|diff| diff.degraded())
+                    && !outcome.report().runs().is_empty()),
+                "checks={checks}: a spent budget must not be reported as a degraded base with head runs"
+            );
+        }
+        assert!(
+            diff_base_deadlines > 0,
+            "the sweep never reached the diff-base phase"
+        );
+    }
+
+    #[test]
+    fn a_diff_scoped_run_attributes_its_base_phase_separately() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        init_git_workspace(workspace.path());
+        fs::write(
+            workspace.path().join("app.ts"),
+            "export function target() {}\n",
+        )
+        .expect("source fixture");
+        write_policy(
+            workspace.path(),
+            "policies/diff.rqlp",
+            &match_policy("test.diff", "Diff test"),
+        );
+        commit_everything(workspace.path(), "base");
+        let paths = [PathBuf::from("policies/diff.rqlp")];
+
+        let diff_options = evaluation_options().with_diff_base("HEAD".to_string());
+        let scoped =
+            evaluate_policy_files(workspace.path(), &paths, &diff_options).expect("diff run");
+        let stages = scoped
+            .stage_attribution()
+            .iter()
+            .map(PolicyStageTiming::stage)
+            .collect::<Vec<_>>();
+        assert!(
+            stages.contains(&PolicyExecutionStage::DiffBase),
+            "a diff-scoped run attributes its base phase: {stages:?}"
+        );
+        assert_eq!(
+            stages
+                .iter()
+                .filter(|stage| **stage == PolicyExecutionStage::DiffBase)
+                .count(),
+            1,
+            "{stages:?}"
+        );
+
+        let full = evaluate_policy_files(workspace.path(), &paths, &evaluation_options())
+            .expect("full run");
+        assert!(
+            !full
+                .stage_attribution()
+                .iter()
+                .any(|timing| timing.stage() == PolicyExecutionStage::DiffBase),
+            "a run without a diff base has no base phase to attribute"
         );
     }
 

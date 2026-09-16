@@ -13,9 +13,9 @@ use super::artifact::{
     CompiledSummaryOutput, CompiledSummaryTransfer, CompiledSummaryValuePreservation,
     CompiledSummaryValueTransfer, CompiledSummaryValueTransferKind,
     CompiledSummaryValueTransferLimitation, CompiledSummaryValueTransferLimitationKind,
-    CompiledSummaryValueTransferOperation, DecodeLimits, canonical_json, content_digest,
-    manifest_content_digest, manifest_semantic_digest, routing_keys, semantic_digest,
-    shard_inventory, stored_digest,
+    CompiledSummaryValueTransferOperation, CompiledSyncMapOperation, CompiledTaskSpawnCondition,
+    DecodeLimits, canonical_json, content_digest, manifest_content_digest,
+    manifest_semantic_digest, routing_keys, semantic_digest, shard_inventory, stored_digest,
 };
 use super::model::*;
 use super::source::{SourceFormat, parse_source};
@@ -775,12 +775,21 @@ fn compile_concurrency_effect(effect: &AuthoredConcurrencyEffect) -> CompiledCon
                 protocol: protocol.clone(),
             }
         }
-        AuthoredConcurrencyEffect::TaskSpawn { callable, group } => {
-            CompiledConcurrencyEffect::TaskSpawn {
-                callable: compile_summary_input(callable),
-                group: group.as_ref().map(compile_summary_input),
-            }
-        }
+        AuthoredConcurrencyEffect::TaskSpawn {
+            callable,
+            group,
+            condition,
+            timer,
+        } => CompiledConcurrencyEffect::TaskSpawn {
+            callable: compile_summary_input(callable),
+            group: group.as_ref().map(compile_summary_input),
+            condition: condition.map(|condition| match condition {
+                AuthoredTaskSpawnCondition::CallResultTrue => {
+                    CompiledTaskSpawnCondition::CallResultTrue
+                }
+            }),
+            timer: timer.as_ref().map(compile_summary_output),
+        },
         AuthoredConcurrencyEffect::TaskJoin { group } => CompiledConcurrencyEffect::TaskJoin {
             group: compile_summary_input(group),
         },
@@ -856,6 +865,53 @@ fn compile_concurrency_effect(effect: &AuthoredConcurrencyEffect) -> CompiledCon
                     AuthoredCondWaiters::One => CompiledCondWaiters::One,
                     AuthoredCondWaiters::All => CompiledCondWaiters::All,
                 },
+            }
+        }
+        AuthoredConcurrencyEffect::SyncMap {
+            map,
+            key,
+            operation,
+        } => CompiledConcurrencyEffect::SyncMap {
+            map: compile_summary_input(map),
+            key: key.as_ref().map(compile_summary_input),
+            operation: match operation {
+                AuthoredSyncMapOperation::Store => CompiledSyncMapOperation::Store,
+                AuthoredSyncMapOperation::Delete => CompiledSyncMapOperation::Delete,
+                AuthoredSyncMapOperation::Clear => CompiledSyncMapOperation::Clear,
+                AuthoredSyncMapOperation::Load => CompiledSyncMapOperation::Load,
+                AuthoredSyncMapOperation::Range => CompiledSyncMapOperation::Range,
+                AuthoredSyncMapOperation::LoadOrStore => CompiledSyncMapOperation::LoadOrStore,
+                AuthoredSyncMapOperation::LoadAndDelete => CompiledSyncMapOperation::LoadAndDelete,
+                AuthoredSyncMapOperation::Swap => CompiledSyncMapOperation::Swap,
+                AuthoredSyncMapOperation::CompareAndSwap => {
+                    CompiledSyncMapOperation::CompareAndSwap
+                }
+                AuthoredSyncMapOperation::CompareAndDelete => {
+                    CompiledSyncMapOperation::CompareAndDelete
+                }
+            },
+        },
+        AuthoredConcurrencyEffect::TimerStop { timer } => CompiledConcurrencyEffect::TimerStop {
+            timer: compile_summary_input(timer),
+        },
+        AuthoredConcurrencyEffect::TimerReset { timer } => CompiledConcurrencyEffect::TimerReset {
+            timer: compile_summary_input(timer),
+        },
+        AuthoredConcurrencyEffect::SubtestRun { callable, group } => {
+            CompiledConcurrencyEffect::SubtestRun {
+                callable: compile_summary_input(callable),
+                group: compile_summary_input(group),
+            }
+        }
+        AuthoredConcurrencyEffect::SubtestParallel { receiver } => {
+            CompiledConcurrencyEffect::SubtestParallel {
+                receiver: compile_summary_input(receiver),
+            }
+        }
+        AuthoredConcurrencyEffect::SubtestCleanup { callable, group } => {
+            CompiledConcurrencyEffect::SubtestCleanup {
+                callable: compile_summary_input(callable),
+                group: compile_summary_input(group),
             }
         }
     }

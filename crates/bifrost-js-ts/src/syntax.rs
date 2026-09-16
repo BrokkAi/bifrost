@@ -502,6 +502,11 @@ pub struct JsTsRuntimeRead {
     pub lexical_resolution: JsTsRuntimeRootResolution,
     pub mutation: JsTsRuntimeMutationEvidence,
     pub execution: JsTsRuntimeExecutionContext,
+    /// Accessor and proxy coverage scoped to this read's own execution
+    /// context: its innermost enclosing function, or the program top level
+    /// for a top-level read. Direct writes stay module-wide; unknown calls
+    /// and member hazards in another function do not poison this read.
+    pub accessor: JsTsRuntimeAccessorCoverage,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1651,8 +1656,18 @@ pub fn extract_js_ts_runtime_reads(
         runtime_effect_coverage_with_bindings_bounded(&bindings, root, source, &mut budget);
     let (accessor_coverage, accessors_complete) =
         runtime_accessor_coverage_bounded(&bindings, root, source, &mut budget);
-    let has_unknown_effects = effect_coverage == JsTsRuntimeEffectCoverage::Unknown
-        || accessor_coverage == JsTsRuntimeAccessorCoverage::UnknownAccessorEffects;
+    // Effect and accessor hazards are scoped to each read's own execution
+    // context, so an external call in one function cannot poison a read in
+    // another. Direct writes stay module-wide: any write to the root
+    // anywhere in the single-file module still poisons every read. The
+    // file-wide coverages above remain the reported module summary.
+    let (local_functions, local_functions_complete) =
+        local_function_bindings_bounded(root, source, &mut budget);
+    let mut scope_coverages: HashMap<
+        Option<usize>,
+        (JsTsRuntimeEffectCoverage, JsTsRuntimeAccessorCoverage),
+    > = HashMap::default();
+    let mut scopes_complete = local_functions_complete;
     let mut reads = Vec::new();
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
@@ -1669,6 +1684,32 @@ pub fn extract_js_ts_runtime_reads(
         {
             let container = &segments[0];
             let key = &segments[1];
+            let scope = enclosing_runtime_function(node);
+            let scope_key = scope.map(|scope| scope.id());
+            let (scope_effect, scope_accessor) = match scope_coverages.get(&scope_key) {
+                Some(cached) => *cached,
+                None => {
+                    let scope_root = scope.unwrap_or(root);
+                    let (effect, effect_complete) = runtime_effect_coverage_scoped(
+                        &bindings,
+                        &local_functions,
+                        scope_root,
+                        source,
+                        &mut budget,
+                    );
+                    let (accessor, accessor_complete) = runtime_accessor_coverage_scoped(
+                        &bindings,
+                        scope_root,
+                        source,
+                        &mut budget,
+                    );
+                    scopes_complete &= effect_complete && accessor_complete;
+                    scope_coverages.insert(scope_key, (effect, accessor));
+                    (effect, accessor)
+                }
+            };
+            let has_unknown_effects = scope_effect == JsTsRuntimeEffectCoverage::Unknown
+                || scope_accessor == JsTsRuntimeAccessorCoverage::UnknownAccessorEffects;
             let mutation = if has_unknown_effects {
                 if writes.iter().any(|write| {
                     write.root_name == root_name
@@ -1686,7 +1727,12 @@ pub fn extract_js_ts_runtime_reads(
             } else {
                 JsTsRuntimeMutationEvidence::NoKnownWrite
             };
-            let execution = enclosing_runtime_execution_context(node);
+            let execution = match scope {
+                Some(function) => {
+                    JsTsRuntimeExecutionContext::DeferredFunction(node_source_range(function))
+                }
+                None => JsTsRuntimeExecutionContext::Program,
+            };
             reads.push(JsTsRuntimeRead {
                 binding_name: slice(path_root, source).to_string(),
                 root_name,
@@ -1704,6 +1750,7 @@ pub fn extract_js_ts_runtime_reads(
                 lexical_resolution,
                 mutation,
                 execution,
+                accessor: scope_accessor,
             });
         }
         let mut cursor = node.walk();
@@ -1721,11 +1768,13 @@ pub fn extract_js_ts_runtime_reads(
             && writes_complete
             && effects_complete
             && accessors_complete
+            && scopes_complete
             && !budget.exhausted,
         complete: bindings_complete
             && writes_complete
             && effects_complete
             && accessors_complete
+            && scopes_complete
             && !budget.exhausted,
     }
 }
@@ -1763,6 +1812,76 @@ fn runtime_effect_coverage_with_bindings(
     .0
 }
 
+/// Function shapes that own a runtime execution context. Both scope
+/// assignment and scope walking share this predicate so they cannot drift.
+fn is_runtime_function_boundary(kind: &str) -> bool {
+    matches!(
+        kind,
+        "function_declaration"
+            | "function_expression"
+            | "generator_function"
+            | "arrow_function"
+            | "method_definition"
+    )
+}
+
+/// The innermost enclosing function of a syntax node, or `None` for a
+/// program top-level node.
+fn enclosing_runtime_function<'tree>(node: Node<'tree>) -> Option<Node<'tree>> {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if is_runtime_function_boundary(parent.kind()) {
+            return Some(parent);
+        }
+        current = parent.parent();
+    }
+    None
+}
+
+/// Push the children that execute in the walked scope. A nested function
+/// body executes only when that function is called, so it belongs to the
+/// nested scope; the nested header stays, conservatively, so computed
+/// method names and decorators cannot hide a hazard.
+fn push_scope_children<'tree>(
+    stack: &mut Vec<Node<'tree>>,
+    node: Node<'tree>,
+    scope_root: Node<'tree>,
+) {
+    let nested = node.id() != scope_root.id() && is_runtime_function_boundary(node.kind());
+    let body = nested.then(|| node.child_by_field_name("body")).flatten();
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if body.is_some_and(|body| body.id() == child.id()) {
+            continue;
+        }
+        stack.push(child);
+    }
+}
+
+fn runtime_call_is_local(
+    bindings: &JsTsLexicalBindingIndex,
+    local_functions: &[JsTsLocalFunctionBinding],
+    node: Node<'_>,
+    source: &str,
+) -> bool {
+    node.child_by_field_name("function")
+        .filter(|callee| callee.kind() == "identifier")
+        .is_some_and(|callee| {
+            let name = slice(callee, source);
+            let Some(scope) = bindings.binding_scope_at(name, callee.start_byte()) else {
+                return false;
+            };
+            let declaration_ranges =
+                bindings.binding_identifier_ranges_at(name, callee.start_byte());
+            !bindings.is_binding_reassigned_at(name, callee.start_byte())
+                && local_functions.iter().any(|function| {
+                    function.name == name
+                        && function.scope == scope
+                        && declaration_ranges.contains(&function.binder_range)
+                })
+        })
+}
+
 fn runtime_effect_coverage_with_bindings_bounded(
     bindings: &JsTsLexicalBindingIndex,
     root: Node<'_>,
@@ -1793,27 +1912,10 @@ fn runtime_effect_coverage_with_bindings_bounded(
         if matches!(node.kind(), "import_statement" | "export_statement") {
             return (JsTsRuntimeEffectCoverage::Unknown, !budget.exhausted);
         }
-        if node.kind() == "call_expression" {
-            let local_call = node
-                .child_by_field_name("function")
-                .filter(|callee| callee.kind() == "identifier")
-                .is_some_and(|callee| {
-                    let name = slice(callee, source);
-                    let Some(scope) = bindings.binding_scope_at(name, callee.start_byte()) else {
-                        return false;
-                    };
-                    let declaration_ranges =
-                        bindings.binding_identifier_ranges_at(name, callee.start_byte());
-                    !bindings.is_binding_reassigned_at(name, callee.start_byte())
-                        && local_functions.iter().any(|function| {
-                            function.name == name
-                                && function.scope == scope
-                                && declaration_ranges.contains(&function.binder_range)
-                        })
-                });
-            if !local_call {
-                return (JsTsRuntimeEffectCoverage::Unknown, !budget.exhausted);
-            }
+        if node.kind() == "call_expression"
+            && !runtime_call_is_local(bindings, &local_functions, node, source)
+        {
+            return (JsTsRuntimeEffectCoverage::Unknown, !budget.exhausted);
         }
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
@@ -1823,6 +1925,93 @@ fn runtime_effect_coverage_with_bindings_bounded(
     (
         JsTsRuntimeEffectCoverage::ClosedLocalCalls,
         !budget.exhausted,
+    )
+}
+
+/// Effect coverage for one execution context: a function body, or the
+/// program top level when the scope root is the file root. Nested function
+/// bodies belong to their own scopes. Local-call resolution still uses the
+/// module-wide function index, so a call into a sibling function whose body
+/// is present stays closed.
+fn runtime_effect_coverage_scoped(
+    bindings: &JsTsLexicalBindingIndex,
+    local_functions: &[JsTsLocalFunctionBinding],
+    scope_root: Node<'_>,
+    source: &str,
+    budget: &mut JsTsRuntimeTraversalBudget,
+) -> (JsTsRuntimeEffectCoverage, bool) {
+    let mut stack = vec![scope_root];
+    while let Some(node) = stack.pop() {
+        if !budget.visit() {
+            break;
+        }
+        if matches!(
+            node.kind(),
+            "new_expression"
+                | "await_expression"
+                | "yield_expression"
+                | "with_statement"
+                | "for_in_statement"
+                | "for_of_statement"
+        ) {
+            return (JsTsRuntimeEffectCoverage::Unknown, !budget.exhausted);
+        }
+        if matches!(node.kind(), "import_statement" | "export_statement") {
+            return (JsTsRuntimeEffectCoverage::Unknown, !budget.exhausted);
+        }
+        if node.kind() == "call_expression"
+            && !runtime_call_is_local(bindings, local_functions, node, source)
+        {
+            return (JsTsRuntimeEffectCoverage::Unknown, !budget.exhausted);
+        }
+        push_scope_children(&mut stack, node, scope_root);
+    }
+    (
+        JsTsRuntimeEffectCoverage::ClosedLocalCalls,
+        !budget.exhausted,
+    )
+}
+
+fn runtime_member_is_known_safe_or_runtime(
+    bindings: &JsTsLexicalBindingIndex,
+    node: Node<'_>,
+    source: &str,
+) -> bool {
+    runtime_path(node, source)
+        .and_then(|(path_root, segments)| {
+            normalized_runtime_path(bindings, path_root, segments, source)
+        })
+        .is_some_and(|(root_name, resolution, segments)| {
+            (resolution == JsTsRuntimeRootResolution::UnboundGlobal
+                || resolution == JsTsRuntimeRootResolution::ProvenGlobalAlias)
+                && root_name == "process"
+                && (segments.is_empty() || (1..=2).contains(&segments.len()))
+                && segments.iter().all(|segment| {
+                    !segment.optional
+                        && !matches!(&segment.access, JsTsRuntimeAccessKey::Unsupported)
+                })
+                && segments.first().is_none_or(|segment| {
+                    matches!(
+                        &segment.access,
+                        JsTsRuntimeAccessKey::Property(container)
+                            if matches!(container.as_str(), "env" | "argv")
+                    )
+                })
+        })
+}
+
+fn runtime_accessor_hazard_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "binary_expression"
+            | "template_string"
+            | "spread_element"
+            | "rest_pattern"
+            | "object_pattern"
+            | "array_pattern"
+            | "for_in_statement"
+            | "for_of_statement"
+            | "unary_expression"
     )
 }
 
@@ -1837,56 +2026,50 @@ fn runtime_accessor_coverage_bounded(
         if !budget.visit() {
             break;
         }
-        if matches!(
-            node.kind(),
-            "binary_expression"
-                | "template_string"
-                | "spread_element"
-                | "rest_pattern"
-                | "object_pattern"
-                | "array_pattern"
-                | "for_in_statement"
-                | "for_of_statement"
-                | "unary_expression"
-        ) {
+        if runtime_accessor_hazard_kind(node.kind())
+            || matches!(node.kind(), "member_expression" | "subscript_expression")
+                && !runtime_member_is_known_safe_or_runtime(bindings, node, source)
+        {
             return (
                 JsTsRuntimeAccessorCoverage::UnknownAccessorEffects,
                 !budget.exhausted,
             );
         }
-        if matches!(node.kind(), "member_expression" | "subscript_expression") {
-            let known_safe_or_runtime = runtime_path(node, source)
-                .and_then(|(path_root, segments)| {
-                    normalized_runtime_path(bindings, path_root, segments, source)
-                })
-                .is_some_and(|(root_name, resolution, segments)| {
-                    (resolution == JsTsRuntimeRootResolution::UnboundGlobal
-                        || resolution == JsTsRuntimeRootResolution::ProvenGlobalAlias)
-                        && root_name == "process"
-                        && (segments.is_empty() || (1..=2).contains(&segments.len()))
-                        && segments.iter().all(|segment| {
-                            !segment.optional
-                                && !matches!(&segment.access, JsTsRuntimeAccessKey::Unsupported)
-                        })
-                        && segments.first().is_none_or(|segment| {
-                            matches!(
-                                &segment.access,
-                                JsTsRuntimeAccessKey::Property(container)
-                                    if matches!(container.as_str(), "env" | "argv")
-                            )
-                        })
-                });
-            if !known_safe_or_runtime {
-                return (
-                    JsTsRuntimeAccessorCoverage::UnknownAccessorEffects,
-                    !budget.exhausted,
-                );
-            }
-        }
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
             stack.push(child);
         }
+    }
+    (
+        JsTsRuntimeAccessorCoverage::NoKnownAccessorEffects,
+        !budget.exhausted,
+    )
+}
+
+/// Accessor coverage for one execution context, with the same hazard rules
+/// as the module-wide pass. Nested function bodies belong to their own
+/// scopes.
+fn runtime_accessor_coverage_scoped(
+    bindings: &JsTsLexicalBindingIndex,
+    scope_root: Node<'_>,
+    source: &str,
+    budget: &mut JsTsRuntimeTraversalBudget,
+) -> (JsTsRuntimeAccessorCoverage, bool) {
+    let mut stack = vec![scope_root];
+    while let Some(node) = stack.pop() {
+        if !budget.visit() {
+            break;
+        }
+        if runtime_accessor_hazard_kind(node.kind())
+            || matches!(node.kind(), "member_expression" | "subscript_expression")
+                && !runtime_member_is_known_safe_or_runtime(bindings, node, source)
+        {
+            return (
+                JsTsRuntimeAccessorCoverage::UnknownAccessorEffects,
+                !budget.exhausted,
+            );
+        }
+        push_scope_children(&mut stack, node, scope_root);
     }
     (
         JsTsRuntimeAccessorCoverage::NoKnownAccessorEffects,
@@ -1952,24 +2135,6 @@ fn local_function_bindings_bounded(
         }
     }
     (functions, !budget.exhausted)
-}
-
-fn enclosing_runtime_execution_context(node: Node<'_>) -> JsTsRuntimeExecutionContext {
-    let mut current = node.parent();
-    while let Some(parent) = current {
-        if matches!(
-            parent.kind(),
-            "function_declaration"
-                | "function_expression"
-                | "generator_function"
-                | "arrow_function"
-                | "method_definition"
-        ) {
-            return JsTsRuntimeExecutionContext::DeferredFunction(node_source_range(parent));
-        }
-        current = parent.parent();
-    }
-    JsTsRuntimeExecutionContext::Program
 }
 
 /// Resolve a property/member-name node whose name is statically determined by
@@ -3282,10 +3447,10 @@ process.env.DFB_INPUT;
             global.lexical_resolution,
             JsTsRuntimeRootResolution::UnboundGlobal
         );
-        assert_eq!(
-            global.mutation,
-            JsTsRuntimeMutationEvidence::KnownWriteAndUnknownEffects
-        );
+        // The top-level scope holds a known write and no unknown effects of
+        // its own; hazards inside the shadowed function no longer leak into
+        // the global read's evidence (#3329).
+        assert_eq!(global.mutation, JsTsRuntimeMutationEvidence::KnownWrite);
         assert!(facts.writes.iter().any(|write| {
             write.root_name == "process"
                 && write.target == JsTsRuntimeWriteTarget::Root
@@ -3428,6 +3593,92 @@ host.process.env.DFB_INPUT;
         assert_eq!(
             facts.reads[0].access,
             JsTsRuntimeAccessKey::Property("DFB_INPUT".into())
+        );
+    }
+
+    #[test]
+    fn runtime_read_effects_scope_to_the_read_own_function() {
+        // An external call in one function must not poison a read in
+        // another, or a reviewed sink call could never share a module with
+        // its source (#3329). Direct writes stay module-wide.
+        let source = r#"
+const cp = require("child_process");
+function readEnv() {
+  return process.env.DFB_INPUT;
+}
+function run() {
+  cp.execSync(readEnv());
+}
+run();
+"#;
+        let tree = parse_javascript(source);
+        let facts = extract_js_ts_runtime_reads(tree.root_node(), source, 64);
+        assert!(facts.complete, "{facts:#?}");
+        let read = facts
+            .reads
+            .iter()
+            .find(|read| read.root_name == "process")
+            .expect("the env read is extracted");
+        assert_eq!(read.mutation, JsTsRuntimeMutationEvidence::NoKnownWrite);
+        assert_eq!(
+            read.accessor,
+            JsTsRuntimeAccessorCoverage::NoKnownAccessorEffects
+        );
+        assert!(matches!(
+            read.execution,
+            JsTsRuntimeExecutionContext::DeferredFunction(_)
+        ));
+        // The module-wide summary still reports the external call.
+        assert_eq!(facts.effect_coverage, JsTsRuntimeEffectCoverage::Unknown);
+    }
+
+    #[test]
+    fn runtime_read_top_level_effects_stay_in_their_own_scope() {
+        // A top-level external call poisons a top-level read but not a read
+        // inside a function, and a write anywhere still poisons every read.
+        let source = r#"
+const top = process.env.TOP_KEY;
+external();
+function read() {
+  return process.env.FN_KEY;
+}
+"#;
+        let tree = parse_javascript(source);
+        let facts = extract_js_ts_runtime_reads(tree.root_node(), source, 64);
+        assert!(facts.complete, "{facts:#?}");
+        let top = facts
+            .reads
+            .iter()
+            .find(|read| read.access == JsTsRuntimeAccessKey::Property("TOP_KEY".into()))
+            .expect("the top-level read is extracted");
+        assert_eq!(top.mutation, JsTsRuntimeMutationEvidence::UnknownEffects);
+        assert_eq!(top.execution, JsTsRuntimeExecutionContext::Program);
+        let nested = facts
+            .reads
+            .iter()
+            .find(|read| read.access == JsTsRuntimeAccessKey::Property("FN_KEY".into()))
+            .expect("the function read is extracted");
+        assert_eq!(
+            nested.mutation,
+            JsTsRuntimeMutationEvidence::NoKnownWrite,
+            "{facts:#?}"
+        );
+
+        let written = r#"
+process.env.TOP_KEY = "dirty";
+function read() {
+  return process.env.FN_KEY;
+}
+"#;
+        let tree = parse_javascript(written);
+        let facts = extract_js_ts_runtime_reads(tree.root_node(), written, 64);
+        assert!(!facts.writes.is_empty());
+        assert!(
+            facts.reads.iter().all(|read| {
+                read.mutation == JsTsRuntimeMutationEvidence::KnownWrite
+                    || read.mutation == JsTsRuntimeMutationEvidence::KnownWriteAndUnknownEffects
+            }),
+            "a module-wide write poisons every scope: {facts:#?}"
         );
     }
 

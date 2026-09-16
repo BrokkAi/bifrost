@@ -352,8 +352,8 @@ fn gap_belongs_to_load(
 
 use crate::analyzer::complete_value_cache::{CompleteValueAcquisition, CompleteValueCache};
 use brokk_bifrost_js_ts::syntax::{
-    JsTsRuntimeAccessKey, JsTsRuntimeMutationEvidence, JsTsRuntimeRootResolution,
-    extract_js_ts_runtime_reads,
+    JsTsRuntimeAccessKey, JsTsRuntimeAccessorCoverage, JsTsRuntimeMutationEvidence,
+    JsTsRuntimeRootResolution, extract_js_ts_runtime_reads,
 };
 
 pub(super) type RuntimeReadCache = CompleteValueCache<ProcedureHandle, RuntimeKeyedReadResult>;
@@ -521,15 +521,10 @@ impl WorkspaceSemanticOracle<'_> {
         let max_bytes = request.budget.remaining().source_bytes;
         // The initial effect proof closes one source module. A profile assertion
         // cannot discharge writes in sibling modules that have not been inspected.
-        if self.workspace.project_file_count() != 1 {
-            result
-                .limitations
-                .push(RuntimeReadLimitation::MutationIncomplete);
-            return Ok(SemanticOutcome::Unproven {
-                partial: result,
-                work: SemanticWork::default(),
-            });
-        }
+        // The footprint check runs after extraction so shaped reads in a wider
+        // workspace keep their typed incomplete rows instead of vanishing into
+        // a clean zero.
+        let single_file_footprint = self.workspace.project_file_count() == 1;
         let Some((file, source)) =
             exact_source_for_procedure(self.workspace, procedure, max_bytes)?
         else {
@@ -615,6 +610,38 @@ impl WorkspaceSemanticOracle<'_> {
                 .limitations
                 .push(RuntimeReadLimitation::CoverageLimited);
         }
+        if !single_file_footprint {
+            for read in &facts.reads {
+                if loads_at_range(procedure, read.range).is_empty() {
+                    continue;
+                }
+                // The key identity is intentionally left uninterpreted on
+                // this path: the read keeps its anchor so the limitation
+                // below attaches to it, but no endpoint can publish.
+                result.candidates.push(RuntimeKeyedReadCandidate {
+                    anchor: read.candidate_anchor,
+                    global: read.root_name.clone(),
+                    container: read.container.clone(),
+                    key: None,
+                    excluded: false,
+                });
+            }
+            result
+                .limitations
+                .push(RuntimeReadLimitation::MutationIncomplete);
+            result.limitations.sort_by_key(|limit| limit.label());
+            result.limitations.dedup();
+            if request.cancellation.is_cancelled() {
+                return Ok(SemanticOutcome::Cancelled {
+                    partial: Some(result),
+                    work,
+                });
+            }
+            return Ok(SemanticOutcome::Unproven {
+                partial: result,
+                work,
+            });
+        }
         for read in &facts.reads {
             let loads = loads_at_range(procedure, read.range);
             if loads.is_empty() {
@@ -651,9 +678,12 @@ impl WorkspaceSemanticOracle<'_> {
             if read.lexical_resolution == JsTsRuntimeRootResolution::LexicallyBound {
                 continue;
             }
-            if facts.accessor_coverage
-                != brokk_bifrost_js_ts::syntax::JsTsRuntimeAccessorCoverage::NoKnownAccessorEffects
-            {
+            // Accessor and effect hazards are scoped to the read's own
+            // execution context; direct writes stay module-wide in the
+            // extractor's mutation evidence. An external call in a sibling
+            // function must not poison this read, or a reviewed sink call
+            // could never share a module with its source.
+            if read.accessor != JsTsRuntimeAccessorCoverage::NoKnownAccessorEffects {
                 result
                     .limitations
                     .push(RuntimeReadLimitation::AccessorOrProxyIncomplete);
@@ -771,6 +801,11 @@ impl WorkspaceSemanticOracle<'_> {
                 }
                 // A host must explicitly select the complete execution profile.
                 // Catalog availability and the source language do not establish it.
+                // An exposure authored as `enabled` is intrinsically eligible
+                // within its model; it does not bypass pack activation. The
+                // pack-level `safety.review_required` gate remains the explicit
+                // user authorization, enforced by the activation resolver
+                // before this join ever runs.
                 if shard.matched_evidence.configuration.as_deref()
                     != Some(&exposure.runtime_profile_digest)
                     || !shard
@@ -856,6 +891,9 @@ impl WorkspaceSemanticOracle<'_> {
         }
         // These are explicit authored analysis assumptions. They are not
         // inferred from a file extension, Node declarations, or an absent binder.
+        // The engine implements exactly one reviewed profile; an exposure
+        // naming any other realm, module mode, platform, or architecture
+        // stays incomplete rather than silently publishing.
         if exposure.runtime.initialization_boundary != "pristine-runtime-at-entry"
             || !exposure
                 .runtime
@@ -863,7 +901,9 @@ impl WorkspaceSemanticOracle<'_> {
                 .iter()
                 .any(|assumption| assumption == "closed-workspace-no-preloads")
             || exposure.runtime.realm != "main"
+            || exposure.runtime.module_mode != "commonjs"
             || exposure.runtime.platform.as_deref() != Some("linux")
+            || exposure.runtime.architecture.as_deref() != Some("x64")
         {
             result
                 .limitations

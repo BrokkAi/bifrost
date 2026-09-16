@@ -2196,6 +2196,8 @@ fn unsupported_effects_fail_closed_and_value_transfer_facts_export() {
         .push(AuthoredConcurrencyEffect::TaskSpawn {
             callable: AuthoredSummaryInput::Parameter { ordinal: 0 },
             group: None,
+            condition: None,
+            timer: None,
         });
     let concurrency_error = export_authored_csmi_pack(&concurrency, &artifact, &options)
         .expect_err("unsupported concurrency effects must not be approximated");

@@ -135,13 +135,13 @@ impl PolicyRegistry {
         path: PolicySelectorPath,
         authored: &PolicySelector,
         retained_bytes: &mut usize,
-        analyzer: Option<&dyn IAnalyzer>,
+        locators: LocatorResolution<'_>,
         imports: &EndpointSetClosure,
     ) -> Result<ResolvedPolicySelector, PolicyRegistryError> {
         if let Some(selector) = imports.selectors.get(&path) {
             return Ok(selector.clone());
         }
-        self.resolve_selector(parsed, path, authored, retained_bytes, analyzer)
+        self.resolve_selector(parsed, path, authored, retained_bytes, locators)
     }
 
     pub(super) fn close_endpoint_sets(
@@ -149,7 +149,7 @@ impl PolicyRegistry {
         parsed: &ParsedRqlpDocument,
         definition: &mut PolicyDefinition,
         source_bytes: usize,
-        analyzer: Option<&dyn IAnalyzer>,
+        locators: LocatorResolution<'_>,
     ) -> Result<EndpointSetClosure, PolicyRegistryError> {
         self.ensure_local_retained_bytes(source_bytes)?;
         let mut closure = EndpointSetClosure {
@@ -245,7 +245,7 @@ impl PolicyRegistry {
                             ),
                         ));
                     }
-                    resolve_selector_locators(selector, analyzer)?;
+                    resolve_selector_locators(selector, locators)?;
                     let source_path = selector_path(format!(
                         "/set/entries/{}/selector",
                         pointer_segment(id.as_str())
@@ -255,7 +255,7 @@ impl PolicyRegistry {
                         &document,
                         source_path,
                         selector,
-                        analyzer,
+                        locators,
                     )
                     .map_err(|error| {
                         import_error(&frame, "endpoint-set-selector", error.to_string())
@@ -291,13 +291,13 @@ impl PolicyRegistry {
                     &mut catalog_dependencies,
                     &mut endpoint_dependencies,
                     &mut closure.retained_bytes,
-                    analyzer,
+                    locators,
                 )?;
                 let match_inputs = self.build_match_inputs(
                     &taint_match_uses(&typed.spec)?,
                     &mut catalog_dependencies,
                     &mut closure.retained_bytes,
-                    analyzer,
+                    locators,
                 )?;
                 endpoint_dependencies.extend(match_inputs.dependencies);
                 for path in catalog_selectors.keys().chain(catalog_dependencies.keys()) {
@@ -540,7 +540,7 @@ impl PolicyRegistry {
         }
         clear_imports(spec);
         sort_entries(spec);
-        self.validate_imported_store_conflicts(&parsed, spec, analyzer, &closure)?;
+        self.validate_imported_store_conflicts(&parsed, spec, locators, &closure)?;
         closure
             .dependencies
             .sort_by(|left, right| left.source.cmp(&right.source));
@@ -551,7 +551,7 @@ impl PolicyRegistry {
         &self,
         parsed: &ParsedRqlpDocument,
         spec: &TaintPolicySpec,
-        analyzer: Option<&dyn IAnalyzer>,
+        locators: LocatorResolution<'_>,
         closure: &EndpointSetClosure,
     ) -> Result<(), PolicyRegistryError> {
         let mut contracts = HashMap::new();
@@ -591,7 +591,7 @@ impl PolicyRegistry {
                 path.clone(),
                 selector,
                 &mut retained,
-                analyzer,
+                locators,
                 closure,
             )?;
             let contract = (key, instance, port);

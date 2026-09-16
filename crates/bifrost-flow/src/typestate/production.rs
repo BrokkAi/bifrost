@@ -54,6 +54,7 @@ use crate::analyzer::semantic::{
 use crate::concurrency::{
     ConcurrencyAnswer, ConcurrencyAtomicOperation, ConcurrencyLockMode, ConcurrencyProvider,
     ConcurrencySubjectIdentity, ResolvedConcurrencyEffect, ResolvedLockAcquisition,
+    ResolvedTaskSpawnCondition, ResolvedTimerStopOutcome,
 };
 use crate::dataflow::{
     DataflowRequest, ProcedureSummaryIdentity, ProcedureSummaryKey,
@@ -79,7 +80,7 @@ use super::{
     solve_typestate_with_reusable_summaries, solve_typestate_with_summaries,
 };
 
-const PRODUCTION_SUMMARY_SEMANTICS: &[u8] = b"bifrost-production-semantic-summary-v21";
+const PRODUCTION_SUMMARY_SEMANTICS: &[u8] = b"bifrost-production-semantic-summary-v24";
 const EMPTY_CALL_CONTEXT: &[u8] = b"bifrost-production-empty-call-context-v1";
 const PRODUCTION_ICFG_BEHAVIOR_DOMAIN: &[u8] = b"bifrost-production-icfg-behavior-v2";
 const PRODUCTION_PUBLICATION_BEHAVIOR_DOMAIN: &[u8] = b"bifrost-production-publication-behavior-v1";
@@ -1727,35 +1728,22 @@ fn project_modeled_call_effects(
     };
     let mut stable = Vec::with_capacity(modeled.len());
     for effect in modeled {
-        if matches!(
-            effect,
-            ResolvedConcurrencyEffect::LockAcquire {
-                acquisition: ResolvedLockAcquisition::CallResultTrue,
-                ..
-            }
-        ) && !summary_returns_identify_call_result(procedure, call)
-        {
-            // A summary boundary may carry the try-acquire condition only when
-            // its own normal result is exactly the guarded call's result.
-            // Otherwise the condition would describe a result it does not
-            // name; keep the open boundary visible instead.
-            let open = SummaryConcurrencyEffectKind::Unsupported {
-                protocol: "try-acquire:summary return does not identify the call result".into(),
-            };
-            if !stable.contains(&open) {
-                stable.push(open);
-            }
-            continue;
-        }
         if let ResolvedConcurrencyEffect::TaskSpawn {
             callable,
             targets,
             group,
+            condition,
+            timer,
         } = &effect
         {
             let recovered = crate::concurrency::source_callable_targets(procedure, *callable);
             if !matches!(recovered, ConcurrencyAnswer::Proven(ref recovered) if recovered == targets)
             {
+                // A callable this procedure cannot name (a forwarded formal,
+                // for example) does not project. The condition still lives on
+                // the caller's solve, which reports its own typed boundary;
+                // composing it here would name a callable the boundary cannot
+                // describe.
                 return Ok(());
             }
             let ordinals = call
@@ -1793,12 +1781,36 @@ fn project_modeled_call_effects(
             } else {
                 None
             };
+            // The timer is the spawn call's own result, so it reaches the
+            // boundary exactly when the wrapper's normal returns identify
+            // that result. A timer that stays local cannot be named on the
+            // boundary, so the spawn does not project at all and the live
+            // model lookup keeps answering the call, exactly like a group
+            // that stays local.
+            let timer = if timer.is_some() {
+                let Some(port) = direct_timer_return_port(procedure, call) else {
+                    return Ok(());
+                };
+                Some(SummaryConcurrencyAccessPath::port(port))
+            } else {
+                None
+            };
             let kind = SummaryConcurrencyEffectKind::TaskSpawn {
                 callable: crate::dataflow::SummaryConcurrencyCallable::SourceArgument(
                     u32::try_from(*ordinal).expect("validated call argument ordinal fits u32"),
                 ),
                 target_coverage: crate::dataflow::SummaryConcurrencyTargetCoverage::Exhaustive,
+                condition: match condition {
+                    ResolvedTaskSpawnCondition::Unconditional => {
+                        crate::dataflow::SummaryTaskSpawnCondition::Unconditional
+                    }
+                    ResolvedTaskSpawnCondition::CallResultTrue
+                    | ResolvedTaskSpawnCondition::OnResultTrue { .. } => {
+                        crate::dataflow::SummaryTaskSpawnCondition::CallResultTrue
+                    }
+                },
                 group,
+                timer,
             };
             if stable.contains(&kind) {
                 return Ok(());
@@ -1845,6 +1857,225 @@ fn project_modeled_call_effects(
                     u32::try_from(*ordinal).expect("validated call argument ordinal fits u32"),
                 ),
                 target_coverage: crate::dataflow::SummaryConcurrencyTargetCoverage::Exhaustive,
+            };
+            if stable.contains(&kind) {
+                return Ok(());
+            }
+            stable.push(kind);
+            continue;
+        }
+        if let ResolvedConcurrencyEffect::SubtestRun {
+            callable,
+            targets,
+            group,
+        }
+        | ResolvedConcurrencyEffect::SubtestCleanup {
+            callable,
+            targets,
+            group,
+        } = &effect
+        {
+            // A subtest spawn projects like a task spawn: the callable stays
+            // a witnessed source argument with exhaustive targets and the
+            // group stays a boundary port. The consuming solver classifies
+            // the resolved callback itself, so the classification never
+            // crosses the summary boundary as a frozen fact. The `Parallel`
+            // marker never projects: the classification pre-scan reads the
+            // available callback bodies directly.
+            let recovered = crate::concurrency::source_callable_targets(procedure, *callable);
+            if !matches!(recovered, ConcurrencyAnswer::Proven(ref recovered) if recovered == targets)
+            {
+                return Ok(());
+            }
+            let ordinals = call
+                .arguments
+                .iter()
+                .enumerate()
+                .filter_map(|(ordinal, argument)| (argument.value == *callable).then_some(ordinal))
+                .collect::<Vec<_>>();
+            let [ordinal] = ordinals.as_slice() else {
+                return Ok(());
+            };
+            let DirectConcurrencyPath::Boundary(location) =
+                direct_concurrency_modeled_subject_path(
+                    procedure,
+                    call,
+                    group.value,
+                    provider,
+                    request,
+                )?
+            else {
+                return Ok(());
+            };
+            let group = crate::dataflow::SummaryConcurrencyTaskGroup {
+                location,
+                identity: match group.identity {
+                    ConcurrencySubjectIdentity::Value => SummaryConcurrencySubjectIdentity::Value,
+                    ConcurrencySubjectIdentity::Backing => {
+                        SummaryConcurrencySubjectIdentity::Backing
+                    }
+                },
+            };
+            let kind = if matches!(effect, ResolvedConcurrencyEffect::SubtestRun { .. }) {
+                SummaryConcurrencyEffectKind::SubtestRun {
+                    callable: crate::dataflow::SummaryConcurrencyCallable::SourceArgument(
+                        u32::try_from(*ordinal).expect("validated call argument ordinal fits u32"),
+                    ),
+                    target_coverage: crate::dataflow::SummaryConcurrencyTargetCoverage::Exhaustive,
+                    group,
+                }
+            } else {
+                SummaryConcurrencyEffectKind::SubtestCleanup {
+                    callable: crate::dataflow::SummaryConcurrencyCallable::SourceArgument(
+                        u32::try_from(*ordinal).expect("validated call argument ordinal fits u32"),
+                    ),
+                    target_coverage: crate::dataflow::SummaryConcurrencyTargetCoverage::Exhaustive,
+                    group,
+                }
+            };
+            if stable.contains(&kind) {
+                return Ok(());
+            }
+            stable.push(kind);
+            continue;
+        }
+        if let ResolvedConcurrencyEffect::SyncMap {
+            map,
+            key,
+            operation,
+            ..
+        } = &effect
+        {
+            let DirectConcurrencyPath::Boundary(map_path) =
+                direct_concurrency_modeled_subject_path(
+                    procedure, call, map.value, provider, request,
+                )?
+            else {
+                return Ok(());
+            };
+            let key_path = match key {
+                Some(key) => match direct_concurrency_modeled_subject_path(
+                    procedure, call, key.value, provider, request,
+                )? {
+                    DirectConcurrencyPath::Boundary(path) => Some(path),
+                    // A key that names no boundary port stays unnamed: the
+                    // projected protocol keeps the map port and the consumer
+                    // states the key boundary rather than losing the effect.
+                    _ => None,
+                },
+                None => None,
+            };
+            let kind = SummaryConcurrencyEffectKind::SyncMap {
+                map: map_path,
+                identity: match map.identity {
+                    ConcurrencySubjectIdentity::Value => SummaryConcurrencySubjectIdentity::Value,
+                    ConcurrencySubjectIdentity::Backing => {
+                        SummaryConcurrencySubjectIdentity::Backing
+                    }
+                },
+                key: key_path,
+                operation: match operation {
+                    crate::concurrency::ConcurrencySyncMapOperation::Store => {
+                        crate::dataflow::SummaryConcurrencySyncMapOperation::Store
+                    }
+                    crate::concurrency::ConcurrencySyncMapOperation::Delete => {
+                        crate::dataflow::SummaryConcurrencySyncMapOperation::Delete
+                    }
+                    crate::concurrency::ConcurrencySyncMapOperation::Clear => {
+                        crate::dataflow::SummaryConcurrencySyncMapOperation::Clear
+                    }
+                    crate::concurrency::ConcurrencySyncMapOperation::Load => {
+                        crate::dataflow::SummaryConcurrencySyncMapOperation::Load
+                    }
+                    crate::concurrency::ConcurrencySyncMapOperation::Range => {
+                        crate::dataflow::SummaryConcurrencySyncMapOperation::Range
+                    }
+                    crate::concurrency::ConcurrencySyncMapOperation::LoadOrStore => {
+                        crate::dataflow::SummaryConcurrencySyncMapOperation::LoadOrStore
+                    }
+                    crate::concurrency::ConcurrencySyncMapOperation::LoadAndDelete => {
+                        crate::dataflow::SummaryConcurrencySyncMapOperation::LoadAndDelete
+                    }
+                    crate::concurrency::ConcurrencySyncMapOperation::Swap => {
+                        crate::dataflow::SummaryConcurrencySyncMapOperation::Swap
+                    }
+                    crate::concurrency::ConcurrencySyncMapOperation::CompareAndSwap => {
+                        crate::dataflow::SummaryConcurrencySyncMapOperation::CompareAndSwap
+                    }
+                    crate::concurrency::ConcurrencySyncMapOperation::CompareAndDelete => {
+                        crate::dataflow::SummaryConcurrencySyncMapOperation::CompareAndDelete
+                    }
+                },
+            };
+            if stable.contains(&kind) {
+                return Ok(());
+            }
+            stable.push(kind);
+            continue;
+        }
+        if let ResolvedConcurrencyEffect::TimerStop { timer, outcome } = &effect {
+            match outcome {
+                ResolvedTimerStopOutcome::CallResultTrue => {}
+                // Provider answers are raw model answers; a bound outcome
+                // never reaches projection.
+                ResolvedTimerStopOutcome::OnResultTrue { .. } => {
+                    unreachable!("provider answers carry unresolved stops")
+                }
+            }
+            // A summary boundary may carry the stop only when its own normal
+            // result is exactly the call's result. A transformed or discarded
+            // result would describe a cancellation no consumer can establish,
+            // so the stop is dropped silently and consumers keep the may-run
+            // answer instead.
+            if !summary_returns_identify_call_result(procedure, call) {
+                continue;
+            }
+            let DirectConcurrencyPath::Boundary(timer_path) =
+                direct_concurrency_modeled_subject_path(
+                    procedure,
+                    call,
+                    timer.value,
+                    provider,
+                    request,
+                )?
+            else {
+                return Ok(());
+            };
+            let kind = SummaryConcurrencyEffectKind::TimerStop {
+                timer: timer_path,
+                identity: match timer.identity {
+                    ConcurrencySubjectIdentity::Value => SummaryConcurrencySubjectIdentity::Value,
+                    ConcurrencySubjectIdentity::Backing => {
+                        SummaryConcurrencySubjectIdentity::Backing
+                    }
+                },
+            };
+            if stable.contains(&kind) {
+                return Ok(());
+            }
+            stable.push(kind);
+            continue;
+        }
+        if let ResolvedConcurrencyEffect::TimerReset { timer } = &effect {
+            let DirectConcurrencyPath::Boundary(timer_path) =
+                direct_concurrency_modeled_subject_path(
+                    procedure,
+                    call,
+                    timer.value,
+                    provider,
+                    request,
+                )?
+            else {
+                return Ok(());
+            };
+            let kind = SummaryConcurrencyEffectKind::TimerReset {
+                timer: timer_path,
+                identity: match timer.identity {
+                    ConcurrencySubjectIdentity::Value => SummaryConcurrencySubjectIdentity::Value,
+                    ConcurrencySubjectIdentity::Backing => {
+                        SummaryConcurrencySubjectIdentity::Backing
+                    }
+                },
             };
             if stable.contains(&kind) {
                 return Ok(());
@@ -2064,6 +2295,48 @@ pub(crate) fn summary_returns_identify_call_result(
         && returned_values
             .iter()
             .all(|value| flows.iter().any(|(_, target)| target == value))
+}
+
+/// The boundary port a spawn call's timer result escapes through, when the
+/// wrapper's normal returns identify that result exactly (issue #3382).
+///
+/// The port names the single return position every normal return carries the
+/// timer through. A wrapper that keeps the timer local, returns it through
+/// more than one position, or mixes it with other results names no port, and
+/// the projected spawn keeps its task but loses the cancellable identity.
+fn direct_timer_return_port(
+    procedure: &ProcedureHandle,
+    call: &SemanticCallSite,
+) -> Option<SummaryPort> {
+    if !summary_returns_identify_call_result(procedure, call) {
+        return None;
+    }
+    let result = call.result?;
+    let mut ports = procedure
+        .semantics()
+        .points()
+        .iter()
+        .flat_map(|point| &point.events)
+        .filter_map(|event| match event.effect {
+            SemanticEffect::ValueFlow {
+                kind: ValueFlowKind::Return,
+                source,
+                ..
+            } if source == result => Some(SummaryPort::NormalReturn),
+            SemanticEffect::ValueFlow {
+                kind: ValueFlowKind::IndexedReturn { ordinal },
+                source,
+                ..
+            } if source == result => Some(SummaryPort::IndexedNormalReturn(ordinal)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    ports.sort();
+    ports.dedup();
+    match ports.as_slice() {
+        [port] => Some(port.clone()),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -2901,6 +3174,8 @@ fn direct_value_is_reassigned(
 pub(crate) enum DirectScalarSource {
     Port(SummaryPort),
     UnsignedInteger(u128),
+    /// An exact structured string constant, spelled as its source text.
+    ConstantString(Box<str>),
     IntegerOffset {
         source: ValueId,
         offset: crate::analyzer::semantic::SignedIntegerMagnitude,
@@ -2930,6 +3205,9 @@ pub(crate) fn direct_scalar_source(
         }
         if let SemanticValueKind::UnsignedInteger(integer) = semantics.value(value)?.kind {
             return Some(DirectScalarSource::UnsignedInteger(integer));
+        }
+        if let SemanticValueKind::ConstantString(text) = semantics.value(value)?.kind.clone() {
+            return Some(DirectScalarSource::ConstantString(text));
         }
         let mut predecessors = semantics
             .points()
@@ -2968,7 +3246,9 @@ pub(crate) fn direct_scalar_summary_port(
 ) -> Option<SummaryPort> {
     match direct_scalar_source(semantics, value)? {
         DirectScalarSource::Port(port) => Some(port),
-        DirectScalarSource::UnsignedInteger(_) | DirectScalarSource::IntegerOffset { .. } => None,
+        DirectScalarSource::UnsignedInteger(_)
+        | DirectScalarSource::ConstantString(_)
+        | DirectScalarSource::IntegerOffset { .. } => None,
     }
 }
 

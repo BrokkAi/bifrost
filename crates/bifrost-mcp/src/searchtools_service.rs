@@ -79,7 +79,7 @@ use std::io;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -1143,10 +1143,211 @@ enum StartupIndexWarm {
     OnDemand,
 }
 
+/// The semantic-pack activation a session performs once, and whether it has
+/// settled.
+///
+/// Activation resolves the workspace's dependency evidence against the pack
+/// catalog. That can read a local toolchain, download and verify a release
+/// bundle, produce a generated pack, and decode whole packs into the active
+/// model set, so it is measured in seconds on a JVM workspace with a local JDK
+/// while the analyzer snapshot itself is ready in hundreds of milliseconds.
+///
+/// It is therefore a warm-up for the session, not part of publishing its
+/// analyzer: a deferred build starts it on its own thread and reports the
+/// workspace ready as soon as the analyzer is installed (issue #3372, the
+/// #2377 family). The settled state is published here, and the consumers that
+/// hand it to the runtime -- policy evaluation and a scope refresh -- wait for
+/// it. A session assembled synchronously starts settled, so a one-shot
+/// invocation and a test fixture keep the previous behavior exactly.
+struct SemanticPackWarm {
+    state: Mutex<PackWarmState>,
+    settled: Condvar,
+    started_at: Instant,
+    settled_ns: AtomicU64,
+    /// Parks the worker before it touches the catalog, so a test can prove the
+    /// readiness barrier does not cover it without racing the real activation.
+    #[cfg(test)]
+    hold: Option<Arc<PackWarmHold>>,
+}
+
+enum PackWarmState {
+    Pending,
+    Settled(Option<Arc<WorkspacePackActivationState>>),
+}
+
+impl SemanticPackWarm {
+    fn settled(state: Option<Arc<WorkspacePackActivationState>>) -> Self {
+        Self {
+            state: Mutex::new(PackWarmState::Settled(state)),
+            settled: Condvar::new(),
+            started_at: Instant::now(),
+            settled_ns: AtomicU64::new(0),
+            #[cfg(test)]
+            hold: None,
+        }
+    }
+
+    fn pending() -> Self {
+        Self {
+            state: Mutex::new(PackWarmState::Pending),
+            settled: Condvar::new(),
+            started_at: Instant::now(),
+            settled_ns: AtomicU64::new(0),
+            #[cfg(test)]
+            hold: None,
+        }
+    }
+
+    /// Start the activation on its own thread and publish what it returns.
+    fn spawn(project_root: PathBuf, analyzer: WorkspaceAnalyzer) -> Result<Arc<Self>, String> {
+        let warm = Arc::new(Self::pending());
+        start_pack_warm_worker(Arc::clone(&warm), project_root, analyzer)?;
+        Ok(warm)
+    }
+
+    /// [`Self::spawn`] with the worker parked until `hold` releases it, so a
+    /// test can hold the activation open and observe what the readiness barrier
+    /// does while it is still running.
+    #[cfg(test)]
+    fn spawn_held(
+        project_root: PathBuf,
+        analyzer: WorkspaceAnalyzer,
+        hold: Arc<PackWarmHold>,
+    ) -> Result<Arc<Self>, String> {
+        let warm = Arc::new(Self {
+            hold: Some(hold),
+            ..Self::pending()
+        });
+        start_pack_warm_worker(Arc::clone(&warm), project_root, analyzer)?;
+        Ok(warm)
+    }
+
+    /// The activation state, or `None` while the warm is still running.
+    fn state(&self) -> Option<Arc<WorkspacePackActivationState>> {
+        match &*self
+            .state
+            .lock()
+            .expect("semantic-pack warm mutex poisoned")
+        {
+            PackWarmState::Pending => None,
+            PackWarmState::Settled(state) => state.clone(),
+        }
+    }
+
+    fn is_ready(&self) -> bool {
+        !matches!(
+            *self
+                .state
+                .lock()
+                .expect("semantic-pack warm mutex poisoned"),
+            PackWarmState::Pending
+        )
+    }
+
+    /// How long the warm ran, or `None` while it is pending.
+    fn duration(&self) -> Option<Duration> {
+        let settled_ns = self.settled_ns.load(Ordering::Relaxed);
+        (settled_ns != 0).then(|| Duration::from_nanos(settled_ns))
+    }
+
+    /// Block until the warm settles and return its state.
+    fn wait(&self) -> Option<Arc<WorkspacePackActivationState>> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("semantic-pack warm mutex poisoned");
+        while matches!(*state, PackWarmState::Pending) {
+            state = self
+                .settled
+                .wait(state)
+                .expect("semantic-pack warm mutex poisoned");
+        }
+        match &*state {
+            PackWarmState::Pending => unreachable!("the wait loop leaves only a settled state"),
+            PackWarmState::Settled(state) => state.clone(),
+        }
+    }
+
+    fn publish(&self, state: Option<Arc<WorkspacePackActivationState>>) {
+        self.settled_ns
+            .store(duration_ns(self.started_at.elapsed()), Ordering::Relaxed);
+        *self
+            .state
+            .lock()
+            .expect("semantic-pack warm mutex poisoned") = PackWarmState::Settled(state);
+        self.settled.notify_all();
+        // The readiness barrier deliberately excludes this work, so a profile
+        // has to name it from here or the cost moves off the reported path
+        // without ever being visible (issue #3372).
+        if let Some(duration) = self.duration() {
+            profiling::note_with(|| {
+                format!(
+                    "semantic_pack.warm settled off the readiness path after {:.1} ms",
+                    duration.as_secs_f64() * 1000.0
+                )
+            });
+        }
+    }
+}
+
+fn start_pack_warm_worker(
+    warm: Arc<SemanticPackWarm>,
+    project_root: PathBuf,
+    analyzer: WorkspaceAnalyzer,
+) -> Result<(), String> {
+    std::thread::Builder::new()
+        .name("bifrost-semantic-pack-warm".to_string())
+        .spawn(move || {
+            #[cfg(test)]
+            if let Some(hold) = &warm.hold {
+                hold.park_until_released();
+            }
+            let state = activate_session_semantic_packs(&project_root, &analyzer);
+            warm.publish(state);
+        })
+        .map_err(|error| format!("Failed to spawn semantic-pack warm thread: {error}"))?;
+    Ok(())
+}
+
+/// Test-only latch that parks a semantic-pack warm before it starts.
+#[cfg(test)]
+struct PackWarmHold {
+    released: Mutex<bool>,
+    progress: Condvar,
+}
+
+#[cfg(test)]
+impl PackWarmHold {
+    fn new() -> Self {
+        Self {
+            released: Mutex::new(false),
+            progress: Condvar::new(),
+        }
+    }
+
+    fn park_until_released(&self) {
+        let mut released = self.released.lock().expect("pack warm hold mutex poisoned");
+        while !*released {
+            released = self
+                .progress
+                .wait(released)
+                .expect("pack warm hold mutex poisoned");
+        }
+    }
+
+    fn release(&self) {
+        *self.released.lock().expect("pack warm hold mutex poisoned") = true;
+        self.progress.notify_all();
+    }
+}
+
 struct WorkspaceSession {
     snapshot: Arc<WorkspaceAnalyzer>,
     document_root: Arc<WorkspaceRoot>,
-    pack_activation: Option<Arc<WorkspacePackActivationState>>,
+    /// Read through [`WorkspaceSession::pack_activation`]; the warm is settled
+    /// for a synchronously assembled session and may still be running for a
+    /// deferred one.
+    semantic_packs: Arc<SemanticPackWarm>,
     watcher: SessionWatcher,
     usage_index_warm: Option<JoinHandle<()>>,
     index_warmer: Arc<IndexWarmer>,
@@ -2066,8 +2267,14 @@ fn stale_symbol_source_files(
 }
 
 impl WorkspaceSession {
+    /// The semantic-pack activation this session has settled on, or `None`
+    /// while a deferred warm is still running.
+    fn pack_activation(&self) -> Option<Arc<WorkspacePackActivationState>> {
+        self.semantic_packs.state()
+    }
+
     fn pack_activation_scope_changed(&self) -> bool {
-        self.pack_activation.as_ref().is_some_and(|state| {
+        self.pack_activation().as_ref().is_some_and(|state| {
             workspace_pack_ecosystems(&self.snapshot, state.config.as_deref()) != state.ecosystems
         })
     }
@@ -2075,21 +2282,18 @@ impl WorkspaceSession {
     /// Re-run the shared activation transaction after dependency inputs or the
     /// workspace pack document change. Invalidation happens first so a failed
     /// replacement cannot leave proof from an older workspace generation.
+    ///
+    /// A deferred warm settles first: the refresh must supersede the startup
+    /// activation, not race it to the analyzer's overlay.
     fn refresh_pack_activation(&mut self) {
         self.snapshot
             .invalidate_dependency_pack_state(&crate::analyzer::DependencyPackEcosystem::ALL);
         let root = self.snapshot.analyzer().project().root();
-        self.pack_activation = match configured_semantic_models().and_then(|configured| {
-            activate_configured_semantic_models(root, self.snapshot.as_ref(), configured)
-        }) {
-            Ok(state) => Some(Arc::new(state)),
-            Err(error) => {
-                eprintln!(
-                    "bifrost: workspace semantic-pack activation refresh unavailable: {error}"
-                );
-                None
-            }
-        };
+        self.semantic_packs.wait();
+        self.semantic_packs.publish(activate_session_semantic_packs(
+            root,
+            self.snapshot.as_ref(),
+        ));
     }
 
     /// Queue a background warm of the current snapshot's lazy query indexes.
@@ -2584,6 +2788,8 @@ impl SearchToolsService {
         policy_inputs: &[PolicyEvaluationInput],
         options: &PolicyEvaluationOptions,
     ) -> Result<PolicyBatchOutcome, String> {
+        self.settle_pack_activation(None)
+            .map_err(|error| error.to_string())?;
         loop {
             let generation = self.workspace_generation();
             let snapshot = self
@@ -4136,7 +4342,7 @@ impl SearchToolsService {
                         build_file_listing,
                         update_strategy,
                     )?;
-                    let session = assemble_session(
+                    let session = assemble_session_deferred(
                         project,
                         workspace,
                         update_strategy,
@@ -4271,7 +4477,7 @@ impl SearchToolsService {
                         update_strategy,
                     )
                     .map_err(|error| format!("Failed to build persisted workspace: {error}"))?;
-                    let session = assemble_session(
+                    let session = assemble_session_deferred(
                         project,
                         workspace,
                         update_strategy,
@@ -4307,6 +4513,10 @@ impl SearchToolsService {
     /// the first call. Safe under concurrency: the first caller joins the build
     /// and installs the session while holding `pending_build`; later callers
     /// wait on that mutex and then observe the installed session.
+    ///
+    /// A session installed here may still be running its semantic-pack warm;
+    /// that is deliberate (issue #3372) and `get_active_workspace` reports it
+    /// as `semantic_packs_ready`.
     fn ensure_ready(&self) -> Result<(), SearchToolsServiceError> {
         let mut pending = self
             .pending_build
@@ -4360,7 +4570,7 @@ impl SearchToolsService {
                 .clone();
             let built = build_persisted_workspace(root, file_listing, self.update_strategy)
                 .and_then(|(project, workspace)| {
-                    assemble_session(
+                    assemble_session_deferred(
                         project,
                         workspace,
                         self.update_strategy,
@@ -4395,6 +4605,13 @@ impl SearchToolsService {
     /// not billed to whichever tool calls happen to arrive first. Issues #1423
     /// and #1419: a cold first batch against a large workspace exhausted every
     /// request budget on index-build wait and returned nothing useful.
+    ///
+    /// "Session initialization" is the analyzer snapshot, not everything a
+    /// session eventually warms: the deferred build starts the semantic-pack
+    /// activation on its own thread during assembly (`assemble_session_deferred`),
+    /// so this wait ends when the snapshot is installable and the optional
+    /// catalog, network, and toolchain work the activation performs is not
+    /// charged here (issue #3372).
     ///
     /// This does not run the build itself; `ensure_ready` still joins the
     /// finished handle and installs the session, which is cheap once the build
@@ -4663,8 +4880,14 @@ impl SearchToolsService {
 
         if resolved == session.snapshot.analyzer().project().root() {
             let usage_index_ready = session.usage_index_ready();
+            let semantic_packs_ready = session.semantic_packs.is_ready();
             let session_subset = session_subset(session.snapshot.analyzer());
-            return active_workspace_result(&resolved, usage_index_ready, session_subset);
+            return active_workspace_result(
+                &resolved,
+                usage_index_ready,
+                semantic_packs_ready,
+                session_subset,
+            );
         }
 
         // Fully assemble the replacement before mutating either active field so
@@ -4702,6 +4925,7 @@ impl SearchToolsService {
         let old_session = std::mem::replace(session, new_session);
         session.schedule_index_warm();
         let usage_index_ready = session.usage_index_ready();
+        let semantic_packs_ready = session.semantic_packs.is_ready();
         let session_subset = session_subset(session.snapshot.analyzer());
         *root = Some(resolved.clone());
         *self
@@ -4716,7 +4940,12 @@ impl SearchToolsService {
         // The replacement session's background index warm has only just
         // started, so this reports the newly activated workspace's readiness,
         // not the closed one's.
-        active_workspace_result(&resolved, usage_index_ready, session_subset)
+        active_workspace_result(
+            &resolved,
+            usage_index_ready,
+            semantic_packs_ready,
+            session_subset,
+        )
     }
 
     fn handle_get_active_workspace(
@@ -4732,6 +4961,7 @@ impl SearchToolsService {
         active_workspace_result(
             session.snapshot.analyzer().project().root(),
             session.usage_index_ready(),
+            session.semantic_packs.is_ready(),
             session_subset(session.snapshot.analyzer()),
         )
     }
@@ -4759,7 +4989,7 @@ impl SearchToolsService {
             return Ok(WorkspaceQueryScope::new(
                 Arc::clone(&session.snapshot),
                 Arc::clone(&session.document_root),
-                session.pack_activation.clone(),
+                session.pack_activation(),
             ));
         }
 
@@ -4770,7 +5000,7 @@ impl SearchToolsService {
                 return Ok(WorkspaceQueryScope::new(
                     Arc::clone(&session.snapshot),
                     Arc::clone(&session.document_root),
-                    session.pack_activation.clone(),
+                    session.pack_activation(),
                 ));
             }
         }
@@ -4782,8 +5012,40 @@ impl SearchToolsService {
         Ok(WorkspaceQueryScope::new(
             Arc::clone(&session.snapshot),
             Arc::clone(&session.document_root),
-            session.pack_activation.clone(),
+            session.pack_activation(),
         ))
+    }
+
+    /// Wait for a deferred semantic-pack warm, then report.
+    ///
+    /// Policy evaluation hands the settled activation to the runtime, so it
+    /// waits here rather than reading whatever the session happened to have
+    /// when its snapshot was taken. Nothing else does: the warm is optional
+    /// work with an honest session state, and the readiness barrier that
+    /// publishes the session deliberately excludes it (issue #3372).
+    ///
+    /// Two callers do not wait. One whose budget is already gone reports its
+    /// deadline through the snapshot path, and one whose workspace is still
+    /// being built has no warm to wait for yet; both must reach the same
+    /// canonical answer they reached before this warm existed. The session lock
+    /// is released before waiting, because the warm can take seconds and every
+    /// other caller has to keep working.
+    fn settle_pack_activation(
+        &self,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<(), SearchToolsServiceError> {
+        if cancellation.is_some_and(|token| token.is_cancelled() || token.is_timed_out()) {
+            return Ok(());
+        }
+        let semantic_packs = {
+            let guard = self.read_session()?;
+            match guard.as_ref() {
+                Some(session) => Arc::clone(&session.semantic_packs),
+                None => return Ok(()),
+            }
+        };
+        semantic_packs.wait();
+        Ok(())
     }
 
     fn snapshot_for_query_with_cancellation(
@@ -5299,6 +5561,7 @@ impl SearchToolsService {
             snapshot_started,
             include_stage_timings,
         } = preparation;
+        self.settle_pack_activation(cancellation)?;
         loop {
             let workspace_generation = self.workspace_generation();
             let snapshot_result = {
@@ -5457,18 +5720,31 @@ impl SearchToolsService {
                 }
                 None => runtime,
             };
-            let mut outcome = match suppression_preflight {
-                Some(preflight) => runtime.evaluate_policy_inputs_with_suppression_preflight(
-                    &root,
-                    &policy_inputs,
-                    &options,
-                    preflight,
-                ),
-                None => runtime.evaluate_policy_inputs(&root, &policy_inputs, &options),
-            }
-            .map_err(|error| {
-                SearchToolsServiceError::internal(format!("run_policy evaluation failed: {error}"))
-            })?;
+            // The head evaluation is the other long stretch of a policy
+            // request: name it so a budgeted host reports the phase that spent
+            // the budget rather than the tool (issue #3170).
+            let mut outcome = {
+                let _phase = cancellation.map(|cancellation| {
+                    cancellation.enter_phase(format!(
+                        "evaluating {} policies against the workspace snapshot",
+                        policy_inputs.len()
+                    ))
+                });
+                match suppression_preflight {
+                    Some(preflight) => runtime.evaluate_policy_inputs_with_suppression_preflight(
+                        &root,
+                        &policy_inputs,
+                        &options,
+                        preflight,
+                    ),
+                    None => runtime.evaluate_policy_inputs(&root, &policy_inputs, &options),
+                }
+                .map_err(|error| {
+                    SearchToolsServiceError::internal(format!(
+                        "run_policy evaluation failed: {error}"
+                    ))
+                })?
+            };
             outcome.record_preparation_timings(
                 selection_elapsed,
                 suppression_preflight_elapsed,
@@ -5717,9 +5993,32 @@ fn build_ephemeral_workspace(
     Ok((project, workspace))
 }
 
-/// Assemble a ready `WorkspaceSession` from a built project + analyzer: wrap the
+/// Resolve and activate this workspace's semantic packs, reporting an
+/// unavailable activation the way every other caller does: as a stated failure
+/// on stderr with no active set, never as a silent one.
+fn activate_session_semantic_packs(
+    project_root: &Path,
+    workspace: &WorkspaceAnalyzer,
+) -> Option<Arc<WorkspacePackActivationState>> {
+    match configured_semantic_models().and_then(|configured| {
+        activate_configured_semantic_models(project_root, workspace, configured)
+    }) {
+        Ok(state) => Some(Arc::new(state)),
+        Err(error) => {
+            eprintln!("bifrost: workspace semantic-pack activation unavailable: {error}");
+            None
+        }
+    }
+}
+
+/// Assemble a `WorkspaceSession` from a built project + analyzer: wrap the
 /// analyzer in an `Arc`, start the file watcher (per `update_strategy`), and
-/// create the session state. Shared by synchronous and deferred constructors.
+/// create the session state.
+///
+/// This eager form runs the semantic-pack activation before returning, so the
+/// session it produces has nothing outstanding. It belongs to the constructors
+/// that have no readiness barrier to publish early: a one-shot tool call, an
+/// embedded host, a reload that must swap in a fully settled session.
 fn assemble_session(
     project: Arc<dyn Project>,
     workspace: WorkspaceAnalyzer,
@@ -5727,17 +6026,79 @@ fn assemble_session(
     startup_index_warm: StartupIndexWarm,
     watcher_starter: &WatcherStarter,
 ) -> Result<WorkspaceSession, String> {
-    let pack_activation = match activate_configured_semantic_models(
+    let semantic_packs = Arc::new(SemanticPackWarm::settled(activate_session_semantic_packs(
         project.root(),
         &workspace,
-        configured_semantic_models()?,
-    ) {
-        Ok(state) => Some(Arc::new(state)),
-        Err(error) => {
-            eprintln!("bifrost: workspace semantic-pack activation unavailable: {error}");
-            None
-        }
-    };
+    )));
+    assemble_session_with_warm(
+        project,
+        workspace,
+        update_strategy,
+        startup_index_warm,
+        watcher_starter,
+        semantic_packs,
+    )
+}
+
+/// The deferred counterpart of [`assemble_session`]: the semantic-pack
+/// activation runs on its own thread (`bifrost-semantic-pack-warm`) and the
+/// session is returned while it is still pending.
+///
+/// A deferred build is what the MCP transport's readiness barrier covers, and
+/// that barrier exists so the first tool call pays one-time workspace
+/// initialization rather than an unbounded amount of catalog, network, and
+/// toolchain work. Activation is warm-up work: the analyzer snapshot answers
+/// queries without it, its failure is already a stated session state, and the
+/// consumers that need the settled activation (policy evaluation, a pack-scope
+/// refresh) wait for it themselves (issue #3372).
+fn assemble_session_deferred(
+    project: Arc<dyn Project>,
+    workspace: WorkspaceAnalyzer,
+    update_strategy: UpdateStrategy,
+    startup_index_warm: StartupIndexWarm,
+    watcher_starter: &WatcherStarter,
+) -> Result<WorkspaceSession, String> {
+    let semantic_packs = SemanticPackWarm::spawn(project.root().to_path_buf(), workspace.clone())?;
+    assemble_session_with_warm(
+        project,
+        workspace,
+        update_strategy,
+        startup_index_warm,
+        watcher_starter,
+        semantic_packs,
+    )
+}
+
+/// [`assemble_session_deferred`] with the warm parked until `hold` releases it.
+#[cfg(test)]
+fn assemble_session_deferred_held(
+    project: Arc<dyn Project>,
+    workspace: WorkspaceAnalyzer,
+    update_strategy: UpdateStrategy,
+    startup_index_warm: StartupIndexWarm,
+    watcher_starter: &WatcherStarter,
+    hold: Arc<PackWarmHold>,
+) -> Result<WorkspaceSession, String> {
+    let semantic_packs =
+        SemanticPackWarm::spawn_held(project.root().to_path_buf(), workspace.clone(), hold)?;
+    assemble_session_with_warm(
+        project,
+        workspace,
+        update_strategy,
+        startup_index_warm,
+        watcher_starter,
+        semantic_packs,
+    )
+}
+
+fn assemble_session_with_warm(
+    project: Arc<dyn Project>,
+    workspace: WorkspaceAnalyzer,
+    update_strategy: UpdateStrategy,
+    startup_index_warm: StartupIndexWarm,
+    watcher_starter: &WatcherStarter,
+    semantic_packs: Arc<SemanticPackWarm>,
+) -> Result<WorkspaceSession, String> {
     let document_root = Arc::new(
         WorkspaceRoot::open(project.root())
             .map_err(|error| format!("Failed to open workspace document root: {error}"))?,
@@ -5777,7 +6138,7 @@ fn assemble_session(
     Ok(WorkspaceSession {
         snapshot,
         document_root,
-        pack_activation,
+        semantic_packs,
         watcher,
         usage_index_warm,
         index_warmer: IndexWarmer::new(),
@@ -5837,11 +6198,13 @@ fn resolve_workspace_root(path: &Path) -> Result<PathBuf, String> {
 fn active_workspace_result(
     root: &Path,
     usage_index_ready: bool,
+    semantic_packs_ready: bool,
     session_subset: Option<SubsetCoverage>,
 ) -> Result<ToolOutput, SearchToolsServiceError> {
     let structured = serde_json::to_value(ActiveWorkspaceResult {
         workspace_path: root.display().to_string(),
         usage_index_ready,
+        semantic_packs_ready,
         session_subset,
     })
     .map_err(|err| {
@@ -7120,6 +7483,107 @@ mod watcher_startup_tests {
         }
     }
 
+    /// Issue #3372, the #2377 family: the readiness barrier exists so the
+    /// first tool call pays the workspace snapshot, not whatever optional work
+    /// a background build has taken on. Semantic-pack activation is that kind
+    /// of work -- it reads a local toolchain, verifies a release bundle, and
+    /// decodes whole packs -- so a deferred build publishes its analyzer and
+    /// lets the activation settle on its own thread.
+    ///
+    /// The build thread here holds the activation open on purpose. Before the
+    /// fix the readiness wait covered it and this test fails on its deadline;
+    /// after it, the snapshot installs while the warm is still running, the
+    /// session says so, and the settled state arrives once the warm finishes.
+    #[test]
+    fn workspace_readiness_publishes_before_semantic_pack_activation_settles() {
+        let (_temp, root) = workspace("Warm.java", "class Warm {}\n");
+        let hold = Arc::new(PackWarmHold::new());
+        let holder = Arc::clone(&hold);
+        let build_root = root.clone();
+        let watcher_starter = production_watcher_starter();
+        let handle = std::thread::Builder::new()
+            .name("bifrost-index-build".to_string())
+            .spawn(
+                move || -> Result<(u64, PathBuf, WorkspaceSession), String> {
+                    let (project, workspace) = build_persisted_workspace(
+                        build_root.clone(),
+                        None,
+                        UpdateStrategy::Manual,
+                    )?;
+                    let session = assemble_session_deferred_held(
+                        project,
+                        workspace,
+                        UpdateStrategy::Manual,
+                        StartupIndexWarm::OnDemand,
+                        &watcher_starter,
+                        holder,
+                    )?;
+                    Ok((1, build_root, session))
+                },
+            )
+            .unwrap();
+        let service = service_with_pending_build(root, handle);
+
+        let deadline = Some(Instant::now() + Duration::from_secs(30));
+        service
+            .wait_workspace_ready_until(&|| false, deadline)
+            .expect("the workspace snapshot must be ready while the pack warm is held");
+        service
+            .ensure_ready()
+            .expect("the published snapshot must install");
+        assert!(
+            !pack_warm_ready(&service),
+            "the session must report the semantic-pack warm it is still running"
+        );
+
+        hold.release();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !pack_warm_ready(&service) {
+            assert!(
+                Instant::now() < deadline,
+                "the released semantic-pack warm never settled"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let guard = service.session.read().unwrap();
+        let session = guard.as_ref().unwrap();
+        assert!(
+            session.semantic_packs.duration().is_some(),
+            "a settled warm reports how long it ran, so a profile can name it"
+        );
+    }
+
+    /// A service whose deferred build is the caller's handle, so a test can
+    /// decide what that build is still doing when the readiness barrier runs.
+    fn service_with_pending_build(
+        root: PathBuf,
+        handle: std::thread::JoinHandle<Result<(u64, PathBuf, WorkspaceSession), String>>,
+    ) -> SearchToolsService {
+        SearchToolsService {
+            root: RwLock::new(Some(root)),
+            session: RwLock::new(None),
+            workspace_generation: AtomicU64::new(1),
+            flow_state: crate::flow::FlowWorkspaceState::new(),
+            query_protocols: RwLock::new(Default::default()),
+            query_value_flows: RwLock::new(Default::default()),
+            query_taint_results: RwLock::new(Default::default()),
+            pending_build: Mutex::new(Some(handle)),
+            build_error: Mutex::new(None),
+            file_listing: RwLock::new(None),
+            update_strategy: UpdateStrategy::Manual,
+            startup_index_warm: StartupIndexWarm::OnDemand,
+            watcher_starter: production_watcher_starter(),
+            diff_snapshot_object_dir: None,
+            diff_scoring: DiffScoringSession::default(),
+            workspace_scaled_query_limits: false,
+        }
+    }
+
+    fn pack_warm_ready(service: &SearchToolsService) -> bool {
+        let guard = service.session.read().unwrap();
+        guard.as_ref().unwrap().semantic_packs.is_ready()
+    }
+
     /// The other half of the trigger: a synchronously constructed service is a
     /// one-shot invocation or an embedded host, which can exit seconds later.
     /// It must not spend startup on Rust usage work it may never query
@@ -7623,7 +8087,7 @@ public partial class MudDialogContainer
             session: RwLock::new(Some(WorkspaceSession {
                 snapshot: Arc::new(workspace),
                 document_root: Arc::new(WorkspaceRoot::open(project.root()).unwrap()),
-                pack_activation: None,
+                semantic_packs: Arc::new(SemanticPackWarm::settled(None)),
                 watcher: SessionWatcher::Disabled,
                 usage_index_warm: None,
                 index_warmer: IndexWarmer::new(),

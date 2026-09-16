@@ -1,15 +1,15 @@
 {
   "schema_version": 2,
   "pack_id": "bifrost.go.stdlib.testing",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "producer": {
     "name": "bifrost",
-    "version": "0.10.5"
+    "version": "0.11.3"
   },
   "language": "go",
   "ecosystem": "go",
   "compatibility": {
-    "bifrost": ">=0.10.5, <1.0.0",
+    "bifrost": ">=0.11.3, <1.0.0",
     "toolchains": []
   },
   "provenance": {
@@ -198,6 +198,66 @@
               "kind": "source",
               "path": "src/testing/testing.go",
               "symbol": "testing.T.SkipNow"
+            }
+          },
+          {
+            "id": "member.testing.t.run",
+            "owner": "type.testing.t",
+            "name": "Run",
+            "member_kind": "method",
+            "visibility": "public",
+            "signature": {
+              "parameters": [
+                {
+                  "name": "name",
+                  "type": { "kind": "named", "name": "string" }
+                },
+                {
+                  "name": "f",
+                  "type": { "kind": "named", "name": "func" }
+                }
+              ]
+            },
+            "receiver": { "pointer": true },
+            "locator": {
+              "kind": "source",
+              "path": "src/testing/testing.go",
+              "symbol": "testing.T.Run"
+            }
+          },
+          {
+            "id": "member.testing.t.parallel",
+            "owner": "type.testing.t",
+            "name": "Parallel",
+            "member_kind": "method",
+            "visibility": "public",
+            "signature": { "parameters": [] },
+            "receiver": { "pointer": true },
+            "locator": {
+              "kind": "source",
+              "path": "src/testing/testing.go",
+              "symbol": "testing.T.Parallel"
+            }
+          },
+          {
+            "id": "member.testing.t.cleanup",
+            "owner": "type.testing.t",
+            "name": "Cleanup",
+            "member_kind": "method",
+            "visibility": "public",
+            "signature": {
+              "parameters": [
+                {
+                  "name": "f",
+                  "type": { "kind": "named", "name": "func" }
+                }
+              ]
+            },
+            "receiver": { "pointer": true },
+            "locator": {
+              "kind": "source",
+              "path": "src/testing/testing.go",
+              "symbol": "testing.T.Cleanup"
             }
           },
           {

@@ -241,6 +241,17 @@
             "callable": {
               "$ref": "#/$defs/AuthoredSummaryInput"
             },
+            "condition": {
+              "description": "The spawn condition this modeled call establishes itself.\n\n`None` is the plain spawn (`errgroup.Group.Go`,\n`sync.WaitGroup.Go`, `time.AfterFunc`): the callable starts on\nevery path that reaches the call's continuation. `call_result_true`\nis the conditional-spawn contract (`errgroup.Group.TryGo`): the\ncall starts the callable exactly when its boolean result reports\nthat it did, and starts nothing otherwise, so the spawned task is\nan event on the paths where the call's result is established true\nand no event on the paths where it is established false or never\nconsumed. The task's cardinality is therefore at most one per\ncall, and a group join covers whatever the call started.",
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/AuthoredTaskSpawnCondition"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "group": {
               "anyOf": [
                 {
@@ -254,6 +265,17 @@
             "kind": {
               "type": "string",
               "const": "task_spawn"
+            },
+            "timer": {
+              "description": "The timer object this spawn call returns, when the spawned\ncallback belongs to a cancellable timer (`time.AfterFunc`).\n\nOnly a normal-return port can name it: the timer is the\nconstruction call's own result, and its identity is what a later\n`timer_stop` or `timer_reset` on the same object binds against.\nSpawns without a timer (`errgroup.Group.Go`,\n`sync.WaitGroup.Go`, `errgroup.Group.TryGo`) omit it.",
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/AuthoredSummaryOutput"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             }
           },
           "additionalProperties": false,
@@ -490,6 +512,137 @@
             "kind",
             "condition",
             "waiters"
+          ]
+        },
+        {
+          "description": "One `sync.Map` entry operation on the (map, key) entry named by the\nexact receiver and key inputs (issue #3370).\n\nThe map's own state is internally synchronized and is never an\nordinary access, and a stored value keeps its own identity, so the\nmodel carries the operation's read/write classification instead of an\nordinary-map approximation. Per the package documentation, a write\noperation synchronizes before any read operation that observes its\neffect; the solver binds the observation through structured guard\nfacts on the documented boolean results.",
+          "type": "object",
+          "properties": {
+            "key": {
+              "description": "The key input naming the entry. `Clear` names no key because it\nwrites every entry of the map.",
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/AuthoredSummaryInput"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "kind": {
+              "type": "string",
+              "const": "sync_map"
+            },
+            "map": {
+              "$ref": "#/$defs/AuthoredSummaryInput"
+            },
+            "operation": {
+              "$ref": "#/$defs/AuthoredSyncMapOperation"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "map",
+            "operation"
+          ]
+        },
+        {
+          "description": "One `(*time.Timer).Stop` call on the `timer` object (issue #3382).\n\nThe cancellation contract is intrinsic to the effect: when the call's\nboolean result is established true by a structured guard, the\n`time.AfterFunc` callback for that exact timer did not and will not\nrun, so the guard's true arm never executes concurrently with it. The\nfalse arm, dead paths, and unconsumed results establish nothing, and a\nstop on another timer binds nothing. The stop itself orders nothing:\nit is neither a join nor a lock, only proof of absence.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "timer_stop"
+            },
+            "timer": {
+              "$ref": "#/$defs/AuthoredSummaryInput"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "timer"
+          ]
+        },
+        {
+          "description": "One `(*time.Timer).Reset` call on the `timer` object (issue #3382).\n\nReset re-arms the timer: for an `AfterFunc` timer it reschedules the\ncallback, or schedules it to run again. A reset therefore voids the\n`timer_stop` cancellation for every path that passes through it after\nthe establishing stop. Like the stop, the reset orders nothing by\nitself.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "timer_reset"
+            },
+            "timer": {
+              "$ref": "#/$defs/AuthoredSummaryInput"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "timer"
+          ]
+        },
+        {
+          "description": "One `testing.T.Run` call (issue #3383). `callable` names the subtest\ncallback and `group` names the parent test node. The callback runs as\none subtest task on every path that reaches the call; the call joins\nthat task and its subtest-cleanup subtree exactly when no execution\nof the callback calls `Parallel` on its own parameter, and joins\nnothing otherwise. Parallel siblings of one parent may run in\nparallel with each other and with nothing else of the parent body.",
+          "type": "object",
+          "properties": {
+            "callable": {
+              "$ref": "#/$defs/AuthoredSummaryInput"
+            },
+            "group": {
+              "$ref": "#/$defs/AuthoredSummaryInput"
+            },
+            "kind": {
+              "type": "string",
+              "const": "subtest_run"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "callable",
+            "group"
+          ]
+        },
+        {
+          "description": "One `testing.T.Parallel` call (issue #3383). `receiver` names the test\nnode being marked. The call creates no task and orders nothing by\nitself; the enclosing `Run` consumes it as classification evidence\nfor its callback. Only a call on the callback's own parameter marks\nthe subtest parallel.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "subtest_parallel"
+            },
+            "receiver": {
+              "$ref": "#/$defs/AuthoredSummaryInput"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "receiver"
+          ]
+        },
+        {
+          "description": "One `testing.T.Cleanup` call (issue #3383). `callable` names the\nregistered callback and `group` names the test node whose completion\nruns it. The callback runs as one deferred task after the test and\nall its subtests complete, in last-added-first-called order among the\ncleanups of one node, so the call joins the receiver's subtest\nsubtree before the cleanup body.",
+          "type": "object",
+          "properties": {
+            "callable": {
+              "$ref": "#/$defs/AuthoredSummaryInput"
+            },
+            "group": {
+              "$ref": "#/$defs/AuthoredSummaryInput"
+            },
+            "kind": {
+              "type": "string",
+              "const": "subtest_cleanup"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "callable",
+            "group"
           ]
         }
       ]
@@ -1452,6 +1605,68 @@
         "input",
         "exit_kind",
         "output"
+      ]
+    },
+    "AuthoredSyncMapOperation": {
+      "description": "The documented entry-level classification of one `sync.Map` operation\n(issue #3370).\n\nEach variant states when the call writes the entry and when it observes\nit. An observation is claimed only where the call's documented boolean\nresult is established true by a structured guard (`Load`, `LoadOrStore`,\n`LoadAndDelete`, `Swap`: ordinal 1; `CompareAndDelete`: ordinal 0), or\nunconditionally where the operation's comparison reads the entry\n(`CompareAndSwap`, `CompareAndDelete`). `Range`'s per-entry observation\nthrough its callback is deliberately not claimed.",
+      "oneOf": [
+        {
+          "description": "`Store(k, v)`: installs `v` at `k`, unconditionally, and observes nothing.",
+          "type": "string",
+          "const": "store"
+        },
+        {
+          "description": "`Delete(k)`: removes the entry, unconditionally.",
+          "type": "string",
+          "const": "delete"
+        },
+        {
+          "description": "`Clear()`: removes every entry of the map, unconditionally.",
+          "type": "string",
+          "const": "clear"
+        },
+        {
+          "description": "`Load(k)`: observes the entry when its ordinal-1 boolean result is\nestablished true; a miss observes nothing.",
+          "type": "string",
+          "const": "load"
+        },
+        {
+          "description": "`Range(f)`: visits entries inside `f` without claiming per-entry\nobservation; the callback's value identity remains an open boundary.",
+          "type": "string",
+          "const": "range"
+        },
+        {
+          "description": "`LoadOrStore(k, v)`: observes the entry when the ordinal-1 result is\nestablished true, and installs `v` when it is established false.",
+          "type": "string",
+          "const": "load_or_store"
+        },
+        {
+          "description": "`LoadAndDelete(k)`: removes the entry unconditionally and observes it\nwhen the ordinal-1 result is established true.",
+          "type": "string",
+          "const": "load_and_delete"
+        },
+        {
+          "description": "`Swap(k, v)`: installs `v` unconditionally and observes the entry when\nthe ordinal-1 result is established true.",
+          "type": "string",
+          "const": "swap"
+        },
+        {
+          "description": "`CompareAndSwap(k, old, new)`: the comparison reads the entry\nunconditionally, and installs `new` when the ordinal-1 result is\nestablished true.",
+          "type": "string",
+          "const": "compare_and_swap"
+        },
+        {
+          "description": "`CompareAndDelete(k, old)`: the comparison reads the entry\nunconditionally, and removes it when the ordinal-0 result is\nestablished true.",
+          "type": "string",
+          "const": "compare_and_delete"
+        }
+      ]
+    },
+    "AuthoredTaskSpawnCondition": {
+      "description": "The spawn condition a reviewed summary call establishes by its own result\n(issue #3371).\n\nThe only modeled condition is the conditional-spawn contract: the call\nstarts the callable in a new goroutine exactly when it reports `true`.\nConsumers must bind the condition through structured branch facts about\nthe call's result, never through the method or import spelling, and must\nkeep the paths that establish the result false free of the spawned task.",
+      "type": "string",
+      "enum": [
+        "call_result_true"
       ]
     },
     "CaptureBinding": {
@@ -4451,11 +4666,19 @@
       ]
     },
     "RuntimeExposureActivation": {
-      "type": "string",
-      "enum": [
-        "enabled",
-        "disabled",
-        "review-required"
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "disabled",
+            "review-required"
+          ]
+        },
+        {
+          "description": "Intrinsically eligible within its model. This does not bypass pack\nactivation: a pack marked `safety.review_required` still needs an\nexplicit compatible enable control before its exposures can publish.",
+          "type": "string",
+          "const": "enabled"
+        }
       ]
     },
     "RuntimeGlobalBindingEvidence": {

@@ -204,6 +204,7 @@ pub(super) fn measure_artifact_work(
         for value in &procedure.values {
             match &value.kind {
                 SemanticValueKind::LanguageDefined(name) => account_text(name, &mut work),
+                SemanticValueKind::ConstantString(payload) => account_text(payload, &mut work),
                 SemanticValueKind::Parameter {
                     multiplicity, name, ..
                 } => {

@@ -17,10 +17,10 @@ use crate::mcp_common::{
     AGENTS_GUIDANCE_MIME_TYPE, AGENTS_GUIDANCE_TEXT, AGENTS_GUIDANCE_URI,
     BENCHMARK_PROFILE_BOUNDARY_MARKER, BENCHMARK_PROFILE_BOUNDARY_METHOD, CODEX_MCP_CLIENT_NAME,
     CODEX_SANDBOX_STATE_META_CAPABILITY, MCP_DISCOVERY_TEXT_MAX_CHARS, MCP_FILE_WATCHER_ENV,
-    McpRenderOptions, McpServerSpec, UNBOUND_WORKSPACE_MESSAGE, attach_run_policy_correlation,
-    attach_run_policy_correlation_result, client_root_to_path, file_uri_to_path,
-    file_watching_enabled, fit_get_summaries_output_to_budget, mcp_analyzer_request_budget,
-    mcp_request_deadline, request_correlation_id, serial_tool_request,
+    McpRenderOptions, McpServerSpec, UNBOUND_WORKSPACE_MESSAGE, analyzer_stop_deadline,
+    attach_run_policy_correlation, attach_run_policy_correlation_result, client_root_to_path,
+    file_uri_to_path, file_watching_enabled, fit_get_summaries_output_to_budget,
+    mcp_analyzer_request_budget, mcp_request_deadline, request_correlation_id, serial_tool_request,
 };
 use crate::ordered_transport::{
     OutboundResponseTimings, ResponseTimingTransport, RootsOrderedTransport, RootsRevocations,
@@ -1345,8 +1345,16 @@ impl BifrostMcpHandler {
         // The deadline was set when the request was accepted, not when it
         // reached the analyzer, so time already spent queueing counts against
         // it. A request that waited most of its budget gets what remains.
+        // A policy run asks its analyzer to stop `POLICY_REPORT_GRACE` before
+        // this request's timer, so the canonical deadline report -- status,
+        // terminal stage, completed and pending policy ids -- is what the
+        // client usually receives; the timer below remains the backstop that
+        // answers with the typed budget error when the work cannot stop. The
+        // reserve is measured from now, so readiness and admission wait already
+        // spent are never handed back as grace.
         let bifrost_cancellation = match deadline {
-            Some(deadline) => crate::CancellationToken::default().with_deadline(deadline),
+            Some(deadline) => crate::CancellationToken::default()
+                .with_deadline(analyzer_stop_deadline(&name, Instant::now(), deadline)),
             None => crate::CancellationToken::default(),
         };
         // How the analyzer's phases reach the client while the call is still

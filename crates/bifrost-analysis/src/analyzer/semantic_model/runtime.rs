@@ -166,7 +166,9 @@ pub struct SemanticModelActivationPhaseMeasurements {
 
 #[derive(Debug)]
 pub struct ActiveSemanticModelShard {
-    pub manifest: CompiledPackManifest,
+    /// Shared with the catalog's decoded-manifest memo and with every other
+    /// shard of the same pack (#3101).
+    pub manifest: Arc<CompiledPackManifest>,
     pub shard: CompiledShard,
     pub source_kind: CatalogPackSourceKind,
     pub source_id: String,
@@ -2454,6 +2456,14 @@ pub fn resolve_active_semantic_models(
     });
 
     for selection in &active {
+        // A review-gated pack reaches this push only through an explicit
+        // compatible enable control, so the report retains that user
+        // authorization decision rather than merely implying it.
+        let reason = if selection.active.manifest.safety.review_required {
+            "strict activation evidence and an explicit enable control selected this shard"
+        } else {
+            "strict activation evidence and controls selected this shard"
+        };
         push_explanation(
             &mut report,
             request.limits,
@@ -2464,7 +2474,7 @@ pub fn resolve_active_semantic_models(
                 source_kind: selection.active.source_kind,
                 source_id: selection.active.source_id.clone(),
                 status: SemanticModelActivationStatus::Active,
-                reason: "strict activation evidence and controls selected this shard".to_owned(),
+                reason: reason.to_owned(),
             },
         );
     }
@@ -2517,9 +2527,7 @@ pub fn resolve_active_semantic_models(
         if explanation.status == SemanticModelActivationStatus::Active
             && let Some(gaps) = extraction_gap_counts.get(&explanation.manifest_digest)
         {
-            explanation.reason = format!(
-                "strict activation evidence and controls selected this shard; gaps: {gaps}"
-            );
+            explanation.reason = format!("{}; gaps: {gaps}", explanation.reason);
         }
     }
     extraction_gaps.sort_by(|left, right| {
@@ -3573,7 +3581,7 @@ mod unmaterialized_call_shape_binding_tests {
         )
         .expect("the compiled call-shape shard decodes");
         let active = ActiveSemanticModelShard {
-            manifest: compiled.manifest,
+            manifest: std::sync::Arc::new(compiled.manifest),
             shard,
             source_kind: CatalogPackSourceKind::Embedded,
             source_id: "test:call-shape".to_owned(),
@@ -3719,7 +3727,7 @@ mod active_model_set_identity_tests {
             evidence_rank,
             source_rank: 0,
             active: ActiveSemanticModelShard {
-                manifest: compiled.manifest,
+                manifest: std::sync::Arc::new(compiled.manifest),
                 shard,
                 source_kind: CatalogPackSourceKind::Embedded,
                 source_id: format!("test:{pack_id}"),
@@ -3921,6 +3929,8 @@ mod procedure_claim_agreement_tests {
             .push(CompiledConcurrencyEffect::TaskSpawn {
                 callable: CompiledSummaryInput::Parameter { ordinal: 0 },
                 group: None,
+                condition: None,
+                timer: None,
             });
         assert!(!procedure_claims_agree(&left, &right));
     }

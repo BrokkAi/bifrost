@@ -2997,7 +2997,7 @@ mod scan_cli_tests {
 
     fn empty_manifest() -> BuiltInPolicyCatalogManifest {
         BuiltInPolicyCatalogManifest {
-            schema_version: 1,
+            schema_version: 2,
             packs: Vec::new(),
         }
     }

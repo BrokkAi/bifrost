@@ -5,9 +5,20 @@ analysis behavior, integrations, and release artifacts. It is curated from the
 complete private release range because the public open-core repository is a
 projection and its commit history does not contain every source commit.
 
-## [0.11.4] - 2026-09-15
+## Unreleased
 
 ### Added
+
+- Shipped reviewed Node runtime-values packs for JavaScript and TypeScript
+  plus `child_process.execSync` procedure summaries, so exact
+  `process.env` and `process.argv` values can flow into the exact
+  `execSync(command)` sink through the production scan and policy route.
+  Activation stays review-gated behind explicit enable controls with exact
+  Node artifact evidence; shadowed, mutated, and dynamic reads remain
+  excluded or typed incomplete.
+- TypeScript transparent wrapper expressions (`as`, `satisfies`, `!`,
+  angle-bracket assertions, and generic instantiations) now propagate
+  their operand's value through dataflow instead of severing the chain.
 
 - Persistence taint policies distinguish complete finite string-key sets
   through bounded Java local copies and reaching definitions. Unknown origins
@@ -30,14 +41,33 @@ projection and its commit history does not contain every source commit.
   another goroutine, a goroutine that never calls `Do`, and a callback bound to
   a different object stay unordered, while a `Do` whose callback cannot be
   resolved remains an explicit open boundary.
-- Go data-race analysis now models `sync.Cond` through its associated locker.
-  `Wait` unlocks, suspends, and reacquires that locker; `Signal` and `Broadcast`
-  remain notifications rather than unconditional joins, so a missed signal or
-  a different waiter does not invent ordering.
-- Go data-race analysis now applies `Mutex.TryLock`, `RWMutex.TryLock`, and
-  `RWMutex.TryRLock` protection only on paths where the returned boolean is
-  proven true, retaining the correct reader or writer mode. The false branch
-  holds no lock, and unresolved result flow remains an open boundary.
+- Go data-race analysis now models `errgroup.Group.TryGo` as a conditional
+  spawn: the callable starts exactly when the call's boolean result reports
+  that it did, so a parent access only the failed branch can reach is never
+  concurrent with the callback, a `Wait` on the same group orders whatever the
+  group started, and a result no structured guard consumes keeps an explicit
+  `unsupported_synchronization` boundary instead of a guessed task. The
+  reviewed `bifrost.go.concurrency` pack is 1.2.0, and the built-in
+  `bifrost.code-smells` pack is 2.12.0 so the public Go data-race policy also
+  seeds roots that call `TryGo`.
+- Go data-race analysis now models the `time.AfterFunc` timer protocol: the
+  spawn names its timer, a `Timer.Stop` that reports true proves the callback
+  did not and will not run so the guarded arm is never compared against it,
+  and a `Timer.Reset` on the same timer re-arms the callback. A stop on
+  another timer, the false arm, a callback shared with a running timer, and
+  an unresolved callable keep the ordinary answer, and the returned timer
+  joins nothing. The public Go data-race policy already seeds `AfterFunc`
+  roots, so it consumes the model with no policy change.
+- Go data-race analysis now models `testing.T.Run` subtests: `Run` spawns its
+  callback and joins it exactly when no execution of the callback calls
+  `Parallel` on its own parameter, parallel siblings of one parent may run in
+  parallel with each other and with nothing else of the parent body, and
+  `Cleanup` callbacks stay ordered after the subtest tree. A conditional
+  `Parallel` keeps an explicit `unsupported_synchronization` boundary instead
+  of a guessed task. The reviewed `bifrost.go.concurrency` pack is 1.4.0
+  (reconciling the timer and subtest models), the `bifrost.go.stdlib.testing`
+  declarations are 1.1.0, and the built-in `bifrost.code-smells` pack is
+  2.13.0 so the public Go data-race policy also seeds roots that call `Run`.
 - Python conditional type refinements now survive semantic-pack and CSMI
   wire round trips, with exact binding and preserved provenance.
 - Configuration facts are now exposed through canonical CodeQuery and RQL.
@@ -76,9 +106,12 @@ projection and its commit history does not contain every source commit.
 
 ### Changed
 
-- Cold-retention benchmark comparisons now judge the first request against a
-  monotonic absolute ceiling as well as its warm median, and expose the reason
-  structurally instead of inferring it from rendered detail text.
+- Semantic-pack candidate selection and shard loading decode each stored
+  manifest once per catalog and validate its record-id inventory once, instead
+  of re-decoding and re-validating the same multi-megabyte manifest for every
+  selector row and every loaded shard. Fresh policy processes that activate a
+  released dependency pack spend materially less time before evaluation, with
+  unchanged activation decisions and provenance.
 - Python type-flow queries reuse semantic artifacts prepared by field-slot
   surveys. Binding and correlation refinement share their copy, open-binding,
   and relevant-event inventories, allowing more fixed-budget analyses to
@@ -112,9 +145,6 @@ projection and its commit history does not contain every source commit.
 - Diff-tool requests now report their execution phases to the client while
   running, and analyzer cache build-lock waits are cancellable and
   self-naming.
-- MCP clients can negotiate the stable 2026-07-28 protocol revision. Discovery
-  advertises only the revisions covered by Bifrost's wire and conformance
-  gates, and unadvertised prompt and resource-template methods fail explicitly.
 - Analyzer cache collection stays out of the way of interactive work and
   paces itself per new store.
 - Kotlin overload selection now resolves through the shared call_binding
@@ -122,10 +152,15 @@ projection and its commit history does not contain every source commit.
 
 ### Fixed
 
-- Semantic-pack acquisition now rejects incompatible generated productions
-  from bundle index metadata before reading their assets, skips decoding stale
-  productions that will not be installed, and avoids re-verifying the same
-  cache-miss bytes after a publish race.
+- MCP `run_policy` is bounded by default: a synchronous policy request carries
+  a four-minute budget and its analyzer stops five seconds earlier, so a
+  diff-scoped or full-pack run that cannot finish returns the canonical report
+  with `deadline_exceeded` termination, the phase that spent the budget, and
+  the policy ids still pending, instead of outliving the client's own tool
+  deadline with no result. The diff-base phase is attributed as its own
+  `diff_base` stage and a budget that expires there no longer degrades gating to
+  a full run. MCP Tasks keep their ten-minute window.
+
 - A Python guard whose arm calls the builtin `exit` or `quit` now ends that
   arm. The generated stdlib pack projects the `__call__` contract of the
   `_sitebuiltins.Quitter` values those names bind, so the class the guard
@@ -139,11 +174,6 @@ projection and its commit history does not contain every source commit.
 - `query_code` advertises schema versions as strings, avoiding Gemini tool-list
   rejection of numeric enums. Canonical CodeQuery JSON emits `"1"`; existing
   numeric version inputs remain readable.
-
-- The DeepSeek Harness npm plugin is now promoted from the same immutable
-  qualification bundle as the release binaries. Its launcher metadata is
-  checked after publication against the macOS archive sidecar, preventing a
-  stale `archiveSha256` pin from making every managed binary preparation fail.
 
 - Java receiver lookup now infers `var` locals from uniquely resolved factory
   return declarations, preserving separate runtime-dispatch proof and incomplete

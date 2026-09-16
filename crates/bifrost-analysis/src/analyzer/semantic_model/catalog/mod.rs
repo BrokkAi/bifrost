@@ -6,7 +6,7 @@ use std::fmt;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, Weak};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
@@ -19,7 +19,7 @@ use super::validate::is_canonical_relative_path;
 use super::{
     ActivationSelector, ArtifactEncoding, CompiledPackManifest, CompiledSemanticModelPack,
     CompiledShard, CompiledShardDescriptor, Completeness, DecodeLimits, NameSelector, PayloadKind,
-    decode_manifest, decode_shard_for_manifest,
+    decode_manifest, decode_validated_shard_for_manifest, validate_manifest_inventory,
 };
 use crate::analyzer::canonical_hash::{CanonicalHasher, is_lower_sha256, lower_hex_string};
 use crate::analyzer::store::{
@@ -307,7 +307,9 @@ impl CatalogCandidate {
 
 #[derive(Debug)]
 pub struct LoadedCatalogShard {
-    pub manifest: CompiledPackManifest,
+    /// Shared with the catalog's decoded-manifest memo and with every other
+    /// shard of the same pack (#3101).
+    pub manifest: Arc<CompiledPackManifest>,
     pub shard: CompiledShard,
     pub source_kind: CatalogPackSourceKind,
     pub source_id: String,
@@ -842,7 +844,6 @@ impl SemanticPackVersionNearMiss {
 /// One raw `catalog_selectors` join row, before compatibility filtering.
 struct DurableSelectorRow {
     manifest_digest: String,
-    manifest_bytes: Vec<u8>,
     shard_id: String,
     descriptor_json: Vec<u8>,
     selector_json: Vec<u8>,
@@ -919,6 +920,10 @@ pub struct SemanticPackCatalog {
     session_packs: Mutex<Vec<SessionPack>>,
     session_activations: Mutex<HashMap<String, SessionActivation>>,
     rejected_manifests: Mutex<HashSet<String>>,
+    decoded_manifests: Mutex<DecodedManifestMemo>,
+    verified_manifest_inventories: Mutex<HashSet<String>>,
+    manifest_decodes: AtomicU64,
+    manifest_inventory_validations: AtomicU64,
     lookup_hits: AtomicU64,
     lookup_misses: AtomicU64,
     sql_statements: AtomicU64,
@@ -926,6 +931,28 @@ pub struct SemanticPackCatalog {
     mutation_generation: AtomicU64,
     _ephemeral_root: Option<TempDir>,
 }
+
+/// Decoded manifests of one catalog, keyed by their content digest.
+///
+/// Candidate selection visits one row per (shard, selector) and shard loading
+/// visits one row per shard. Both used to deserialize the same stored manifest
+/// once per row: one fresh policy process decoded the same two JDK manifests
+/// 259 times, 18.8 of its 31 activation seconds (#3101). The key is the
+/// manifest's own `content_sha256`, and `decode_manifest` proves that the value
+/// it returns hashes to that key, so a hit is the value the miss would return.
+/// Catalog mutations cannot make an entry stale: a manifest digest names its
+/// exact bytes, and readers keep checking each pack's stored state themselves.
+struct DecodedManifestMemo {
+    entries: HashMap<String, Arc<CompiledPackManifest>>,
+    bytes: usize,
+}
+
+/// Canonical manifest bytes the memo retains before it starts over.
+///
+/// Manifests of one pack are adjacent in every ordered reader, so a restart
+/// costs one decode per distinct manifest, never one per row. The bound keeps a
+/// catalog that serves many packs from retaining unbounded decoded state.
+const DECODED_MANIFEST_MEMO_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct SemanticPackCatalogCacheIdentity {
@@ -947,7 +974,7 @@ struct ValidatedPack {
 }
 
 struct SessionPack {
-    manifest: CompiledPackManifest,
+    manifest: Arc<CompiledPackManifest>,
     shards: Vec<ValidatedShard>,
     source: SessionPackSource,
 }
@@ -1076,6 +1103,13 @@ impl SemanticPackCatalog {
             session_packs: Mutex::new(Vec::new()),
             session_activations: Mutex::new(HashMap::new()),
             rejected_manifests: Mutex::new(HashSet::new()),
+            decoded_manifests: Mutex::new(DecodedManifestMemo {
+                entries: HashMap::new(),
+                bytes: 0,
+            }),
+            verified_manifest_inventories: Mutex::new(HashSet::new()),
+            manifest_decodes: AtomicU64::new(0),
+            manifest_inventory_validations: AtomicU64::new(0),
             lookup_hits: AtomicU64::new(0),
             lookup_misses: AtomicU64::new(0),
             sql_statements: AtomicU64::new(0),
@@ -1125,6 +1159,138 @@ impl SemanticPackCatalog {
         self.object_reads.load(Ordering::Relaxed)
     }
 
+    /// Return the number of stored-manifest decodes this instance performed.
+    ///
+    /// A memo hit is not a decode. Selection, near-miss attribution, and shard
+    /// loading all read the same stored manifests, so this count is the pin
+    /// that each distinct manifest is deserialized once per catalog (#3101).
+    pub fn manifest_decode_count(&self) -> u64 {
+        self.manifest_decodes.load(Ordering::Relaxed)
+    }
+
+    /// Return the number of whole-manifest inventory validations this instance
+    /// performed.
+    ///
+    /// A memo hit is not a validation. Decoding one shard at a time used to
+    /// revalidate every record id of the manifest per shard (#3101).
+    pub fn manifest_inventory_validation_count(&self) -> u64 {
+        self.manifest_inventory_validations.load(Ordering::Relaxed)
+    }
+
+    /// Validate one stored manifest's inventory at most once per catalog.
+    fn validated_manifest_inventory(
+        &self,
+        manifest: &CompiledPackManifest,
+    ) -> Result<(), CatalogError> {
+        let digest = &manifest.content_sha256;
+        if self
+            .verified_manifest_inventories
+            .lock()
+            .expect("semantic-pack inventory mutex poisoned")
+            .contains(digest)
+        {
+            return Ok(());
+        }
+        validate_manifest_inventory(manifest)
+            .map_err(|error| CatalogError::Artifact(error.to_string()))?;
+        self.manifest_inventory_validations
+            .fetch_add(1, Ordering::Relaxed);
+        self.verified_manifest_inventories
+            .lock()
+            .expect("semantic-pack inventory mutex poisoned")
+            .insert(digest.clone());
+        Ok(())
+    }
+
+    /// Decode one shard of a stored manifest after one inventory validation.
+    fn decode_stored_shard(
+        &self,
+        manifest: &CompiledPackManifest,
+        descriptor: &CompiledShardDescriptor,
+        bytes: &[u8],
+    ) -> Result<CompiledShard, CatalogError> {
+        self.validated_manifest_inventory(manifest)?;
+        decode_validated_shard_for_manifest(
+            manifest,
+            descriptor,
+            bytes,
+            &self.options.decode_limits,
+        )
+        .map_err(|error| CatalogError::Artifact(error.to_string()))
+    }
+
+    /// Decode one stored manifest, reusing the decode of an equal digest.
+    ///
+    /// Callers read stored manifests by digest, so the memo is keyed by that
+    /// digest and the decode re-proves it: a value the cache returns for a key
+    /// is the value a miss would decode for the same key.
+    fn decoded_manifest(
+        &self,
+        manifest_digest: &str,
+        manifest_bytes: &[u8],
+    ) -> Result<Arc<CompiledPackManifest>, CatalogError> {
+        if let Some(manifest) = self.memoized_manifest(manifest_digest) {
+            return Ok(manifest);
+        }
+        let manifest = Arc::new(
+            decode_manifest(manifest_bytes, &self.options.decode_limits)
+                .map_err(|error| CatalogError::Artifact(error.to_string()))?,
+        );
+        if manifest.content_sha256 != manifest_digest {
+            return Err(CatalogError::Integrity(
+                "catalog manifest key does not match decoded manifest".to_owned(),
+            ));
+        }
+        self.manifest_decodes.fetch_add(1, Ordering::Relaxed);
+        let mut memo = self
+            .decoded_manifests
+            .lock()
+            .expect("semantic-pack manifest memo mutex poisoned");
+        if memo.bytes.saturating_add(manifest_bytes.len()) > DECODED_MANIFEST_MEMO_BYTES {
+            memo.entries.clear();
+            memo.bytes = 0;
+        }
+        memo.bytes = memo.bytes.saturating_add(manifest_bytes.len());
+        memo.entries
+            .insert(manifest_digest.to_owned(), Arc::clone(&manifest));
+        Ok(manifest)
+    }
+
+    /// The memoized decode of one stored manifest, when this catalog has it.
+    fn memoized_manifest(&self, manifest_digest: &str) -> Option<Arc<CompiledPackManifest>> {
+        self.decoded_manifests
+            .lock()
+            .expect("semantic-pack manifest memo mutex poisoned")
+            .entries
+            .get(manifest_digest)
+            .map(Arc::clone)
+    }
+
+    /// Decode one stored manifest, reading its bytes only on a memo miss.
+    ///
+    /// Candidate selection visits one row per (shard, selector), so a reader
+    /// that pulled `manifest_bytes` per row moved the same multi-megabyte blob
+    /// out of SQLite dozens of times per pack (#3101). The memo makes the read
+    /// and the decode happen once per distinct digest.
+    fn stored_manifest(
+        &self,
+        manifest_digest: &str,
+    ) -> Result<Arc<CompiledPackManifest>, CatalogError> {
+        if let Some(manifest) = self.memoized_manifest(manifest_digest) {
+            return Ok(manifest);
+        }
+        let bytes = {
+            let connection = self
+                .connection
+                .lock()
+                .expect("semantic-pack catalog connection mutex poisoned");
+            self.sql_statements.fetch_add(1, Ordering::Relaxed);
+            stored_manifest_bytes_on(&connection, manifest_digest)?
+                .ok_or(CatalogError::Unavailable)?
+        };
+        self.decoded_manifest(manifest_digest, &bytes)
+    }
+
     pub fn inventory_bounded(&self, max_packs: usize) -> Result<CatalogInventory, CatalogError> {
         let row_limit = max_packs.saturating_add(1);
         let connection = self
@@ -1133,7 +1299,7 @@ impl SemanticPackCatalog {
             .expect("semantic-pack catalog connection mutex poisoned");
         let mut pack_statement = connection
             .prepare(
-                "SELECT manifest_bytes, state
+                "SELECT manifest_digest, manifest_bytes, state
                  FROM catalog_packs
                  ORDER BY pack_id, pack_version, manifest_digest
                  LIMIT ?1",
@@ -1141,16 +1307,19 @@ impl SemanticPackCatalog {
             .map_err(|error| CatalogError::sqlite("prepare catalog inventory", error))?;
         let pack_rows = pack_statement
             .query_map([i64::try_from(row_limit).unwrap_or(i64::MAX)], |row| {
-                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
             })
             .map_err(|error| CatalogError::sqlite("query catalog inventory", error))?;
         let mut packs = BTreeMap::new();
         let mut complete = true;
         for row in pack_rows {
-            let (manifest_bytes, state) =
+            let (manifest_digest, manifest_bytes, state) =
                 row.map_err(|error| CatalogError::sqlite("read catalog inventory", error))?;
-            let manifest = decode_manifest(&manifest_bytes, &self.options.decode_limits)
-                .map_err(|error| CatalogError::Artifact(error.to_string()))?;
+            let manifest = self.decoded_manifest(&manifest_digest, &manifest_bytes)?;
             if packs.len() >= max_packs {
                 complete = false;
                 continue;
@@ -1662,13 +1831,7 @@ impl SemanticPackCatalog {
                     "generated-production row does not match its canonical key".to_owned(),
                 ));
             }
-            let manifest = decode_manifest(&manifest_bytes, &self.options.decode_limits)
-                .map_err(|error| CatalogError::Artifact(error.to_string()))?;
-            if manifest.content_sha256 != manifest_digest {
-                return Err(CatalogError::Integrity(
-                    "generated-production manifest key does not match decoded manifest".to_owned(),
-                ));
-            }
+            let manifest = self.decoded_manifest(&manifest_digest, &manifest_bytes)?;
             validate_generated_pack_identity(key, &manifest)?;
             self.validate_generated_shard_rows(&manifest_digest, &manifest)?;
             Ok(GeneratedProduction {
@@ -2337,7 +2500,7 @@ impl SemanticPackCatalog {
             .any(|entry| entry.manifest.content_sha256 == digest && entry.source == *source)
         {
             session_packs.push(SessionPack {
-                manifest: validated.manifest,
+                manifest: Arc::new(validated.manifest),
                 shards: validated.shards,
                 source: source.clone(),
             });
@@ -2942,10 +3105,8 @@ impl SemanticPackCatalog {
                     source
                 )));
             };
-            let manifest = decode_manifest(&manifest_bytes, &self.options.decode_limits)
-                .map_err(|error| CatalogError::Artifact(error.to_string()))?;
+            let manifest = self.decoded_manifest(&source.manifest_digest, &manifest_bytes)?;
             if state != "verified"
-                || manifest.content_sha256 != source.manifest_digest
                 || !manifest_shard_rows_present(
                     &self.root,
                     &transaction,
@@ -3064,7 +3225,6 @@ impl SemanticPackCatalog {
         for row in durable_rows {
             let DurableSelectorRow {
                 manifest_digest,
-                manifest_bytes,
                 shard_id,
                 descriptor_json,
                 selector_json,
@@ -3077,13 +3237,7 @@ impl SemanticPackCatalog {
                 continue;
             }
             let decoded = (|| -> Result<Option<CatalogCandidate>, CatalogError> {
-                let manifest = decode_manifest(&manifest_bytes, &self.options.decode_limits)
-                    .map_err(|error| CatalogError::Artifact(error.to_string()))?;
-                if manifest.content_sha256 != manifest_digest {
-                    return Err(CatalogError::Integrity(
-                        "catalog manifest key does not match decoded manifest".to_owned(),
-                    ));
-                }
+                let manifest = self.stored_manifest(&manifest_digest)?;
                 if !manifest_compatible(&manifest, query)? {
                     return Ok(None);
                 }
@@ -3228,8 +3382,7 @@ impl SemanticPackCatalog {
                 {
                     continue;
                 }
-                let manifest = decode_manifest(&row.manifest_bytes, &self.options.decode_limits)
-                    .map_err(|error| CatalogError::Artifact(error.to_string()))?;
+                let manifest = self.stored_manifest(&row.manifest_digest)?;
                 let selector: ActivationSelector = serde_json::from_slice(&row.selector_json)
                     .map_err(|error| CatalogError::Integrity(error.to_string()))?;
                 if let Some(miss) =
@@ -3500,6 +3653,10 @@ impl SemanticPackCatalog {
         &self,
         candidate: &CatalogCandidate,
     ) -> Result<LoadedCatalogShard, CatalogError> {
+        // The manifest comes from the memo, not from this statement: a pack
+        // with 44 shards used to ship its multi-megabyte manifest bytes out of
+        // SQLite once per loaded shard (#3101).
+        let manifest = self.stored_manifest(&candidate.manifest_digest)?;
         let connection = self
             .connection
             .lock()
@@ -3507,7 +3664,7 @@ impl SemanticPackCatalog {
         self.sql_statements.fetch_add(1, Ordering::Relaxed);
         let row = connection
             .query_row(
-                "SELECT p.manifest_bytes, o.relative_path, o.stored_size
+                "SELECT o.relative_path, o.stored_size
                  FROM catalog_packs AS p
                  JOIN catalog_pack_shards AS ps
                    ON ps.manifest_digest = p.manifest_digest
@@ -3522,33 +3679,19 @@ impl SemanticPackCatalog {
                     &candidate.shard_id,
                     &candidate.descriptor.stored_sha256
                 ],
-                |row| {
-                    Ok((
-                        row.get::<_, Vec<u8>>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, u64>(2)?,
-                    ))
-                },
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?)),
             )
             .optional()
             .map_err(|error| CatalogError::sqlite("load candidate location", error))?
             .ok_or(CatalogError::Unavailable)?;
-        let manifest = decode_manifest(&row.0, &self.options.decode_limits)
-            .map_err(|error| CatalogError::Artifact(error.to_string()))?;
         self.object_reads.fetch_add(1, Ordering::Relaxed);
         let bytes = storage::read(
             &self.root,
-            &row.1,
+            &row.0,
             &candidate.descriptor.stored_sha256,
-            row.2,
+            row.1,
         )?;
-        let shard = decode_shard_for_manifest(
-            &manifest,
-            &candidate.descriptor,
-            &bytes,
-            &self.options.decode_limits,
-        )
-        .map_err(|error| CatalogError::Artifact(error.to_string()))?;
+        let shard = self.decode_stored_shard(&manifest, &candidate.descriptor, &bytes)?;
         if self.mode == CatalogOpenMode::ReadWrite {
             connection
                 .execute(
@@ -3590,15 +3733,9 @@ impl SemanticPackCatalog {
         {
             return Err(CatalogError::Unavailable);
         }
-        let decoded = decode_shard_for_manifest(
-            &pack.manifest,
-            &shard.descriptor,
-            &shard.bytes,
-            &self.options.decode_limits,
-        )
-        .map_err(|error| CatalogError::Artifact(error.to_string()))?;
+        let decoded = self.decode_stored_shard(&pack.manifest, &shard.descriptor, &shard.bytes)?;
         Ok(LoadedCatalogShard {
-            manifest: pack.manifest.clone(),
+            manifest: Arc::clone(&pack.manifest),
             shard: decoded,
             source_kind: candidate.source_kind,
             source_id: candidate.source_id.clone(),
@@ -3907,7 +4044,7 @@ fn durable_selector_rows_on(
         "SELECT * FROM catalog_selectors"
     };
     let candidate_sql = format!(
-        "SELECT p.manifest_digest, p.manifest_bytes, ps.shard_id,
+        "SELECT p.manifest_digest, ps.shard_id,
                 ps.descriptor_json, s.selector_json,
                 source.source_kind, source.source_id
          FROM catalog_packs AS p
@@ -3991,12 +4128,11 @@ fn durable_selector_rows_on(
             |row| {
                 Ok(DurableSelectorRow {
                     manifest_digest: row.get::<_, String>(0)?,
-                    manifest_bytes: row.get::<_, Vec<u8>>(1)?,
-                    shard_id: row.get::<_, String>(2)?,
-                    descriptor_json: row.get::<_, Vec<u8>>(3)?,
-                    selector_json: row.get::<_, Vec<u8>>(4)?,
-                    source_kind: row.get::<_, String>(5)?,
-                    source_id: row.get::<_, String>(6)?,
+                    shard_id: row.get::<_, String>(1)?,
+                    descriptor_json: row.get::<_, Vec<u8>>(2)?,
+                    selector_json: row.get::<_, Vec<u8>>(3)?,
+                    source_kind: row.get::<_, String>(4)?,
+                    source_id: row.get::<_, String>(5)?,
                 })
             },
         )
@@ -4024,6 +4160,10 @@ fn validate_pack(
             "compiled pack does not contain every manifest shard".to_owned(),
         ));
     }
+    // One inventory validation covers every shard below; validating per shard
+    // re-walked every record id of the manifest once per shard (#3101).
+    validate_manifest_inventory(&manifest)
+        .map_err(|error| CatalogError::Artifact(error.to_string()))?;
 
     let mut shards = Vec::with_capacity(pack.shards.len());
     let mut matched = HashSet::with_capacity(pack.shards.len());
@@ -4044,8 +4184,9 @@ fn validate_pack(
                 descriptor.shard_id
             )));
         }
-        let decoded = decode_shard_for_manifest(&manifest, descriptor, &artifact.bytes, limits)
-            .map_err(|error| CatalogError::Artifact(error.to_string()))?;
+        let decoded =
+            decode_validated_shard_for_manifest(&manifest, descriptor, &artifact.bytes, limits)
+                .map_err(|error| CatalogError::Artifact(error.to_string()))?;
         shards.push(ValidatedShard {
             descriptor: descriptor.clone(),
             bytes: artifact.bytes.clone(),
@@ -4121,10 +4262,21 @@ fn acquisition_request_satisfied(
         }
         AcquisitionReceiptRequest::DeclaredPack(query) => {
             assert!(query_has_exact_coordinate(query));
+            let mut manifests = HashMap::<String, Option<Arc<CompiledPackManifest>>>::new();
             for row in durable_selector_rows_on(connection, query, usize::MAX)? {
-                let manifest = match decode_manifest(&row.manifest_bytes, limits) {
-                    Ok(manifest) => manifest,
-                    Err(_) => continue,
+                let manifest = match manifests
+                    .entry(row.manifest_digest.clone())
+                    .or_insert_with(|| {
+                        stored_manifest_bytes_on(connection, &row.manifest_digest)
+                            .ok()
+                            .flatten()
+                            .and_then(|bytes| decode_manifest(&bytes, limits).ok())
+                            .map(Arc::new)
+                    })
+                    .as_ref()
+                {
+                    Some(manifest) => Arc::clone(manifest),
+                    None => continue,
                 };
                 if manifest.content_sha256 != row.manifest_digest {
                     continue;
@@ -4153,6 +4305,24 @@ fn acquisition_request_satisfied(
             Ok(false)
         }
     }
+}
+
+/// Read one stored manifest's bytes through a caller-held connection.
+///
+/// The catalog's own readers go through its decoded-manifest memo instead; this
+/// is for the receipt proof, which runs on a catalog transaction.
+fn stored_manifest_bytes_on(
+    connection: &Connection,
+    manifest_digest: &str,
+) -> Result<Option<Vec<u8>>, CatalogError> {
+    connection
+        .query_row(
+            "SELECT manifest_bytes FROM catalog_packs WHERE manifest_digest = ?1",
+            [manifest_digest],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .optional()
+        .map_err(|error| CatalogError::sqlite("read stored manifest", error))
 }
 
 fn manifest_shard_rows_present(
@@ -5282,6 +5452,128 @@ mod acquisition_receipt_tests {
         fs::remove_file(root.path().join(&relative)).unwrap();
         assert!(
             !receipt_object_is_valid(root.path(), &relative, &digest, bytes.len() as u64).unwrap()
+        );
+    }
+}
+
+#[cfg(test)]
+mod stored_manifest_memo_tests {
+    /// One stored manifest is deserialized once per catalog, however many
+    /// (shard, selector) rows selection, near-miss attribution, and shard
+    /// loading visit (#3101).
+    ///
+    /// The fixture holds three shards with two selectors each, so the candidate
+    /// query answers with six rows over one manifest. Before the decoded
+    /// manifest memo, every row and every loaded shard decoded the same bytes
+    /// again: one fresh policy process decoded the same JDK manifests hundreds
+    /// of times.
+    #[test]
+    fn a_stored_manifest_is_decoded_once_per_catalog() {
+        use super::{
+            CatalogCoordinate, CatalogOptions, DurablePackSource, DurablePackSourceKind,
+            SemanticPackCatalog, SemanticPackSelectorQuery,
+        };
+        use crate::analyzer::semantic_model::{CompilerOptions, SourceFormat, compile_source};
+        use semver::Version;
+
+        let mut shards = Vec::new();
+        for index in 0..3 {
+            shards.push(serde_json::json!({
+                "id": format!("python.stdlib.{index}"),
+                "activation": [
+                    {"toolchain": {"name": "cpython", "version": ">=3.10.0, <3.15.0"}},
+                    {"toolchain": {"name": "cpython", "version": ">=3.10.0, <3.15.0"}}
+                ],
+                "payload": {
+                    "kind": "declaration_facts",
+                    "types": [{
+                        "id": format!("python.types-none-type-{index}"),
+                        "name": "types.NoneType",
+                        "type_kind": "class",
+                        "visibility": "public",
+                        "type_parameters": [],
+                        "hierarchy": [],
+                        "aliases": [],
+                        "extension_surfaces": [],
+                        "locator": {
+                            "kind": "artifact",
+                            "path": "stdlib/types.pyi",
+                            "symbol": "types.NoneType"
+                        }
+                    }],
+                    "members": [],
+                    "relations": []
+                }
+            }));
+        }
+        let source = serde_json::json!({
+            "schema_version": 2,
+            "pack_id": "fixture.python-stdlib",
+            "version": "2026.9.4",
+            "producer": {"name": "bifrost-fixture", "version": "1.0.0"},
+            "language": "python",
+            "ecosystem": "python",
+            "compatibility": {
+                "bifrost": ">=0.8.0, <1.0.0",
+                "toolchains": [{"name": "cpython", "requirement": ">=3.10.0, <3.15.0"}]
+            },
+            "provenance": {"source": "checked-in test source", "revision": "fixture-v1"},
+            "license": "Apache-2.0",
+            "completeness": "complete",
+            "safety": {"generated_code_only": false, "review_required": false},
+            "shards": shards,
+        });
+        let compiled = compile_source(
+            SourceFormat::Json,
+            &serde_json::to_vec(&source).unwrap(),
+            &CompilerOptions::default(),
+        )
+        .expect("fixture pack compiles");
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        catalog
+            .install(
+                &compiled,
+                &DurablePackSource {
+                    kind: DurablePackSourceKind::Installed,
+                    source_id: "fixture".to_owned(),
+                },
+            )
+            .unwrap();
+        let query = SemanticPackSelectorQuery {
+            language: "python".to_owned(),
+            ecosystem: "python".to_owned(),
+            package: None,
+            module: None,
+            toolchain: Some(CatalogCoordinate {
+                name: "cpython".to_owned(),
+                version: Some(Version::parse("3.12.0").unwrap()),
+            }),
+            target: None,
+            configuration: None,
+            artifact_sha256: None,
+            bifrost_version: Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
+        };
+
+        let candidates = catalog.candidates_bounded(&query, usize::MAX).unwrap();
+        assert_eq!(candidates.len(), 3);
+        assert!(catalog.version_near_misses(&query).unwrap().is_empty());
+        assert_eq!(
+            catalog.manifest_decode_count(),
+            1,
+            "six selector rows must not decode the manifest six times"
+        );
+        for candidate in &candidates {
+            catalog.load(candidate).unwrap();
+        }
+        assert_eq!(
+            catalog.manifest_decode_count(),
+            1,
+            "loading every shard must not decode the manifest again"
+        );
+        assert_eq!(
+            catalog.manifest_inventory_validation_count(),
+            1,
+            "loading every shard must not revalidate the manifest inventory"
         );
     }
 }

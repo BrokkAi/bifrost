@@ -1156,7 +1156,7 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                     "include_stage_timings": {
                         "type": "boolean",
                         "default": false,
-                        "description": "When true, the result carries a `stage_timings` sibling with wall-clock per-stage attribution (selection, suppression preflight, workspace snapshot, registration, preparation, evaluation, report construction). Timings are non-deterministic by nature and are delivered beside the canonical report, which stays byte-identical across invocations either way."
+                        "description": "When true, the result carries a `stage_timings` sibling with wall-clock per-stage attribution (selection, suppression preflight, workspace snapshot, registration, preparation, diff base, evaluation, report construction). Timings are non-deterministic by nature and are delivered beside the canonical report, which stays byte-identical across invocations either way."
                     }
                 },
                 "required": ["evaluation_date"],

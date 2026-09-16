@@ -23,6 +23,31 @@ pub(crate) const COLD_WORKSPACE_REQUEST_BUDGET: Duration = Duration::from_millis
 /// ([`BENCHMARK_MCP_REQUEST_BUDGET_SECS`]), so the default and the measured
 /// contract agree.
 pub(crate) const DEFAULT_INTERACTIVE_REQUEST_BUDGET: Duration = Duration::from_secs(60);
+/// The budget a synchronous `run_policy` gets when no operator configured one.
+///
+/// Policy evaluation is the one tool whose cost scales with the whole corpus
+/// times the policy count, and #3279 left it unbounded so an interactive timer
+/// would not cut a batch run short. #3351 is what that costs a real client: a
+/// diff-scoped correctness check against the self repository outlived the
+/// client's own 300-second tool deadline and came back with no report, no
+/// findings and no completion state, and a subsequent full-pack request did the
+/// same. Four minutes leaves a minute of margin under that observed deadline.
+/// A client that genuinely needs the batch window asks for an MCP Task, whose
+/// ten-minute TTL `run_policy` already qualifies for and which no fallback
+/// budget touches.
+pub(crate) const DEFAULT_POLICY_REQUEST_BUDGET: Duration = Duration::from_secs(240);
+/// How long before its request deadline a policy run stops its analyzer.
+///
+/// A budget expiry has two possible answers: the host's typed budget error, or
+/// the canonical policy report the analyzer builds when it observes the
+/// deadline itself. The analyzer is synchronous and cooperative while the
+/// host's timer is exact, so without a head start the timer usually wins and
+/// the completion state the report carries -- status, terminal stage,
+/// completed and pending policy ids, stage timings -- is lost. Reserving this
+/// much of the budget for that unwinding lets the canonical report arrive
+/// inside the tool deadline. The host's timer remains the backstop for work
+/// that cannot stop in time, such as a base-revision build parked on a lock.
+pub(crate) const POLICY_REPORT_GRACE: Duration = Duration::from_secs(5);
 #[doc(hidden)]
 pub const BENCHMARK_MCP_REQUEST_BUDGET_SECS: u64 = 60;
 pub(crate) const AGENTS_GUIDANCE_URI: &str = "bifrost://agent-guidance/agents.md";
@@ -97,11 +122,14 @@ fn mcp_request_deadline_with_budget(
 ///
 /// * A configured `BIFROST_MCP_REQUEST_BUDGET_SECS` always wins, for every
 ///   tool, so operators and benchmarks keep one knob.
-/// * `run_policy` and the serial workspace-mutating tools get no fallback.
-///   Their work is batch-shaped (policy evaluation is what MCP Tasks and its
-///   ten-minute TTL exist for) or already serialized by the workspace lock,
-///   and cutting a mutation or a policy run mid-flight on a timer nobody
-///   asked for trades a rare slow call for a broken one.
+/// * `run_policy` gets [`DEFAULT_POLICY_REQUEST_BUDGET`]: a synchronous policy
+///   run is the one batch-shaped call, and #3351 showed that leaving it
+///   unbounded loses the whole call to the client's own deadline. The MCP Task
+///   path keeps the ten-minute TTL for callers that want the full window.
+/// * The serial workspace-mutating tools get no fallback. Their work is
+///   already serialized by the workspace lock, and cutting a mutation
+///   mid-flight on a timer nobody asked for trades a rare slow call for a
+///   broken one.
 /// * A cold workspace fails non-discovery tools fast (4.5 s) with a typed,
 ///   retryable not-ready error instead of billing them the whole interactive
 ///   budget for a wait they cannot shorten.
@@ -110,13 +138,38 @@ fn mcp_request_deadline_with_budget(
 ///   is the #3279 fix: discovery used to wait out cold initialization with
 ///   no deadline at all, and warm reads had no deadline either.
 pub(crate) fn fallback_request_budget(tool_name: &str, cold_workspace: bool) -> Option<Duration> {
-    if tool_name == "run_policy" || serial_tool_request(tool_name) {
+    if tool_name == "run_policy" {
+        return Some(DEFAULT_POLICY_REQUEST_BUDGET);
+    }
+    if serial_tool_request(tool_name) {
         return None;
     }
     if cold_workspace && tool_name != "search_symbols" {
         return Some(COLD_WORKSPACE_REQUEST_BUDGET);
     }
     Some(DEFAULT_INTERACTIVE_REQUEST_BUDGET)
+}
+
+/// The instant a request asks its analyzer to stop.
+///
+/// Every tool stops at its request deadline. A synchronous `run_policy` stops
+/// [`POLICY_REPORT_GRACE`] earlier so the canonical deadline report it can
+/// produce is ready before the host's own timer fires; the timer still answers
+/// with the typed budget error when the work cannot stop in time. The reserve
+/// is capped at a quarter of the request's own budget, so a deliberately short
+/// operator budget still spends most of its window on real work instead of on
+/// an immediate cancellation.
+pub(crate) fn analyzer_stop_deadline(
+    tool_name: &str,
+    accepted_at: Instant,
+    deadline: Instant,
+) -> Instant {
+    if tool_name != "run_policy" {
+        return deadline;
+    }
+    let remaining = deadline.saturating_duration_since(accepted_at);
+    let grace = POLICY_REPORT_GRACE.min(remaining / 4);
+    deadline.checked_sub(grace).unwrap_or(deadline)
 }
 
 fn mcp_analyzer_request_budget_secs(value: Option<String>) -> Option<u64> {
@@ -1205,11 +1258,9 @@ mod shared_tests {
     }
 
     #[test]
-    fn batch_and_mutation_tools_have_no_fallback_budget() {
+    fn mutation_tools_have_no_fallback_budget() {
         let accepted_at = Instant::now();
         for (tool_name, cold_workspace) in [
-            ("run_policy", false),
-            ("run_policy", true),
             ("refresh", false),
             ("update_paths", false),
             ("activate_workspace", false),
@@ -1221,6 +1272,64 @@ mod shared_tests {
                 "{tool_name} (cold={cold_workspace}) must stay unbounded without a configured budget"
             );
         }
+    }
+
+    /// Issue #3351: a synchronous policy run is bounded, because the client's
+    /// own tool deadline is not something the server can see. The bound sits
+    /// below the 300-second deadline the issue measured.
+    #[test]
+    fn synchronous_policy_runs_get_the_policy_budget() {
+        let accepted_at = Instant::now();
+        for cold_workspace in [false, true] {
+            let deadline =
+                mcp_request_deadline_with_budget(accepted_at, "run_policy", cold_workspace, None)
+                    .unwrap_or_else(|| {
+                        panic!("run_policy (cold={cold_workspace}) must be bounded by default")
+                    });
+            assert_eq!(
+                deadline.duration_since(accepted_at),
+                DEFAULT_POLICY_REQUEST_BUDGET
+            );
+        }
+        assert!(
+            DEFAULT_POLICY_REQUEST_BUDGET < Duration::from_secs(300),
+            "the fallback must leave room under the client deadline the issue reported"
+        );
+        // A configured budget still wins, including one below the fallback.
+        let configured = mcp_request_deadline_with_budget(
+            accepted_at,
+            "run_policy",
+            false,
+            Some(Duration::from_secs(30)),
+        )
+        .expect("a configured budget applies to run_policy");
+        assert_eq!(
+            configured.duration_since(accepted_at),
+            Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn only_policy_runs_stop_their_analyzer_before_the_request_deadline() {
+        let accepted_at = Instant::now();
+        let deadline = accepted_at + Duration::from_secs(240);
+        assert_eq!(
+            analyzer_stop_deadline("run_policy", accepted_at, deadline),
+            deadline - POLICY_REPORT_GRACE
+        );
+        for tool_name in ["search_symbols", "get_summaries", "refresh"] {
+            assert_eq!(
+                analyzer_stop_deadline(tool_name, accepted_at, deadline),
+                deadline
+            );
+        }
+        // A budget shorter than the grace keeps most of its own window: the
+        // reserve never becomes the whole request.
+        let short = accepted_at + Duration::from_secs(4);
+        assert_eq!(
+            analyzer_stop_deadline("run_policy", accepted_at, short),
+            short - Duration::from_secs(1)
+        );
     }
 
     #[test]

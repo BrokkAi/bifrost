@@ -1,0 +1,94 @@
+{
+  "schema_version": 4,
+  "pack_id": "bifrost.node-child-process-typescript-summaries",
+  "version": "0.1.0",
+  "producer": {
+    "name": "bifrost-reviewed-node-models",
+    "version": "0.1.0"
+  },
+  "language": "typescript",
+  "ecosystem": "npm",
+  "compatibility": {
+    "bifrost": ">=0.8.0, <1.0.0",
+    "toolchains": []
+  },
+  "provenance": {
+    "source": "Node.js child_process API",
+    "revision": "v22.11.0"
+  },
+  "license": "Apache-2.0",
+  "completeness": "complete",
+  "safety": {
+    "generated_code_only": false,
+    "review_required": true
+  },
+  "shards": [
+    {
+      "id": "summaries.child-process-exec-sync",
+      "activation": [
+        {
+          "targets": [],
+          "configurations": []
+        }
+      ],
+      "payload": {
+        "kind": "procedure_summaries",
+        "summaries": [
+          {
+            "id": "node.child-process.exec-sync",
+            "target": {
+              "path": "node/lib/child_process.js",
+              "symbol": "child_process.execSync",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "covers_overrides": true,
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "receiver"
+                }
+              },
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              },
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "exceptional",
+                "output": {
+                  "kind": "exceptional_return"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "kind": "escape",
+                "event": "node.child-process.exec-sync.command",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                }
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

@@ -2216,7 +2216,12 @@ impl Validator {
                         );
                     }
                 }
-                AuthoredConcurrencyEffect::TaskSpawn { callable, group } => {
+                AuthoredConcurrencyEffect::TaskSpawn {
+                    callable,
+                    group,
+                    timer,
+                    ..
+                } => {
                     self.summary_input(&format!("{effect_path}.callable"), callable, target);
                     if !matches!(callable, AuthoredSummaryInput::Parameter { .. }) {
                         self.error(
@@ -2230,8 +2235,32 @@ impl Validator {
                         if group == callable {
                             self.error(
                                 "summary.conflicting_concurrency_effect",
-                                effect_path,
+                                effect_path.clone(),
                                 "task callable and task group must be distinct ports",
+                            );
+                        }
+                    }
+                    if let Some(timer) = timer {
+                        self.summary_output(
+                            &format!("{effect_path}.timer"),
+                            timer,
+                            locations,
+                            target,
+                            normal_result_count,
+                        );
+                        // Only the construction call's own result can carry
+                        // the timer identity a later stop or reset binds
+                        // against: a stored, captured, or escaped timer has no
+                        // call result to bind at the spawn site.
+                        if !matches!(
+                            timer,
+                            AuthoredSummaryOutput::NormalReturn {}
+                                | AuthoredSummaryOutput::IndexedNormalReturn { .. }
+                        ) {
+                            self.error(
+                                "summary.invalid_timer_output",
+                                format!("{effect_path}.timer"),
+                                "a spawn timer must name a normal-return port",
                             );
                         }
                     }
@@ -2312,6 +2341,57 @@ impl Validator {
                 }
                 AuthoredConcurrencyEffect::CondNotify { condition, .. } => {
                     self.summary_input(&format!("{effect_path}.condition"), condition, target);
+                }
+                AuthoredConcurrencyEffect::SyncMap { map, key, .. } => {
+                    self.summary_input(&format!("{effect_path}.map"), map, target);
+                    if let Some(key) = key {
+                        self.summary_input(&format!("{effect_path}.key"), key, target);
+                    }
+                }
+                AuthoredConcurrencyEffect::TimerStop { timer } => {
+                    self.summary_input(&format!("{effect_path}.timer"), timer, target);
+                }
+                AuthoredConcurrencyEffect::TimerReset { timer } => {
+                    self.summary_input(&format!("{effect_path}.timer"), timer, target);
+                }
+                AuthoredConcurrencyEffect::SubtestRun { callable, group } => {
+                    self.summary_input(&format!("{effect_path}.callable"), callable, target);
+                    self.summary_input(&format!("{effect_path}.group"), group, target);
+                    if !matches!(callable, AuthoredSummaryInput::Parameter { .. }) {
+                        self.error(
+                            "summary.invalid_subtest_callable",
+                            format!("{effect_path}.callable"),
+                            "a subtest callback must be a parameter port",
+                        );
+                    }
+                    if group == callable {
+                        self.error(
+                            "summary.conflicting_concurrency_effect",
+                            effect_path,
+                            "subtest callback and parent test node must be distinct ports",
+                        );
+                    }
+                }
+                AuthoredConcurrencyEffect::SubtestParallel { receiver } => {
+                    self.summary_input(&format!("{effect_path}.receiver"), receiver, target);
+                }
+                AuthoredConcurrencyEffect::SubtestCleanup { callable, group } => {
+                    self.summary_input(&format!("{effect_path}.callable"), callable, target);
+                    self.summary_input(&format!("{effect_path}.group"), group, target);
+                    if !matches!(callable, AuthoredSummaryInput::Parameter { .. }) {
+                        self.error(
+                            "summary.invalid_subtest_callable",
+                            format!("{effect_path}.callable"),
+                            "a cleanup callback must be a parameter port",
+                        );
+                    }
+                    if group == callable {
+                        self.error(
+                            "summary.conflicting_concurrency_effect",
+                            effect_path,
+                            "cleanup callback and test node must be distinct ports",
+                        );
+                    }
                 }
             }
         }
@@ -2396,6 +2476,12 @@ impl Validator {
                 } => Some("an atomic memory mutation contradicts ordinary_heap_unchanged"),
                 AuthoredConcurrencyEffect::TaskSpawn { .. } => {
                     Some("a spawned callback contradicts ordinary_heap_unchanged")
+                }
+                AuthoredConcurrencyEffect::SubtestRun { .. } => {
+                    Some("a spawned subtest callback contradicts ordinary_heap_unchanged")
+                }
+                AuthoredConcurrencyEffect::SubtestCleanup { .. } => {
+                    Some("a spawned cleanup callback contradicts ordinary_heap_unchanged")
                 }
                 AuthoredConcurrencyEffect::OnceDo { .. } => {
                     Some("a conditional Once callback contradicts ordinary_heap_unchanged")

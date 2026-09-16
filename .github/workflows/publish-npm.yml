@@ -134,11 +134,10 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/npm-qualified"
-          mapfile -t files < <(jq -r '.files[] | select(.path | test("^(brokkai-bifrost-|brokkai-dsh-plugin-bifrost-).*\\.tgz$")) | .path' qualification/release-qualification.json)
-          # One root package, six platform packages, and the separately named
-          # DSH bundle. The brokk-bifrost-agent archive is published by
-          # release.yml and is intentionally not part of this publisher.
-          test "${#files[@]}" -eq 8
+          mapfile -t files < <(jq -r '.files[] | select(.path | startswith("brokkai-bifrost-") and endswith(".tgz")) | .path' qualification/release-qualification.json)
+          # One root package plus six platform packages. The separately named
+          # brokk-bifrost-agent archive is published by release.yml.
+          test "${#files[@]}" -eq 7
           for file in "${files[@]}"; do cp "qualification/$file" "$RUNNER_TEMP/npm-qualified/"; done
 
       - name: Install npm trusted-publishing client

@@ -25,7 +25,7 @@ use crate::dataflow::{
     SummaryConcurrencyAccessPath, SummaryConcurrencyAccessSelector, SummaryConcurrencyEffect,
     SummaryConcurrencyEffectKind, SummaryConcurrencyLockMode, SummaryConcurrencyLockOperation,
     SummaryConcurrencySubjectIdentity, SummaryDependencyKey, SummaryEffectKey, SummaryEventKey,
-    SummaryLocationKey, SummaryLockAcquisition, SummaryPort,
+    SummaryLocationKey, SummaryLockAcquisition, SummaryPort, SummaryTaskSpawnCondition,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::scalar_state::{
@@ -516,8 +516,45 @@ pub enum ResolvedConcurrencyEffect {
         callable: ValueId,
         targets: Vec<ProcedureHandle>,
         group: Option<ResolvedConcurrencySubject>,
+        condition: ResolvedTaskSpawnCondition,
+        /// The timer object the spawn call returns, when the spawned
+        /// callback belongs to a cancellable timer (`time.AfterFunc`). A
+        /// later `TimerStop` or `TimerReset` on the same object binds against
+        /// this subject.
+        timer: Option<ResolvedConcurrencySubject>,
     },
     TaskJoin {
+        group: ResolvedConcurrencySubject,
+    },
+    /// One `testing.T.Run` call with `callable` on the parent test node
+    /// `group` (issue #3383).
+    ///
+    /// The callback runs as one subtest task on every path that reaches the
+    /// call. The call joins that task and its subtest-cleanup subtree
+    /// exactly when no execution of the callback calls `Parallel` on its own
+    /// parameter, and joins nothing otherwise. Parallel siblings of one
+    /// parent may run in parallel with each other and with nothing else of
+    /// the parent body. The join is per call, never by group identity: a
+    /// later `Run` joins nothing from an earlier parallel sibling.
+    SubtestRun {
+        callable: ValueId,
+        targets: Vec<ProcedureHandle>,
+        group: ResolvedConcurrencySubject,
+    },
+    /// One `testing.T.Parallel` call marking `receiver` (issue #3383). The
+    /// call creates no task and orders nothing by itself; the enclosing
+    /// `Run` consumes it as classification evidence for its callback.
+    SubtestParallel {
+        receiver: ResolvedConcurrencySubject,
+    },
+    /// One `testing.T.Cleanup` call with `callable` on the test node `group`
+    /// (issue #3383). The callback runs as one deferred task after the test
+    /// and all its subtests complete, in last-added-first-called order among
+    /// the cleanups of one node, so the call joins the receiver's subtest
+    /// subtree before the cleanup body.
+    SubtestCleanup {
+        callable: ValueId,
+        targets: Vec<ProcedureHandle>,
         group: ResolvedConcurrencySubject,
     },
     /// One `sync.Once.Do` call on `once` with `callable`.
@@ -580,6 +617,162 @@ pub enum ResolvedConcurrencyEffect {
         condition: ResolvedConcurrencySubject,
         waiters: ConcurrencyCondWaiters,
     },
+    /// One `sync.Map` entry operation on the (map, key) entry (issue #3370).
+    ///
+    /// The reviewed classification carries when the call writes the entry and
+    /// when it observes it; the map's own state never becomes an ordinary
+    /// access and a stored value keeps its own identity. Per the package
+    /// documentation, a write operation synchronizes before any read
+    /// operation that observes its effect; the entry serialization makes
+    /// every executed write precede every later observing read, so the
+    /// solver pairs writes with observing reads per entry instead of
+    /// matching individual store/load values.
+    SyncMap {
+        map: ResolvedConcurrencySubject,
+        /// The key subject naming the entry; `Clear` names none because it
+        /// writes every entry of the map.
+        key: Option<ResolvedConcurrencySubject>,
+        key_constant: Option<Box<str>>,
+        operation: ConcurrencySyncMapOperation,
+        /// When the call writes the entry; `None` for read-only operations.
+        write: Option<ResolvedSyncMapOutcome>,
+        /// When the call observes the entry; `None` for write-only operations
+        /// and for `Range`, which claims no per-entry observation.
+        observe: Option<ResolvedSyncMapOutcome>,
+    },
+    /// One `(*time.Timer).Stop` call on `timer` (issue #3382).
+    ///
+    /// The cancellation contract is intrinsic: a stop whose boolean result a
+    /// structured guard establishes true proves the `time.AfterFunc` callback
+    /// for that exact timer did not and will not run. Binding rewrites the
+    /// pending `CallResultTrue` outcome to `OnResultTrue` with the proven
+    /// true edges; a result no guard consumes is dropped silently, because
+    /// the conservative may-run answer stays sound for race reporting.
+    TimerStop {
+        timer: ResolvedConcurrencySubject,
+        outcome: ResolvedTimerStopOutcome,
+    },
+    /// One `(*time.Timer).Reset` call on `timer` (issue #3382).
+    ///
+    /// Reset re-arms the timer, so the callback may run (again) downstream of
+    /// it. A reset voids the `TimerStop` cancellation for every path that
+    /// passes through it after the establishing stop.
+    TimerReset {
+        timer: ResolvedConcurrencySubject,
+    },
+}
+
+/// The cancellation shape one resolved timer-stop effect carries (issue
+/// #3382).
+///
+/// `CallResultTrue` is the reviewed contract in its unresolved form: the
+/// stop proves the callback's absence exactly on the paths where its boolean
+/// result is established true, and the solver must still bind that condition
+/// to this procedure's guard facts. Binding rewrites the effect to
+/// `OnResultTrue` with the proven true edges of the decision points that test
+/// the call's result. The cancelled paths are edges, not target points,
+/// because a true arm and a false arm commonly rejoin at one block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolvedTimerStopOutcome {
+    CallResultTrue,
+    OnResultTrue {
+        edges: Vec<crate::analyzer::semantic::ControlEdgeId>,
+    },
+}
+
+/// The documented entry-level classification of one `sync.Map` operation
+/// (issue #3370).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ConcurrencySyncMapOperation {
+    Store,
+    Delete,
+    Clear,
+    Load,
+    Range,
+    LoadOrStore,
+    LoadAndDelete,
+    Swap,
+    CompareAndSwap,
+    CompareAndDelete,
+}
+
+impl ConcurrencySyncMapOperation {
+    /// The call result whose structured guard establishes the documented
+    /// outcome: `Load`, `LoadOrStore`, `LoadAndDelete`, and `Swap` guard on
+    /// their ordinal-1 presence result, `CompareAndDelete` on its only
+    /// result, and `CompareAndSwap` on its ordinal-1 success result.
+    pub(crate) const fn guard_result_ordinal(self) -> Option<u32> {
+        match self {
+            Self::Store | Self::Delete | Self::Clear | Self::Range => None,
+            Self::Load | Self::LoadOrStore | Self::LoadAndDelete | Self::Swap => Some(1),
+            Self::CompareAndSwap => Some(1),
+            Self::CompareAndDelete => Some(0),
+        }
+    }
+
+    /// The reviewed write part: unconditional where the operation always
+    /// installs or removes the entry, pending-false where `LoadOrStore`
+    /// stores on the stored outcome, pending-true where the compare
+    /// operations write on success, and none for read-only operations.
+    pub const fn write_outcome(self) -> Option<ResolvedSyncMapOutcome> {
+        match self {
+            Self::Store | Self::Delete | Self::Clear | Self::LoadAndDelete | Self::Swap => {
+                Some(ResolvedSyncMapOutcome::Unconditional)
+            }
+            Self::LoadOrStore => Some(ResolvedSyncMapOutcome::PendingFalse { result: 1 }),
+            Self::CompareAndSwap | Self::CompareAndDelete => {
+                Some(ResolvedSyncMapOutcome::PendingTrue {
+                    result: if matches!(self, Self::CompareAndDelete) {
+                        0
+                    } else {
+                        1
+                    },
+                })
+            }
+            Self::Load | Self::Range => None,
+        }
+    }
+
+    /// The reviewed observation part: pending-true where the documented
+    /// presence result gates the read, unconditionally reading for the
+    /// compare operations, and none for write-only operations and `Range`,
+    /// which claims no per-entry observation.
+    pub const fn observe_outcome(self) -> Option<ResolvedSyncMapOutcome> {
+        match self {
+            Self::Load | Self::LoadOrStore | Self::LoadAndDelete | Self::Swap => {
+                Some(ResolvedSyncMapOutcome::PendingTrue { result: 1 })
+            }
+            Self::CompareAndSwap | Self::CompareAndDelete => {
+                Some(ResolvedSyncMapOutcome::Unconditional)
+            }
+            Self::Store | Self::Delete | Self::Clear | Self::Range => None,
+        }
+    }
+}
+
+/// When one `sync.Map` operation part happens, as bound against this
+/// procedure's guard facts (issue #3370).
+///
+/// `PendingTrue`/`PendingFalse` are the unresolved reviewed forms the model
+/// ships: the part happens exactly when the named call result is established
+/// true or false. Binding rewrites them to `OnResult` with the proven edges
+/// of the decision points that consume the result, or to `Unestablished`
+/// when no structured guard ever does; an unestablished part never
+/// publishes or observes, and the pairing states the typed boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolvedSyncMapOutcome {
+    Unconditional,
+    PendingTrue {
+        result: u32,
+    },
+    PendingFalse {
+        result: u32,
+    },
+    OnResult {
+        want_true: bool,
+        edges: Vec<crate::analyzer::semantic::ControlEdgeId>,
+    },
+    Unestablished,
 }
 
 /// How many suspended waiters one notification can resume.
@@ -610,6 +803,30 @@ pub enum ResolvedLockAcquisition {
         edges: Vec<crate::analyzer::semantic::ControlEdgeId>,
     },
     Unestablished,
+}
+
+/// The spawn shape one resolved task-spawn effect carries (issue #3371).
+///
+/// `Unconditional` starts the callable on every path that reaches the call's
+/// continuation. `CallResultTrue` is the conditional-spawn contract in its
+/// unresolved form: the reviewed model states that the call starts the
+/// callable exactly when its boolean result reports that it did, and the
+/// solver must still bind that condition to this procedure's guard facts.
+/// Binding rewrites the effect to `OnResultTrue` with the decision point that
+/// tests the call's result and that decision's proven true edges. The spawned
+/// task then exists only on the paths beginning with one of those edges: the
+/// false edge, the unconsumed result, and the dead paths start nothing, so a
+/// parent access those paths alone reach is never concurrent with the
+/// callback. A result no structured guard consumes contributes no task and a
+/// typed boundary reason instead of an unconditional spawn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolvedTaskSpawnCondition {
+    Unconditional,
+    CallResultTrue,
+    OnResultTrue {
+        point: crate::analyzer::semantic::ProgramPointId,
+        edges: Vec<crate::analyzer::semantic::ControlEdgeId>,
+    },
 }
 
 /// The field declaration one member locator stands for.
@@ -1022,11 +1239,113 @@ struct Task {
     /// object's per-activation identity can be settled once every allocation
     /// origin in the solve is known.
     once_context: Option<ContextKey>,
+    /// The structured guard that establishes this task's conditional spawn
+    /// (issue #3371). `Some` only for a reviewed conditional spawn
+    /// (`errgroup.Group.TryGo`): the callback starts only on the executions
+    /// that take one of the guard's true edges, so the false arms are recorded
+    /// and a parent access that only those paths can reach is never concurrent
+    /// with the callback. The task's cardinality is therefore at most one per
+    /// call: a join covers the callback when it was started and nothing when
+    /// it was not.
+    conditional_spawn: Option<ConditionalTaskSpawn>,
+    /// The timer object a reviewed `time.AfterFunc` spawn returned (issue
+    /// #3382). `Some` only for a spawn whose summary names its timer: the
+    /// callback belongs to that timer, and a `Timer.Stop` or `Timer.Reset`
+    /// on the identical object binds against this subject.
+    timer: Option<ResolvedConcurrencySubject>,
+    /// The caller context that resolved the `timer` subject. Retained so the
+    /// timer's backing identity is compared in the activation that created
+    /// it, exactly like the `once` subject.
+    timer_context: Option<ContextKey>,
+    /// The same-invocation stops and resets linked to this task's timer
+    /// (issue #3382). `Some` only when at least one reviewed stop on the
+    /// identical timer bound its guard: a parent access that every path from
+    /// the spawn reaches only through a stop-true edge, with no same-timer
+    /// reset after the stop, never runs concurrently with the callback.
+    timer_cancellation: Option<TimerCancellation>,
+    /// The reviewed subtest spawn that created this task (issue #3383).
+    /// `Some` only for a `testing.T.Run` or `testing.T.Cleanup` callback:
+    /// the classification decides whether the spawning call joins this task
+    /// and whether this task's subtree is deferred past the parent body.
+    subtest: Option<SubtestSpawn>,
     // Manual Done orders only effects before this event, unlike a reviewed
     // task join whose completion is the child's return.
     completion: Option<(InvocationId, ProgramPointId)>,
     repetition: Option<InvocationId>,
     repetitions_serialized: bool,
+}
+
+/// The reviewed subtest spawn of one `testing.T.Run` or `testing.T.Cleanup`
+/// callback task (issue #3383).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SubtestSpawn {
+    kind: SubtestSpawnKind,
+    /// The receiver value of the spawning `Run` or `Cleanup` call, in the
+    /// spawn procedure, so same-procedure receiver matching stays exact even
+    /// when no canonical location resolves (a `*testing.T` procedure
+    /// parameter). Values are procedure-local; cross-procedure matching uses
+    /// the group canonical instead.
+    receiver: ValueId,
+    /// The spawn effect's group subject, for canonical receiver matching.
+    group: ResolvedConcurrencySubject,
+}
+
+/// Which reviewed subtest event spawned a task (issue #3383).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubtestSpawnKind {
+    /// A `Run` callback. Sequential tasks join at their spawning call;
+    /// parallel tasks run after the parent body; unknown tasks join nothing,
+    /// defer nothing, and keep every classification-dependent pair open.
+    Run(SubtestParallelism),
+    /// A `Cleanup` callback. Cleanup tasks are deferred past the parent body
+    /// like parallel tasks, and two cleanups of one test node never overlap:
+    /// they run sequentially in last-added-first-called order.
+    Cleanup,
+}
+
+/// Whether a subtest callback calls `Parallel` on its own parameter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubtestParallelism {
+    Sequential,
+    Parallel,
+    Unknown,
+}
+
+/// A `Run` or `Cleanup` spawn awaiting callback classification (issue #3383).
+/// The classification runs once per spawning call, before the per-target
+/// spawn loop, because it is a property of the callback set, not of one
+/// target.
+#[derive(Debug, Clone)]
+struct SubtestSpawnTemplate {
+    receiver: ValueId,
+    group: ResolvedConcurrencySubject,
+    cleanup: bool,
+}
+
+/// The established-true guard of one reviewed conditional spawn (issue #3371).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConditionalTaskSpawn {
+    /// Control edges of the guard's arms other than the established-true
+    /// edges. An execution that takes one of them did not start the callback,
+    /// so every path that reaches the compared access by taking one starts no
+    /// task; the arms are edges, not target points, because a false arm and a
+    /// true arm commonly rejoin at one block.
+    false_edges: Vec<crate::analyzer::semantic::ControlEdgeId>,
+}
+
+/// The reviewed stops and resets linked to one timer task (issue #3382).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TimerCancellation {
+    /// Proven true edges of every same-timer stop guard. An execution that
+    /// takes one of them stopped the timer before it fired, so the callback
+    /// did not and will not run on that execution unless a reset below
+    /// re-arms it. The cancelled paths are edges, not target points, because
+    /// a true arm and a false arm commonly rejoin at one block.
+    stop_edges: Vec<crate::analyzer::semantic::ControlEdgeId>,
+    /// Same-timer reset points, which re-arm the callback. A path that takes
+    /// a stop edge and later passes one of these points may run the callback
+    /// after all.
+    resets: Vec<ProgramPointId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -2633,10 +2952,25 @@ pub(crate) struct SolveRequest<'a, 'b> {
 
 /// Completed answers belong to one immutable graph projection. Holding its Rc
 /// prevents an old projection's identity from being reused after replacement.
+/// One origin-based avoidance query: an origin, blocked control edges, and
+/// blocked program points. The vectors are canonical (sorted and deduplicated)
+/// so equal queries share one cached answer.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RootedAvoidingQuery {
+    origin: ProgramPointId,
+    blocked_edges: Vec<crate::analyzer::semantic::ControlEdgeId>,
+    blocked_points: Vec<ProgramPointId>,
+}
+
 struct ControlQueries {
     projection: Option<std::rc::Rc<crate::flow_state::ProcedureContinuationProjection>>,
     reaches: HashMap<ProgramPointId, HashSet<ProgramPointId>>,
     avoiding: HashMap<Vec<ProgramPointId>, HashSet<ProgramPointId>>,
+    /// Points reachable from one origin without taking a canonical blocked
+    /// edge or entering a canonical blocked point. A conditional spawn asks
+    /// this with its guard's false arms blocked, and its conditional join asks
+    /// it again with those arms and the join points blocked together.
+    rooted_avoiding: HashMap<RootedAvoidingQuery, std::rc::Rc<HashSet<ProgramPointId>>>,
     dominators: Option<crate::analyzer::semantic::cfg_algorithms::Dominators<ProgramPointId>>,
 }
 
@@ -2678,6 +3012,7 @@ impl<'a, 'b> SolveRequest<'a, 'b> {
                     projection,
                     reaches: HashMap::default(),
                     avoiding: HashMap::default(),
+                    rooted_avoiding: HashMap::default(),
                     dominators: None,
                 },
             );
@@ -2900,6 +3235,11 @@ fn solve_concurrent_access_conflicts(
         group: None,
         once: None,
         once_context: None,
+        conditional_spawn: None,
+        timer: None,
+        timer_context: None,
+        timer_cancellation: None,
+        subtest: None,
         completion: None,
         repetition: None,
         repetitions_serialized: false,
@@ -3335,8 +3675,13 @@ fn solve_concurrent_access_conflicts(
                                                 | SummaryConcurrencyEffectKind::TaskSpawn { .. }
                                                 | SummaryConcurrencyEffectKind::TaskJoin { .. }
                                                 | SummaryConcurrencyEffectKind::OnceDo { .. }
+                                                | SummaryConcurrencyEffectKind::SubtestRun { .. }
+                                                | SummaryConcurrencyEffectKind::SubtestCleanup { .. }
                                                 | SummaryConcurrencyEffectKind::CondWait { .. }
                                                 | SummaryConcurrencyEffectKind::CondNotify { .. }
+                                                | SummaryConcurrencyEffectKind::TimerStop { .. }
+                                                | SummaryConcurrencyEffectKind::TimerReset { .. }
+                                                | SummaryConcurrencyEffectKind::SyncMap { .. }
                                         ) =>
                                 {
                                     Some((candidate_effect, candidate.evidence()))
@@ -3474,8 +3819,13 @@ fn solve_concurrent_access_conflicts(
                         | SummaryConcurrencyEffectKind::WaitGroupWait { .. }
                         | SummaryConcurrencyEffectKind::TaskSpawn { .. }
                         | SummaryConcurrencyEffectKind::TaskJoin { .. }
+                        | SummaryConcurrencyEffectKind::SubtestRun { .. }
+                        | SummaryConcurrencyEffectKind::SubtestCleanup { .. }
                         | SummaryConcurrencyEffectKind::CondWait { .. }
-                        | SummaryConcurrencyEffectKind::CondNotify { .. })
+                        | SummaryConcurrencyEffectKind::CondNotify { .. }
+                        | SummaryConcurrencyEffectKind::TimerStop { .. }
+                        | SummaryConcurrencyEffectKind::TimerReset { .. }
+                        | SummaryConcurrencyEffectKind::SyncMap { .. })
                         && !unreachable_events.contains(&effect.event())
                         && !replayed_summary_modeled_events.contains(&effect.event()))
             }) {
@@ -4409,12 +4759,25 @@ fn solve_concurrent_access_conflicts(
                 };
             let call_effects_closed = matches!(&modeled_answer, ConcurrencyAnswer::Proven(_));
             let (effects, mut model_resolution_reasons) = modeled_answer.into_parts();
-            let bound_effects = bind_try_lock_acquisitions(
+            let bound_effects = bind_sync_map_operations(
+                bind_try_lock_acquisitions(
+                    &context.procedure,
+                    call,
+                    effects,
+                    &mut model_resolution_reasons,
+                ),
                 &context.procedure,
                 call,
-                effects,
+                &invocations,
+                context.invocation,
+            );
+            let bound_effects = bind_conditional_task_spawns(
+                &context.procedure,
+                call,
+                bound_effects,
                 &mut model_resolution_reasons,
             );
+            let bound_effects = bind_timer_stops(&context.procedure, call, bound_effects);
             let call_has_no_modeled_effects = bound_effects.is_empty();
             if !call_effects_closed && model_resolution_reasons.is_empty() {
                 model_resolution_reasons.push(ConcurrencyOpenReason::UnsupportedSynchronization(
@@ -4444,12 +4807,77 @@ fn solve_concurrent_access_conflicts(
                         callable,
                         targets,
                         group,
-                    } => Some((targets.clone(), group.clone(), false, *callable, None)),
+                        condition,
+                        timer,
+                    } => {
+                        let conditional = match condition {
+                            ResolvedTaskSpawnCondition::OnResultTrue { point, edges } => {
+                                Some((*point, edges.clone()))
+                            }
+                            ResolvedTaskSpawnCondition::Unconditional
+                            | ResolvedTaskSpawnCondition::CallResultTrue => None,
+                        };
+                        Some((
+                            targets.clone(),
+                            group.clone(),
+                            false,
+                            *callable,
+                            None,
+                            conditional,
+                            timer.clone(),
+                            None,
+                        ))
+                    }
                     ResolvedConcurrencyEffect::OnceDo {
                         once,
                         callable,
                         targets,
-                    } => Some((targets.clone(), None, false, *callable, Some(once.clone()))),
+                    } => Some((
+                        targets.clone(),
+                        None,
+                        false,
+                        *callable,
+                        Some(once.clone()),
+                        None,
+                        None,
+                        None,
+                    )),
+                    ResolvedConcurrencyEffect::SubtestRun {
+                        callable,
+                        targets,
+                        group,
+                    } => Some((
+                        targets.clone(),
+                        None,
+                        false,
+                        *callable,
+                        None,
+                        None,
+                        None,
+                        Some(SubtestSpawnTemplate {
+                            receiver: group.value,
+                            group: group.clone(),
+                            cleanup: false,
+                        }),
+                    )),
+                    ResolvedConcurrencyEffect::SubtestCleanup {
+                        callable,
+                        targets,
+                        group,
+                    } => Some((
+                        targets.clone(),
+                        None,
+                        false,
+                        *callable,
+                        None,
+                        None,
+                        None,
+                        Some(SubtestSpawnTemplate {
+                            receiver: group.value,
+                            group: group.clone(),
+                            cleanup: true,
+                        }),
+                    )),
                     _ => None,
                 })
                 .collect::<Vec<_>>();
@@ -4473,10 +4901,6 @@ fn solve_concurrent_access_conflicts(
                         })
                     });
                     if !matches {
-                        // Direct resolution still supplies the target for expansion,
-                        // but this retained boundary cannot certify that it describes
-                        // the same invocation. Keep the mismatch visible rather than
-                        // applying another procedure's effects under these actuals.
                         report.reasons.push(ConcurrencyOpenReason::UnresolvedTarget);
                     }
                     matches
@@ -4497,14 +4921,61 @@ fn solve_concurrent_access_conflicts(
             }
             report.reasons.extend(target_reasons);
             let (direct_targets, synchronous_targets) = if detached {
-                (Some((targets, None, true, call.callee, None)), Vec::new())
+                (
+                    Some((targets, None, true, call.callee, None, None, None, None)),
+                    Vec::new(),
+                )
             } else {
                 (None, targets)
             };
             let mut spawned_any_task = false;
-            for (targets, group, bind_invocation, invoked_callable, once) in
-                direct_targets.into_iter().chain(modeled_spawns)
+            for (
+                targets,
+                group,
+                bind_invocation,
+                invoked_callable,
+                once,
+                conditional,
+                timer,
+                subtest_template,
+            ) in direct_targets.into_iter().chain(modeled_spawns)
             {
+                // A subtest classification is a property of the callback set,
+                // so it runs once per spawning call, before the per-target
+                // loop. An unknown callback keeps its typed boundary; a
+                // budget failure stops the solve like any other exhaustion.
+                let subtest = match subtest_template.as_ref() {
+                    Some(template) => {
+                        let kind = if template.cleanup {
+                            SubtestSpawnKind::Cleanup
+                        } else {
+                            match classify_subtest_callback(&targets, provider, request) {
+                                Ok(parallel) => SubtestSpawnKind::Run(parallel),
+                                Err(SubtestClassifyError::Budget(reason)) => {
+                                    report.reasons.push(reason);
+                                    report.reasons.sort();
+                                    report.reasons.dedup();
+                                    return Ok(report);
+                                }
+                                Err(SubtestClassifyError::Provider(error)) => return Err(error),
+                            }
+                        };
+                        if matches!(kind, SubtestSpawnKind::Run(SubtestParallelism::Unknown)) {
+                            report.reasons.push(
+                                ConcurrencyOpenReason::UnsupportedSynchronization(
+                                    "subtest Parallel is conditional or unresolved; the subtest joins nothing and defers nothing"
+                                        .into(),
+                                ),
+                            );
+                        }
+                        Some(SubtestSpawn {
+                            kind,
+                            receiver: template.receiver,
+                            group: template.group.clone(),
+                        })
+                    }
+                    None => None,
+                };
                 for target in targets {
                     spawned_any_task = true;
                     match invocations.repeats_spawn_edge(
@@ -4558,6 +5029,22 @@ fn solve_concurrent_access_conflicts(
                     };
                     invocations.entries[target_context.invocation.0 as usize].callable =
                         Some(invoked_callable);
+                    let conditional_spawn = match conditional.as_ref() {
+                        Some((guard, true_edges)) => {
+                            match conditional_spawn_false_edges(
+                                &context, *guard, true_edges, request,
+                            ) {
+                                Ok(false_edges) => Some(ConditionalTaskSpawn { false_edges }),
+                                Err(reason) => {
+                                    report.reasons.push(reason);
+                                    report.reasons.sort();
+                                    report.reasons.dedup();
+                                    return Ok(report);
+                                }
+                            }
+                        }
+                        None => None,
+                    };
                     tasks.push(Task {
                         parent: Some(context.task),
                         entry_procedure: Some(target.clone()),
@@ -4568,6 +5055,11 @@ fn solve_concurrent_access_conflicts(
                         group: group.clone(),
                         once: once.clone(),
                         once_context: once.as_ref().map(|_| context.clone()),
+                        conditional_spawn,
+                        timer: timer.clone(),
+                        timer_context: timer.as_ref().map(|_| context.clone()),
+                        timer_cancellation: None,
+                        subtest: subtest.clone(),
                         completion: None,
                         repetition: invocations.entries[target_context.invocation.0 as usize]
                             .repetition,
@@ -4763,6 +5255,8 @@ fn solve_concurrent_access_conflicts(
     // carries no store at all while the body has still replaced what it
     // holds; naming it from the binding then reports a write to a fresh
     // task-local object as a write to the caller's.
+    let sync_map_payload_transports =
+        sync_map_payload_transports(&mut synchronization_subjects, &modeled_by_context);
     let written_once = synchronization_subjects
         .location_stores
         .iter()
@@ -4788,6 +5282,7 @@ fn solve_concurrent_access_conflicts(
         &written_once,
         &reference_allocations,
         &pending_synchronizations,
+        &sync_map_payload_transports,
         &summary_effect_free_call_targets,
         &closed_recursive_calls,
         provider,
@@ -4900,6 +5395,7 @@ fn solve_concurrent_access_conflicts(
             &written_once,
             &reference_allocations,
             &pending_synchronizations,
+            &sync_map_payload_transports,
             &summary_effect_free_call_targets,
             &closed_recursive_calls,
             provider,
@@ -4919,6 +5415,11 @@ fn solve_concurrent_access_conflicts(
         &mut tasks,
     );
     associate_once_tasks(&mut tasks, &mut synchronization_subjects);
+    associate_timer_tasks(
+        &mut tasks,
+        &modeled_by_context,
+        &mut synchronization_subjects,
+    );
     append_summary_accesses(
         provider,
         &mut synchronization_subjects,
@@ -4981,6 +5482,7 @@ fn solve_concurrent_access_conflicts(
         &lock_states,
         &mut report,
     );
+    report_sync_map_boundaries(&modeled_by_context, &mut report);
     let synchronizations = resolve_intrinsic_synchronizations(
         provider,
         &mut synchronization_subjects,
@@ -7377,6 +7879,130 @@ fn channel_transport_is_retained(
     true
 }
 
+/// The value one `sync.Map` entry transports from its single unconditional
+/// `Store` to every proven observing read (issue #3384).
+///
+/// The entry stays no ordinary cell and two operations on it never conflict:
+/// only the stored reference keeps its identity across the documented
+/// publication, exactly as a channel transports the reference it carried.
+/// Pairing is claimed only for the one shape the reviewed model can name
+/// exactly: one unconditional `Store` on one entry, no other operation on
+/// that entry, and observing reads whose guards proved the observed outcome.
+/// The entry is named by the map subject's class and the key's exact constant
+/// or class, so two accesses through one shared map object and key agree.
+/// Everything else stays unpaired.
+fn sync_map_payload_transports(
+    classes: &mut SynchronizationSubjectClasses,
+    modeled: &HashMap<ContextKey, Vec<(ProgramPointId, ResolvedConcurrencyEffect)>>,
+) -> Vec<(LocalSynchronizationSubject, ReferenceIdentityUse)> {
+    #[derive(PartialEq, Eq, Hash)]
+    enum TransportKey {
+        Constant(Box<str>),
+        Class(LocalSynchronizationSubject),
+    }
+    #[derive(Default)]
+    struct Entry {
+        store: Option<ReferenceIdentityUse>,
+        disqualified: bool,
+        observers: Vec<LocalSynchronizationSubject>,
+    }
+    let mut entries = HashMap::<(LocalSynchronizationSubject, TransportKey), Entry>::default();
+    for (context, effects) in modeled {
+        let semantics = context.procedure.semantics();
+        let subject = |value| LocalSynchronizationSubject::Value {
+            task: context.task,
+            invocation: context.invocation,
+            procedure: context.procedure.clone(),
+            value,
+        };
+        for (point, effect) in effects {
+            let ResolvedConcurrencyEffect::SyncMap {
+                map,
+                key,
+                key_constant,
+                operation,
+                write,
+                observe,
+            } = effect
+            else {
+                continue;
+            };
+            let map_class = classes.root(subject(map.value));
+            let key_identity = match (key_constant, key) {
+                (Some(constant), _) => TransportKey::Constant(constant.clone()),
+                (None, Some(key)) => TransportKey::Class(classes.root(subject(key.value))),
+                (None, None) => continue,
+            };
+            let entry = entries.entry((map_class, key_identity)).or_default();
+            let Some(call) = semantics
+                .call_sites()
+                .iter()
+                .find(|call| call.point == *point)
+            else {
+                entry.disqualified = true;
+                continue;
+            };
+            let event = semantics
+                .point(*point)
+                .and_then(|point| {
+                    point.events.iter().position(|row| {
+                        matches!(row.effect, SemanticEffect::Invoke { call_site } if call_site == call.id)
+                    })
+                })
+                .unwrap_or(0);
+            let established = |outcome: &Option<ResolvedSyncMapOutcome>| {
+                matches!(
+                    outcome,
+                    Some(
+                        ResolvedSyncMapOutcome::Unconditional
+                            | ResolvedSyncMapOutcome::OnResult { .. }
+                    )
+                )
+            };
+            match operation {
+                ConcurrencySyncMapOperation::Store => {
+                    let Some(value) = call.arguments.get(1).map(|argument| argument.value) else {
+                        entry.disqualified = true;
+                        continue;
+                    };
+                    if !established(write) || entry.store.is_some() {
+                        entry.disqualified = true;
+                        continue;
+                    }
+                    entry.store = Some(ReferenceIdentityUse {
+                        subject: subject(value),
+                        invocation: context.invocation,
+                        point: *point,
+                        event,
+                    });
+                }
+                ConcurrencySyncMapOperation::Load if established(observe) => {
+                    if let Some(result) = call.normal_result(0) {
+                        entry.observers.push(subject(result));
+                    }
+                }
+                // Any other operation on the entry may install, remove, or
+                // replace what an observing read receives, so it leaves the
+                // entry's transported value unnamed.
+                _ => entry.disqualified = true,
+            }
+        }
+    }
+    let mut transports = Vec::new();
+    for entry in entries.into_values() {
+        if entry.disqualified {
+            continue;
+        }
+        let Some(store) = entry.store else {
+            continue;
+        };
+        for destination in entry.observers {
+            transports.push((destination, store.clone()));
+        }
+    }
+    transports
+}
+
 #[allow(clippy::too_many_arguments)]
 fn propagate_reference_identities(
     classes: &mut SynchronizationSubjectClasses,
@@ -7386,6 +8012,7 @@ fn propagate_reference_identities(
     cells: &[(LocalLocation, Option<LocalSynchronizationSubject>)],
     reference_allocations: &HashSet<CanonicalConcurrencyLocation>,
     synchronizations: &[PendingIntrinsicSynchronization],
+    sync_map_transports: &[(LocalSynchronizationSubject, ReferenceIdentityUse)],
     effect_free_call_targets: &HashMap<(InvocationId, CallSiteId), ProcedureHandle>,
     closed_recursive_calls: &HashSet<(InvocationId, CallSiteId)>,
     provider: &impl ConcurrencyProvider,
@@ -7409,6 +8036,15 @@ fn propagate_reference_identities(
     // storage. Pair exact packing and extraction facts through the stable
     // wrapper binding without unioning wrapper and payload identities.
     let mut boxed_payloads = HashMap::<_, Vec<_>>::default();
+    // A value read back from one exactly named `sync.Map` entry is the value
+    // its single unconditional `Store` installed, so a later assertion on it
+    // pairs with that stored object exactly as a directly boxed payload does.
+    for (destination, source) in sync_map_transports {
+        boxed_payloads
+            .entry(classes.root(destination.clone()))
+            .or_default()
+            .push(Some(source.clone()));
+    }
     let mut extractions = Vec::new();
     for entry in &invocations.entries {
         let context = &entry.context;
@@ -8673,6 +9309,71 @@ fn once_object_outlives_repetition(
     origin.is_some_and(|origin| !classes.repeated_allocations.contains(origin))
 }
 
+/// Link each reviewed timer task to the stops and resets on its identical
+/// timer in the activation that created it (issue #3382).
+///
+/// The timer is a modeled external construction with no body for the object
+/// oracle to name, so the link keys on the backing equivalence class, exactly
+/// like the condition-variable association: the value-flow relation already
+/// connects the spawn's result, the cell or field that stores it, and every
+/// later load of that storage. Only bound stops (whose guard proved the true
+/// outcome) contribute cancellation edges; resets re-arm whatever they reach.
+/// A task with no bound same-timer stop keeps no record and the ordinary
+/// may-run answer.
+fn associate_timer_tasks(
+    tasks: &mut [Task],
+    modeled: &HashMap<ContextKey, Vec<(ProgramPointId, ResolvedConcurrencyEffect)>>,
+    classes: &mut SynchronizationSubjectClasses,
+) {
+    for task in tasks.iter_mut().skip(1) {
+        let (Some(timer), Some(context)) = (task.timer.as_ref(), task.timer_context.clone()) else {
+            continue;
+        };
+        let timer_root = classes.backing_root(LocalSynchronizationSubject::Value {
+            task: context.task,
+            invocation: context.invocation,
+            procedure: context.procedure.clone(),
+            value: timer.value,
+        });
+        let Some(effects) = modeled.get(&context) else {
+            continue;
+        };
+        let mut stop_edges = Vec::new();
+        let mut resets = Vec::new();
+        for (point, effect) in effects {
+            let (candidate, edges) = match effect {
+                ResolvedConcurrencyEffect::TimerStop {
+                    timer,
+                    outcome: ResolvedTimerStopOutcome::OnResultTrue { edges },
+                } => (timer, Some(edges)),
+                ResolvedConcurrencyEffect::TimerReset { timer } => (timer, None),
+                _ => continue,
+            };
+            let candidate_root = classes.backing_root(LocalSynchronizationSubject::Value {
+                task: context.task,
+                invocation: context.invocation,
+                procedure: context.procedure.clone(),
+                value: candidate.value,
+            });
+            if candidate_root != timer_root {
+                continue;
+            }
+            match edges {
+                Some(edges) => stop_edges.extend(edges.iter().copied()),
+                None => resets.push(*point),
+            }
+        }
+        if stop_edges.is_empty() {
+            continue;
+        }
+        stop_edges.sort_unstable();
+        stop_edges.dedup();
+        resets.sort_unstable();
+        resets.dedup();
+        task.timer_cancellation = Some(TimerCancellation { stop_edges, resets });
+    }
+}
+
 fn associate_wait_group_tasks(
     tasks: &mut [Task],
     modeled: &HashMap<ContextKey, Vec<(ProgramPointId, ResolvedConcurrencyEffect)>>,
@@ -8923,6 +9624,39 @@ fn associate_wait_group_tasks(
 
 type CompletionEffects = HashMap<(InvocationId, ProgramPointId), ResolvedConcurrencySubject>;
 
+/// The decision point and true edges that establish one modeled call's
+/// boolean result, when a structured guard consumes it (issues #3369 and
+/// #3371).
+///
+/// One decision point guards one evaluation of the result; several true edges
+/// of that point all prove the call. A result no guard ever tests has no
+/// binding, and callers must keep their conditional effect unapplied.
+fn established_call_result_guard(
+    procedure: &ProcedureHandle,
+    call: &crate::analyzer::semantic::SemanticCallSite,
+) -> Option<(
+    ProgramPointId,
+    Vec<crate::analyzer::semantic::ControlEdgeId>,
+)> {
+    let mut binding: Option<(
+        ProgramPointId,
+        Vec<crate::analyzer::semantic::ControlEdgeId>,
+    )> = None;
+    let result = call.result?;
+    for guard in procedure.semantics().guard_facts() {
+        if guard.subject == Some(result)
+            && let Some(edge) = guard.true_edge
+        {
+            let (point, edges) = binding.get_or_insert_with(|| (guard.point, Vec::new()));
+            if *point != guard.point {
+                continue;
+            }
+            edges.push(edge);
+        }
+    }
+    binding.filter(|(_, edges)| !edges.is_empty())
+}
+
 /// Bind every unresolved try-acquire in `effects` to the procedure's guard
 /// facts and return the rows to attach (issue #3369).
 ///
@@ -8957,24 +9691,7 @@ fn bind_try_lock_acquisitions(
             .map(|effect| (call.point, effect))
             .collect();
     }
-    let semantics = procedure.semantics();
-    let mut binding = None;
-    if let Some(result) = call.result {
-        for guard in semantics.guard_facts() {
-            if guard.subject == Some(result)
-                && let Some(edge) = guard.true_edge
-            {
-                let (point, edges) = binding.get_or_insert_with(|| (guard.point, Vec::new()));
-                if *point != guard.point {
-                    // One decision point guards one evaluation of this result;
-                    // several true edges of that point all prove the call.
-                    continue;
-                }
-                edges.push(edge);
-            }
-        }
-    }
-    let Some((guard_point, edges)) = binding.filter(|(_, edges)| !edges.is_empty()) else {
+    let Some((guard_point, edges)) = established_call_result_guard(procedure, call) else {
         let exported = crate::typestate::summary_returns_identify_call_result(procedure, call);
         let reason = if exported {
             // The condition survives on the summary boundary (the projection
@@ -9035,6 +9752,392 @@ fn bind_try_lock_acquisitions(
             (point, effect)
         })
         .collect()
+}
+
+/// Bind every unresolved conditional spawn in `rows` to the procedure's guard
+/// facts (issue #3371).
+///
+/// The reviewed model states the conditional-spawn contract
+/// (`errgroup.Group.TryGo`: the callable starts exactly when the call reports
+/// that it did). The structured evidence that the call's boolean result is
+/// established lives in the calling procedure's guard facts. A guard whose
+/// subject is the call's result proves the spawn on its true edges and
+/// nothing on its false edge, so the bound effect records that decision point
+/// and those edges; the spawned task then exists only on the paths that begin
+/// with one of them. A result no guard ever tests (discarded, or reached only
+/// through storage the guard table cannot name) proves nothing: the spawn is
+/// dropped and the typed boundary reason keeps the answer open rather than
+/// inventing a task the contract does not start or silently hiding one it may.
+fn bind_conditional_task_spawns(
+    procedure: &ProcedureHandle,
+    call: &crate::analyzer::semantic::SemanticCallSite,
+    rows: Vec<(ProgramPointId, ResolvedConcurrencyEffect)>,
+    reasons: &mut Vec<ConcurrencyOpenReason>,
+) -> Vec<(ProgramPointId, ResolvedConcurrencyEffect)> {
+    let unresolved = rows.iter().any(|(_, effect)| {
+        matches!(
+            effect,
+            ResolvedConcurrencyEffect::TaskSpawn {
+                condition: ResolvedTaskSpawnCondition::CallResultTrue,
+                ..
+            }
+        )
+    });
+    if !unresolved {
+        return rows;
+    }
+    let Some((guard_point, edges)) = established_call_result_guard(procedure, call) else {
+        let exported = crate::typestate::summary_returns_identify_call_result(procedure, call);
+        let reason = if exported {
+            // The condition survives on the summary boundary (the projection
+            // retains it on the caller's result), but this solver cannot yet
+            // apply a callee's conditional spawn in the caller's guard
+            // context; the caller-state application is the remaining
+            // exact-wrapper work.
+            "try-spawn result is returned untested; its guard lives in a caller"
+        } else {
+            "try-spawn result is not established by a structured guard"
+        };
+        let mut bound = Vec::with_capacity(rows.len());
+        for (point, effect) in rows {
+            if matches!(
+                effect,
+                ResolvedConcurrencyEffect::TaskSpawn {
+                    condition: ResolvedTaskSpawnCondition::CallResultTrue,
+                    ..
+                }
+            ) {
+                continue;
+            }
+            bound.push((point, effect));
+        }
+        reasons.push(ConcurrencyOpenReason::UnsupportedSynchronization(
+            reason.into(),
+        ));
+        return bound;
+    };
+    rows.into_iter()
+        .map(|(point, effect)| {
+            let effect = match effect {
+                ResolvedConcurrencyEffect::TaskSpawn {
+                    callable,
+                    targets,
+                    group,
+                    condition: ResolvedTaskSpawnCondition::CallResultTrue,
+                    timer,
+                } => ResolvedConcurrencyEffect::TaskSpawn {
+                    callable,
+                    targets,
+                    group,
+                    condition: ResolvedTaskSpawnCondition::OnResultTrue {
+                        point: guard_point,
+                        edges: edges.clone(),
+                    },
+                    timer,
+                },
+                other => other,
+            };
+            (point, effect)
+        })
+        .collect()
+}
+
+/// Bind every unresolved timer stop in `rows` to the procedure's guard
+/// facts (issue #3382).
+///
+/// The reviewed model states the cancellation contract intrinsically: a stop
+/// whose boolean result is established true proves the `time.AfterFunc`
+/// callback for that exact timer did not and will not run. The structured
+/// evidence lives in the calling procedure's guard facts, shared with the
+/// try-acquire and conditional-spawn lookups. A guard whose subject is the
+/// call's result proves the cancellation on its true edges. A result no
+/// guard ever tests (discarded, or reached only through storage the guard
+/// table cannot name) proves nothing: the stop is dropped silently, because
+/// the conservative may-run answer stays sound for race reporting -- a race
+/// exists on the executions where the stop reports false -- unlike a dropped
+/// spawn, which would hide accesses.
+fn bind_timer_stops(
+    procedure: &ProcedureHandle,
+    call: &crate::analyzer::semantic::SemanticCallSite,
+    rows: Vec<(ProgramPointId, ResolvedConcurrencyEffect)>,
+) -> Vec<(ProgramPointId, ResolvedConcurrencyEffect)> {
+    let unresolved = rows.iter().any(|(_, effect)| {
+        matches!(
+            effect,
+            ResolvedConcurrencyEffect::TimerStop {
+                outcome: ResolvedTimerStopOutcome::CallResultTrue,
+                ..
+            }
+        )
+    });
+    if !unresolved {
+        return rows;
+    }
+    let Some((_, edges)) = established_call_result_guard(procedure, call) else {
+        return rows
+            .into_iter()
+            .filter(|(_, effect)| {
+                !matches!(
+                    effect,
+                    ResolvedConcurrencyEffect::TimerStop {
+                        outcome: ResolvedTimerStopOutcome::CallResultTrue,
+                        ..
+                    }
+                )
+            })
+            .collect();
+    };
+    rows.into_iter()
+        .map(|(point, effect)| {
+            let effect = match effect {
+                ResolvedConcurrencyEffect::TimerStop {
+                    timer,
+                    outcome: ResolvedTimerStopOutcome::CallResultTrue,
+                } => ResolvedConcurrencyEffect::TimerStop {
+                    timer,
+                    outcome: ResolvedTimerStopOutcome::OnResultTrue {
+                        edges: edges.clone(),
+                    },
+                },
+                other => other,
+            };
+            (point, effect)
+        })
+        .collect()
+}
+
+/// The control edges that prove one conditional spawn did not start its
+/// callback: the establishing guard's arms other than the settled true edges
+/// (issue #3371).
+fn conditional_spawn_false_edges(
+    scope: &impl ControlScope,
+    guard: ProgramPointId,
+    true_edges: &[crate::analyzer::semantic::ControlEdgeId],
+    request: &mut SolveRequest<'_, '_>,
+) -> Result<Vec<crate::analyzer::semantic::ControlEdgeId>, ConcurrencyOpenReason> {
+    use crate::analyzer::semantic::cfg_algorithms::DenseBidirectionalGraph;
+
+    let mut false_edges = with_concurrency_graph!(request, scope, |graph| {
+        let mut edges = Vec::new();
+        for (edge, _) in graph.successors(guard) {
+            charge_concurrency_work(request, 1)?;
+            if !true_edges.contains(&edge) {
+                edges.push(edge);
+            }
+        }
+        Ok(edges)
+    })?;
+    charge_concurrency_work(request, 1)?;
+    false_edges.sort_unstable();
+    false_edges.dedup();
+    Ok(false_edges)
+}
+
+/// Failure of a subtest callback classification scan (issue #3383). Budget
+/// exhaustion stops the solve like any other exhaustion; a provider failure
+/// propagates to the caller.
+enum SubtestClassifyError {
+    Budget(ConcurrencyOpenReason),
+    Provider(SemanticProviderError),
+}
+
+impl From<ConcurrencyOpenReason> for SubtestClassifyError {
+    fn from(reason: ConcurrencyOpenReason) -> Self {
+        Self::Budget(reason)
+    }
+}
+
+impl From<SemanticProviderError> for SubtestClassifyError {
+    fn from(error: SemanticProviderError) -> Self {
+        Self::Provider(error)
+    }
+}
+
+/// Classify one `Run` callback set by its `Parallel` evidence (issue #3383).
+///
+/// Every target is scanned for reviewed `Parallel` calls. All sequential
+/// targets make a sequential subtest, all parallel targets a parallel one,
+/// and anything else -- mixed targets, conditional or aliased `Parallel`
+/// calls, unresolved or cyclic routes, exhausted scan budget -- keeps the
+/// subtest unknown with its typed boundary instead of guessing a task the
+/// contract does not establish.
+fn classify_subtest_callback(
+    targets: &[ProcedureHandle],
+    provider: &impl ConcurrencyProvider,
+    request: &mut SolveRequest<'_, '_>,
+) -> Result<SubtestParallelism, SubtestClassifyError> {
+    assert!(
+        !targets.is_empty(),
+        "a subtest spawn names its callback targets"
+    );
+    let mut parallel = 0;
+    for target in targets {
+        match classify_subtest_target(target, provider, request)? {
+            SubtestParallelism::Sequential => {}
+            SubtestParallelism::Parallel => parallel += 1,
+            SubtestParallelism::Unknown => return Ok(SubtestParallelism::Unknown),
+        }
+    }
+    Ok(if parallel == targets.len() {
+        SubtestParallelism::Parallel
+    } else if parallel == 0 {
+        SubtestParallelism::Sequential
+    } else {
+        SubtestParallelism::Unknown
+    })
+}
+
+/// Classify one callback procedure by its reviewed `Parallel` evidence.
+///
+/// Only a `Parallel` call on the callback's own parameter (ordinal 0) marks
+/// the subtest, and only when every reachable exit path crosses one. A call
+/// on any other receiver, a path that skips the call, an unresolved target,
+/// a call cycle, or an exhausted scan keeps the procedure unknown. Exact
+/// local callees are scanned transitively; a `Parallel` anywhere below the
+/// callback vetoes rather than marks, because the scan does not thread the
+/// test value across the call boundary. Complete external dispatches (an
+/// unmodeled `Log` call, for example) resolve to no local body and veto
+/// nothing; they keep their usual open call-effect reasons instead.
+fn classify_subtest_target(
+    target: &ProcedureHandle,
+    provider: &impl ConcurrencyProvider,
+    request: &mut SolveRequest<'_, '_>,
+) -> Result<SubtestParallelism, SubtestClassifyError> {
+    let own = target.semantics().values().iter().find_map(|value| {
+        matches!(
+            value.kind,
+            crate::analyzer::semantic::SemanticValueKind::Parameter { ordinal: 0, .. }
+        )
+        .then_some(value.id)
+    });
+    let mut scan = SubtestParallelScan {
+        own,
+        visited: HashSet::default(),
+        parallel_points: Vec::new(),
+        veto: false,
+    };
+    scan.scan_procedure(target, true, provider, request)?;
+    scan.verdict(target, request)
+}
+
+struct SubtestParallelScan {
+    own: Option<ValueId>,
+    visited: HashSet<ProcedureHandle>,
+    parallel_points: Vec<ProgramPointId>,
+    veto: bool,
+}
+
+impl SubtestParallelScan {
+    fn scan_procedure(
+        &mut self,
+        procedure: &ProcedureHandle,
+        top: bool,
+        provider: &impl ConcurrencyProvider,
+        request: &mut SolveRequest<'_, '_>,
+    ) -> Result<(), SubtestClassifyError> {
+        if !self.visited.insert(procedure.clone()) {
+            self.veto = true;
+            return Ok(());
+        }
+        charge_concurrency_work(request, 1)?;
+        for call in procedure.semantics().call_sites() {
+            charge_concurrency_work(request, 1)?;
+            let handle = procedure
+                .call_site_handle(call.id)
+                .expect("validated call belongs to its procedure");
+            // The expansion loop's own context-free resolution: declared
+            // local targets resolve without dispatch, and complete external
+            // dispatches resolve to no local body. There is no invocation to
+            // supply caller bindings before the callback task exists.
+            let resolved = match &call.declared_targets {
+                CallableTargetResolution::Proven(CallableTarget::Local(target)) => {
+                    ConcurrencyAnswer::Proven(vec![
+                        procedure
+                            .artifact()
+                            .procedure_handle(*target)
+                            .expect("validated local target belongs to its artifact"),
+                    ])
+                }
+                _ => provider.resolve_call(&handle, request)?,
+            };
+            let (effects, _) = provider
+                .modeled_effects(&handle, &resolved, request)?
+                .into_parts();
+            for effect in &effects {
+                if let ResolvedConcurrencyEffect::SubtestParallel { receiver } = effect {
+                    // The receiver names the callback's own parameter only
+                    // when its single-inflow chain reaches that parameter; a
+                    // reassigned parameter fails the root walk by itself.
+                    let mut own = false;
+                    if top && let Some(param) = self.own {
+                        own = subtest_receiver_root(procedure, receiver.value, request)?
+                            == Some(param);
+                    }
+                    if own {
+                        self.parallel_points.push(call.point);
+                    } else {
+                        self.veto = true;
+                    }
+                }
+            }
+            if self.veto {
+                return Ok(());
+            }
+            match resolved {
+                ConcurrencyAnswer::Proven(targets) => {
+                    for target in targets {
+                        self.scan_procedure(&target, false, provider, request)?;
+                        if self.veto {
+                            return Ok(());
+                        }
+                    }
+                }
+                ConcurrencyAnswer::Open { .. } => {
+                    self.veto = true;
+                    return Ok(());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn verdict(
+        &self,
+        target: &ProcedureHandle,
+        request: &mut SolveRequest<'_, '_>,
+    ) -> Result<SubtestParallelism, SubtestClassifyError> {
+        if self.veto {
+            return Ok(SubtestParallelism::Unknown);
+        }
+        if self.parallel_points.is_empty() {
+            return Ok(SubtestParallelism::Sequential);
+        }
+        let semantics = target.semantics();
+        let entry = semantics.entry_point();
+        let required = HashSet::from_iter(self.parallel_points.iter().copied());
+        let mut reachable_exit = false;
+        for exit in [
+            semantics.normal_exit_point(),
+            semantics.exceptional_exit_point(),
+        ] {
+            if !point_reaches(target, entry, exit, request)? {
+                continue;
+            }
+            reachable_exit = true;
+            if !all_paths_cross_points(target, exit, &required, request)? {
+                return Ok(SubtestParallelism::Unknown);
+            }
+        }
+        if !reachable_exit {
+            for point in &self.parallel_points {
+                if point_reaches(target, entry, *point, request)? {
+                    return Ok(SubtestParallelism::Parallel);
+                }
+            }
+            return Ok(SubtestParallelism::Unknown);
+        }
+        Ok(SubtestParallelism::Parallel)
+    }
 }
 
 fn must_completion_effects(
@@ -9130,6 +10233,12 @@ fn resolve_modeled_subjects(
         if let (Some(context), Some(once)) = (task.once_context.clone(), task.once.as_mut()) {
             resolve_modeled_subject(classes, &context, once);
         }
+        // A timer callback's subject belongs to the caller that ran the
+        // AfterFunc, so it resolves against the retained caller context
+        // rather than against the callback's own entry.
+        if let (Some(context), Some(timer)) = (task.timer_context.clone(), task.timer.as_mut()) {
+            resolve_modeled_subject(classes, &context, timer);
+        }
         let (Some(parent), Some(procedure), Some(group)) = (
             task.parent,
             task.spawn_procedure.clone(),
@@ -9153,7 +10262,14 @@ fn resolve_modeled_subjects(
 
 fn modeled_effect_subjects(effect: &ResolvedConcurrencyEffect) -> Vec<&ResolvedConcurrencySubject> {
     match effect {
-        ResolvedConcurrencyEffect::TaskSpawn { group, .. } => group.iter().collect(),
+        ResolvedConcurrencyEffect::TaskSpawn { group, timer, .. } => {
+            group.iter().chain(timer.iter()).collect()
+        }
+        ResolvedConcurrencyEffect::TimerStop { timer, .. }
+        | ResolvedConcurrencyEffect::TimerReset { timer } => vec![timer],
+        ResolvedConcurrencyEffect::SubtestRun { group, .. }
+        | ResolvedConcurrencyEffect::SubtestCleanup { group, .. } => vec![group],
+        ResolvedConcurrencyEffect::SubtestParallel { receiver } => vec![receiver],
         ResolvedConcurrencyEffect::OnceDo { once, .. } => vec![once],
         ResolvedConcurrencyEffect::TaskJoin { group }
         | ResolvedConcurrencyEffect::WaitGroupAdd { group, .. }
@@ -9165,6 +10281,11 @@ fn modeled_effect_subjects(effect: &ResolvedConcurrencyEffect) -> Vec<&ResolvedC
         ResolvedConcurrencyEffect::CondBind { condition, lock } => vec![condition, lock],
         ResolvedConcurrencyEffect::CondWait { condition }
         | ResolvedConcurrencyEffect::CondNotify { condition, .. } => vec![condition],
+        ResolvedConcurrencyEffect::SyncMap { map, key, .. } => {
+            let mut subjects = vec![map];
+            subjects.extend(key.as_ref());
+            subjects
+        }
     }
 }
 
@@ -9172,7 +10293,14 @@ fn modeled_effect_subjects_mut(
     effect: &mut ResolvedConcurrencyEffect,
 ) -> Vec<&mut ResolvedConcurrencySubject> {
     match effect {
-        ResolvedConcurrencyEffect::TaskSpawn { group, .. } => group.iter_mut().collect(),
+        ResolvedConcurrencyEffect::TaskSpawn { group, timer, .. } => {
+            group.iter_mut().chain(timer.iter_mut()).collect()
+        }
+        ResolvedConcurrencyEffect::TimerStop { timer, .. }
+        | ResolvedConcurrencyEffect::TimerReset { timer } => vec![timer],
+        ResolvedConcurrencyEffect::SubtestRun { group, .. }
+        | ResolvedConcurrencyEffect::SubtestCleanup { group, .. } => vec![group],
+        ResolvedConcurrencyEffect::SubtestParallel { receiver } => vec![receiver],
         ResolvedConcurrencyEffect::OnceDo { once, .. } => vec![once],
         ResolvedConcurrencyEffect::TaskJoin { group }
         | ResolvedConcurrencyEffect::WaitGroupAdd { group, .. }
@@ -9184,6 +10312,11 @@ fn modeled_effect_subjects_mut(
         ResolvedConcurrencyEffect::CondBind { condition, lock } => vec![condition, lock],
         ResolvedConcurrencyEffect::CondWait { condition }
         | ResolvedConcurrencyEffect::CondNotify { condition, .. } => vec![condition],
+        ResolvedConcurrencyEffect::SyncMap { map, key, .. } => {
+            let mut subjects = vec![map];
+            subjects.extend(key.as_mut());
+            subjects
+        }
     }
 }
 
@@ -9302,44 +10435,37 @@ pub fn source_callable_targets(
     let semantics = procedure.semantics();
     let mut targets = Vec::new();
     let mut open = false;
-    for point in semantics.points() {
-        for event in &point.events {
-            let callable = match &event.effect {
-                SemanticEffect::CallableCreation { result, callable }
-                | SemanticEffect::CallableReference { result, callable }
-                    if *result == value =>
-                {
-                    callable
-                }
-                SemanticEffect::ValueFlow {
-                    source,
-                    target,
-                    kind: crate::analyzer::semantic::ValueFlowKind::Local,
-                } if *target == value => {
-                    for source_point in semantics.points() {
-                        for source_event in &source_point.events {
-                            let source_callable = match &source_event.effect {
-                                SemanticEffect::CallableCreation { result, callable }
-                                | SemanticEffect::CallableReference { result, callable }
-                                    if result == source =>
-                                {
-                                    callable
-                                }
-                                _ => continue,
-                            };
-                            collect_local_callable_targets(
-                                procedure,
-                                &source_callable.targets,
-                                &mut targets,
-                                &mut open,
-                            );
-                        }
+    // A callable stored in a variable reaches the call through one local
+    // flow per copy, so follow the chain back to its creations. The visited
+    // set bounds the walk; every visited creation contributes its targets.
+    let mut visited = HashSet::default();
+    visited.insert(value);
+    let mut queue = VecDeque::from([value]);
+    while let Some(current) = queue.pop_front() {
+        for point in semantics.points() {
+            for event in &point.events {
+                match &event.effect {
+                    SemanticEffect::CallableCreation { result, callable }
+                    | SemanticEffect::CallableReference { result, callable }
+                        if *result == current =>
+                    {
+                        collect_local_callable_targets(
+                            procedure,
+                            &callable.targets,
+                            &mut targets,
+                            &mut open,
+                        );
                     }
-                    continue;
+                    SemanticEffect::ValueFlow {
+                        source,
+                        target,
+                        kind: crate::analyzer::semantic::ValueFlowKind::Local,
+                    } if *target == current && visited.insert(*source) => {
+                        queue.push_back(*source);
+                    }
+                    _ => {}
                 }
-                _ => continue,
-            };
-            collect_local_callable_targets(procedure, &callable.targets, &mut targets, &mut open);
+            }
         }
     }
     // Sorted by the mount-free procedure wire id, which is the identity
@@ -9893,7 +11019,8 @@ fn invocation_scalar_integer(
                 | SummaryPort::ExceptionalReturn
                 | SummaryPort::Capture(_)
                 | SummaryPort::Heap(_),
-            ) => return None,
+            )
+            | crate::typestate::DirectScalarSource::ConstantString(_) => return None,
         }
     }
 }
@@ -11421,6 +12548,43 @@ fn source_summary_modeled_subject(
     })
 }
 
+/// Resolve the timer object one retained `TaskSpawn` names.
+///
+/// The timer is the spawn call's own result, not one of its inputs, so it is
+/// resolved from the exact result ordinal instead of from the input subject
+/// paths. Only a plain return port can name it: a captured or stored timer is
+/// a different object graph position and stays unresolved.
+fn source_summary_timer_subject(
+    pending: &PendingSummaryEffect,
+    call: &crate::analyzer::semantic::SemanticCallSite,
+    path: &SummaryConcurrencyAccessPath,
+    provider: &dyn ConcurrencyProvider,
+    request: &mut SolveRequest<'_, '_>,
+) -> Result<ResolvedConcurrencySubject, &'static str> {
+    if !path.selectors().is_empty() {
+        return Err("summary timer path has selectors");
+    }
+    let value = match path.root() {
+        SummaryPort::NormalReturn => call.result,
+        SummaryPort::IndexedNormalReturn(ordinal) => call.normal_result(*ordinal as usize),
+        _ => None,
+    }
+    .ok_or("summary timer result is unavailable")?;
+    let (canonical, reasons) = provider
+        .canonical_value(&pending.context.procedure, call.point, value, request)
+        .map_err(|_| "summary timer identity query is unavailable")?
+        .into_parts();
+    if canonical.is_none() && reasons.is_empty() {
+        return Err("summary timer identity is unavailable");
+    }
+    Ok(ResolvedConcurrencySubject {
+        value,
+        canonical,
+        reasons,
+        identity: ConcurrencySubjectIdentity::Value,
+    })
+}
+
 /// Resolve the condition object one retained `CondBind` constructs.
 ///
 /// The condition is the construction call's own result, not one of its inputs,
@@ -11486,6 +12650,8 @@ fn source_summary_modeled_effect(
         callable,
         target_coverage,
         group,
+        condition,
+        timer,
     } = pending.effect.kind()
     {
         if *target_coverage != crate::dataflow::SummaryConcurrencyTargetCoverage::Exhaustive {
@@ -11517,10 +12683,23 @@ fn source_summary_modeled_effect(
                 )
             })
             .transpose()?;
+        let timer = timer
+            .as_ref()
+            .map(|timer| source_summary_timer_subject(pending, call, timer, provider, request))
+            .transpose()?;
         return Ok(ResolvedConcurrencyEffect::TaskSpawn {
             callable,
             targets,
             group,
+            condition: match condition {
+                SummaryTaskSpawnCondition::Unconditional => {
+                    ResolvedTaskSpawnCondition::Unconditional
+                }
+                SummaryTaskSpawnCondition::CallResultTrue => {
+                    ResolvedTaskSpawnCondition::CallResultTrue
+                }
+            },
+            timer,
         });
     }
     if let SummaryConcurrencyEffectKind::OnceDo {
@@ -11560,6 +12739,78 @@ fn source_summary_modeled_effect(
             targets,
         });
     }
+    if let SummaryConcurrencyEffectKind::SubtestRun {
+        callable,
+        target_coverage,
+        group,
+    } = pending.effect.kind()
+    {
+        if *target_coverage != crate::dataflow::SummaryConcurrencyTargetCoverage::Exhaustive {
+            return Err("summary subtest target coverage is incomplete");
+        }
+        let crate::dataflow::SummaryConcurrencyCallable::SourceArgument(ordinal) = callable else {
+            return Err("summary subtest callable has no witnessed source argument");
+        };
+        let callable = call
+            .arguments
+            .get(*ordinal as usize)
+            .ok_or("summary subtest callable argument is unavailable")?
+            .value;
+        let ConcurrencyAnswer::Proven(targets) =
+            source_callable_targets(&pending.context.procedure, callable)
+        else {
+            return Err("summary subtest callable targets are unavailable");
+        };
+        let group = source_summary_modeled_subject(
+            &pending.context.procedure,
+            call,
+            &group.location,
+            group.identity,
+            provider,
+            request,
+        )?;
+        return Ok(ResolvedConcurrencyEffect::SubtestRun {
+            callable,
+            targets,
+            group,
+        });
+    }
+    if let SummaryConcurrencyEffectKind::SubtestCleanup {
+        callable,
+        target_coverage,
+        group,
+    } = pending.effect.kind()
+    {
+        if *target_coverage != crate::dataflow::SummaryConcurrencyTargetCoverage::Exhaustive {
+            return Err("summary cleanup target coverage is incomplete");
+        }
+        let crate::dataflow::SummaryConcurrencyCallable::SourceArgument(ordinal) = callable else {
+            return Err("summary cleanup callable has no witnessed source argument");
+        };
+        let callable = call
+            .arguments
+            .get(*ordinal as usize)
+            .ok_or("summary cleanup callable argument is unavailable")?
+            .value;
+        let ConcurrencyAnswer::Proven(targets) =
+            source_callable_targets(&pending.context.procedure, callable)
+        else {
+            return Err("summary cleanup callable targets are unavailable");
+        };
+        let group = source_summary_modeled_subject(
+            &pending.context.procedure,
+            call,
+            &group.location,
+            group.identity,
+            provider,
+            request,
+        )?;
+        return Ok(ResolvedConcurrencyEffect::SubtestCleanup {
+            callable,
+            targets,
+            group,
+        });
+    }
     if let SummaryConcurrencyEffectKind::CondBind { condition, lock } = pending.effect.kind() {
         let condition =
             source_summary_condition_subject(pending, call, condition, provider, request)?;
@@ -11572,6 +12823,101 @@ fn source_summary_modeled_effect(
             request,
         )?;
         return Ok(ResolvedConcurrencyEffect::CondBind { condition, lock });
+    }
+    if let SummaryConcurrencyEffectKind::SyncMap {
+        map,
+        identity,
+        key,
+        operation,
+    } = pending.effect.kind()
+    {
+        let map = source_summary_modeled_subject(
+            &pending.context.procedure,
+            call,
+            map,
+            *identity,
+            provider,
+            request,
+        )?;
+        let operation = match operation {
+            crate::dataflow::SummaryConcurrencySyncMapOperation::Store => {
+                ConcurrencySyncMapOperation::Store
+            }
+            crate::dataflow::SummaryConcurrencySyncMapOperation::Delete => {
+                ConcurrencySyncMapOperation::Delete
+            }
+            crate::dataflow::SummaryConcurrencySyncMapOperation::Clear => {
+                ConcurrencySyncMapOperation::Clear
+            }
+            crate::dataflow::SummaryConcurrencySyncMapOperation::Load => {
+                ConcurrencySyncMapOperation::Load
+            }
+            crate::dataflow::SummaryConcurrencySyncMapOperation::Range => {
+                ConcurrencySyncMapOperation::Range
+            }
+            crate::dataflow::SummaryConcurrencySyncMapOperation::LoadOrStore => {
+                ConcurrencySyncMapOperation::LoadOrStore
+            }
+            crate::dataflow::SummaryConcurrencySyncMapOperation::LoadAndDelete => {
+                ConcurrencySyncMapOperation::LoadAndDelete
+            }
+            crate::dataflow::SummaryConcurrencySyncMapOperation::Swap => {
+                ConcurrencySyncMapOperation::Swap
+            }
+            crate::dataflow::SummaryConcurrencySyncMapOperation::CompareAndSwap => {
+                ConcurrencySyncMapOperation::CompareAndSwap
+            }
+            crate::dataflow::SummaryConcurrencySyncMapOperation::CompareAndDelete => {
+                ConcurrencySyncMapOperation::CompareAndDelete
+            }
+        };
+        // A key that crossed the boundary keeps its port; a call-local key is
+        // recovered from the live call's own argument, which the summary
+        // target pins exactly.
+        let key = match key {
+            Some(key) => Some(source_summary_modeled_subject(
+                &pending.context.procedure,
+                call,
+                key,
+                SummaryConcurrencySubjectIdentity::Value,
+                provider,
+                request,
+            )?),
+            None if operation != ConcurrencySyncMapOperation::Clear => {
+                let row = call;
+                let value = row
+                    .arguments
+                    .first()
+                    .map(|argument| argument.value)
+                    .ok_or("summary sync.Map key actual is unavailable")?;
+                let (canonical, reasons) = match provider.canonical_value(
+                    &pending.context.procedure,
+                    row.point,
+                    value,
+                    request,
+                ) {
+                    Ok(answer) => answer.into_parts(),
+                    // An unavailable identity query leaves the key unresolved
+                    // rather than invalidating the reviewed inventory.
+                    Err(_) => (None, Vec::new()),
+                };
+                Some(ResolvedConcurrencySubject {
+                    value,
+                    canonical,
+                    reasons,
+                    identity: ConcurrencySubjectIdentity::Value,
+                })
+            }
+            None => None,
+        };
+        return Ok(ResolvedConcurrencyEffect::SyncMap {
+            map,
+            key,
+            key_constant: None,
+            operation,
+            write: operation.write_outcome(),
+            observe: operation.observe_outcome(),
+        });
     }
     let (path, identity) = match pending.effect.kind() {
         SummaryConcurrencyEffectKind::Lock { lock, identity, .. } => (lock, *identity),
@@ -11590,6 +12936,8 @@ fn source_summary_modeled_effect(
         SummaryConcurrencyEffectKind::CondNotify { condition, .. } => {
             (condition, SummaryConcurrencySubjectIdentity::Value)
         }
+        SummaryConcurrencyEffectKind::TimerStop { timer, identity }
+        | SummaryConcurrencyEffectKind::TimerReset { timer, identity } => (timer, *identity),
         _ => return Err("summary modeled effect has an incompatible kind"),
     };
     let subject = source_summary_modeled_subject(
@@ -11673,6 +13021,13 @@ fn source_summary_modeled_effect(
         }
         SummaryConcurrencyEffectKind::CondWait { .. } => {
             ResolvedConcurrencyEffect::CondWait { condition: subject }
+        }
+        SummaryConcurrencyEffectKind::TimerStop { .. } => ResolvedConcurrencyEffect::TimerStop {
+            timer: subject,
+            outcome: ResolvedTimerStopOutcome::CallResultTrue,
+        },
+        SummaryConcurrencyEffectKind::TimerReset { .. } => {
+            ResolvedConcurrencyEffect::TimerReset { timer: subject }
         }
         SummaryConcurrencyEffectKind::CondNotify { waiters, .. } => {
             ResolvedConcurrencyEffect::CondNotify {
@@ -12750,6 +14105,13 @@ fn compare_accesses(
             return;
         }
     };
+    let sync_map = match SyncMapPublications::build(modeled, request) {
+        Ok(publications) => publications,
+        Err(reason) => {
+            report.reasons.push(reason);
+            return;
+        }
+    };
     let mut channel_barriers = ChannelCompletionBarriers {
         tasks,
         invocations,
@@ -12825,6 +14187,7 @@ fn compare_accesses(
                 second,
                 modeled,
                 &mut channel_barriers,
+                &sync_map,
                 allocation_origins,
                 &mut control,
                 request,
@@ -13347,6 +14710,10 @@ struct AccessControlCache {
         ControlScopeKey,
         crate::analyzer::semantic::cfg_algorithms::Dominators<ProgramPointId>,
     >,
+    /// Whether two subtest tasks name one test node, keyed by ordered task
+    /// pair (issue #3383). Receiver matching scans the spawn procedure for
+    /// redefinitions, so one answer serves every access pair of two tasks.
+    subtest_receivers: HashMap<(TaskId, TaskId), bool>,
 }
 
 impl AccessControlCache {
@@ -13451,6 +14818,289 @@ impl AccessControlCache {
     }
 }
 
+/// Whether the task was spawned by a sequential `Run` step (issue #3383).
+/// Sequential subtests complete at their spawning call, so a chain of them
+/// runs entirely inside the spawning body.
+fn is_sequential_subtest_step(tasks: &[Task], task: TaskId) -> bool {
+    matches!(
+        tasks[task.0 as usize]
+            .subtest
+            .as_ref()
+            .map(|spawn| &spawn.kind),
+        Some(SubtestSpawnKind::Run(SubtestParallelism::Sequential))
+    )
+}
+
+/// Whether the task's subtree is deferred past its parent body (issue #3383).
+/// Parallel subtests run after the parent test function returns; cleanup
+/// callbacks run after the test and all its subtests complete.
+fn is_deferred_subtest(tasks: &[Task], task: TaskId) -> bool {
+    matches!(
+        tasks[task.0 as usize]
+            .subtest
+            .as_ref()
+            .map(|spawn| &spawn.kind),
+        Some(SubtestSpawnKind::Run(SubtestParallelism::Parallel)) | Some(SubtestSpawnKind::Cleanup)
+    )
+}
+
+/// The least common ancestor task of two tasks. Tasks share the solve root.
+fn least_common_task(tasks: &[Task], first: TaskId, second: TaskId) -> TaskId {
+    let mut ancestors = HashSet::default();
+    let mut current = Some(first);
+    while let Some(task) = current {
+        ancestors.insert(task);
+        current = tasks[task.0 as usize].parent;
+    }
+    let mut common = second;
+    while !ancestors.contains(&common) {
+        common = tasks[common.0 as usize]
+            .parent
+            .expect("tasks share the solve root");
+    }
+    common
+}
+
+/// The child of `ancestor` toward `descendant`, or `None` when they are one
+/// task. The ancestor must be an ancestor-or-self of the descendant.
+fn child_toward(tasks: &[Task], ancestor: TaskId, descendant: TaskId) -> Option<TaskId> {
+    let mut current = descendant;
+    loop {
+        let parent = tasks[current.0 as usize].parent?;
+        if parent == ancestor {
+            return Some(current);
+        }
+        current = parent;
+    }
+}
+
+/// Whether the side task runs inside the ancestor body: the task itself, or
+/// a chain of sequential subtest steps below it (issue #3383). Sequential
+/// subtests complete at their spawning calls, so the whole chain executes
+/// while the ancestor body runs. Deferred, unknown, and detached steps can
+/// outlive the body and fail the check.
+fn side_runs_in_ancestor_body(tasks: &[Task], ancestor: TaskId, side: TaskId) -> bool {
+    let mut current = side;
+    while current != ancestor {
+        if !is_sequential_subtest_step(tasks, current) {
+            return false;
+        }
+        let Some(parent) = tasks[current.0 as usize].parent else {
+            return false;
+        };
+        current = parent;
+    }
+    true
+}
+
+/// Whether one task is another task or its strict ancestor.
+fn is_task_ancestor_or_self(tasks: &[Task], ancestor: TaskId, descendant: TaskId) -> bool {
+    let mut current = Some(descendant);
+    while let Some(task) = current {
+        if task == ancestor {
+            return true;
+        }
+        current = tasks[task.0 as usize].parent;
+    }
+    false
+}
+
+/// Whether an unknown subtest classification separates two tasks (issue
+/// #3383). An unknown task on one side's ancestor chain (inclusive) that is
+/// not shared with the other side decides whether the sides overlap: a
+/// parallel outcome defers one side past the body while a sequential outcome
+/// joins it inside. Such pairs stay open.
+fn subtest_unknown_separates(tasks: &[Task], first: TaskId, second: TaskId) -> bool {
+    let mut current = Some(first);
+    while let Some(task) = current {
+        if matches!(
+            tasks[task.0 as usize]
+                .subtest
+                .as_ref()
+                .map(|spawn| &spawn.kind),
+            Some(SubtestSpawnKind::Run(SubtestParallelism::Unknown))
+        ) && !is_task_ancestor_or_self(tasks, task, second)
+        {
+            return true;
+        }
+        current = tasks[task.0 as usize].parent;
+    }
+    let mut current = Some(second);
+    while let Some(task) = current {
+        if matches!(
+            tasks[task.0 as usize]
+                .subtest
+                .as_ref()
+                .map(|spawn| &spawn.kind),
+            Some(SubtestSpawnKind::Run(SubtestParallelism::Unknown))
+        ) && !is_task_ancestor_or_self(tasks, task, first)
+        {
+            return true;
+        }
+        current = tasks[task.0 as usize].parent;
+    }
+    false
+}
+
+/// Whether a deferred spawn separates one side from the ancestor body (issue
+/// #3383). When exactly one least-common-ancestor child is deferred and the
+/// other side runs inside the ancestor body, the two sides never overlap:
+/// the body side completes before the deferred subtree starts.
+fn subtest_deferred_separates(tasks: &[Task], first: TaskId, second: TaskId) -> bool {
+    if first == second {
+        return false;
+    }
+    let ancestor = least_common_task(tasks, first, second);
+    let to_first = child_toward(tasks, ancestor, first);
+    let to_second = child_toward(tasks, ancestor, second);
+    to_first.is_some_and(|child| is_deferred_subtest(tasks, child))
+        && side_runs_in_ancestor_body(tasks, ancestor, second)
+        || to_second.is_some_and(|child| is_deferred_subtest(tasks, child))
+            && side_runs_in_ancestor_body(tasks, ancestor, first)
+}
+
+/// The single-inflow root of a receiver use value (issue #3383). The lowerer
+/// evaluates each receiver expression to a fresh value, so two uses name one
+/// runtime value only when both single-inflow chains reach one root: every
+/// step must have exactly one defining value flow, and any reassignment,
+/// memory round trip, call result, or cycle fails the walk with `None`.
+/// Copies preserve the pointed-to test node, so all flow kinds qualify. A
+/// root has no defining event at all, so reaching one also proves the root
+/// itself is never redefined in the procedure.
+fn subtest_receiver_root(
+    procedure: &ProcedureHandle,
+    value: ValueId,
+    request: &mut SolveRequest<'_, '_>,
+) -> Result<Option<ValueId>, ConcurrencyOpenReason> {
+    use crate::analyzer::semantic::SemanticEffect;
+    let semantics = procedure.semantics();
+    let mut current = value;
+    let mut visited = HashSet::default();
+    loop {
+        if !visited.insert(current) {
+            return Ok(None);
+        }
+        charge_concurrency_work(request, 1)?;
+        for call in semantics.call_sites() {
+            charge_concurrency_work(request, 1)?;
+            if call.result == Some(current) {
+                return Ok(None);
+            }
+        }
+        let mut inflow = None;
+        let mut redefined = false;
+        for point in semantics.points() {
+            charge_concurrency_work(request, 1)?;
+            for event in &point.events {
+                charge_concurrency_work(request, 1)?;
+                // The match is exhaustive so a future effect variant must
+                // state whether it defines a value.
+                match &event.effect {
+                    SemanticEffect::ValueFlow { source, target, .. } if *target == current => {
+                        if inflow.replace(*source).is_some() {
+                            return Ok(None);
+                        }
+                    }
+                    SemanticEffect::Assignment { target, .. }
+                    | SemanticEffect::AggregateInitializer {
+                        aggregate: target, ..
+                    } if *target == current => redefined = true,
+                    SemanticEffect::MemoryLoad { result, .. }
+                    | SemanticEffect::CallableCreation { result, .. }
+                    | SemanticEffect::CallableReference { result, .. }
+                        if *result == current =>
+                    {
+                        redefined = true;
+                    }
+                    SemanticEffect::AsyncResume { result, .. } if *result == Some(current) => {
+                        redefined = true;
+                    }
+                    SemanticEffect::ValueFlow { .. }
+                    | SemanticEffect::Assignment { .. }
+                    | SemanticEffect::AggregateInitializer { .. }
+                    | SemanticEffect::MemoryLoad { .. }
+                    | SemanticEffect::CallableCreation { .. }
+                    | SemanticEffect::CallableReference { .. }
+                    | SemanticEffect::AsyncResume { .. }
+                    | SemanticEffect::Entry
+                    | SemanticEffect::NormalExit
+                    | SemanticEffect::ExceptionalExit
+                    | SemanticEffect::ValueUse { .. }
+                    | SemanticEffect::Allocation { .. }
+                    | SemanticEffect::MemoryStore { .. }
+                    | SemanticEffect::Synchronization { .. }
+                    | SemanticEffect::CaptureBind { .. }
+                    | SemanticEffect::Invoke { .. }
+                    | SemanticEffect::CallContinuation { .. }
+                    | SemanticEffect::ProcedureReturn { .. }
+                    | SemanticEffect::Throw { .. }
+                    | SemanticEffect::AsyncSuspend { .. }
+                    | SemanticEffect::Gap { .. } => {}
+                }
+                if redefined {
+                    return Ok(None);
+                }
+            }
+        }
+        match inflow {
+            Some(source) => current = source,
+            None => return Ok(Some(current)),
+        }
+    }
+}
+
+/// Whether two subtest tasks name one test node (issue #3383). Same-procedure
+/// single-inflow roots cover the common `*testing.T` parameter, whose
+/// canonical location never resolves; exact canonical equality covers
+/// allocation-backed receivers. Anything else stays unresolved rather than
+/// guessed.
+fn subtest_tasks_share_receiver(
+    tasks: &[Task],
+    first: TaskId,
+    second: TaskId,
+    control: &mut AccessControlCache,
+    request: &mut SolveRequest<'_, '_>,
+) -> Result<bool, ConcurrencyOpenReason> {
+    let key = if first <= second {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    if let Some(answer) = control.subtest_receivers.get(&key) {
+        return Ok(*answer);
+    }
+    let answer = subtest_receivers_match_uncached(tasks, first, second, request)?;
+    control.subtest_receivers.insert(key, answer);
+    Ok(answer)
+}
+
+fn subtest_receivers_match_uncached(
+    tasks: &[Task],
+    first: TaskId,
+    second: TaskId,
+    request: &mut SolveRequest<'_, '_>,
+) -> Result<bool, ConcurrencyOpenReason> {
+    let (Some(first_subtest), Some(second_subtest)) = (
+        tasks[first.0 as usize].subtest.as_ref(),
+        tasks[second.0 as usize].subtest.as_ref(),
+    ) else {
+        return Ok(false);
+    };
+    if tasks[first.0 as usize].spawn_procedure == tasks[second.0 as usize].spawn_procedure
+        && let Some(procedure) = tasks[first.0 as usize].spawn_procedure.as_ref()
+    {
+        let first_root = subtest_receiver_root(procedure, first_subtest.receiver, request)?;
+        let second_root = subtest_receiver_root(procedure, second_subtest.receiver, request)?;
+        if first_root.is_some() && first_root == second_root {
+            return Ok(true);
+        }
+    }
+    Ok(subtest_canonicals_match(
+        &first_subtest.group,
+        &second_subtest.group,
+    ))
+}
+
 fn tasks_may_parallel(
     tasks: &[Task],
     invocations: &Invocations,
@@ -13473,6 +15123,28 @@ fn tasks_may_parallel(
         && second_once.reasons.is_empty()
         && first_once.canonical.is_some()
         && first_once.canonical == second_once.canonical
+    {
+        return Ok(false);
+    }
+    // A deferred subtest subtree (parallel or cleanup, issue #3383) runs
+    // after its parent body, so a body side and a deferred side of one
+    // ancestor never overlap and need no ordering relation to explain them.
+    if subtest_deferred_separates(tasks, first.site.task, second.site.task) {
+        return Ok(false);
+    }
+    // Two cleanup callbacks of one test node run sequentially in
+    // last-added-first-called order, so they never overlap. Unmatched
+    // receivers stay open in ordering rather than guessed here.
+    if first.site.task != second.site.task
+        && matches!(
+            first_task.subtest.as_ref().map(|spawn| &spawn.kind),
+            Some(SubtestSpawnKind::Cleanup)
+        )
+        && matches!(
+            second_task.subtest.as_ref().map(|spawn| &spawn.kind),
+            Some(SubtestSpawnKind::Cleanup)
+        )
+        && subtest_tasks_share_receiver(tasks, first.site.task, second.site.task, control, request)?
     {
         return Ok(false);
     }
@@ -13518,15 +15190,78 @@ fn tasks_may_parallel(
         );
         let (parent_reaches_spawn, spawn_reaches_parent) =
             control.relation(context, spawn, parent_point, request)?;
-        Ok(Some(
-            (invocations.entries[context.invocation.0 as usize]
-                .repetition
-                .is_some()
-                && !fresh_in_common)
-                || parent_point == spawn
-                || parent_reaches_spawn
-                || spawn_reaches_parent,
-        ))
+        let repetition_parallel = invocations.entries[context.invocation.0 as usize]
+            .repetition
+            .is_some()
+            && !fresh_in_common;
+        let mut may_parallel = repetition_parallel
+            || parent_point == spawn
+            || parent_reaches_spawn
+            || spawn_reaches_parent;
+        if may_parallel
+            && spawn_reaches_parent
+            && context.invocation == spawn_invocation
+            && let Some(conditional) = child_task.conditional_spawn.as_ref()
+        {
+            // A reviewed conditional spawn (`errgroup.Group.TryGo`) starts its
+            // callback only on the guard's established-true paths. A parent
+            // access that only a false arm can reach therefore executes with
+            // no callback running, so the pair is not concurrent at all and
+            // needs no ordering relation to explain it. An access strictly
+            // before the spawn keeps the ordinary answer, because it is
+            // ordered by the spawn itself rather than by any join. Repeating
+            // parents keep the cross-activation obligation: a previous
+            // activation's callback can still be running here. A common scope
+            // above the spawn activation cannot place the guard's arms, so it
+            // keeps the conservative answer.
+            let reachable =
+                reachable_avoiding(context, spawn, &conditional.false_edges, &[], request)?;
+            may_parallel = repetition_parallel || reachable.contains(&parent_point);
+        }
+        if may_parallel
+            && spawn_reaches_parent
+            && context.invocation == spawn_invocation
+            && let Some(cancellation) = child_task.timer_cancellation.as_ref()
+        {
+            // A reviewed `Timer.Stop` that reports true proves the AfterFunc
+            // callback did not and will not run, so a parent access that
+            // every path from the spawn reaches only through a stop-true edge
+            // executes with no callback running and needs no ordering
+            // relation to explain it. A same-timer `Timer.Reset` after the
+            // stop re-arms the callback: a reset that every path from the
+            // spawn reaches through a stop edge restarts the may-run state,
+            // and a parent access reachable from such a reset without taking
+            // another stop edge keeps the ordinary answer. An access strictly
+            // before the spawn keeps the ordinary answer, because it is
+            // ordered by the spawn itself rather than by any stop. Repeating
+            // parents keep the cross-activation obligation: a previous
+            // activation's callback can still be running here. A common scope
+            // above the spawn activation cannot place the stop's arms, so it
+            // keeps the conservative answer.
+            let uncancelled =
+                reachable_avoiding(context, spawn, &cancellation.stop_edges, &[], request)?;
+            may_parallel = repetition_parallel || uncancelled.contains(&parent_point);
+            if !may_parallel {
+                let downstream = reachable_avoiding(context, spawn, &[], &[], request)?;
+                for reset in &cancellation.resets {
+                    if !downstream.contains(reset) || uncancelled.contains(reset) {
+                        continue;
+                    }
+                    let rearmed = reachable_avoiding(
+                        context,
+                        *reset,
+                        &cancellation.stop_edges,
+                        &[],
+                        request,
+                    )?;
+                    if rearmed.contains(&parent_point) {
+                        may_parallel = true;
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(Some(may_parallel))
     };
     if let Some(answer) = parent_child(first, second, second_task)? {
         return Ok(answer);
@@ -13619,6 +15354,7 @@ fn ordering(
     second: &Access,
     modeled: &HashMap<ContextKey, Vec<(ProgramPointId, ResolvedConcurrencyEffect)>>,
     channel_barriers: &mut ChannelCompletionBarriers<'_>,
+    sync_map: &SyncMapPublications<'_>,
     allocation_origins: &HashMap<CanonicalConcurrencyLocation, AllocationOrigin>,
     control: &mut AccessControlCache,
     request: &mut SolveRequest<'_, '_>,
@@ -13658,6 +15394,18 @@ fn ordering(
             reasons.dedup();
             (ConcurrentOrdering::Open, reasons)
         });
+    }
+    // An unknown subtest classification that separates the two tasks decides
+    // whether the sides overlap, so the pair stays open with its typed
+    // boundary instead of reading as a race or as ordered (issue #3383).
+    if subtest_unknown_separates(tasks, first.site.task, second.site.task) {
+        return Ok((
+            ConcurrentOrdering::Open,
+            vec![ConcurrencyOpenReason::UnsupportedSynchronization(
+                "subtest Parallel is conditional or unresolved; the subtest joins nothing and defers nothing"
+                    .into(),
+            )],
+        ));
     }
     let mut ancestors = HashSet::default();
     let mut current = Some(first.site.task);
@@ -13875,6 +15623,27 @@ fn ordering(
     {
         return Ok(ordered);
     }
+    let forward_map = map_published_before_point(
+        tasks,
+        invocations,
+        first,
+        (second.site.invocation, second.site.point),
+        sync_map,
+        request,
+    )?;
+    let reverse_map = map_published_before_point(
+        tasks,
+        invocations,
+        second,
+        (first.site.invocation, first.site.point),
+        sync_map,
+        request,
+    )?;
+    if matches!(forward_map, ConcurrencyAnswer::Proven(true))
+        || matches!(reverse_map, ConcurrencyAnswer::Proven(true))
+    {
+        return Ok(ordered);
+    }
     let mut reasons = recurrence_reasons;
     for answer in [forward_join, reverse_join] {
         if let ConcurrencyAnswer::Open {
@@ -13901,11 +15670,103 @@ fn ordering(
     }
     reasons.sort();
     reasons.dedup();
-    Ok(if reasons.is_empty() {
-        (ConcurrentOrdering::Unordered, reasons)
-    } else {
-        (ConcurrentOrdering::Open, reasons)
-    })
+    if reasons.is_empty() {
+        if let Some(reason) =
+            subtest_open_reason_for_unordered_pair(tasks, first, second, control, request)?
+        {
+            return Ok((ConcurrentOrdering::Open, vec![reason]));
+        }
+        return Ok((ConcurrentOrdering::Unordered, reasons));
+    }
+    Ok((ConcurrentOrdering::Open, reasons))
+}
+
+/// Whether the task is a parallel `Run` step (issue #3383).
+fn is_parallel_subtest(tasks: &[Task], task: TaskId) -> bool {
+    matches!(
+        tasks[task.0 as usize]
+            .subtest
+            .as_ref()
+            .map(|spawn| &spawn.kind),
+        Some(SubtestSpawnKind::Run(SubtestParallelism::Parallel))
+    )
+}
+
+/// Whether the side chain from a task up to (excluding) an ancestor passes
+/// through a cleanup task (issue #3383).
+fn side_chain_contains_cleanup(tasks: &[Task], ancestor: TaskId, side: TaskId) -> bool {
+    let mut current = side;
+    while current != ancestor {
+        if matches!(
+            tasks[current.0 as usize]
+                .subtest
+                .as_ref()
+                .map(|spawn| &spawn.kind),
+            Some(SubtestSpawnKind::Cleanup)
+        ) {
+            return true;
+        }
+        let Some(parent) = tasks[current.0 as usize].parent else {
+            return false;
+        };
+        current = parent;
+    }
+    false
+}
+
+/// Whether the side chain from a task up to (excluding) an ancestor uses
+/// subtest edges only (issue #3383). Detached steps can outlive the body and
+/// fail the check.
+fn side_chain_is_subtest_only(tasks: &[Task], ancestor: TaskId, side: TaskId) -> bool {
+    let mut current = side;
+    while current != ancestor {
+        if tasks[current.0 as usize].subtest.is_none() {
+            return false;
+        }
+        let Some(parent) = tasks[current.0 as usize].parent else {
+            return false;
+        };
+        current = parent;
+    }
+    true
+}
+
+/// The typed boundary keeping a subtest pair open when no barrier ordered it
+/// (issue #3383). Parallel siblings with unmatched receivers may name
+/// different test nodes, whose executions the model cannot overlap; a pair
+/// rooted under a cleanup task on one side while the other side stays within
+/// subtest edges cannot claim the scoped order without a receiver match.
+/// Matched receivers already ordered through the scoped barrier or skipped
+/// as sequential, and detached sides keep their genuine unordered verdict.
+fn subtest_open_reason_for_unordered_pair(
+    tasks: &[Task],
+    first: &Access,
+    second: &Access,
+    control: &mut AccessControlCache,
+    request: &mut SolveRequest<'_, '_>,
+) -> Result<Option<ConcurrencyOpenReason>, ConcurrencyOpenReason> {
+    let ancestor = least_common_task(tasks, first.site.task, second.site.task);
+    let to_first = child_toward(tasks, ancestor, first.site.task);
+    let to_second = child_toward(tasks, ancestor, second.site.task);
+    if let (Some(first_child), Some(second_child)) = (to_first, to_second)
+        && is_parallel_subtest(tasks, first_child)
+        && is_parallel_subtest(tasks, second_child)
+        && !subtest_tasks_share_receiver(tasks, first_child, second_child, control, request)?
+    {
+        return Ok(Some(ConcurrencyOpenReason::UnsupportedSynchronization(
+            "subtest Parallel siblings name unresolved test nodes".into(),
+        )));
+    }
+    if side_chain_contains_cleanup(tasks, ancestor, first.site.task)
+        && side_chain_is_subtest_only(tasks, ancestor, second.site.task)
+        || side_chain_contains_cleanup(tasks, ancestor, second.site.task)
+            && side_chain_is_subtest_only(tasks, ancestor, first.site.task)
+    {
+        return Ok(Some(ConcurrencyOpenReason::UnsupportedSynchronization(
+            "subtest Cleanup order is unresolved for these test nodes".into(),
+        )));
+    }
+    Ok(None)
 }
 
 /// Points at which an access has completed, as observed by one synchronous
@@ -13917,6 +15778,44 @@ struct CompletionBarrier {
     invocation: InvocationId,
     points: HashSet<ProgramPointId>,
     reasons: Vec<ConcurrencyOpenReason>,
+    /// The conditional spawn this barrier completes, when the joined task
+    /// started only on one of the guard's established-true paths (issue
+    /// #3371). The join then orders an access only when every path that can
+    /// start the callback crosses it; a path that establishes the result
+    /// false starts nothing and needs no join.
+    conditional: Option<ConditionalJoinOrigin>,
+    /// The cleanup task whose subtree this barrier orders after the joined
+    /// task (issue #3383). `Some` only for a scoped subtest-cleanup join: a
+    /// parallel subtest completes before the cleanup body of its own test
+    /// node, but at no parent-body point, so the barrier applies only to
+    /// accesses inside the cleanup subtree and never by point dominance.
+    cleanup_scope: Option<TaskId>,
+}
+
+/// The established-true origin of one conditional join (issue #3371).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ConditionalJoinOrigin {
+    /// The activation that holds the spawn call and the guard.
+    invocation: InvocationId,
+    /// The conditional spawn's call point in that activation.
+    call: ProgramPointId,
+    /// Control edges of the guard's arms other than the proven true edges.
+    /// An execution that takes one of them started no callback.
+    false_edges: Vec<crate::analyzer::semantic::ControlEdgeId>,
+}
+
+/// How one completion barrier relates to the compared access.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BarrierOrdering {
+    /// Every path that can reach the access crosses this barrier.
+    Ordered,
+    /// This barrier is not between the two points on any path.
+    NotOrdered,
+    /// The barrier completes a conditional spawn, and the access sits in
+    /// another activation where the entry-based lift cannot express the
+    /// guard's established-true origin. The pair stays open instead of
+    /// reading as a race the contract does not establish.
+    ConditionalOpen,
 }
 
 impl CompletionBarrier {
@@ -13926,21 +15825,78 @@ impl CompletionBarrier {
         invocations: &Invocations,
         after: (InvocationId, ProgramPointId),
         request: &mut SolveRequest<'_, '_>,
-    ) -> Result<bool, ConcurrencyOpenReason> {
+    ) -> Result<BarrierOrdering, ConcurrencyOpenReason> {
+        if let Some(scope) = self.cleanup_scope {
+            // A scoped cleanup join orders the joined parallel subtest before
+            // the cleanup body of its own test node. The joined task runs
+            // after the parent body, so no parent-body point completes it;
+            // only accesses inside the cleanup subtree are ordered.
+            let mut current = Some(invocations.entries[after.0.0 as usize].context.task);
+            while let Some(task) = current {
+                charge_concurrency_work(request, 1)?;
+                if task == scope {
+                    return Ok(BarrierOrdering::Ordered);
+                }
+                current = tasks[task.0 as usize].parent;
+            }
+            return Ok(BarrierOrdering::NotOrdered);
+        }
         let task = invocations.entries[self.invocation.0 as usize].context.task;
         let Some((target, point)) =
             observation_in_task_bounded(tasks, invocations, task, after, request)?
         else {
-            return Ok(false);
+            return Ok(BarrierOrdering::NotOrdered);
         };
         charge_concurrency_work(request, self.points.len())?;
-        invocations.required_points_before(
+        let Some(conditional) = self.conditional.as_ref() else {
+            return Ok(
+                if invocations.required_points_before(
+                    self.invocation,
+                    self.points.clone(),
+                    target,
+                    point,
+                    request,
+                )? {
+                    BarrierOrdering::Ordered
+                } else {
+                    BarrierOrdering::NotOrdered
+                },
+            );
+        };
+        if target == self.invocation && conditional.invocation == self.invocation {
+            // The access, the guard's arms, and the join points are one
+            // activation's graph. A path that started the callback and
+            // reaches the access without entering a join point leaves the
+            // pair unordered; every other path either started no callback or
+            // crossed the join. The join point itself is not ordered, matching
+            // the unconditional barrier's convention.
+            if self.points.contains(&point) {
+                return Ok(BarrierOrdering::NotOrdered);
+            }
+            let join_points = self.points.iter().copied().collect::<Vec<_>>();
+            let reachable = reachable_avoiding(
+                &invocations.entries[target.0 as usize].context,
+                conditional.call,
+                &conditional.false_edges,
+                &join_points,
+                request,
+            )?;
+            return Ok(if reachable.contains(&point) {
+                BarrierOrdering::NotOrdered
+            } else {
+                BarrierOrdering::Ordered
+            });
+        }
+        if invocations.required_points_before(
             self.invocation,
             self.points.clone(),
             target,
             point,
             request,
-        )
+        )? {
+            return Ok(BarrierOrdering::Ordered);
+        }
+        Ok(BarrierOrdering::ConditionalOpen)
     }
 
     fn between_recurrences(
@@ -13950,6 +15906,11 @@ impl CompletionBarrier {
         point: ProgramPointId,
         request: &mut SolveRequest<'_, '_>,
     ) -> Result<bool, ConcurrencyOpenReason> {
+        if self.cleanup_scope.is_some() {
+            // A scoped cleanup join is a subtree relation, not a point
+            // dominance claim, so it never sits between recurrences.
+            return Ok(false);
+        }
         let context = &invocations.entries[invocation.0 as usize].context;
         assert!(point_is_cyclic(context, point, request)?);
         charge_concurrency_work(request, self.points.len())?;
@@ -13977,11 +15938,18 @@ fn completed_before_point(
 ) -> Result<ConcurrencyAnswer<bool>, ConcurrencyOpenReason> {
     let mut reasons = Vec::new();
     for barrier in barriers {
-        if barrier.before(tasks, invocations, after, request)? {
-            if barrier.reasons.is_empty() {
-                return Ok(ConcurrencyAnswer::Proven(true));
+        match barrier.before(tasks, invocations, after, request)? {
+            BarrierOrdering::Ordered => {
+                if barrier.reasons.is_empty() {
+                    return Ok(ConcurrencyAnswer::Proven(true));
+                }
+                reasons.extend(barrier.reasons.iter().cloned());
             }
-            reasons.extend(barrier.reasons.iter().cloned());
+            BarrierOrdering::ConditionalOpen => {
+                reasons.push(ConcurrencyOpenReason::AmbiguousSynchronization);
+                reasons.extend(barrier.reasons.iter().cloned());
+            }
+            BarrierOrdering::NotOrdered => {}
         }
     }
     Ok(if reasons.is_empty() {
@@ -14532,6 +16500,8 @@ fn channel_completion_barriers(
                         invocation: *invocation,
                         points,
                         reasons,
+                        conditional: None,
+                        cleanup_scope: None,
                     },
                     request,
                 )?;
@@ -14599,6 +16569,8 @@ fn channel_completion_barriers(
                     invocation,
                     points,
                     reasons,
+                    conditional: None,
+                    cleanup_scope: None,
                 },
                 request,
             )?;
@@ -14633,12 +16605,15 @@ fn extend_channel_completion_barriers(
             if request.cancellation.is_cancelled() {
                 return Err(ConcurrencyOpenReason::BudgetExhausted);
             }
-            if !before.before(
-                tasks,
-                invocations,
-                (sender.invocation, sender.point),
-                request,
-            )? {
+            if !matches!(
+                before.before(
+                    tasks,
+                    invocations,
+                    (sender.invocation, sender.point),
+                    request,
+                )?,
+                BarrierOrdering::Ordered
+            ) {
                 continue;
             }
 
@@ -14758,6 +16733,8 @@ fn extend_channel_completion_barriers(
                         invocation,
                         points,
                         reasons,
+                        conditional: None,
+                        cleanup_scope: None,
                     },
                     request,
                 )?;
@@ -15162,6 +17139,184 @@ fn joined_before_point(
     completed_before_point(tasks, invocations, &barriers, after, request)
 }
 
+/// Whether two subtest group subjects name one test node by exact canonical
+/// equality (issue #3383). Allocation-backed receivers match here; the
+/// common `*testing.T` parameter never resolves a canonical and matches by
+/// stable value identity instead.
+fn subtest_canonicals_match(
+    first: &ResolvedConcurrencySubject,
+    second: &ResolvedConcurrencySubject,
+) -> bool {
+    first.canonical.is_some()
+        && first.canonical == second.canonical
+        && first
+            .reasons
+            .iter()
+            .chain(&second.reasons)
+            .all(|reason| *reason == ConcurrencyOpenReason::UnknownLocation)
+}
+
+/// Whether a `Cleanup` effect joins one parallel subtest task (issue #3383).
+/// The effect's receiver must name the task's spawning receiver: one shared
+/// single-inflow root in the spawning procedure, or exact canonical equality.
+fn subtest_cleanup_effect_matches_task(
+    tasks: &[Task],
+    task: TaskId,
+    effect_procedure: &ProcedureHandle,
+    effect_group: &ResolvedConcurrencySubject,
+    request: &mut SolveRequest<'_, '_>,
+) -> Result<bool, ConcurrencyOpenReason> {
+    let Some(subtest) = tasks[task.0 as usize].subtest.as_ref() else {
+        return Ok(false);
+    };
+    if !matches!(
+        subtest.kind,
+        SubtestSpawnKind::Run(SubtestParallelism::Parallel)
+    ) {
+        return Ok(false);
+    }
+    if tasks[task.0 as usize].spawn_procedure.as_ref() == Some(effect_procedure) {
+        let task_root = subtest_receiver_root(effect_procedure, subtest.receiver, request)?;
+        let effect_root = subtest_receiver_root(effect_procedure, effect_group.value, request)?;
+        if task_root.is_some() && task_root == effect_root {
+            return Ok(true);
+        }
+    }
+    Ok(subtest_canonicals_match(&subtest.group, effect_group))
+}
+
+/// The cleanup tasks one `Cleanup` call spawned (issue #3383). One task per
+/// callback target shares the call point; a task whose receiver names
+/// another test node is excluded even at a shared point.
+fn cleanup_tasks_spawned_at(
+    tasks: &[Task],
+    invocation: InvocationId,
+    point: ProgramPointId,
+    effect_group: &ResolvedConcurrencySubject,
+    request: &mut SolveRequest<'_, '_>,
+) -> Result<Vec<TaskId>, ConcurrencyOpenReason> {
+    let mut found = Vec::new();
+    for (index, task) in tasks.iter().enumerate() {
+        charge_concurrency_work(request, 1)?;
+        if task.spawn_invocation != Some(invocation)
+            || !matches!(
+                task.subtest.as_ref().map(|spawn| &spawn.kind),
+                Some(SubtestSpawnKind::Cleanup)
+            )
+        {
+            continue;
+        }
+        let (Some(procedure), Some(call)) = (task.spawn_procedure.as_ref(), task.spawn_call) else {
+            continue;
+        };
+        let spawn_point = procedure
+            .semantics()
+            .call_site(call)
+            .expect("spawn belongs to its caller")
+            .point;
+        if spawn_point != point {
+            continue;
+        }
+        let subtest = task
+            .subtest
+            .as_ref()
+            .expect("cleanup task retains its spawn");
+        let task_root = subtest_receiver_root(procedure, subtest.receiver, request)?;
+        let effect_root = subtest_receiver_root(procedure, effect_group.value, request)?;
+        if task_root.is_some() && task_root == effect_root
+            || subtest_canonicals_match(&subtest.group, effect_group)
+        {
+            found.push(TaskId(u32::try_from(index).expect("task count fits u32")));
+        }
+    }
+    Ok(found)
+}
+
+/// The subtest joins completing one access (issue #3383): the per-call join
+/// of a sequential task, the sequential-`Run` spawn points above it through
+/// subtest edges only, and the scoped cleanup joins of a parallel task. A
+/// sequential `Run` joins its whole subtest-cleanup subtree, but never a
+/// detached child; a parallel task completes at no parent-body point, so its
+/// cleanup joins apply only inside the cleanup subtree.
+fn subtest_join_barriers(
+    tasks: &[Task],
+    child: &Access,
+    modeled: &HashMap<ContextKey, Vec<(ProgramPointId, ResolvedConcurrencyEffect)>>,
+    completion_reasons: &[ConcurrencyOpenReason],
+    request: &mut SolveRequest<'_, '_>,
+) -> Result<Vec<CompletionBarrier>, ConcurrencyOpenReason> {
+    let mut barriers = Vec::new();
+    let mut descendant = Some(child.site.task);
+    while let Some(current) = descendant {
+        charge_concurrency_work(request, 1)?;
+        let task = &tasks[current.0 as usize];
+        if matches!(
+            task.subtest.as_ref().map(|spawn| &spawn.kind),
+            Some(SubtestSpawnKind::Run(SubtestParallelism::Sequential))
+        ) && let (Some(procedure), Some(invocation), Some(call)) = (
+            task.spawn_procedure.as_ref(),
+            task.spawn_invocation,
+            task.spawn_call,
+        ) {
+            let point = procedure
+                .semantics()
+                .call_site(call)
+                .expect("spawn belongs to its caller")
+                .point;
+            barriers.push(CompletionBarrier {
+                invocation,
+                points: HashSet::from_iter([point]),
+                reasons: completion_reasons.to_vec(),
+                conditional: None,
+                cleanup_scope: None,
+            });
+        }
+        if task.subtest.is_none() {
+            break;
+        }
+        descendant = task.parent;
+    }
+    if !matches!(
+        tasks[child.site.task.0 as usize]
+            .subtest
+            .as_ref()
+            .map(|spawn| &spawn.kind),
+        Some(SubtestSpawnKind::Run(SubtestParallelism::Parallel))
+    ) {
+        return Ok(barriers);
+    }
+    for (context, effects) in modeled {
+        charge_concurrency_work(request, 1)?;
+        for (point, effect) in effects {
+            charge_concurrency_work(request, 1)?;
+            let ResolvedConcurrencyEffect::SubtestCleanup { group, .. } = effect else {
+                continue;
+            };
+            if !subtest_cleanup_effect_matches_task(
+                tasks,
+                child.site.task,
+                &context.procedure,
+                group,
+                request,
+            )? {
+                continue;
+            }
+            for scope in
+                cleanup_tasks_spawned_at(tasks, context.invocation, *point, group, request)?
+            {
+                barriers.push(CompletionBarrier {
+                    invocation: context.invocation,
+                    points: HashSet::from_iter([*point]),
+                    reasons: completion_reasons.to_vec(),
+                    conditional: None,
+                    cleanup_scope: Some(scope),
+                });
+            }
+        }
+    }
+    Ok(barriers)
+}
+
 fn join_completion_barriers(
     tasks: &[Task],
     invocations: &Invocations,
@@ -15173,19 +17328,50 @@ fn join_completion_barriers(
     let Some(parent) = task.parent else {
         return Ok(Vec::new());
     };
-    // A reviewed task join completes a whole spawned task; a reviewed Once
-    // completes only its own conditional callback. Each kind therefore joins
-    // against its own effect and never against the other.
-    let once_task = task.once.as_ref();
-    let Some(task_subject) = task.group.as_ref().or(once_task) else {
-        return Ok(Vec::new());
-    };
     let completion_reasons = match completion_orders_access(tasks, invocations, child, request)? {
         ConcurrencyAnswer::Proven(false) => return Ok(Vec::new()),
         ConcurrencyAnswer::Proven(true) => Vec::new(),
         ConcurrencyAnswer::Open { reasons, .. } => reasons,
     };
     let mut barriers = Vec::new();
+    barriers.extend(subtest_join_barriers(
+        tasks,
+        child,
+        modeled,
+        &completion_reasons,
+        request,
+    )?);
+    // A reviewed task join completes a whole spawned task; a reviewed Once
+    // completes only its own conditional callback. Each kind therefore joins
+    // against its own effect and never against the other. Subtest tasks carry
+    // no group precisely so this path skips them: their joins are per call.
+    let once_task = task.once.as_ref();
+    let Some(task_subject) = task.group.as_ref().or(once_task) else {
+        return Ok(barriers);
+    };
+    // A conditional spawn's join orders an access only on the paths that
+    // started the callback, so the barrier carries the spawn call and the
+    // guard's false arms. The call point is the spawn invocation's own point;
+    // a barrier in another activation keeps the ordinary lift and stays open
+    // when that lift cannot prove the ordering.
+    let conditional = task.conditional_spawn.as_ref().map(|conditional| {
+        let procedure = task
+            .spawn_procedure
+            .as_ref()
+            .expect("a conditional spawn retains its caller procedure");
+        let call = task
+            .spawn_call
+            .and_then(|call| procedure.semantics().call_site(call))
+            .expect("a conditional spawn retains its call site")
+            .point;
+        ConditionalJoinOrigin {
+            invocation: task
+                .spawn_invocation
+                .expect("a conditional spawn retains its caller invocation"),
+            call,
+            false_edges: conditional.false_edges.clone(),
+        }
+    });
     for (context, effects) in modeled {
         charge_concurrency_work(request, 1)?;
         // A completed Once publishes its callback to every later Do on the
@@ -15232,6 +17418,8 @@ fn join_completion_barriers(
                 invocation: context.invocation,
                 points: exact,
                 reasons: completion_reasons.clone(),
+                conditional: conditional.clone(),
+                cleanup_scope: None,
             });
         }
         let possible = joins
@@ -15258,6 +17446,8 @@ fn join_completion_barriers(
                 invocation: context.invocation,
                 points: possible,
                 reasons,
+                conditional: conditional.clone(),
+                cleanup_scope: None,
             });
         }
     }
@@ -15654,6 +17844,520 @@ fn cond_lock_bindings(
 /// task provably holds that locker at the call: without the association the
 /// release names no object, and without the held locker the source did not
 /// enter `Wait` through the documented protocol.
+/// The per-solve `sync.Map` entry inventory built from the bound modeled
+/// effects (issue #3370).
+///
+/// One entry names one (map canonical, key identity) pair. The entry
+/// serialization makes every executed write precede every later observing
+/// read, so the inventory pairs whole entries rather than individual
+/// store/load values. A `Clear` writes every entry of its map.
+#[derive(Default)]
+struct SyncMapPublications<'a> {
+    entries: Vec<SyncMapEntry<'a>>,
+}
+
+/// One entry's write and observation inventory.
+struct SyncMapEntry<'a> {
+    map: &'a CanonicalConcurrencyLocation,
+    key: Option<SyncMapKeyIdentity>,
+    /// Write-capable parts that may publish: the writing context, its call
+    /// point, and the bound outcome. A conditional write publishes only as
+    /// the entry's only write, because a competing write could be the one an
+    /// observation consumed while this write never ran.
+    writes: Vec<(&'a ContextKey, ProgramPointId, &'a ResolvedSyncMapOutcome)>,
+    /// Observing reads whose guard proved the true outcome, with the
+    /// observer's invocation and the control points where the observation
+    /// spans.
+    observers: Vec<(&'a ContextKey, HashSet<ProgramPointId>)>,
+    /// An observing read whose guard never established the outcome while the
+    /// entry also has a write: a real publication may hide behind it.
+    observation_unproven: bool,
+}
+
+/// The exact identity that names one `sync.Map` entry's key (issue #3370).
+///
+/// Two operations share an entry when their map subjects are one canonical
+/// object and their key identities are equal: equal structured string
+/// constants, or one canonical storage location for a computed key. A key
+/// that resolves neither stays unpaired and states the typed boundary
+/// instead of assuming equality.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum SyncMapKeyIdentity {
+    Constant(Box<str>),
+    Location(CanonicalConcurrencyLocation),
+}
+
+/// Follow one immutable key value to its exact constant payload through the
+/// invocation's actual arguments, mirroring the integer scalar tracer.
+fn invocation_sync_map_key(
+    invocations: &Invocations,
+    mut invocation: InvocationId,
+    mut value: ValueId,
+) -> Option<Box<str>> {
+    let mut visited = HashSet::default();
+    loop {
+        if !visited.insert((invocation, value)) {
+            return None;
+        }
+        let current = invocations.entries.get(invocation.0 as usize)?;
+        match crate::typestate::direct_scalar_source(current.context.procedure.semantics(), value)?
+        {
+            crate::typestate::DirectScalarSource::ConstantString(text) => return Some(text),
+            crate::typestate::DirectScalarSource::Port(SummaryPort::Parameter(ordinal)) => {
+                let (parent, call) = current.caller?;
+                let caller = invocations.entries.get(parent.0 as usize)?;
+                value = caller
+                    .context
+                    .procedure
+                    .semantics()
+                    .call_site(call)?
+                    .arguments
+                    .get(usize::try_from(ordinal).ok()?)?
+                    .value;
+                invocation = parent;
+            }
+            crate::typestate::DirectScalarSource::Port(
+                SummaryPort::Receiver
+                | SummaryPort::NormalReturn
+                | SummaryPort::IndexedNormalReturn(_)
+                | SummaryPort::ExceptionalReturn
+                | SummaryPort::Capture(_)
+                | SummaryPort::Heap(_),
+            )
+            | crate::typestate::DirectScalarSource::UnsignedInteger(_)
+            | crate::typestate::DirectScalarSource::IntegerOffset { .. } => return None,
+        }
+    }
+}
+
+/// The values a call result may be guarded through: the result itself and
+/// the immutable local bindings that received it. Go names a multi-result
+/// call (`v, ok := m.Load(k)`) with locals, so the branch decision tests the
+/// named binding rather than the result value, and one immutable copy step
+/// still proves the outcome.
+fn sync_map_guard_subjects(
+    semantics: &crate::analyzer::semantic::ProcedureSemantics,
+    result: ValueId,
+) -> Vec<ValueId> {
+    let mut subjects = vec![result];
+    let mut cursor = result;
+    for _ in 0..4 {
+        let mut successors = semantics
+            .points()
+            .iter()
+            .flat_map(|point| &point.events)
+            .filter_map(|event| match &event.effect {
+                SemanticEffect::Assignment { target, value } if *value == cursor => Some(*target),
+                SemanticEffect::ValueFlow {
+                    kind:
+                        crate::analyzer::semantic::ValueFlowKind::Local
+                        | crate::analyzer::semantic::ValueFlowKind::Parameter
+                        | crate::analyzer::semantic::ValueFlowKind::Receiver,
+                    source,
+                    target,
+                } if *source == cursor => Some(*target),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        successors.sort_unstable();
+        successors.dedup();
+        let [next] = successors.as_slice() else {
+            break;
+        };
+        let reassigned = semantics
+            .points()
+            .iter()
+            .flat_map(|point| &point.events)
+            .any(|event| {
+                matches!(
+                    event.effect,
+                    crate::analyzer::semantic::SemanticEffect::Assignment { target, .. }
+                        if target == *next
+                )
+            });
+        // The binding was created by that same assignment, so one matching
+        // assignment is the creation itself; a second would be a reassignment.
+        if reassigned && cursor != result {
+            break;
+        }
+        if reassigned && !subjects.contains(&cursor) {
+            break;
+        }
+        cursor = *next;
+        subjects.push(cursor);
+    }
+    subjects
+}
+
+/// Bind every `sync.Map` operation's documented outcomes against this
+/// procedure's guard facts, and resolve the entry's exact key identity
+/// (issue #3370).
+///
+/// A part left pending by the reviewed model becomes `OnResult` with the
+/// proven edges of every decision point that consumes the call result, or
+/// `Unestablished` when no structured guard ever does; an unestablished part
+/// neither publishes nor observes. The key constant follows immutable value
+/// chains into caller arguments exactly as the integer scalar tracer does.
+fn bind_sync_map_operations(
+    effects: Vec<(ProgramPointId, ResolvedConcurrencyEffect)>,
+    procedure: &ProcedureHandle,
+    call: &crate::analyzer::semantic::SemanticCallSite,
+    invocations: &Invocations,
+    invocation: InvocationId,
+) -> Vec<(ProgramPointId, ResolvedConcurrencyEffect)> {
+    let has_pending = effects.iter().any(|(_, effect)| match effect {
+        ResolvedConcurrencyEffect::SyncMap { write, observe, .. } => {
+            let pending = |outcome: &Option<ResolvedSyncMapOutcome>| {
+                matches!(
+                    outcome,
+                    Some(
+                        ResolvedSyncMapOutcome::PendingTrue { .. }
+                            | ResolvedSyncMapOutcome::PendingFalse { .. }
+                    )
+                )
+            };
+            pending(write) || pending(observe)
+        }
+        _ => false,
+    });
+    let key_constant = effects.iter().find_map(|(_, effect)| {
+        let ResolvedConcurrencyEffect::SyncMap { key, .. } = effect else {
+            return None;
+        };
+        let key = key.as_ref()?;
+        invocation_sync_map_key(invocations, invocation, key.value)
+    });
+    if !has_pending && key_constant.is_none() {
+        return effects;
+    }
+    let semantics = procedure.semantics();
+    let mut guards: HashMap<u32, Vec<(crate::analyzer::semantic::ControlEdgeId, bool)>> =
+        HashMap::default();
+    for effect in &effects {
+        let ResolvedConcurrencyEffect::SyncMap { operation, .. } = effect.1 else {
+            continue;
+        };
+        let Some(ordinal) = operation.guard_result_ordinal() else {
+            continue;
+        };
+        let Some(result) = call.normal_result(ordinal as usize) else {
+            continue;
+        };
+        let subjects = sync_map_guard_subjects(semantics, result);
+        for guard in semantics.guard_facts() {
+            if !guard
+                .subject
+                .is_some_and(|subject| subjects.contains(&subject))
+            {
+                continue;
+            }
+            let points = guards.entry(ordinal).or_default();
+            if let Some(edge) = guard.true_edge {
+                points.push((edge, true));
+            }
+            if let Some(edge) = guard.false_edge {
+                points.push((edge, false));
+            }
+        }
+    }
+    effects
+        .into_iter()
+        .map(|(point, effect)| {
+            let ResolvedConcurrencyEffect::SyncMap {
+                map,
+                key,
+                key_constant: existing_constant,
+                operation,
+                write,
+                observe,
+            } = effect
+            else {
+                return (point, effect);
+            };
+            let bind = |outcome: Option<ResolvedSyncMapOutcome>| {
+                outcome.map(|outcome| match outcome {
+                    ResolvedSyncMapOutcome::PendingTrue { result } => {
+                        bind_sync_map_outcome(&guards, result, true)
+                    }
+                    ResolvedSyncMapOutcome::PendingFalse { result } => {
+                        bind_sync_map_outcome(&guards, result, false)
+                    }
+                    other => other,
+                })
+            };
+            (
+                point,
+                ResolvedConcurrencyEffect::SyncMap {
+                    map,
+                    key,
+                    key_constant: existing_constant.or_else(|| key_constant.clone()),
+                    operation,
+                    write: bind(write),
+                    observe: bind(observe),
+                },
+            )
+        })
+        .collect()
+}
+
+/// Bind one pending outcome against the guards collected for its result.
+///
+/// A guard's edge of the proven polarity establishes the outcome along that
+/// edge; the decision points of separate guards for the same result stand as
+/// alternative observation points.
+fn bind_sync_map_outcome(
+    guards: &HashMap<u32, Vec<(crate::analyzer::semantic::ControlEdgeId, bool)>>,
+    result: u32,
+    want_true: bool,
+) -> ResolvedSyncMapOutcome {
+    let mut edges = Vec::new();
+    for (edge, is_true) in guards.get(&result).into_iter().flatten() {
+        if *is_true == want_true {
+            edges.push(*edge);
+        }
+    }
+    if edges.is_empty() {
+        ResolvedSyncMapOutcome::Unestablished
+    } else {
+        ResolvedSyncMapOutcome::OnResult { want_true, edges }
+    }
+}
+
+impl<'a> SyncMapPublications<'a> {
+    /// Index every bound `sync.Map` operation in the solve.
+    fn build(
+        modeled: &'a HashMap<ContextKey, Vec<(ProgramPointId, ResolvedConcurrencyEffect)>>,
+        request: &mut SolveRequest<'_, '_>,
+    ) -> Result<SyncMapPublications<'a>, ConcurrencyOpenReason> {
+        // Group rows by entry first, so a `Clear` can distribute its write to
+        // every entry of its map regardless of row order.
+        struct PendingRow<'a> {
+            context: &'a ContextKey,
+            point: ProgramPointId,
+            map: &'a CanonicalConcurrencyLocation,
+            key: Option<SyncMapKeyIdentity>,
+            operation: ConcurrencySyncMapOperation,
+            write: Option<&'a ResolvedSyncMapOutcome>,
+            observe: Option<&'a ResolvedSyncMapOutcome>,
+        }
+        let mut rows: Vec<PendingRow<'a>> = Vec::new();
+        for (context, effects) in modeled {
+            for (point, effect) in effects {
+                let ResolvedConcurrencyEffect::SyncMap {
+                    map,
+                    key,
+                    key_constant,
+                    operation,
+                    write,
+                    observe,
+                } = effect
+                else {
+                    continue;
+                };
+                let Some(map_canonical) = map.canonical.as_ref() else {
+                    continue;
+                };
+                let key = key_constant
+                    .as_ref()
+                    .map(|payload| SyncMapKeyIdentity::Constant(payload.clone()))
+                    .or_else(|| {
+                        key.as_ref()
+                            .and_then(|key| key.canonical.as_ref())
+                            .map(|canonical| SyncMapKeyIdentity::Location(canonical.clone()))
+                    });
+                charge_concurrency_work(request, 1)?;
+                rows.push(PendingRow {
+                    context,
+                    point: *point,
+                    map: map_canonical,
+                    key,
+                    operation: *operation,
+                    write: write.as_ref(),
+                    observe: observe.as_ref(),
+                });
+            }
+        }
+        let mut entries: Vec<SyncMapEntry<'a>> = Vec::new();
+        for row in &rows {
+            let Some(key) = row.key.as_ref() else {
+                continue;
+            };
+            if entries
+                .iter()
+                .any(|entry| entry.map == row.map && entry.key.as_ref() == Some(key))
+            {
+                continue;
+            }
+            entries.push(SyncMapEntry {
+                map: row.map,
+                key: Some(key.clone()),
+                writes: Vec::new(),
+                observers: Vec::new(),
+                observation_unproven: false,
+            });
+        }
+        for row in &rows {
+            if row.operation == ConcurrencySyncMapOperation::Clear {
+                // A Clear writes every entry of its map.
+                let Some(outcome) = row.write else {
+                    continue;
+                };
+                for entry in entries.iter_mut().filter(|entry| entry.map == row.map) {
+                    entry.writes.push((row.context, row.point, outcome));
+                }
+                continue;
+            }
+            let Some(entry) = entries
+                .iter_mut()
+                .find(|entry| entry.map == row.map && entry.key.as_ref() == row.key.as_ref())
+            else {
+                continue;
+            };
+            if let Some(
+                outcome @ (ResolvedSyncMapOutcome::Unconditional
+                | ResolvedSyncMapOutcome::OnResult { .. }),
+            ) = row.write
+            {
+                entry.writes.push((row.context, row.point, outcome));
+            }
+            match row.observe {
+                Some(ResolvedSyncMapOutcome::OnResult {
+                    want_true: true,
+                    edges,
+                }) if !edges.is_empty() => {
+                    let control = row.context.procedure.semantics().cfg();
+                    let mut points = HashSet::default();
+                    for edge in edges {
+                        let Some(target) = control
+                            .edges()
+                            .get(edge.index())
+                            .map(|edge| edge.target_point)
+                        else {
+                            continue;
+                        };
+                        points.insert(target);
+                    }
+                    charge_concurrency_work(request, points.len() + 1)?;
+                    if !points.is_empty() {
+                        entry.observers.push((row.context, points));
+                    }
+                }
+                Some(ResolvedSyncMapOutcome::Unestablished) => {
+                    entry.observation_unproven = true;
+                }
+                _ => {}
+            }
+        }
+        // A conditional write publishes only as the entry's only write: any
+        // competing write could be the one the observation consumed.
+        for entry in &mut entries {
+            if entry.writes.len() > 1 {
+                entry.writes.retain(|(_, _, outcome)| {
+                    matches!(outcome, ResolvedSyncMapOutcome::Unconditional)
+                });
+            }
+        }
+        Ok(SyncMapPublications { entries })
+    }
+}
+
+/// Whether an access is ordered after an entry write by the entry's
+/// documented publication: a write the access mandatorily precedes published
+/// to an observing read whose observation points are mandatory before the
+/// access.
+fn map_published_before_point(
+    tasks: &[Task],
+    invocations: &Invocations,
+    before: &Access,
+    after: (InvocationId, ProgramPointId),
+    publications: &SyncMapPublications<'_>,
+    request: &mut SolveRequest<'_, '_>,
+) -> Result<ConcurrencyAnswer<bool>, ConcurrencyOpenReason> {
+    let mut barriers = Vec::new();
+    for entry in &publications.entries {
+        for (context, point, outcome) in &entry.writes {
+            if matches!(outcome, ResolvedSyncMapOutcome::Unestablished) {
+                continue;
+            }
+            if context.task != before.site.task
+                || context.procedure != before.site.procedure
+                || (*point != before.site.point
+                    && !all_exit_paths_cross_points(
+                        &before.site.procedure,
+                        before.site.point,
+                        &HashSet::from_iter([*point]),
+                        request,
+                    )?)
+            {
+                continue;
+            }
+            for (observer, points) in &entry.observers {
+                charge_concurrency_work(request, points.len() + 1)?;
+                barriers.push(CompletionBarrier {
+                    invocation: observer.invocation,
+                    points: points.clone(),
+                    reasons: Vec::new(),
+                    conditional: None,
+                    cleanup_scope: None,
+                });
+            }
+        }
+    }
+    if barriers.is_empty() {
+        return Ok(ConcurrencyAnswer::Proven(false));
+    }
+    completed_before_point(tasks, invocations, &barriers, after, request)
+}
+
+/// State every `sync.Map` pairing boundary the bound operations leave open.
+fn report_sync_map_boundaries(
+    modeled: &HashMap<ContextKey, Vec<(ProgramPointId, ResolvedConcurrencyEffect)>>,
+    report: &mut ConcurrentAccessReport,
+) {
+    let mut stated = Vec::new();
+    for (context, effects) in modeled {
+        for (_, effect) in effects {
+            let ResolvedConcurrencyEffect::SyncMap {
+                key,
+                key_constant,
+                operation,
+                observe,
+                ..
+            } = effect
+            else {
+                continue;
+            };
+            let _ = context;
+            let boundary = if *operation == ConcurrencySyncMapOperation::Range {
+                Some("sync.Map.range-values-unresolved")
+            } else if key_constant.is_none()
+                && key
+                    .as_ref()
+                    .and_then(|key| key.canonical.as_ref())
+                    .is_none()
+            {
+                Some("sync.Map.key-unresolved")
+            } else if matches!(observe, Some(ResolvedSyncMapOutcome::Unestablished)) {
+                Some("sync.Map.observation-unproven")
+            } else {
+                None
+            };
+            if let Some(boundary) = boundary {
+                stated.push(boundary);
+            }
+        }
+    }
+    stated.sort_unstable();
+    stated.dedup();
+    for boundary in stated {
+        report
+            .reasons
+            .push(ConcurrencyOpenReason::UnsupportedSynchronization(
+                boundary.into(),
+            ));
+    }
+}
+
 fn report_cond_wait_boundaries(
     classes: &mut SynchronizationSubjectClasses,
     bindings: &CondLockBindings,
@@ -15908,6 +18612,67 @@ fn points_strictly_before_call(
         }
         Err(reason) => Err(reason),
     }
+}
+
+/// Points reachable from `origin` without taking a blocked control edge or
+/// entering a blocked point (issue #3371).
+///
+/// A conditional spawn asks this with its guard's false arms blocked: the
+/// answer is exactly the set of program points where the callback may be
+/// running. Its conditional join asks it again with those arms and the join
+/// points blocked together: reaching the compared access then means no join
+/// completed on any path that started the callback. Blocking the arms by edge
+/// rather than by target keeps a false arm and a true arm that rejoin at one
+/// block distinct.
+fn reachable_avoiding(
+    scope: &impl ControlScope,
+    origin: ProgramPointId,
+    blocked_edges: &[crate::analyzer::semantic::ControlEdgeId],
+    blocked_points: &[ProgramPointId],
+    request: &mut SolveRequest<'_, '_>,
+) -> Result<std::rc::Rc<HashSet<ProgramPointId>>, ConcurrencyOpenReason> {
+    use crate::analyzer::semantic::cfg_algorithms::DenseBidirectionalGraph;
+
+    let mut blocked_edges = blocked_edges.to_vec();
+    blocked_edges.sort_unstable();
+    blocked_edges.dedup();
+    let mut blocked_points = blocked_points.to_vec();
+    blocked_points.sort_unstable();
+    blocked_points.dedup();
+    let key = RootedAvoidingQuery {
+        origin,
+        blocked_edges,
+        blocked_points,
+    };
+    if let Some(reachable) = request.control_queries(scope)?.rooted_avoiding.get(&key) {
+        return Ok(reachable.clone());
+    }
+    let blocked_points = key.blocked_points.iter().copied().collect::<HashSet<_>>();
+    let reachable = with_concurrency_graph!(request, scope, |graph| {
+        // The origin is reachable by the zero-length path; every caller that
+        // needs a positive-length relation tests its target separately.
+        let mut queue = VecDeque::from([origin]);
+        let mut visited = HashSet::from_iter([origin]);
+        while let Some(point) = queue.pop_front() {
+            charge_concurrency_work(request, 1)?;
+            for (edge, successor) in graph.successors(point) {
+                charge_concurrency_work(request, 1)?;
+                if key.blocked_edges.contains(&edge) || blocked_points.contains(&successor) {
+                    continue;
+                }
+                if visited.insert(successor) {
+                    queue.push_back(successor);
+                }
+            }
+        }
+        Ok(std::rc::Rc::new(visited))
+    })?;
+    charge_concurrency_work(request, reachable.len() + 1)?;
+    request
+        .control_queries(scope)?
+        .rooted_avoiding
+        .insert(key, reachable.clone());
+    Ok(reachable)
 }
 
 fn point_reaches(
@@ -16285,6 +19050,11 @@ mod tests {
             group: None,
             once: None,
             once_context: None,
+            conditional_spawn: None,
+            timer: None,
+            timer_context: None,
+            timer_cancellation: None,
+            subtest: None,
             completion: None,
             repetition: None,
             repetitions_serialized: false,
@@ -16374,6 +19144,8 @@ mod tests {
                 invocation: context.invocation,
                 points: [receive_a].into_iter().collect(),
                 reasons: Vec::new(),
+                conditional: None,
+                cleanup_scope: None,
             }]
         };
 
@@ -18363,6 +21135,11 @@ func root() {
                 group: None,
                 once: None,
                 once_context: None,
+                conditional_spawn: None,
+                timer: None,
+                timer_context: None,
+                timer_cancellation: None,
+                subtest: None,
                 completion: None,
                 repetition: None,
                 repetitions_serialized: false,
@@ -18545,6 +21322,7 @@ func root() {
                 &[],
                 &cells,
                 &reference_allocations,
+                &[],
                 &[],
                 &HashMap::default(),
                 &HashSet::default(),

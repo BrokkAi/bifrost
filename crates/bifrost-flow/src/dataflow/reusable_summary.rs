@@ -32,7 +32,7 @@ use super::{PathQuality, PathQualityFrontier, SummaryCallCycle, UnmodeledCallBeh
 /// contract. Embedded procedure summaries remain
 /// `PROCEDURE_SUMMARY_CONTRACT_VERSION` 1; this revision invalidates only
 /// carriers whose keys embed this module's internal summary schema.
-pub const SUMMARY_SCHEMA_VERSION: u32 = 6;
+pub const SUMMARY_SCHEMA_VERSION: u32 = 9;
 pub const MAX_SUMMARY_TRANSFERS: usize =
     crate::analyzer::semantic_model::MAX_PROCEDURE_SUMMARY_TRANSFERS;
 pub const MAX_SUMMARY_EFFECTS: usize =
@@ -1512,6 +1512,25 @@ pub struct SummaryConcurrencyTaskGroup {
     pub identity: SummaryConcurrencySubjectIdentity,
 }
 
+/// The spawn shape one modeled task-spawn event carries through a summary
+/// boundary (issue #3371).
+///
+/// `Unconditional` starts the callable on every path that reaches the call's
+/// continuation (`errgroup.Group.Go`, `sync.WaitGroup.Go`,
+/// `time.AfterFunc`). `CallResultTrue` is the conditional-spawn contract
+/// (`errgroup.Group.TryGo`): the call starts the callable exactly when its
+/// boolean result reports that it did, so a consumer must bind the spawn to
+/// structured branch facts about that result and keep the paths that
+/// establish it false free of the spawned task. The condition belongs to the
+/// modeled call whose event carries it; summary composition keeps it attached
+/// to the boundary result that the exact return transfer identifies with that
+/// call's result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SummaryTaskSpawnCondition {
+    Unconditional,
+    CallResultTrue,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SummaryConcurrencyEffectKind {
     Unsupported {
@@ -1533,6 +1552,12 @@ pub enum SummaryConcurrencyEffectKind {
         callable: SummaryConcurrencyCallable,
         target_coverage: SummaryConcurrencyTargetCoverage,
         group: Option<SummaryConcurrencyTaskGroup>,
+        condition: SummaryTaskSpawnCondition,
+        /// The timer object the spawn call returns, when the spawned
+        /// callback belongs to a cancellable timer (`time.AfterFunc`). A
+        /// later `TimerStop` or `TimerReset` on the same object binds against
+        /// this boundary port.
+        timer: Option<SummaryConcurrencyAccessPath>,
     },
     TaskJoin {
         group: SummaryConcurrencyTaskGroup,
@@ -1552,6 +1577,38 @@ pub enum SummaryConcurrencyEffectKind {
         identity: SummaryConcurrencySubjectIdentity,
         callable: SummaryConcurrencyCallable,
         target_coverage: SummaryConcurrencyTargetCoverage,
+    },
+    /// One `testing.T.Run`: `callable` runs as one subtest task of the
+    /// parent test node named by `group` (issue #3383).
+    ///
+    /// The event that carries this effect is both the subtest spawn and the
+    /// same-call conditional join, so a consumer must not replay it as an
+    /// unconditional spawn or as a generic group join. The consumer
+    /// classifies the resolved callback itself and joins the task at the
+    /// call exactly when no execution of the callback calls `Parallel` on
+    /// its own parameter; the classification never crosses the summary
+    /// boundary as a frozen fact.
+    SubtestRun {
+        callable: SummaryConcurrencyCallable,
+        target_coverage: SummaryConcurrencyTargetCoverage,
+        group: SummaryConcurrencyTaskGroup,
+    },
+    /// One `testing.T.Parallel` marking `receiver` (issue #3383). The event
+    /// carries classification evidence for the enclosing `Run` callback; it
+    /// creates no task and orders nothing by itself.
+    SubtestParallel {
+        receiver: SummaryConcurrencyAccessPath,
+        identity: SummaryConcurrencySubjectIdentity,
+    },
+    /// One `testing.T.Cleanup`: `callable` runs as one deferred task after
+    /// the test node named by `group` and all its subtests complete (issue
+    /// #3383). The event that carries this effect is both the cleanup spawn
+    /// and the scoped subtree join before the cleanup body, so a consumer
+    /// must not replay it as an unconditional spawn or as a generic join.
+    SubtestCleanup {
+        callable: SummaryConcurrencyCallable,
+        target_coverage: SummaryConcurrencyTargetCoverage,
+        group: SummaryConcurrencyTaskGroup,
     },
     /// Complete reviewed-model effect inventory for one source call. Effects
     /// sharing this event may replace live model lookup only when their count
@@ -1621,6 +1678,46 @@ pub enum SummaryConcurrencyEffectKind {
         condition: SummaryConcurrencyAccessPath,
         waiters: SummaryConcurrencyCondWaiters,
     },
+    /// One `sync.Map` entry operation on the (map, key) entry named by the
+    /// exact boundary ports. The kind carries the reviewed classification;
+    /// the solver binds observation and guard structure.
+    SyncMap {
+        map: SummaryConcurrencyAccessPath,
+        identity: SummaryConcurrencySubjectIdentity,
+        /// The key port naming the entry; `Clear` names none.
+        key: Option<SummaryConcurrencyAccessPath>,
+        operation: SummaryConcurrencySyncMapOperation,
+    },
+    /// One `(*time.Timer).Stop`: when the call's boolean result is
+    /// established true, the `time.AfterFunc` callback for `timer` did not
+    /// and will not run. The solver binds the guard structure; the
+    /// cancellation contract itself is intrinsic to the kind.
+    TimerStop {
+        timer: SummaryConcurrencyAccessPath,
+        identity: SummaryConcurrencySubjectIdentity,
+    },
+    /// One `(*time.Timer).Reset`, which re-arms `timer` and voids the
+    /// `TimerStop` cancellation downstream of it.
+    TimerReset {
+        timer: SummaryConcurrencyAccessPath,
+        identity: SummaryConcurrencySubjectIdentity,
+    },
+}
+
+/// The documented entry-level classification of one `sync.Map` operation
+/// (issue #3370).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SummaryConcurrencySyncMapOperation {
+    Store,
+    Delete,
+    Clear,
+    Load,
+    Range,
+    LoadOrStore,
+    LoadAndDelete,
+    Swap,
+    CompareAndSwap,
+    CompareAndDelete,
 }
 
 /// How many suspended waiters one notification can resume.
@@ -3279,6 +3376,8 @@ fn substitute_concurrency_effect_kind(
             callable,
             target_coverage,
             group,
+            condition,
+            timer,
         } => SummaryConcurrencyEffectKind::TaskSpawn {
             callable: match callable {
                 SummaryConcurrencyCallable::Boundary(boundary) => {
@@ -3289,6 +3388,7 @@ fn substitute_concurrency_effect_kind(
                 }
             },
             target_coverage: *target_coverage,
+            condition: *condition,
             group: group
                 .as_ref()
                 .map(|group| {
@@ -3298,6 +3398,7 @@ fn substitute_concurrency_effect_kind(
                     })
                 })
                 .transpose()?,
+            timer: timer.as_ref().map(path).transpose()?,
         },
         SummaryConcurrencyEffectKind::TaskJoin { group } => {
             SummaryConcurrencyEffectKind::TaskJoin {
@@ -3324,6 +3425,50 @@ fn substitute_concurrency_effect_kind(
                 }
             },
             target_coverage: *target_coverage,
+        },
+        SummaryConcurrencyEffectKind::SubtestRun {
+            callable,
+            target_coverage,
+            group,
+        } => SummaryConcurrencyEffectKind::SubtestRun {
+            callable: match callable {
+                SummaryConcurrencyCallable::Boundary(boundary) => {
+                    SummaryConcurrencyCallable::Boundary(port(boundary)?)
+                }
+                SummaryConcurrencyCallable::SourceArgument(ordinal) => {
+                    SummaryConcurrencyCallable::SourceArgument(*ordinal)
+                }
+            },
+            target_coverage: *target_coverage,
+            group: SummaryConcurrencyTaskGroup {
+                location: path(&group.location)?,
+                identity: group.identity,
+            },
+        },
+        SummaryConcurrencyEffectKind::SubtestParallel { receiver, identity } => {
+            SummaryConcurrencyEffectKind::SubtestParallel {
+                receiver: path(receiver)?,
+                identity: *identity,
+            }
+        }
+        SummaryConcurrencyEffectKind::SubtestCleanup {
+            callable,
+            target_coverage,
+            group,
+        } => SummaryConcurrencyEffectKind::SubtestCleanup {
+            callable: match callable {
+                SummaryConcurrencyCallable::Boundary(boundary) => {
+                    SummaryConcurrencyCallable::Boundary(port(boundary)?)
+                }
+                SummaryConcurrencyCallable::SourceArgument(ordinal) => {
+                    SummaryConcurrencyCallable::SourceArgument(*ordinal)
+                }
+            },
+            target_coverage: *target_coverage,
+            group: SummaryConcurrencyTaskGroup {
+                location: path(&group.location)?,
+                identity: group.identity,
+            },
         },
         SummaryConcurrencyEffectKind::ModeledCall { effect_count } => {
             SummaryConcurrencyEffectKind::ModeledCall {
@@ -3420,6 +3565,29 @@ fn substitute_concurrency_effect_kind(
             SummaryConcurrencyEffectKind::CondNotify {
                 condition: path(condition)?,
                 waiters: *waiters,
+            }
+        }
+        SummaryConcurrencyEffectKind::SyncMap {
+            map,
+            identity,
+            key,
+            operation,
+        } => SummaryConcurrencyEffectKind::SyncMap {
+            map: path(map)?,
+            identity: *identity,
+            key: key.as_ref().map(path).transpose()?,
+            operation: *operation,
+        },
+        SummaryConcurrencyEffectKind::TimerStop { timer, identity } => {
+            SummaryConcurrencyEffectKind::TimerStop {
+                timer: path(timer)?,
+                identity: *identity,
+            }
+        }
+        SummaryConcurrencyEffectKind::TimerReset { timer, identity } => {
+            SummaryConcurrencyEffectKind::TimerReset {
+                timer: path(timer)?,
+                identity: *identity,
             }
         }
     })
@@ -5032,11 +5200,15 @@ fn concurrency_effect_heap_bytes(effect: &SummaryConcurrencyEffect) -> usize {
         SummaryConcurrencyEffectKind::Alias { source, target } => {
             path_bytes(source).saturating_add(path_bytes(target))
         }
-        SummaryConcurrencyEffectKind::TaskSpawn { group, .. } => group
+        SummaryConcurrencyEffectKind::TaskSpawn { group, timer, .. } => group
             .as_ref()
-            .map_or(0, |group| path_bytes(&group.location)),
+            .map_or(0, |group| path_bytes(&group.location))
+            .saturating_add(timer.as_ref().map_or(0, path_bytes)),
         SummaryConcurrencyEffectKind::TaskJoin { group } => path_bytes(&group.location),
         SummaryConcurrencyEffectKind::OnceDo { once, .. } => path_bytes(once),
+        SummaryConcurrencyEffectKind::SubtestRun { group, .. }
+        | SummaryConcurrencyEffectKind::SubtestCleanup { group, .. } => path_bytes(&group.location),
+        SummaryConcurrencyEffectKind::SubtestParallel { receiver, .. } => path_bytes(receiver),
         SummaryConcurrencyEffectKind::WaitGroupAdd { group, .. }
         | SummaryConcurrencyEffectKind::WaitGroupDone { group, .. }
         | SummaryConcurrencyEffectKind::WaitGroupWait { group, .. } => path_bytes(group),
@@ -5056,6 +5228,11 @@ fn concurrency_effect_heap_bytes(effect: &SummaryConcurrencyEffect) -> usize {
         }
         SummaryConcurrencyEffectKind::CondWait { condition } => path_bytes(condition),
         SummaryConcurrencyEffectKind::CondNotify { condition, .. } => path_bytes(condition),
+        SummaryConcurrencyEffectKind::SyncMap { map, key, .. } => {
+            path_bytes(map).saturating_add(key.as_ref().map_or(0, path_bytes))
+        }
+        SummaryConcurrencyEffectKind::TimerStop { timer, .. }
+        | SummaryConcurrencyEffectKind::TimerReset { timer, .. } => path_bytes(timer),
     }
 }
 

@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "id": "bifrost.security",
   "version": "1.1.0",
   "name": "Bifrost security",
@@ -8,7 +8,8 @@
     {
       "path": "policies/jvm/servlet-parameter-to-jdbc.rqlp",
       "id": "bifrost.security.java.servlet-parameter-to-jdbc",
-      "semantic_hash": "b88225d8df37ba00381431577a1f54fc18d43c981ed9bc44f02124279e255c21",
+      "authored_hash": "b88225d8df37ba00381431577a1f54fc18d43c981ed9bc44f02124279e255c21",
+      "resolved_semantic_hash": "b88225d8df37ba00381431577a1f54fc18d43c981ed9bc44f02124279e255c21",
       "category": "security",
       "supported_languages": [
         "java"
@@ -26,7 +27,8 @@
     {
       "path": "policies/jvm/system-getenv-to-runtime-exec.rqlp",
       "id": "bifrost.security.java.system-getenv-to-runtime-exec",
-      "semantic_hash": "e6124423292a84eb827aafd80379d40c788b9759fad5eab9ed046b4a9eeb234e",
+      "authored_hash": "e6124423292a84eb827aafd80379d40c788b9759fad5eab9ed046b4a9eeb234e",
+      "resolved_semantic_hash": "e6124423292a84eb827aafd80379d40c788b9759fad5eab9ed046b4a9eeb234e",
       "category": "security",
       "supported_languages": [
         "java"

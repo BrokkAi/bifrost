@@ -2615,7 +2615,9 @@ fn seed_procedure(
     }
     for value in semantics.values() {
         match &value.kind {
-            SemanticValueKind::Constant | SemanticValueKind::Boolean(_) => {
+            SemanticValueKind::Constant
+            | SemanticValueKind::ConstantString(_)
+            | SemanticValueKind::Boolean(_) => {
                 let span = mapping_span(procedure, value.source);
                 for atom in adapter
                     .constant_class(workspace, procedure, value)

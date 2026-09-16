@@ -274,11 +274,15 @@ lang_epoch!(
 // structural facts, so every blob parsed before the repair holds a different
 // reading of the same bytes. The grammar itself is unchanged, which is why the
 // fingerprint cannot carry this and the salt must.
+// Salt bumped again (#3370): string literals now lower to the structured
+// `ConstantString` value kind with their exact source text instead of the
+// payload-free `Constant`. Warm semantic rows hold the old kind, and the race
+// solver's exact map-key pairing must not silently misread them.
 lang_epoch!(
     Go,
     "go",
     "treesitter/go/",
-    "go-canonical-import-path-fqn-2026-06;synthetic-file-scope-code-units-2026-07;raw-package-qualifier-2026-07;fq-interned-segments-2026-07;return-expression-list-value-identity-2026-07;go-query-assets-in-brokk-bifrost-go-2026-08;named-type-underlying-identity-2026-08;empty-interface-map-key-identity-2026-09;go-1-26-new-expression-parse-2026-09"
+    "go-canonical-import-path-fqn-2026-06;synthetic-file-scope-code-units-2026-07;raw-package-qualifier-2026-07;fq-interned-segments-2026-07;return-expression-list-value-identity-2026-07;go-query-assets-in-brokk-bifrost-go-2026-08;named-type-underlying-identity-2026-08;empty-interface-map-key-identity-2026-09;go-1-26-new-expression-parse-2026-09;go-constant-string-values-2026-09"
 );
 // Salt bumped: out-of-line member definitions whose owner class is named with
 // no namespace segment of its own (`Class::method` under an in-effect `using

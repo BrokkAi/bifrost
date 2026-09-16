@@ -18,6 +18,34 @@ use brokk_bifrost_rql::{
 use super::definition::*;
 use super::source::{PolicySourceDiagnostic, PolicySourceDiagnosticSeverity, PolicySourceError};
 
+/// How the loaded-policy boundary treats qualified call and receiver locators.
+///
+/// A host that already holds a pinned analyzer snapshot resolves immediately.
+/// The analyzer-free authoring boundary requires an analyzer, because an
+/// unresolved qualified locator there is an authoring error. The built-in
+/// catalog boundary defers: the qualified name stays in the loaded plan and a
+/// host resolves it once, after workspace activation, against the active
+/// immutable semantic-model snapshot.
+#[derive(Clone, Copy)]
+pub(crate) enum LocatorResolution<'a> {
+    Analyzer(&'a dyn IAnalyzer),
+    Required,
+    Deferred,
+}
+
+impl<'a> LocatorResolution<'a> {
+    pub(crate) const fn analyzer(self) -> Option<&'a dyn IAnalyzer> {
+        match self {
+            Self::Analyzer(analyzer) => Some(analyzer),
+            Self::Required | Self::Deferred => None,
+        }
+    }
+
+    pub(crate) const fn is_deferred(self) -> bool {
+        matches!(self, Self::Deferred)
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 enum LocatorRole {
     Callable,
@@ -25,6 +53,8 @@ enum LocatorRole {
 }
 
 impl LocatorRole {
+    const ALL: [Self; 2] = [Self::Callable, Self::ReceiverType];
+
     const fn public(self) -> ResolvedPolicyLocatorRole {
         match self {
             Self::Callable => ResolvedPolicyLocatorRole::Callable,
@@ -50,6 +80,14 @@ enum LocatorFailure {
 }
 
 impl LocatorFailure {
+    const ALL: [Self; 5] = [
+        Self::Zero,
+        Self::Ambiguous,
+        Self::Partial,
+        Self::InactiveModel,
+        Self::Incomplete,
+    ];
+
     const fn code(self, role: LocatorRole) -> &'static str {
         match (role, self) {
             (LocatorRole::Callable, Self::Zero) => "qualified-call-locator-zero",
@@ -119,34 +157,34 @@ impl ResolvedLocatorIdentity {
 /// Resolve every qualified locator reachable from one policy definition.
 pub(super) fn resolve_policy_definition_locators(
     definition: &mut PolicyDefinition,
-    analyzer: Option<&dyn IAnalyzer>,
+    locators: LocatorResolution<'_>,
 ) -> Result<(), PolicySourceError> {
     match &mut definition.analysis {
-        PolicyAnalysis::Match { spec } => resolve_selector_locators(&mut spec.selector, analyzer),
+        PolicyAnalysis::Match { spec } => resolve_selector_locators(&mut spec.selector, locators),
         PolicyAnalysis::Assertion { spec } => {
             if let Some(plan) = &mut spec.relational {
-                resolve_relational_assertion_plan(plan, analyzer)
+                resolve_relational_assertion_plan(plan, locators)
             } else {
-                resolve_selector_locators(&mut spec.subject, analyzer)
+                resolve_selector_locators(&mut spec.subject, locators)
             }
         }
         PolicyAnalysis::Taint { spec } | PolicyAnalysis::Flow { spec } => {
-            resolve_taint_set(&mut spec.sources, analyzer)?;
-            resolve_taint_set(&mut spec.sinks, analyzer)?;
-            resolve_taint_set(&mut spec.sanitizers, analyzer)?;
-            resolve_taint_set(&mut spec.entry_points, analyzer)?;
-            resolve_taint_set(&mut spec.transforms, analyzer)?;
-            resolve_taint_set(&mut spec.external_models, analyzer)?;
-            resolve_taint_entries(&mut spec.store_writes, analyzer)?;
-            resolve_taint_entries(&mut spec.store_reads, analyzer)
+            resolve_taint_set(&mut spec.sources, locators)?;
+            resolve_taint_set(&mut spec.sinks, locators)?;
+            resolve_taint_set(&mut spec.sanitizers, locators)?;
+            resolve_taint_set(&mut spec.entry_points, locators)?;
+            resolve_taint_set(&mut spec.transforms, locators)?;
+            resolve_taint_set(&mut spec.external_models, locators)?;
+            resolve_taint_entries(&mut spec.store_writes, locators)?;
+            resolve_taint_entries(&mut spec.store_reads, locators)
         }
         PolicyAnalysis::Typestate { spec } => {
             for subject in &mut spec.subjects.entries {
-                resolve_selector_locators(&mut subject.selector, analyzer)?;
+                resolve_selector_locators(&mut subject.selector, locators)?;
             }
             for event in &mut spec.automaton.events {
                 if let TypestateEventTrigger::Calls { selector, .. } = &mut event.trigger {
-                    resolve_selector_locators(selector, analyzer)?;
+                    resolve_selector_locators(selector, locators)?;
                 }
             }
             Ok(())
@@ -156,23 +194,23 @@ pub(super) fn resolve_policy_definition_locators(
 
 fn resolve_taint_set<T>(
     set: &mut TaintEndpointSet<T>,
-    analyzer: Option<&dyn IAnalyzer>,
+    locators: LocatorResolution<'_>,
 ) -> Result<(), PolicySourceError>
 where
     T: TaintSelectorAccess,
 {
-    resolve_taint_entries(&mut set.entries, analyzer)
+    resolve_taint_entries(&mut set.entries, locators)
 }
 
 fn resolve_taint_entries<T>(
     entries: &mut [T],
-    analyzer: Option<&dyn IAnalyzer>,
+    locators: LocatorResolution<'_>,
 ) -> Result<(), PolicySourceError>
 where
     T: TaintSelectorAccess,
 {
     for entry in entries {
-        resolve_selector_locators(entry.selector_mut(), analyzer)?;
+        resolve_selector_locators(entry.selector_mut(), locators)?;
     }
     Ok(())
 }
@@ -335,18 +373,18 @@ fn collect_selector_locators<'a>(
 
 fn resolve_relational_assertion_plan(
     plan: &mut RelationalAssertionPlan,
-    analyzer: Option<&dyn IAnalyzer>,
+    locators: LocatorResolution<'_>,
 ) -> Result<(), PolicySourceError> {
     for binding in &mut plan.bindings {
         let RowBindingSource::Query(selector) = &mut binding.source;
-        resolve_selector_locators(selector, analyzer)?;
+        resolve_selector_locators(selector, locators)?;
     }
     Ok(())
 }
 
 pub(super) fn resolve_selector_locators(
     selector: &mut PolicySelector,
-    analyzer: Option<&dyn IAnalyzer>,
+    locators: LocatorResolution<'_>,
 ) -> Result<(), PolicySourceError> {
     if let PolicySelector::Inline {
         query,
@@ -354,7 +392,7 @@ pub(super) fn resolve_selector_locators(
         ..
     } = selector
     {
-        resolve_query_locators(query, resolved_locators, analyzer)?;
+        resolve_query_locators(query, resolved_locators, locators)?;
     }
     Ok(())
 }
@@ -362,7 +400,7 @@ pub(super) fn resolve_selector_locators(
 pub(super) fn resolve_query_locators(
     query: &mut CodeQuery,
     resolved_locators: &mut Vec<ResolvedPolicyLocator>,
-    analyzer: Option<&dyn IAnalyzer>,
+    locators: LocatorResolution<'_>,
 ) -> Result<(), PolicySourceError> {
     let mut pending = vec![&mut query.plan];
     while let Some(plan) = pending.pop() {
@@ -378,7 +416,7 @@ pub(super) fn resolve_query_locators(
                 filter.proof,
                 LocatorRole::Callable,
                 ReceiverTypeConstraintKind::Exact,
-                analyzer,
+                locators,
                 resolved_locators,
             )?;
             if let Some(receiver_type) = &mut filter.receiver_type {
@@ -388,7 +426,7 @@ pub(super) fn resolve_query_locators(
                         filter.proof,
                         LocatorRole::ReceiverType,
                         ReceiverTypeConstraintKind::Exact,
-                        analyzer,
+                        locators,
                         resolved_locators,
                     )?,
                     ResolvedCallReceiverType::AssignableTo {
@@ -397,7 +435,7 @@ pub(super) fn resolve_query_locators(
                     } => resolve_query_receiver_family(
                         root,
                         resolved_identities,
-                        analyzer,
+                        locators,
                         resolved_locators,
                     )?,
                 }
@@ -412,7 +450,7 @@ fn resolve_query_identity(
     proof: ResolvedCallProof,
     role: LocatorRole,
     constraint: ReceiverTypeConstraintKind,
-    analyzer: Option<&dyn IAnalyzer>,
+    locators: LocatorResolution<'_>,
     resolved_locators: &mut Vec<ResolvedPolicyLocator>,
 ) -> Result<(), PolicySourceError> {
     let CallIdentity::Qualified {
@@ -423,14 +461,14 @@ fn resolve_query_identity(
     else {
         return Ok(());
     };
-    if resolved.is_some() {
+    if resolved.is_some() || locators.is_deferred() {
         return Ok(());
     }
     let policy_locator = PolicyLocator {
         value: value.clone(),
         range: source_range.clone().unwrap_or(0..0),
     };
-    let identity = resolve_qualified_locator(analyzer, &policy_locator, role)?;
+    let identity = resolve_qualified_locator(locators.analyzer(), &policy_locator, role)?;
     if matches!(role, LocatorRole::Callable)
         && matches!(proof, ResolvedCallProof::Declared)
         && matches!(identity, ResolvedLocatorIdentity::Workspace { .. })
@@ -466,7 +504,7 @@ fn resolve_query_identity(
 fn resolve_query_receiver_family(
     root: &mut CallIdentity,
     resolved_identities: &mut Vec<String>,
-    analyzer: Option<&dyn IAnalyzer>,
+    locators: LocatorResolution<'_>,
     resolved_locators: &mut Vec<ResolvedPolicyLocator>,
 ) -> Result<(), PolicySourceError> {
     if matches!(
@@ -475,7 +513,8 @@ fn resolve_query_receiver_family(
             resolved: Some(_),
             ..
         }
-    ) {
+    ) || locators.is_deferred()
+    {
         return Ok(());
     }
     let policy_locator = match root {
@@ -492,6 +531,7 @@ fn resolve_query_receiver_family(
             range: source_range.clone().unwrap_or(0..0),
         },
     };
+    let analyzer = locators.analyzer();
     let identity = resolve_qualified_locator(analyzer, &policy_locator, LocatorRole::ReceiverType)?;
     *resolved_identities = materialize_receiver_family(analyzer, &identity, &policy_locator)?;
     if let CallIdentity::Qualified { resolved, .. } = root {
@@ -797,6 +837,22 @@ fn locator_error(
             detail.into()
         ),
     )
+}
+
+/// Whether a loaded-policy diagnostic reports a qualified locator that needs
+/// an active analyzer or semantic-model snapshot, rather than a source defect.
+///
+/// The built-in catalog uses this to distinguish a deferred locator (which is
+/// expected before workspace activation) from an authoring error.
+pub(crate) fn is_qualified_locator_code(code: &str) -> bool {
+    LocatorRole::ALL
+        .iter()
+        .flat_map(|role| {
+            LocatorFailure::ALL
+                .iter()
+                .map(move |failure| failure.code(*role))
+        })
+        .any(|candidate| candidate == code)
 }
 
 fn source_error(

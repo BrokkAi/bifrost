@@ -1737,7 +1737,10 @@ fn bifrost_mcp_lists_and_runs_built_in_policies() {
     );
     assert_eq!(listed["result"]["isError"], false, "{listed}");
     let catalog = &listed["result"]["structuredContent"];
-    assert_eq!(catalog["schema_version"], 1);
+    // Schema 2 records the authored catalog identity and the executable
+    // identity as separate fields; a shipped policy with no deferred locator
+    // records both.
+    assert_eq!(catalog["schema_version"], 2);
     let packs = catalog["packs"].as_array().expect("policy packs");
     assert_eq!(packs.len(), 2);
     assert_eq!(packs[0]["id"], "bifrost.code-smells");
@@ -1745,6 +1748,12 @@ fn bifrost_mcp_lists_and_runs_built_in_policies() {
         .as_array()
         .expect("correctness policies");
     assert_eq!(correctness_policies.len(), 17);
+    assert!(correctness_policies.iter().all(|policy| {
+        policy["authored_hash"].as_str().is_some()
+            && policy["resolved_semantic_hash"]
+                .as_str()
+                .is_some_and(|hash| Some(hash) == policy["authored_hash"].as_str())
+    }));
     assert!(
         correctness_policies
             .iter()

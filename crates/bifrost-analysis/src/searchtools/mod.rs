@@ -457,6 +457,14 @@ pub struct ActiveWorkspaceResult {
     /// the tool contract and did not change when the implementation moved off
     /// the v1 usage index (ExecPlan Milestone 3).
     pub usage_index_ready: bool,
+    /// Whether an answer that consults activated semantic models would wait
+    /// for background work. A deferred workspace build publishes its analyzer
+    /// as soon as it is ready and resolves the workspace's semantic packs on
+    /// its own thread, because that resolution can read a local toolchain,
+    /// verify a release bundle, and decode whole packs before it settles
+    /// (issue #3372). Policy evaluation and a pack-scope refresh wait for it;
+    /// everything else proceeds.
+    pub semantic_packs_ready: bool,
 }
 
 /// The subset of the workspace this session covers, or `None` when it covers

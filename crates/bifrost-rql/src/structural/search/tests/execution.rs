@@ -10119,6 +10119,28 @@ fn go_heap_identity_asserted_pointer_fields_never_disappear() {
 }
 
 #[test]
+fn go_heap_identity_preserves_comma_ok_asserted_pointer_payloads() {
+    let (_project, workspace) = heap_identity_workspace();
+    for root in [
+        "sharedCommaOkPointerAssertion",
+        "sharedLocalCommaOkPointerAssertion",
+    ] {
+        let result = heap_identity_conflicts(&workspace, root);
+        assert_proven_unordered_unprotected_conflict(
+            &result,
+            "a comma-ok assertion result keeps the stored pointer's identity",
+        );
+    }
+}
+
+#[test]
+fn go_heap_identity_keeps_a_failed_comma_ok_arm_unproven() {
+    let (_project, workspace) = heap_identity_workspace();
+    let result = heap_identity_conflicts(&workspace, "commaOkFailedArmAssertion");
+    assert_no_proven_conflicts_with_explicit_evidence(&result);
+}
+
+#[test]
 fn go_heap_identity_preserves_asserted_pointer_payloads() {
     let (_project, workspace) = heap_identity_workspace();
     for root in [
@@ -11325,6 +11347,36 @@ func sharedVarPointerAssertion() {
     var recovered = boxed.(*cell)
     go func() { recovered.n = 1 }()
     go func() { original.n = 2 }()
+}
+
+func sharedCommaOkPointerAssertion() {
+    original := &cell{}
+    var boxed any = original
+    go func() {
+        if recovered, ok := boxed.(*cell); ok {
+            recovered.n = 1
+        }
+    }()
+    go func() { original.n = 2 }()
+}
+
+func sharedLocalCommaOkPointerAssertion() {
+    original := &cell{}
+    go func() {
+        var boxed any = original
+        if recovered, ok := boxed.(*cell); ok {
+            recovered.n = 1
+        }
+    }()
+    go func() { original.n = 2 }()
+}
+
+func commaOkFailedArmAssertion(boxed any, pointer *cell) {
+    var ok bool
+    if pointer, ok = boxed.(*cell); !ok {
+        go func() { pointer.n = 1 }()
+        go func() { pointer.n = 2 }()
+    }
 }
 
 func sharedDirectPointerAssertion() {
@@ -20299,4 +20351,2129 @@ func wrappedRoot(cell *guardedCell) {
             "the {mode} run must not grant protection across the wrapper: {report:#?}"
         );
     }
+}
+
+/// The reviewed conditional-spawn protocol pack shared by the TryGo guard
+/// tests: `golang.org/x/sync/errgroup.Group` with `Go` spawning
+/// unconditionally, `Wait` joining the group, and `TryGo` spawning exactly
+/// when the call's boolean result reports that it did (issue #3371).
+const TRY_GO_GUARD_PACK: &[u8] = br#"{
+  "schema_version": 2,
+  "pack_id": "test.go.trygo-guard",
+  "version": "1.0.0",
+  "producer": { "name": "test", "version": "1.0.0" },
+  "language": "go",
+  "ecosystem": "go",
+  "compatibility": { "bifrost": ">=0.10.7, <1.0.0", "toolchains": [] },
+  "provenance": { "source": "test", "revision": "1" },
+  "license": "MIT",
+  "completeness": "complete",
+  "safety": { "generated_code_only": false, "review_required": false },
+  "shards": [{
+    "id": "declarations",
+    "activation": [{}],
+    "payload": {
+      "kind": "declaration_facts",
+      "types": [
+        {
+          "id": "type.d9a13c3593128df16b560fd8293a702e20b1a36f381b6d54f82a6ccbcd2737cd",
+          "name": "golang.org/x/sync/errgroup", "type_kind": "module", "visibility": "package",
+          "is_abstract": false, "is_sealed": false, "has_explicit_type_terms": false,
+          "type_parameters": [], "type_parameter_constraints": [], "embedded_types": [],
+          "hierarchy": [], "aliases": ["errgroup"], "extension_surfaces": [],
+          "locator": { "kind": "artifact", "path": "errgroup/errgroup.go", "symbol": "golang.org/x/sync/errgroup" }
+        },
+        {
+          "id": "type.0c4f21e4d6d55855f8189f63d90adcce32a1cd675cd25058d1416fba1c0a2927",
+          "name": "golang.org/x/sync/errgroup.Group", "type_kind": "struct", "visibility": "public",
+          "is_abstract": false, "is_sealed": false, "has_explicit_type_terms": false,
+          "type_parameters": [], "type_parameter_constraints": [], "embedded_types": [],
+          "hierarchy": [], "aliases": [], "extension_surfaces": [],
+          "locator": { "kind": "artifact", "path": "errgroup/errgroup.go", "symbol": "golang.org/x/sync/errgroup.Group" }
+        }
+      ],
+      "members": [
+        {
+          "id": "member.8eba5e7e0d44e9a914e81eb4c18dadad146753487819400bd7f686a30da5c9cb",
+          "owner": "type.d9a13c3593128df16b560fd8293a702e20b1a36f381b6d54f82a6ccbcd2737cd",
+          "name": "WithContext", "member_kind": "function", "visibility": "public", "is_static": true,
+          "is_abstract": false, "is_virtual": false,
+          "signature": { "type_parameters": [], "parameters": [{ "name": "ctx", "type": { "kind": "named", "name": "context.Context", "arguments": [], "nullable": false }, "optional": false, "variadic": false }], "returns": { "kind": "tuple", "elements": [{ "kind": "pointer", "element": { "kind": "declared", "id": "type.0c4f21e4d6d55855f8189f63d90adcce32a1cd675cd25058d1416fba1c0a2927", "arguments": [], "nullable": false } }, { "kind": "named", "name": "context.Context", "arguments": [], "nullable": false }] } },
+          "aliases": [],
+          "locator": { "kind": "artifact", "path": "errgroup/errgroup.go", "symbol": "golang.org/x/sync/errgroup.WithContext" }
+        },
+        {
+          "id": "member.4d0432d587858f542855f7836d30c4e8e41ef7cc530c5d10e2adf7297cee2227",
+          "owner": "type.0c4f21e4d6d55855f8189f63d90adcce32a1cd675cd25058d1416fba1c0a2927",
+          "name": "Go", "member_kind": "method", "visibility": "public", "is_static": false,
+          "is_abstract": false, "is_virtual": false,
+          "signature": { "type_parameters": [], "parameters": [{ "name": "f", "type": { "kind": "named", "name": "func", "arguments": [], "nullable": false }, "optional": false, "variadic": false }] },
+          "receiver": { "pointer": true }, "aliases": [],
+          "locator": { "kind": "artifact", "path": "errgroup/errgroup.go", "symbol": "golang.org/x/sync/errgroup.Group.Go" }
+        },
+        {
+          "id": "member.f4ccffe4aee7246f71dafc1d38211225e0c689dfa0068c64def4713ff8e989cd",
+          "owner": "type.0c4f21e4d6d55855f8189f63d90adcce32a1cd675cd25058d1416fba1c0a2927",
+          "name": "Wait", "member_kind": "method", "visibility": "public", "is_static": false,
+          "is_abstract": false, "is_virtual": false,
+          "signature": { "type_parameters": [], "parameters": [], "returns": { "kind": "named", "name": "error", "arguments": [], "nullable": false } },
+          "receiver": { "pointer": true }, "aliases": [],
+          "locator": { "kind": "artifact", "path": "errgroup/errgroup.go", "symbol": "golang.org/x/sync/errgroup.Group.Wait" }
+        },
+        {
+          "id": "member.7c1d0e5f9a8b4c3d2e1f0a9b8c7d6e5f4a3b2c1d0e9f8a7b6c5d4e3f2a1b0c9d",
+          "owner": "type.0c4f21e4d6d55855f8189f63d90adcce32a1cd675cd25058d1416fba1c0a2927",
+          "name": "TryGo", "member_kind": "method", "visibility": "public", "is_static": false,
+          "is_abstract": false, "is_virtual": false,
+          "signature": { "type_parameters": [], "parameters": [{ "name": "f", "type": { "kind": "named", "name": "func", "arguments": [], "nullable": false }, "optional": false, "variadic": false }], "returns": { "kind": "named", "name": "bool", "arguments": [], "nullable": false } },
+          "receiver": { "pointer": true }, "aliases": [],
+          "locator": { "kind": "artifact", "path": "errgroup/errgroup.go", "symbol": "golang.org/x/sync/errgroup.Group.TryGo" }
+        }
+      ],
+      "relations": []
+    }
+  }, {
+    "id": "behavior",
+    "activation": [{}],
+    "payload": {
+      "kind": "procedure_summaries",
+      "summaries": [
+        {
+          "id": "errgroup.with-context",
+          "target": { "path": "errgroup/errgroup.go", "symbol": "golang.org/x/sync/errgroup.WithContext(ctx context.Context)", "has_receiver": false, "parameter_count": 1 },
+          "completeness": "complete",
+          "normal_result_count": 2,
+          "locations": [{ "id": "group", "location_kind": "heap" }],
+          "transfers": [{ "input": { "kind": "parameter", "ordinal": 0 }, "exit_kind": "normal", "output": { "kind": "indexed_normal_return", "ordinal": 1 } }],
+          "effects": [{ "kind": "allocation", "event": "group-allocation", "output": { "kind": "indexed_normal_return", "ordinal": 0 } }]
+        },
+        {
+          "id": "errgroup.go",
+          "target": { "path": "errgroup/errgroup.go", "symbol": "golang.org/x/sync/errgroup.Group.Go(f func() error)", "has_receiver": true, "parameter_count": 1 },
+          "completeness": "complete",
+          "transfers": [],
+          "concurrency_effects": [{ "kind": "task_spawn", "callable": { "kind": "parameter", "ordinal": 0 }, "group": { "kind": "receiver" } }]
+        },
+        {
+          "id": "errgroup.try-go",
+          "target": { "path": "errgroup/errgroup.go", "symbol": "golang.org/x/sync/errgroup.Group.TryGo(f func() error)", "has_receiver": true, "parameter_count": 1 },
+          "completeness": "complete",
+          "normal_result_count": 1,
+          "transfers": [],
+          "concurrency_effects": [{ "kind": "task_spawn", "callable": { "kind": "parameter", "ordinal": 0 }, "group": { "kind": "receiver" }, "condition": "call_result_true" }]
+        },
+        {
+          "id": "errgroup.wait",
+          "target": { "path": "errgroup/errgroup.go", "symbol": "golang.org/x/sync/errgroup.Group.Wait()", "has_receiver": true, "parameter_count": 0 },
+          "completeness": "complete",
+          "transfers": [],
+          "concurrency_effects": [{ "kind": "task_join", "group": { "kind": "receiver" } }]
+        }
+      ]
+    }
+  }]
+}"#;
+
+fn try_go_guard_snapshot(
+    workspace: &WorkspaceAnalyzer,
+) -> std::sync::Arc<ActiveSemanticModelSnapshot> {
+    let pack = compile_source(
+        SourceFormat::Json,
+        TRY_GO_GUARD_PACK,
+        &CompilerOptions::default(),
+    )
+    .unwrap_or_else(|diagnostics| panic!("TryGo guard pack compiles: {diagnostics:#?}"));
+    let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default())
+        .expect("ephemeral semantic-pack catalog");
+    catalog
+        .register_session_pack(
+            &pack,
+            &SessionPackSource {
+                kind: SessionPackSourceKind::Embedded,
+                source_id: "test:go-trygo-guard".to_owned(),
+            },
+        )
+        .expect("register TryGo guard model pack");
+    let activation = acquire_active_semantic_models(
+        workspace.analyzer(),
+        &catalog,
+        None,
+        &SemanticModelActivationRequest {
+            bifrost_version: Version::parse(env!("CARGO_PKG_VERSION")).expect("crate version"),
+            evidence: vec![SemanticModelActivationEvidence {
+                language: "go".to_owned(),
+                ecosystem: "go".to_owned(),
+                package: None,
+                module: None,
+                toolchain: None,
+                target: None,
+                configuration: None,
+                artifact_sha256: None,
+            }],
+            controls: Vec::new(),
+            limits: SemanticModelRuntimeLimits::default(),
+        },
+        &CancellationToken::default(),
+    );
+    match activation {
+        SemanticModelRuntimeOutcome::Ready { snapshot, .. } => snapshot,
+        other => panic!("TryGo guard models activate: {other:#?}"),
+    }
+}
+
+#[test]
+fn go_concurrent_access_conflicts_bind_try_go_results() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file(
+            "main.go",
+            r#"package main
+
+import "golang.org/x/sync/errgroup"
+
+func joinedRoot() int {
+	group := &errgroup.Group{}
+	joined := 0
+	if group.TryGo(func() error { joined = 1; return nil }) {
+		_ = group.Wait()
+	}
+	return joined
+}
+
+func falseBranchRoot() int {
+	group := &errgroup.Group{}
+	branched := 0
+	if group.TryGo(func() error { branched = 1; return nil }) {
+		_ = group.Wait()
+	} else {
+		branched = 2
+	}
+	return 0
+}
+
+func unjoinedRoot() int {
+	group := &errgroup.Group{}
+	unjoined := 0
+	if group.TryGo(func() error { unjoined = 1; return nil }) {
+		unjoined = 2
+	}
+	return 0
+}
+
+func wrongObjectRoot() int {
+	group := &errgroup.Group{}
+	other := &errgroup.Group{}
+	displaced := 0
+	if group.TryGo(func() error { displaced = 1; return nil }) {
+		_ = other.Wait()
+		displaced = 2
+	}
+	return 0
+}
+
+func unestablishedRoot() int {
+	group := &errgroup.Group{}
+	unestablished := 0
+	started := group.TryGo(func() error { unestablished = 1; return nil })
+	unestablished = 2
+	if started {
+		_ = group.Wait()
+	}
+	return 0
+}
+
+type spinner struct{ n int }
+
+func (s *spinner) TryGo(f func() error) bool {
+	s.n++
+	return s.n%2 == 0
+}
+
+func sameNameRoot() int {
+	spun := 0
+	s := &spinner{}
+	if s.TryGo(func() error { spun = 1; return nil }) {
+		spun = 2
+	}
+	return 0
+}
+"#,
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let snapshot = try_go_guard_snapshot(&workspace);
+
+    let cancellation = CancellationToken::default();
+    let mut budget = SemanticBudget::default();
+    let artifact = workspace
+        .materialize_program_semantics(
+            &project.file("main.go"),
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("TryGo guard semantics materialize")
+        .available_value()
+        .cloned()
+        .expect("TryGo guard semantics are available");
+    let procedure = |name: &str| {
+        artifact
+            .procedures()
+            .iter()
+            .find(|candidate| {
+                candidate
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|segment| segment.name())
+                    == Some(name)
+            })
+            .and_then(|row| artifact.procedure_handle(row.id()))
+            .unwrap_or_else(|| panic!("missing {name}"))
+    };
+    let provider = super::super::concurrency::WorkspaceConcurrencyProvider::new(
+        &workspace,
+        Some(snapshot),
+        None,
+    );
+    let report = |name: &str| {
+        let mut budget = SemanticBudget::default();
+        brokk_bifrost_flow::concurrency::concurrent_access_conflicts(
+            &provider,
+            &procedure(name),
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .unwrap_or_else(|error| panic!("{name} report computes: {error}"))
+    };
+
+    // Positive: the guard establishes the spawn on the true edge and the join
+    // covers the callback, so the callback write is ordered before the parent
+    // read that only the established paths can reach.
+    let positive = report("joinedRoot");
+    assert!(
+        positive.conflicts.iter().any(|conflict| {
+            conflict.proven
+                && conflict.exhaustive
+                && conflict.ordering
+                    == brokk_bifrost_flow::concurrency::ConcurrentOrdering::HappensBefore
+        }),
+        "the TryGo/Wait pair must order the callback write before the parent read: {positive:#?}"
+    );
+    assert!(
+        !positive.reasons.iter().any(|reason| matches!(reason,
+            brokk_bifrost_flow::concurrency::ConcurrencyOpenReason::UnsupportedSynchronization(protocol)
+            if protocol.contains("TryGo"))),
+        "the modeled protocol no longer opens an unsupported boundary: {positive:#?}"
+    );
+
+    // Wrong branch: the else arm establishes the result false, so the callback
+    // never started on the path that writes there and the two writes cannot
+    // run together.
+    let wrong_branch = report("falseBranchRoot");
+    assert!(
+        !wrong_branch.conflicts.iter().any(|conflict| {
+            conflict.proven
+                && conflict.ordering
+                    == brokk_bifrost_flow::concurrency::ConcurrentOrdering::Unordered
+        }),
+        "a write only the failed branch reaches cannot race the callback: {wrong_branch:#?}"
+    );
+
+    // No join: the callback starts on the established-true path and stays
+    // unordered with the parent write there.
+    let unjoined = report("unjoinedRoot");
+    assert!(
+        unjoined.conflicts.iter().any(|conflict| {
+            conflict.proven
+                && conflict.exhaustive
+                && conflict.ordering
+                    == brokk_bifrost_flow::concurrency::ConcurrentOrdering::Unordered
+                && conflict.protection
+                    == brokk_bifrost_flow::concurrency::ConcurrentProtection::Unprotected
+        }),
+        "an unjoined conditional spawn must stay a proven race: {unjoined:#?}"
+    );
+
+    // Wrong object: a join on another group does not cover this group's
+    // callback.
+    let wrong_object = report("wrongObjectRoot");
+    assert!(
+        wrong_object.conflicts.iter().any(|conflict| {
+            conflict.proven
+                && conflict.ordering
+                    == brokk_bifrost_flow::concurrency::ConcurrentOrdering::Unordered
+        }),
+        "a join on a distinct group must not order this callback: {wrong_object:#?}"
+    );
+
+    // Incomplete: a result no structured guard tests establishes no spawn, so
+    // the typed boundary keeps the answer open instead of inventing a task.
+    let incomplete = report("unestablishedRoot");
+    assert!(
+        incomplete.reasons.iter().any(|reason| matches!(reason,
+            brokk_bifrost_flow::concurrency::ConcurrencyOpenReason::UnsupportedSynchronization(protocol)
+            if protocol.contains("try-spawn result is not established by a structured guard"))),
+        "the unbound try-spawn result must keep its typed boundary: {incomplete:#?}"
+    );
+    assert!(
+        !incomplete.conflicts.iter().any(|conflict| {
+            conflict.proven
+                && conflict.ordering
+                    == brokk_bifrost_flow::concurrency::ConcurrentOrdering::Unordered
+        }),
+        "no comparison may claim a task the established result does not start: {incomplete:#?}"
+    );
+
+    // Same name, wrong type: an unrelated TryGo method never binds the
+    // reviewed errgroup protocol.
+    let same_name = report("sameNameRoot");
+    assert!(
+        !same_name.conflicts.iter().any(|conflict| {
+            conflict.proven
+                && conflict.ordering
+                    == brokk_bifrost_flow::concurrency::ConcurrentOrdering::Unordered
+        }),
+        "an unrelated same-name method must not spawn a modeled task: {same_name:#?}"
+    );
+    assert!(
+        !same_name.reasons.iter().any(|reason| matches!(reason,
+            brokk_bifrost_flow::concurrency::ConcurrencyOpenReason::UnsupportedSynchronization(protocol)
+            if protocol.contains("TryGo"))),
+        "an unrelated same-name method is not the reviewed protocol: {same_name:#?}"
+    );
+}
+
+#[test]
+fn go_projected_summaries_retain_try_go_conditions() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file(
+            "main.go",
+            r#"package main
+
+import "golang.org/x/sync/errgroup"
+
+func tryGoJoinedBody(group *errgroup.Group) int {
+	value := 0
+	if group.TryGo(func() error { value = 1; return nil }) {
+		_ = group.Wait()
+	}
+	return value
+}
+
+func summarizedRoot(group *errgroup.Group) int {
+	return tryGoJoinedBody(group)
+}
+
+func tryGoThrough(group *errgroup.Group, f func() error) bool {
+	return group.TryGo(f)
+}
+
+func forwardedRoot(group *errgroup.Group) int {
+	value := 0
+	if tryGoThrough(group, func() error { value = 1; return nil }) {
+		_ = group.Wait()
+	}
+	return value
+}
+
+func ignoredTryGo(group *errgroup.Group, f func() error) {
+	group.TryGo(f)
+}
+
+func tryGoInlineReturn(group *errgroup.Group, cell *int) bool {
+	return group.TryGo(func() error { *cell = 1; return nil })
+}
+
+func inlineReturnRoot(group *errgroup.Group, cell *int) int {
+	if tryGoInlineReturn(group, cell) {
+		_ = group.Wait()
+	}
+	return *cell
+}
+
+func ignoredRoot(group *errgroup.Group) int {
+	value := 0
+	ignoredTryGo(group, func() error { value = 1; return nil })
+	_ = group.Wait()
+	return value
+}
+"#,
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let snapshot = try_go_guard_snapshot(&workspace);
+
+    let cancellation = CancellationToken::default();
+    let mut budget = SemanticBudget::default();
+    let artifact = workspace
+        .materialize_program_semantics(
+            &project.file("main.go"),
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("wrapper semantics materialize")
+        .available_value()
+        .cloned()
+        .expect("wrapper semantics are available");
+    let procedure = |name: &str| {
+        artifact
+            .procedures()
+            .iter()
+            .find(|candidate| {
+                candidate
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|segment| segment.name())
+                    == Some(name)
+            })
+            .and_then(|row| artifact.procedure_handle(row.id()))
+            .unwrap_or_else(|| panic!("missing {name}"))
+    };
+    let joined_body = procedure("tryGoJoinedBody");
+    let summarized_root = procedure("summarizedRoot");
+    let try_go_through = procedure("tryGoThrough");
+    let forwarded_root = procedure("forwardedRoot");
+    let ignored_try_go = procedure("ignoredTryGo");
+    let inline_return_root = procedure("inlineReturnRoot");
+
+    // Project production summaries for the wrapper closure and prove that a
+    // wrapper keeps the conditional spawn, its join, and the formal callable
+    // port through exact actual/formal substitution.
+    let icfg =
+        crate::analyzer::semantic::WorkspaceIcfgProvider::with_active_semantic_model_snapshot(
+            &workspace,
+            Some(snapshot.clone()),
+        );
+    let projection_provider = super::super::concurrency::WorkspaceConcurrencyProvider::new(
+        &workspace,
+        Some(snapshot.clone()),
+        None,
+    );
+    let roots = [
+        summarized_root.clone(),
+        forwarded_root.clone(),
+        joined_body.clone(),
+        try_go_through.clone(),
+        ignored_try_go.clone(),
+    ];
+    let mut projection_budget = SemanticBudget::default();
+    let summaries =
+        brokk_bifrost_flow::typestate::project_production_semantic_summaries_with_concurrency(
+            &roots,
+            &icfg,
+            &projection_provider,
+            &mut SemanticRequest::new(&mut projection_budget, &cancellation),
+        )
+        .expect("wrapper summaries project");
+    let body_summary = summaries
+        .summary_for(&joined_body)
+        .expect("the joined wrapper has a production summary");
+    assert!(
+        body_summary.effects().iter().any(|effect| matches!(
+            effect.key(),
+            brokk_bifrost_flow::dataflow::SummaryEffectKey::Concurrency(effect)
+                if matches!(
+                    effect.kind(),
+                    brokk_bifrost_flow::dataflow::SummaryConcurrencyEffectKind::TaskSpawn {
+                        condition: brokk_bifrost_flow::dataflow::SummaryTaskSpawnCondition::CallResultTrue,
+                        ..
+                    }
+                )
+        )),
+        "the joined wrapper must retain the call-result-true spawn: {body_summary:#?}"
+    );
+    assert!(
+        body_summary.effects().iter().any(|effect| matches!(
+            effect.key(),
+            brokk_bifrost_flow::dataflow::SummaryEffectKey::Concurrency(effect)
+                if matches!(
+                    effect.kind(),
+                    brokk_bifrost_flow::dataflow::SummaryConcurrencyEffectKind::TaskJoin { .. }
+                )
+        )),
+        "the joined wrapper must retain its join: {body_summary:#?}"
+    );
+    // The wrapper body keeps the guard and the join in one activation, so the
+    // exact summary and the direct expansion agree on the ordered pair.
+    let direct_provider = super::super::concurrency::WorkspaceConcurrencyProvider::new(
+        &workspace,
+        Some(snapshot.clone()),
+        None,
+    );
+    let mut direct_budget = SemanticBudget::default();
+    let direct = brokk_bifrost_flow::concurrency::concurrent_access_conflicts(
+        &direct_provider,
+        &summarized_root,
+        &mut SemanticRequest::new(&mut direct_budget, &cancellation),
+    )
+    .expect("direct wrapper report computes");
+    assert!(
+        direct.conflicts.iter().any(|conflict| {
+            conflict.proven
+                && conflict.exhaustive
+                && conflict.ordering
+                    == brokk_bifrost_flow::concurrency::ConcurrentOrdering::HappensBefore
+        }),
+        "the wrapper body must order the callback write before the value read: {direct:#?}"
+    );
+    let projected_provider = super::super::concurrency::WorkspaceConcurrencyProvider::new(
+        &workspace,
+        Some(snapshot.clone()),
+        Some(summaries),
+    );
+    let mut projected_budget = SemanticBudget::default();
+    let projected = brokk_bifrost_flow::concurrency::concurrent_access_conflicts(
+        &projected_provider,
+        &summarized_root,
+        &mut SemanticRequest::new(&mut projected_budget, &cancellation),
+    )
+    .expect("projected wrapper report computes");
+    assert_eq!(
+        projected, direct,
+        "fresh task summaries preserve the direct wrapper report"
+    );
+
+    // A wrapper that returns the modeled call's own result hands the guard to
+    // its caller. Neither expansion mode can apply the caller's guard inside
+    // the callee, so the boundary stays typed instead of granting an ordering
+    // the callee cannot establish.
+    let mut inline_budget = SemanticBudget::default();
+    let inline_return = brokk_bifrost_flow::concurrency::concurrent_access_conflicts(
+        &projected_provider,
+        &inline_return_root,
+        &mut SemanticRequest::new(&mut inline_budget, &cancellation),
+    )
+    .expect("inline-return wrapper report computes");
+    assert!(
+        inline_return.reasons.iter().any(|reason| matches!(reason,
+            brokk_bifrost_flow::concurrency::ConcurrencyOpenReason::UnsupportedSynchronization(protocol)
+            if protocol.contains("try-spawn result is returned untested; its guard lives in a caller"))),
+        "the returned result must name its caller guard boundary: {inline_return:#?}"
+    );
+    assert!(
+        !inline_return.conflicts.iter().any(|conflict| {
+            conflict.proven
+                && conflict.ordering
+                    == brokk_bifrost_flow::concurrency::ConcurrentOrdering::HappensBefore
+        }),
+        "a returned result grants no ordering inside the callee: {inline_return:#?}"
+    );
+
+    // A forwarding wrapper returns the call's result untested to its own
+    // caller, so neither expansion mode applies the guard: the boundary stays
+    // typed instead of granting an ordering the callee cannot establish.
+    let mut forwarded_budget = SemanticBudget::default();
+    let forwarded = brokk_bifrost_flow::concurrency::concurrent_access_conflicts(
+        &projected_provider,
+        &forwarded_root,
+        &mut SemanticRequest::new(&mut forwarded_budget, &cancellation),
+    )
+    .expect("forwarding wrapper report computes");
+    assert!(
+        forwarded
+            .reasons
+            .contains(&brokk_bifrost_flow::concurrency::ConcurrencyOpenReason::UnresolvedTarget),
+        "a wrapper that forwards its callable keeps the typed callable boundary: {forwarded:#?}"
+    );
+    assert!(
+        !forwarded.conflicts.iter().any(|conflict| {
+            conflict.proven
+                && conflict.ordering
+                    == brokk_bifrost_flow::concurrency::ConcurrentOrdering::HappensBefore
+        }),
+        "a forwarded result grants no ordering the callee cannot establish: {forwarded:#?}"
+    );
+}
+
+/// The reviewed timer protocol pack shared by the timer stop tests:
+/// `time.AfterFunc` spawning with its timer, `Timer.Stop` cancelling on a
+/// true result, and `Timer.Reset` re-arming (issue #3382).
+const TIMER_STOP_GUARD_PACK: &[u8] = br#"{
+  "schema_version": 2,
+  "pack_id": "test.go.timer-stop-guard",
+  "version": "1.0.0",
+  "producer": { "name": "test", "version": "1.0.0" },
+  "language": "go",
+  "ecosystem": "go",
+  "compatibility": { "bifrost": ">=0.10.7, <1.0.0", "toolchains": [] },
+  "provenance": { "source": "test", "revision": "1" },
+  "license": "MIT",
+  "completeness": "complete",
+  "safety": { "generated_code_only": false, "review_required": false },
+  "shards": [{
+    "id": "declarations",
+    "activation": [{}],
+    "payload": {
+      "kind": "declaration_facts",
+      "types": [
+        {
+          "id": "type.0e5eb8274d8a136652db26087e21a5a350ee36c3b7d9c47f2ffca11ec56d98e0",
+          "name": "time", "type_kind": "module", "visibility": "package",
+          "is_abstract": false, "is_sealed": false, "has_explicit_type_terms": false,
+          "type_parameters": [], "type_parameter_constraints": [], "embedded_types": [],
+          "hierarchy": [], "aliases": ["time"], "extension_surfaces": [],
+          "locator": { "kind": "artifact", "path": "src/time/sleep.go", "symbol": "time" }
+        },
+        {
+          "id": "type.093f2445cc8f7389a5299fa7e7d70ae8fadd6fa2291af0d0b16069cc3433b19f",
+          "name": "time.Duration", "type_kind": "class", "visibility": "public",
+          "is_abstract": false, "is_sealed": false, "has_explicit_type_terms": false,
+          "type_parameters": [], "type_parameter_constraints": [], "embedded_types": [],
+          "hierarchy": [], "aliases": [], "extension_surfaces": [],
+          "locator": { "kind": "artifact", "path": "src/time/time.go", "symbol": "time.Duration" }
+        },
+        {
+          "id": "type.2fd0aa06a7ead591780725343ef0ad1392e76f63c7759ee4578483f9badf438f",
+          "name": "time.Timer", "type_kind": "struct", "visibility": "public",
+          "is_abstract": false, "is_sealed": false, "has_explicit_type_terms": false,
+          "type_parameters": [], "type_parameter_constraints": [], "embedded_types": [],
+          "hierarchy": [], "aliases": [], "extension_surfaces": [],
+          "locator": { "kind": "artifact", "path": "src/time/sleep.go", "symbol": "time.Timer" }
+        }
+      ],
+      "members": [
+        {
+          "id": "member.348968f2fd5d260bd64344016c8075efec0787aeea2760759e5168da502c9f92",
+          "owner": "type.0e5eb8274d8a136652db26087e21a5a350ee36c3b7d9c47f2ffca11ec56d98e0",
+          "name": "AfterFunc", "member_kind": "function", "visibility": "public", "is_static": true,
+          "is_abstract": false, "is_virtual": false,
+          "signature": { "type_parameters": [], "parameters": [{ "name": "d", "type": { "kind": "declared", "id": "type.093f2445cc8f7389a5299fa7e7d70ae8fadd6fa2291af0d0b16069cc3433b19f", "arguments": [], "nullable": false }, "optional": false, "variadic": false }, { "name": "f", "type": { "kind": "named", "name": "func()", "arguments": [], "nullable": false }, "optional": false, "variadic": false }], "returns": { "kind": "pointer", "element": { "kind": "declared", "id": "type.2fd0aa06a7ead591780725343ef0ad1392e76f63c7759ee4578483f9badf438f", "arguments": [], "nullable": false } } },
+          "aliases": [],
+          "locator": { "kind": "artifact", "path": "src/time/sleep.go", "symbol": "time.AfterFunc" }
+        },
+        {
+          "id": "member.6ca7ee4ba1a9781805d964449cad26ea95aaa5ae7b613fb84ce056112268a09f",
+          "owner": "type.2fd0aa06a7ead591780725343ef0ad1392e76f63c7759ee4578483f9badf438f",
+          "name": "Stop", "member_kind": "method", "visibility": "public", "is_static": false,
+          "is_abstract": false, "is_virtual": false,
+          "signature": { "type_parameters": [], "parameters": [], "returns": { "kind": "named", "name": "bool", "arguments": [], "nullable": false } },
+          "receiver": { "pointer": true }, "aliases": [],
+          "locator": { "kind": "artifact", "path": "src/time/sleep.go", "symbol": "time.Timer.Stop" }
+        },
+        {
+          "id": "member.ad262050e1892ca0cfefa1eb48f5bd50aed3de28f7d2c7893cbbe6d9be1e25ae",
+          "owner": "type.2fd0aa06a7ead591780725343ef0ad1392e76f63c7759ee4578483f9badf438f",
+          "name": "Reset", "member_kind": "method", "visibility": "public", "is_static": false,
+          "is_abstract": false, "is_virtual": false,
+          "signature": { "type_parameters": [], "parameters": [{ "name": "d", "type": { "kind": "declared", "id": "type.093f2445cc8f7389a5299fa7e7d70ae8fadd6fa2291af0d0b16069cc3433b19f", "arguments": [], "nullable": false }, "optional": false, "variadic": false }], "returns": { "kind": "named", "name": "bool", "arguments": [], "nullable": false } },
+          "receiver": { "pointer": true }, "aliases": [],
+          "locator": { "kind": "artifact", "path": "src/time/sleep.go", "symbol": "time.Timer.Reset" }
+        }
+      ],
+      "relations": []
+    }
+  }, {
+    "id": "behavior",
+    "activation": [{}],
+    "payload": {
+      "kind": "procedure_summaries",
+      "summaries": [
+        {
+          "id": "time.after-func",
+          "target": { "path": "src/time/sleep.go", "symbol": "time.AfterFunc(d time.Duration, f func())", "has_receiver": false, "parameter_count": 2 },
+          "completeness": "complete",
+          "normal_result_count": 1,
+          "transfers": [],
+          "concurrency_effects": [{ "kind": "task_spawn", "callable": { "kind": "parameter", "ordinal": 1 }, "timer": { "kind": "indexed_normal_return", "ordinal": 0 } }]
+        },
+        {
+          "id": "time.timer.stop",
+          "target": { "path": "src/time/sleep.go", "symbol": "time.Timer.Stop()", "has_receiver": true, "parameter_count": 0 },
+          "completeness": "complete",
+          "normal_result_count": 1,
+          "ordinary_heap_unchanged": true,
+          "transfers": [],
+          "concurrency_effects": [{ "kind": "timer_stop", "timer": { "kind": "receiver" } }]
+        },
+        {
+          "id": "time.timer.reset",
+          "target": { "path": "src/time/sleep.go", "symbol": "time.Timer.Reset(d time.Duration)", "has_receiver": true, "parameter_count": 1 },
+          "completeness": "complete",
+          "normal_result_count": 1,
+          "ordinary_heap_unchanged": true,
+          "transfers": [],
+          "concurrency_effects": [{ "kind": "timer_reset", "timer": { "kind": "receiver" } }]
+        }
+      ]
+    }
+  }]
+}"#;
+
+fn timer_stop_guard_snapshot(
+    workspace: &WorkspaceAnalyzer,
+) -> std::sync::Arc<ActiveSemanticModelSnapshot> {
+    let pack = compile_source(
+        SourceFormat::Json,
+        TIMER_STOP_GUARD_PACK,
+        &CompilerOptions::default(),
+    )
+    .unwrap_or_else(|diagnostics| panic!("timer stop guard pack compiles: {diagnostics:#?}"));
+    let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default())
+        .expect("ephemeral semantic-pack catalog");
+    catalog
+        .register_session_pack(
+            &pack,
+            &SessionPackSource {
+                kind: SessionPackSourceKind::Embedded,
+                source_id: "test:go-timer-stop-guard".to_owned(),
+            },
+        )
+        .expect("register timer stop guard model pack");
+    let activation = acquire_active_semantic_models(
+        workspace.analyzer(),
+        &catalog,
+        None,
+        &SemanticModelActivationRequest {
+            bifrost_version: Version::parse(env!("CARGO_PKG_VERSION")).expect("crate version"),
+            evidence: vec![SemanticModelActivationEvidence {
+                language: "go".to_owned(),
+                ecosystem: "go".to_owned(),
+                package: None,
+                module: None,
+                toolchain: None,
+                target: None,
+                configuration: None,
+                artifact_sha256: None,
+            }],
+            controls: Vec::new(),
+            limits: SemanticModelRuntimeLimits::default(),
+        },
+        &CancellationToken::default(),
+    );
+    match activation {
+        SemanticModelRuntimeOutcome::Ready { snapshot, .. } => snapshot,
+        other => panic!("timer stop guard models activate: {other:#?}"),
+    }
+}
+
+#[test]
+fn go_concurrent_access_conflicts_bind_timer_stop_results() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file(
+            "main.go",
+            r#"package main
+
+import "time"
+
+func spawnOrdersRoot() int {
+	value := 0
+	value = 1
+	time.AfterFunc(0, func() { _ = value })
+	return value
+}
+
+func unjoinedRoot() int {
+	value := 0
+	time.AfterFunc(0, func() { value = 1 })
+	value = 2
+	return value
+}
+
+func stopArmRoot() int {
+	value := 0
+	timer := time.AfterFunc(0, func() { value = 1 })
+	if timer.Stop() {
+		value = 2
+	}
+	return 0
+}
+
+func falseArmRoot() int {
+	value := 0
+	timer := time.AfterFunc(0, func() { value = 1 })
+	if timer.Stop() {
+		value = 2
+	} else {
+		value = 3
+	}
+	return 0
+}
+
+func wrongObjectRoot() int {
+	value := 0
+	timer := time.AfterFunc(0, func() { value = 1 })
+	other := time.AfterFunc(0, func() {})
+	if other.Stop() {
+		value = 2
+	}
+	_ = timer
+	return 0
+}
+
+func resetRoot() int {
+	value := 0
+	timer := time.AfterFunc(0, func() { value = 1 })
+	if timer.Stop() {
+		timer.Reset(0)
+		value = 2
+	}
+	return 0
+}
+
+var sharedValue = 0
+
+func sharedTarget() { sharedValue = 1 }
+
+func sharedRoot() int {
+	stopped := time.AfterFunc(0, sharedTarget)
+	running := time.AfterFunc(0, sharedTarget)
+	_ = running
+	if stopped.Stop() {
+		sharedValue = 2
+	}
+	return 0
+}
+
+type stopwatch struct{ stopped bool }
+
+func (s *stopwatch) Stop() bool {
+	s.stopped = true
+	return s.stopped
+}
+
+func sameNameRoot() int {
+	value := 0
+	watch := &stopwatch{}
+	time.AfterFunc(0, func() { value = 1 })
+	if watch.Stop() {
+		value = 2
+	}
+	return 0
+}
+
+func unresolvedRoot() int {
+	value := 0
+	var callback func()
+	time.AfterFunc(0, callback)
+	value = 2
+	return value
+}
+"#,
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let snapshot = timer_stop_guard_snapshot(&workspace);
+
+    let cancellation = CancellationToken::default();
+    let mut budget = SemanticBudget::default();
+    let artifact = workspace
+        .materialize_program_semantics(
+            &project.file("main.go"),
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("timer stop guard semantics materialize")
+        .available_value()
+        .cloned()
+        .expect("timer stop guard semantics are available");
+    let procedure = |name: &str| {
+        artifact
+            .procedures()
+            .iter()
+            .find(|candidate| {
+                candidate
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|segment| segment.name())
+                    == Some(name)
+            })
+            .and_then(|row| artifact.procedure_handle(row.id()))
+            .unwrap_or_else(|| panic!("missing {name}"))
+    };
+    let provider = super::super::concurrency::WorkspaceConcurrencyProvider::new(
+        &workspace,
+        Some(snapshot),
+        None,
+    );
+    let report = |name: &str| {
+        let mut budget = SemanticBudget::default();
+        brokk_bifrost_flow::concurrency::concurrent_access_conflicts(
+            &provider,
+            &procedure(name),
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .unwrap_or_else(|error| panic!("{name} report computes: {error}"))
+    };
+
+    // Positive: the spawn edge orders a write before the call before the
+    // callback's reads.
+    let ordered = report("spawnOrdersRoot");
+    assert!(
+        ordered.conflicts.iter().any(|conflict| {
+            conflict.proven
+                && conflict.exhaustive
+                && conflict.ordering
+                    == brokk_bifrost_flow::concurrency::ConcurrentOrdering::HappensBefore
+        }),
+        "the AfterFunc spawn must order the write before the callback reads: {ordered:#?}"
+    );
+
+    // No stop: the callback stays unordered with the parent's later access,
+    // because the returned timer is not a join.
+    let unjoined = report("unjoinedRoot");
+    assert!(
+        unjoined.conflicts.iter().any(|conflict| {
+            conflict.proven
+                && conflict.exhaustive
+                && conflict.ordering
+                    == brokk_bifrost_flow::concurrency::ConcurrentOrdering::Unordered
+                && conflict.protection
+                    == brokk_bifrost_flow::concurrency::ConcurrentProtection::Unprotected
+        }),
+        "an unjoined timer callback must stay a proven race: {unjoined:#?}"
+    );
+
+    // Stop-true arm: the stopped callback never runs there, so the write
+    // cannot race it.
+    let stop_arm = report("stopArmRoot");
+    assert!(
+        !stop_arm.conflicts.iter().any(|conflict| {
+            conflict.proven
+                && conflict.ordering
+                    == brokk_bifrost_flow::concurrency::ConcurrentOrdering::Unordered
+        }),
+        "a write only the stop-true arm reaches cannot race the callback: {stop_arm:#?}"
+    );
+
+    // False arm: the timer fired, so the callback may run with the write.
+    let false_arm = report("falseArmRoot");
+    assert!(
+        false_arm.conflicts.iter().any(|conflict| {
+            conflict.proven
+                && conflict.ordering
+                    == brokk_bifrost_flow::concurrency::ConcurrentOrdering::Unordered
+        }),
+        "the stop-false arm must stay a proven race: {false_arm:#?}"
+    );
+
+    // Wrong object: stopping another timer cancels nothing for this callback.
+    let wrong_object = report("wrongObjectRoot");
+    assert!(
+        wrong_object.conflicts.iter().any(|conflict| {
+            conflict.proven
+                && conflict.ordering
+                    == brokk_bifrost_flow::concurrency::ConcurrentOrdering::Unordered
+        }),
+        "a stop on a distinct timer must not cancel this callback: {wrong_object:#?}"
+    );
+
+    // Reset: the stop-true arm re-arms the timer before writing, so the
+    // callback may run again with the write.
+    let reset = report("resetRoot");
+    assert!(
+        reset.conflicts.iter().any(|conflict| {
+            conflict.proven
+                && conflict.ordering
+                    == brokk_bifrost_flow::concurrency::ConcurrentOrdering::Unordered
+        }),
+        "a reset after the stop must re-arm the proven race: {reset:#?}"
+    );
+
+    // Shared callback: stopping one timer leaves the same callback running
+    // under the other.
+    let shared = report("sharedRoot");
+    assert!(
+        shared.conflicts.iter().any(|conflict| {
+            conflict.proven
+                && conflict.ordering
+                    == brokk_bifrost_flow::concurrency::ConcurrentOrdering::Unordered
+        }),
+        "the callback running under the second timer must race the arm write: {shared:#?}"
+    );
+
+    // Same name, wrong type: an unrelated Stop method never binds the
+    // reviewed timer protocol.
+    let same_name = report("sameNameRoot");
+    assert!(
+        same_name.conflicts.iter().any(|conflict| {
+            conflict.proven
+                && conflict.ordering
+                    == brokk_bifrost_flow::concurrency::ConcurrentOrdering::Unordered
+        }),
+        "an unrelated same-name method must not cancel the modeled timer: {same_name:#?}"
+    );
+
+    // Incomplete: a callback the spawn cannot name keeps its typed boundary
+    // instead of inventing a task.
+    let incomplete = report("unresolvedRoot");
+    assert!(
+        incomplete
+            .reasons
+            .contains(&brokk_bifrost_flow::concurrency::ConcurrencyOpenReason::UnresolvedTarget),
+        "the unresolved callback must keep its typed boundary: {incomplete:#?}"
+    );
+    assert!(
+        !incomplete.conflicts.iter().any(|conflict| {
+            conflict.proven
+                && conflict.ordering
+                    == brokk_bifrost_flow::concurrency::ConcurrentOrdering::Unordered
+        }),
+        "no comparison may claim a callback the spawn cannot name: {incomplete:#?}"
+    );
+}
+
+#[test]
+fn go_projected_summaries_retain_timer_stop_conditions() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file(
+            "main.go",
+            r#"package main
+
+import "time"
+
+func timerStopBody() int {
+	value := 0
+	timer := time.AfterFunc(0, func() { value = 1 })
+	if timer.Stop() {
+		value = 2
+	}
+	return 0
+}
+
+func summarizedTimerRoot() int {
+	return timerStopBody()
+}
+
+func stopThrough(timer *time.Timer) bool {
+	return timer.Stop()
+}
+
+func stopThroughRoot() int {
+	value := 0
+	timer := time.AfterFunc(0, func() { value = 1 })
+	if stopThrough(timer) {
+		value = 2
+	}
+	return 0
+}
+
+func ignoreStop(timer *time.Timer) {
+	timer.Stop()
+}
+
+var scheduledValue = 0
+
+func scheduleLiteral() *time.Timer {
+	return time.AfterFunc(0, func() { scheduledValue = 1 })
+}
+
+func scheduleRoot() int {
+	timer := scheduleLiteral()
+	_ = timer
+	return scheduledValue
+}
+"#,
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let snapshot = timer_stop_guard_snapshot(&workspace);
+
+    let cancellation = CancellationToken::default();
+    let mut budget = SemanticBudget::default();
+    let artifact = workspace
+        .materialize_program_semantics(
+            &project.file("main.go"),
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("timer wrapper semantics materialize")
+        .available_value()
+        .cloned()
+        .expect("timer wrapper semantics are available");
+    let procedure = |name: &str| {
+        artifact
+            .procedures()
+            .iter()
+            .find(|candidate| {
+                candidate
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|segment| segment.name())
+                    == Some(name)
+            })
+            .and_then(|row| artifact.procedure_handle(row.id()))
+            .unwrap_or_else(|| panic!("missing {name}"))
+    };
+    let stop_body = procedure("timerStopBody");
+    let summarized_root = procedure("summarizedTimerRoot");
+    let stop_through = procedure("stopThrough");
+    let stop_through_root = procedure("stopThroughRoot");
+    let ignore_stop = procedure("ignoreStop");
+    let schedule_literal = procedure("scheduleLiteral");
+    let schedule_root = procedure("scheduleRoot");
+
+    // Project production summaries for the wrapper closure and prove that a
+    // guard-consuming wrapper drops the spawn whose timer stays local, a
+    // result-returning spawn wrapper keeps its spawn with the timer port, a
+    // result-returning stop wrapper keeps its stop, and a discarding wrapper
+    // drops the stop it cannot name.
+    let icfg =
+        crate::analyzer::semantic::WorkspaceIcfgProvider::with_active_semantic_model_snapshot(
+            &workspace,
+            Some(snapshot.clone()),
+        );
+    let projection_provider = super::super::concurrency::WorkspaceConcurrencyProvider::new(
+        &workspace,
+        Some(snapshot.clone()),
+        None,
+    );
+    let roots = [
+        summarized_root.clone(),
+        stop_body.clone(),
+        stop_through.clone(),
+        stop_through_root.clone(),
+        ignore_stop.clone(),
+        schedule_literal.clone(),
+        schedule_root.clone(),
+    ];
+    let mut projection_budget = SemanticBudget::default();
+    let summaries =
+        brokk_bifrost_flow::typestate::project_production_semantic_summaries_with_concurrency(
+            &roots,
+            &icfg,
+            &projection_provider,
+            &mut SemanticRequest::new(&mut projection_budget, &cancellation),
+        )
+        .expect("timer wrapper summaries project");
+    let body_summary = summaries
+        .summary_for(&stop_body)
+        .expect("the stop wrapper has a production summary");
+    // The guard consumes the stop inside the body and the timer never
+    // escapes, so the projection keeps no modeled rows at all and the live
+    // model lookup keeps answering the body's own solve. There is no join:
+    // the timer never joins its callback.
+    assert!(
+        !body_summary.effects().iter().any(|effect| matches!(
+            effect.key(),
+            brokk_bifrost_flow::dataflow::SummaryEffectKey::Concurrency(effect)
+                if matches!(
+                    effect.kind(),
+                    brokk_bifrost_flow::dataflow::SummaryConcurrencyEffectKind::TaskSpawn { .. }
+                        | brokk_bifrost_flow::dataflow::SummaryConcurrencyEffectKind::TimerStop { .. }
+                        | brokk_bifrost_flow::dataflow::SummaryConcurrencyEffectKind::TaskJoin { .. }
+                )
+        )),
+        "the guard-consuming wrapper keeps no modeled rows and no join: {body_summary:#?}"
+    );
+    // A spawn wrapper that returns the modeled call's own timer keeps the
+    // spawn with the timer port on its normal result.
+    let schedule_summary = summaries
+        .summary_for(&schedule_literal)
+        .expect("the schedule wrapper has a production summary");
+    assert!(
+        schedule_summary.effects().iter().any(|effect| matches!(
+            effect.key(),
+            brokk_bifrost_flow::dataflow::SummaryEffectKey::Concurrency(effect)
+                if matches!(
+                    effect.kind(),
+                    brokk_bifrost_flow::dataflow::SummaryConcurrencyEffectKind::TaskSpawn {
+                        timer: Some(timer),
+                        ..
+                    } if matches!(
+                        timer.root(),
+                        brokk_bifrost_flow::dataflow::SummaryPort::NormalReturn
+                            | brokk_bifrost_flow::dataflow::SummaryPort::IndexedNormalReturn(0)
+                    )
+                )
+        )),
+        "the result-returning spawn wrapper must retain the spawn with its timer port: {schedule_summary:#?}"
+    );
+    // A wrapper that returns the modeled call's own result hands the stop to
+    // its caller through the timer formal.
+    let through_summary = summaries
+        .summary_for(&stop_through)
+        .expect("the stop-through wrapper has a production summary");
+    assert!(
+        through_summary.effects().iter().any(|effect| matches!(
+            effect.key(),
+            brokk_bifrost_flow::dataflow::SummaryEffectKey::Concurrency(effect)
+                if matches!(
+                    effect.kind(),
+                    brokk_bifrost_flow::dataflow::SummaryConcurrencyEffectKind::TimerStop {
+                        timer,
+                        ..
+                    } if timer.root()
+                        == &brokk_bifrost_flow::dataflow::SummaryPort::Parameter(0)
+                )
+        )),
+        "the result-returning wrapper must retain the stop on its timer formal: {through_summary:#?}"
+    );
+    // A wrapper that discards the result drops the stop it cannot name, and
+    // its callers keep the may-run answer instead of an invented exclusion.
+    let ignore_summary = summaries
+        .summary_for(&ignore_stop)
+        .expect("the discarding wrapper has a production summary");
+    assert!(
+        !ignore_summary.effects().iter().any(|effect| matches!(
+            effect.key(),
+            brokk_bifrost_flow::dataflow::SummaryEffectKey::Concurrency(effect)
+                if matches!(
+                    effect.kind(),
+                    brokk_bifrost_flow::dataflow::SummaryConcurrencyEffectKind::TimerStop { .. }
+                )
+        )),
+        "the discarding wrapper must not carry a stop it cannot name: {ignore_summary:#?}"
+    );
+
+    // The wrapper body holds the spawn and the guard in one activation, so
+    // the exact summary and the direct expansion agree that the arm write
+    // never races the callback.
+    let direct_provider = super::super::concurrency::WorkspaceConcurrencyProvider::new(
+        &workspace,
+        Some(snapshot.clone()),
+        None,
+    );
+    let mut direct_budget = SemanticBudget::default();
+    let direct = brokk_bifrost_flow::concurrency::concurrent_access_conflicts(
+        &direct_provider,
+        &summarized_root,
+        &mut SemanticRequest::new(&mut direct_budget, &cancellation),
+    )
+    .expect("direct timer wrapper report computes");
+    assert!(
+        !direct.conflicts.iter().any(|conflict| {
+            conflict.proven
+                && conflict.ordering
+                    == brokk_bifrost_flow::concurrency::ConcurrentOrdering::Unordered
+        }),
+        "the wrapper body must exclude the arm write from the callback: {direct:#?}"
+    );
+    let projected_provider = super::super::concurrency::WorkspaceConcurrencyProvider::new(
+        &workspace,
+        Some(snapshot.clone()),
+        Some(summaries),
+    );
+    let mut projected_budget = SemanticBudget::default();
+    let projected = brokk_bifrost_flow::concurrency::concurrent_access_conflicts(
+        &projected_provider,
+        &summarized_root,
+        &mut SemanticRequest::new(&mut projected_budget, &cancellation),
+    )
+    .expect("projected timer wrapper report computes");
+    assert_eq!(
+        projected, direct,
+        "fresh task summaries preserve the direct timer wrapper report"
+    );
+
+    // A caller guard on a stop-through wrapper cannot bind inside the callee
+    // yet, so both expansion modes keep the same answer instead of granting
+    // an exclusion the callee cannot establish. Applying a callee's stop in
+    // the caller's guard context is the remaining exact-wrapper work.
+    let mut through_direct_budget = SemanticBudget::default();
+    let through_direct = brokk_bifrost_flow::concurrency::concurrent_access_conflicts(
+        &direct_provider,
+        &stop_through_root,
+        &mut SemanticRequest::new(&mut through_direct_budget, &cancellation),
+    )
+    .expect("direct stop-through report computes");
+    let mut through_projected_budget = SemanticBudget::default();
+    let through_projected = brokk_bifrost_flow::concurrency::concurrent_access_conflicts(
+        &projected_provider,
+        &stop_through_root,
+        &mut SemanticRequest::new(&mut through_projected_budget, &cancellation),
+    )
+    .expect("projected stop-through report computes");
+    assert_eq!(
+        through_projected, through_direct,
+        "fresh task summaries preserve the direct stop-through report"
+    );
+
+    // The schedule wrapper returns its timer but stops nothing, so the
+    // callback stays unordered with the root's read in both modes.
+    let mut schedule_direct_budget = SemanticBudget::default();
+    let schedule_direct = brokk_bifrost_flow::concurrency::concurrent_access_conflicts(
+        &direct_provider,
+        &schedule_root,
+        &mut SemanticRequest::new(&mut schedule_direct_budget, &cancellation),
+    )
+    .expect("direct schedule report computes");
+    assert!(
+        schedule_direct.conflicts.iter().any(|conflict| {
+            conflict.proven
+                && conflict.exhaustive
+                && conflict.ordering
+                    == brokk_bifrost_flow::concurrency::ConcurrentOrdering::Unordered
+                && conflict.protection
+                    == brokk_bifrost_flow::concurrency::ConcurrentProtection::Unprotected
+        }),
+        "an unstopped scheduled callback must stay a proven race: {schedule_direct:#?}"
+    );
+    let mut schedule_projected_budget = SemanticBudget::default();
+    let schedule_projected = brokk_bifrost_flow::concurrency::concurrent_access_conflicts(
+        &projected_provider,
+        &schedule_root,
+        &mut SemanticRequest::new(&mut schedule_projected_budget, &cancellation),
+    )
+    .expect("projected schedule report computes");
+    assert_eq!(
+        schedule_projected, schedule_direct,
+        "fresh task summaries preserve the direct schedule report"
+    );
+}
+
+const SUBTEST_GUARD_PACK: &[u8] = br#"{
+  "schema_version": 2,
+  "pack_id": "test.go.subtest-guard",
+  "version": "1.0.0",
+  "producer": { "name": "test", "version": "1.0.0" },
+  "language": "go",
+  "ecosystem": "go",
+  "compatibility": { "bifrost": ">=0.10.7, <1.0.0", "toolchains": [] },
+  "provenance": { "source": "test", "revision": "1" },
+  "license": "MIT",
+  "completeness": "complete",
+  "safety": { "generated_code_only": false, "review_required": false },
+  "shards": [{
+    "id": "declarations",
+    "activation": [{}],
+    "payload": {
+      "kind": "declaration_facts",
+      "types": [
+        {
+          "id": "type.test.subtest.module",
+          "name": "testing", "type_kind": "module", "visibility": "package",
+          "is_abstract": false, "is_sealed": false, "has_explicit_type_terms": false,
+          "type_parameters": [], "type_parameter_constraints": [], "embedded_types": [],
+          "hierarchy": [], "aliases": ["testing"], "extension_surfaces": [],
+          "locator": { "kind": "artifact", "path": "src/testing/testing.go", "symbol": "testing" }
+        },
+        {
+          "id": "type.test.subtest.t",
+          "name": "testing.T", "type_kind": "struct", "visibility": "public",
+          "is_abstract": false, "is_sealed": false, "has_explicit_type_terms": false,
+          "type_parameters": [], "type_parameter_constraints": [], "embedded_types": [],
+          "hierarchy": [], "aliases": [], "extension_surfaces": [],
+          "locator": { "kind": "artifact", "path": "src/testing/testing.go", "symbol": "testing.T" }
+        }
+      ],
+      "members": [
+        {
+          "id": "member.test.subtest.t.run",
+          "owner": "type.test.subtest.t",
+          "name": "Run", "member_kind": "method", "visibility": "public", "is_static": false,
+          "is_abstract": false, "is_virtual": false,
+          "signature": { "type_parameters": [], "parameters": [{ "name": "name", "type": { "kind": "named", "name": "string", "arguments": [], "nullable": false }, "optional": false, "variadic": false }, { "name": "f", "type": { "kind": "named", "name": "func", "arguments": [], "nullable": false }, "optional": false, "variadic": false }], "returns": { "kind": "named", "name": "bool", "arguments": [], "nullable": false } },
+          "receiver": { "pointer": true }, "aliases": [],
+          "locator": { "kind": "artifact", "path": "src/testing/testing.go", "symbol": "testing.T.Run" }
+        },
+        {
+          "id": "member.test.subtest.t.parallel",
+          "owner": "type.test.subtest.t",
+          "name": "Parallel", "member_kind": "method", "visibility": "public", "is_static": false,
+          "is_abstract": false, "is_virtual": false,
+          "signature": { "type_parameters": [], "parameters": [] },
+          "receiver": { "pointer": true }, "aliases": [],
+          "locator": { "kind": "artifact", "path": "src/testing/testing.go", "symbol": "testing.T.Parallel" }
+        },
+        {
+          "id": "member.test.subtest.t.cleanup",
+          "owner": "type.test.subtest.t",
+          "name": "Cleanup", "member_kind": "method", "visibility": "public", "is_static": false,
+          "is_abstract": false, "is_virtual": false,
+          "signature": { "type_parameters": [], "parameters": [{ "name": "f", "type": { "kind": "named", "name": "func", "arguments": [], "nullable": false }, "optional": false, "variadic": false }] },
+          "receiver": { "pointer": true }, "aliases": [],
+          "locator": { "kind": "artifact", "path": "src/testing/testing.go", "symbol": "testing.T.Cleanup" }
+        }
+      ],
+      "relations": []
+    }
+  }, {
+    "id": "behavior",
+    "activation": [{}],
+    "payload": {
+      "kind": "procedure_summaries",
+      "summaries": [
+        {
+          "id": "testing.t.run",
+          "target": { "path": "src/testing/testing.go", "symbol": "testing.T.Run(name string, f func)", "has_receiver": true, "parameter_count": 2 },
+          "completeness": "complete",
+          "normal_result_count": 1,
+          "transfers": [],
+          "concurrency_effects": [{ "kind": "subtest_run", "callable": { "kind": "parameter", "ordinal": 1 }, "group": { "kind": "receiver" } }]
+        },
+        {
+          "id": "testing.t.parallel",
+          "target": { "path": "src/testing/testing.go", "symbol": "testing.T.Parallel()", "has_receiver": true, "parameter_count": 0 },
+          "completeness": "complete",
+          "transfers": [],
+          "concurrency_effects": [{ "kind": "subtest_parallel", "receiver": { "kind": "receiver" } }]
+        },
+        {
+          "id": "testing.t.cleanup",
+          "target": { "path": "src/testing/testing.go", "symbol": "testing.T.Cleanup(f func)", "has_receiver": true, "parameter_count": 1 },
+          "completeness": "complete",
+          "transfers": [],
+          "concurrency_effects": [{ "kind": "subtest_cleanup", "callable": { "kind": "parameter", "ordinal": 0 }, "group": { "kind": "receiver" } }]
+        }
+      ]
+    }
+  }]
+}"#;
+
+fn subtest_guard_snapshot(
+    workspace: &WorkspaceAnalyzer,
+) -> std::sync::Arc<ActiveSemanticModelSnapshot> {
+    subtest_snapshot_from_pack(workspace, SUBTEST_GUARD_PACK, "test:go-subtest-guard")
+}
+
+fn subtest_snapshot_from_pack(
+    workspace: &WorkspaceAnalyzer,
+    pack_bytes: &[u8],
+    source_id: &str,
+) -> std::sync::Arc<ActiveSemanticModelSnapshot> {
+    let pack = compile_source(SourceFormat::Json, pack_bytes, &CompilerOptions::default())
+        .unwrap_or_else(|diagnostics| panic!("subtest guard pack compiles: {diagnostics:#?}"));
+    let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default())
+        .expect("ephemeral semantic-pack catalog");
+    catalog
+        .register_session_pack(
+            &pack,
+            &SessionPackSource {
+                kind: SessionPackSourceKind::Embedded,
+                source_id: source_id.to_owned(),
+            },
+        )
+        .expect("register subtest guard model pack");
+    let activation = acquire_active_semantic_models(
+        workspace.analyzer(),
+        &catalog,
+        None,
+        &SemanticModelActivationRequest {
+            bifrost_version: Version::parse(env!("CARGO_PKG_VERSION")).expect("crate version"),
+            evidence: vec![SemanticModelActivationEvidence {
+                language: "go".to_owned(),
+                ecosystem: "go".to_owned(),
+                package: None,
+                module: None,
+                toolchain: None,
+                target: None,
+                configuration: None,
+                artifact_sha256: None,
+            }],
+            controls: Vec::new(),
+            limits: SemanticModelRuntimeLimits::default(),
+        },
+        &CancellationToken::default(),
+    );
+    match activation {
+        SemanticModelRuntimeOutcome::Ready { snapshot, .. } => snapshot,
+        other => panic!("subtest guard models activate: {other:#?}"),
+    }
+}
+
+#[test]
+fn go_concurrent_access_conflicts_models_subtests() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file(
+            "main.go",
+            r#"package main
+
+import "testing"
+
+var shared = 0
+
+func parallelRaceRoot(t *testing.T) {
+	t.Run("a", func(st *testing.T) {
+		st.Parallel()
+		shared = 1
+	})
+	t.Run("b", func(st *testing.T) {
+		st.Parallel()
+		shared = 2
+	})
+}
+
+func sequentialRoot(t *testing.T) {
+	t.Run("a", func(st *testing.T) {
+		shared = 1
+	})
+	t.Run("b", func(st *testing.T) {
+		shared = 2
+	})
+}
+
+func parentAfterRunRoot(t *testing.T) {
+	t.Run("a", func(st *testing.T) {
+		shared = 1
+	})
+	shared = 2
+}
+
+func conditionalRoot(t *testing.T, flag bool) {
+	t.Run("a", func(st *testing.T) {
+		if flag {
+			st.Parallel()
+		}
+		shared = 1
+	})
+	t.Run("b", func(st *testing.T) {
+		st.Parallel()
+		shared = 2
+	})
+}
+
+func sharedBody(st *testing.T) {
+	shared = 1
+}
+
+func sharedCallableRoot(t *testing.T) {
+	t.Run("a", sharedBody)
+	t.Run("b", sharedBody)
+}
+
+func cleanupRoot(t *testing.T) {
+	t.Run("a", func(st *testing.T) {
+		shared = 1
+	})
+	t.Run("b", func(st *testing.T) {
+		shared = 2
+	})
+	t.Cleanup(func() {
+		_ = shared
+	})
+}
+
+type runner struct{ n int }
+
+func (r *runner) Run(name string, f func(t *testing.T)) bool {
+	r.n++
+	f(nil)
+	return r.n%2 == 0
+}
+
+func sameNameRoot(t *testing.T) {
+	r := &runner{}
+	shared = 0
+	r.Run("a", func(st *testing.T) {
+		shared = 1
+	})
+	shared = 2
+}
+"#,
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let snapshot = subtest_guard_snapshot(&workspace);
+
+    let cancellation = CancellationToken::default();
+    let mut budget = SemanticBudget::default();
+    let artifact = workspace
+        .materialize_program_semantics(
+            &project.file("main.go"),
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("subtest semantics materialize")
+        .available_value()
+        .cloned()
+        .expect("subtest semantics are available");
+    let procedure = |name: &str| {
+        artifact
+            .procedures()
+            .iter()
+            .find(|candidate| {
+                candidate
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|segment| segment.name())
+                    == Some(name)
+            })
+            .and_then(|row| artifact.procedure_handle(row.id()))
+            .unwrap_or_else(|| panic!("missing {name}"))
+    };
+    let provider = super::super::concurrency::WorkspaceConcurrencyProvider::new(
+        &workspace,
+        Some(snapshot),
+        None,
+    );
+    let report = |name: &str| {
+        let mut budget = SemanticBudget::default();
+        brokk_bifrost_flow::concurrency::concurrent_access_conflicts(
+            &provider,
+            &procedure(name),
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .unwrap_or_else(|error| panic!("{name} report computes: {error}"))
+    };
+
+    // Positive: two parallel subtests of one parent may run together, so
+    // their writes to one package variable are a proven race.
+    let parallel = report("parallelRaceRoot");
+    assert!(
+        parallel.conflicts.iter().any(|conflict| {
+            conflict.proven
+                && conflict.exhaustive
+                && conflict.ordering
+                    == brokk_bifrost_flow::concurrency::ConcurrentOrdering::Unordered
+                && conflict.protection
+                    == brokk_bifrost_flow::concurrency::ConcurrentProtection::Unprotected
+        }),
+        "two parallel subtests writing one variable must race: {parallel:#?}"
+    );
+
+    // Sequential: each Run joins its subtest, so the two writes are ordered
+    // and the report explains the join.
+    let sequential = report("sequentialRoot");
+    assert!(
+        !sequential.conflicts.iter().any(|conflict| {
+            conflict.proven
+                && conflict.ordering
+                    == brokk_bifrost_flow::concurrency::ConcurrentOrdering::Unordered
+        }),
+        "two sequential subtests never overlap: {sequential:#?}"
+    );
+    assert!(
+        sequential.conflicts.iter().any(|conflict| {
+            conflict.proven
+                && conflict.exhaustive
+                && conflict.ordering
+                    == brokk_bifrost_flow::concurrency::ConcurrentOrdering::HappensBefore
+        }),
+        "the Run join must order the sequential subtests: {sequential:#?}"
+    );
+
+    // A parent write after a non-parallel Run is ordered after the subtest.
+    let parent = report("parentAfterRunRoot");
+    assert!(
+        !parent.conflicts.iter().any(|conflict| {
+            conflict.proven
+                && conflict.ordering
+                    == brokk_bifrost_flow::concurrency::ConcurrentOrdering::Unordered
+        }),
+        "the Run join covers the subtest write: {parent:#?}"
+    );
+    assert!(
+        parent.conflicts.iter().any(|conflict| {
+            conflict.proven
+                && conflict.exhaustive
+                && conflict.ordering
+                    == brokk_bifrost_flow::concurrency::ConcurrentOrdering::HappensBefore
+        }),
+        "the Run join must order the subtest before the parent write: {parent:#?}"
+    );
+
+    // Conditional: a Parallel call on some paths but not others keeps the
+    // typed boundary instead of guessing a task.
+    let conditional = report("conditionalRoot");
+    assert!(
+        conditional.reasons.iter().any(|reason| matches!(reason,
+            brokk_bifrost_flow::concurrency::ConcurrencyOpenReason::UnsupportedSynchronization(protocol)
+            if protocol.contains("subtest Parallel is conditional or unresolved"))),
+        "the conditional Parallel must keep its typed boundary: {conditional:#?}"
+    );
+    assert!(
+        !conditional.conflicts.iter().any(|conflict| {
+            conflict.proven
+                && conflict.ordering
+                    == brokk_bifrost_flow::concurrency::ConcurrentOrdering::Unordered
+        }),
+        "no comparison may claim a race the classification does not establish: {conditional:#?}"
+    );
+
+    // One named callback shared by two sequential Runs still joins each call.
+    let shared = report("sharedCallableRoot");
+    assert!(
+        !shared.conflicts.iter().any(|conflict| {
+            conflict.proven
+                && conflict.ordering
+                    == brokk_bifrost_flow::concurrency::ConcurrentOrdering::Unordered
+        }),
+        "a shared sequential callback still joins each Run: {shared:#?}"
+    );
+
+    // Cleanup: the registered callback runs after the subtests complete.
+    let cleanup = report("cleanupRoot");
+    assert!(
+        !cleanup.conflicts.iter().any(|conflict| {
+            conflict.proven
+                && conflict.ordering
+                    == brokk_bifrost_flow::concurrency::ConcurrentOrdering::Unordered
+        }),
+        "Cleanup runs after the subtests complete: {cleanup:#?}"
+    );
+    assert!(
+        cleanup.conflicts.iter().any(|conflict| {
+            conflict.proven
+                && conflict.exhaustive
+                && conflict.ordering
+                    == brokk_bifrost_flow::concurrency::ConcurrentOrdering::HappensBefore
+        }),
+        "the subtree join must order the subtests before the Cleanup read: {cleanup:#?}"
+    );
+
+    // Same name, wrong type: an unrelated Run method never binds the
+    // reviewed testing protocol.
+    let same_name = report("sameNameRoot");
+    assert!(
+        !same_name.conflicts.iter().any(|conflict| {
+            conflict.proven
+                && conflict.ordering
+                    == brokk_bifrost_flow::concurrency::ConcurrentOrdering::Unordered
+        }),
+        "an unrelated same-name method must not spawn a modeled task: {same_name:#?}"
+    );
+    assert!(
+        !same_name.reasons.iter().any(|reason| matches!(reason,
+            brokk_bifrost_flow::concurrency::ConcurrencyOpenReason::UnsupportedSynchronization(protocol)
+            if protocol.contains("subtest"))),
+        "an unrelated same-name method is not the reviewed protocol: {same_name:#?}"
+    );
+}
+
+const SUBTEST_RUN_WITHOUT_PARALLEL_PACK: &[u8] = br#"{
+  "schema_version": 2,
+  "pack_id": "test.go.subtest-run-without-parallel",
+  "version": "1.0.0",
+  "producer": { "name": "test", "version": "1.0.0" },
+  "language": "go",
+  "ecosystem": "go",
+  "compatibility": { "bifrost": ">=0.10.7, <1.0.0", "toolchains": [] },
+  "provenance": { "source": "test", "revision": "1" },
+  "license": "MIT",
+  "completeness": "complete",
+  "safety": { "generated_code_only": false, "review_required": false },
+  "shards": [{
+    "id": "declarations",
+    "activation": [{}],
+    "payload": {
+      "kind": "declaration_facts",
+      "types": [
+        {
+          "id": "type.test.subtest.module",
+          "name": "testing", "type_kind": "module", "visibility": "package",
+          "is_abstract": false, "is_sealed": false, "has_explicit_type_terms": false,
+          "type_parameters": [], "type_parameter_constraints": [], "embedded_types": [],
+          "hierarchy": [], "aliases": ["testing"], "extension_surfaces": [],
+          "locator": { "kind": "artifact", "path": "src/testing/testing.go", "symbol": "testing" }
+        },
+        {
+          "id": "type.test.subtest.t",
+          "name": "testing.T", "type_kind": "struct", "visibility": "public",
+          "is_abstract": false, "is_sealed": false, "has_explicit_type_terms": false,
+          "type_parameters": [], "type_parameter_constraints": [], "embedded_types": [],
+          "hierarchy": [], "aliases": [], "extension_surfaces": [],
+          "locator": { "kind": "artifact", "path": "src/testing/testing.go", "symbol": "testing.T" }
+        }
+      ],
+      "members": [
+        {
+          "id": "member.test.subtest.t.run",
+          "owner": "type.test.subtest.t",
+          "name": "Run", "member_kind": "method", "visibility": "public", "is_static": false,
+          "is_abstract": false, "is_virtual": false,
+          "signature": { "type_parameters": [], "parameters": [{ "name": "name", "type": { "kind": "named", "name": "string", "arguments": [], "nullable": false }, "optional": false, "variadic": false }, { "name": "f", "type": { "kind": "named", "name": "func", "arguments": [], "nullable": false }, "optional": false, "variadic": false }], "returns": { "kind": "named", "name": "bool", "arguments": [], "nullable": false } },
+          "receiver": { "pointer": true }, "aliases": [],
+          "locator": { "kind": "artifact", "path": "src/testing/testing.go", "symbol": "testing.T.Run" }
+        }
+      ],
+      "relations": []
+    }
+  }, {
+    "id": "behavior",
+    "activation": [{}],
+    "payload": {
+      "kind": "procedure_summaries",
+      "summaries": [
+        {
+          "id": "testing.t.run",
+          "target": { "path": "src/testing/testing.go", "symbol": "testing.T.Run(name string, f func)", "has_receiver": true, "parameter_count": 2 },
+          "completeness": "complete",
+          "normal_result_count": 1,
+          "transfers": [],
+          "concurrency_effects": [{ "kind": "subtest_run", "callable": { "kind": "parameter", "ordinal": 1 }, "group": { "kind": "receiver" } }]
+        }
+      ]
+    }
+  }]
+}"#;
+
+#[test]
+fn go_subtest_run_without_parallel_keeps_its_typed_boundary() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file(
+            "main.go",
+            r#"package main
+
+import "testing"
+
+var shared = 0
+
+func incoherentRoot(t *testing.T) {
+	t.Run("a", func(st *testing.T) {
+		shared = 1
+	})
+	shared = 2
+}
+"#,
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let snapshot = subtest_snapshot_from_pack(
+        &workspace,
+        SUBTEST_RUN_WITHOUT_PARALLEL_PACK,
+        "test:go-subtest-run-without-parallel",
+    );
+
+    let cancellation = CancellationToken::default();
+    let mut budget = SemanticBudget::default();
+    let artifact = workspace
+        .materialize_program_semantics(
+            &project.file("main.go"),
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("subtest semantics materialize")
+        .available_value()
+        .cloned()
+        .expect("subtest semantics are available");
+    let procedure = artifact
+        .procedures()
+        .iter()
+        .find(|candidate| {
+            candidate
+                .locator()
+                .declaration()
+                .segments()
+                .last()
+                .and_then(|segment| segment.name())
+                == Some("incoherentRoot")
+        })
+        .and_then(|row| artifact.procedure_handle(row.id()))
+        .expect("missing incoherentRoot");
+    let provider = super::super::concurrency::WorkspaceConcurrencyProvider::new(
+        &workspace,
+        Some(snapshot),
+        None,
+    );
+    let mut budget = SemanticBudget::default();
+    let report = brokk_bifrost_flow::concurrency::concurrent_access_conflicts(
+        &provider,
+        &procedure,
+        &mut SemanticRequest::new(&mut budget, &cancellation),
+    )
+    .expect("incoherent report computes");
+
+    // A Run model without its Parallel model cannot classify any callback,
+    // so the Run stays unbound with a typed reason instead of reading every
+    // parallel callback as sequential and hiding its races.
+    assert!(
+        report.reasons.iter().any(|reason| matches!(reason,
+            brokk_bifrost_flow::concurrency::ConcurrencyOpenReason::UnsupportedSynchronization(protocol)
+            if protocol.contains("subtest Run is modeled but Parallel is not"))),
+        "the incoherent pack must name its missing model: {report:#?}"
+    );
+    assert!(
+        !report.conflicts.iter().any(|conflict| {
+            conflict.proven
+                && conflict.ordering
+                    == brokk_bifrost_flow::concurrency::ConcurrentOrdering::Unordered
+        }),
+        "no comparison may claim a race the missing model cannot establish: {report:#?}"
+    );
+}
+
+#[test]
+fn go_projected_summaries_retain_subtest_effects() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file(
+            "main.go",
+            r#"package main
+
+import "testing"
+
+var shared = 0
+
+func runJoinedBody(t *testing.T) {
+	t.Run("a", func(st *testing.T) {
+		shared = 1
+	})
+	shared = 2
+}
+
+func summarizedRoot(t *testing.T) {
+	runJoinedBody(t)
+}
+
+func runThrough(t *testing.T, name string, f func(*testing.T)) bool {
+	return t.Run(name, f)
+}
+
+func forwardedRoot(t *testing.T) {
+	shared = 0
+	runThrough(t, "a", func(st *testing.T) {
+		shared = 1
+	})
+	shared = 2
+}
+"#,
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let snapshot = subtest_guard_snapshot(&workspace);
+
+    let cancellation = CancellationToken::default();
+    let mut budget = SemanticBudget::default();
+    let artifact = workspace
+        .materialize_program_semantics(
+            &project.file("main.go"),
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("wrapper semantics materialize")
+        .available_value()
+        .cloned()
+        .expect("wrapper semantics are available");
+    let procedure = |name: &str| {
+        artifact
+            .procedures()
+            .iter()
+            .find(|candidate| {
+                candidate
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|segment| segment.name())
+                    == Some(name)
+            })
+            .and_then(|row| artifact.procedure_handle(row.id()))
+            .unwrap_or_else(|| panic!("missing {name}"))
+    };
+    let joined_body = procedure("runJoinedBody");
+    let summarized_root = procedure("summarizedRoot");
+    let run_through = procedure("runThrough");
+    let forwarded_root = procedure("forwardedRoot");
+
+    // Project production summaries for the wrapper closure and prove that a
+    // wrapper keeps the subtest spawn and its group through exact
+    // actual/formal substitution.
+    let icfg =
+        crate::analyzer::semantic::WorkspaceIcfgProvider::with_active_semantic_model_snapshot(
+            &workspace,
+            Some(snapshot.clone()),
+        );
+    let projection_provider = super::super::concurrency::WorkspaceConcurrencyProvider::new(
+        &workspace,
+        Some(snapshot.clone()),
+        None,
+    );
+    let roots = [
+        summarized_root.clone(),
+        forwarded_root.clone(),
+        joined_body.clone(),
+        run_through.clone(),
+    ];
+    let mut projection_budget = SemanticBudget::default();
+    let summaries =
+        brokk_bifrost_flow::typestate::project_production_semantic_summaries_with_concurrency(
+            &roots,
+            &icfg,
+            &projection_provider,
+            &mut SemanticRequest::new(&mut projection_budget, &cancellation),
+        )
+        .expect("wrapper summaries project");
+    let body_summary = summaries
+        .summary_for(&joined_body)
+        .expect("the joined wrapper has a production summary");
+    assert!(
+        body_summary.effects().iter().any(|effect| matches!(
+            effect.key(),
+            brokk_bifrost_flow::dataflow::SummaryEffectKey::Concurrency(effect)
+                if matches!(
+                    effect.kind(),
+                    brokk_bifrost_flow::dataflow::SummaryConcurrencyEffectKind::SubtestRun { .. }
+                )
+        )),
+        "the joined wrapper must retain the subtest spawn: {body_summary:#?}"
+    );
+    // The wrapper body holds the Run and the parent write in one activation,
+    // so the exact summary and the direct expansion agree on the ordered pair.
+    let direct_provider = super::super::concurrency::WorkspaceConcurrencyProvider::new(
+        &workspace,
+        Some(snapshot.clone()),
+        None,
+    );
+    let mut direct_budget = SemanticBudget::default();
+    let direct = brokk_bifrost_flow::concurrency::concurrent_access_conflicts(
+        &direct_provider,
+        &summarized_root,
+        &mut SemanticRequest::new(&mut direct_budget, &cancellation),
+    )
+    .expect("direct wrapper report computes");
+    assert!(
+        direct.conflicts.iter().any(|conflict| {
+            conflict.proven
+                && conflict.exhaustive
+                && conflict.ordering
+                    == brokk_bifrost_flow::concurrency::ConcurrentOrdering::HappensBefore
+        }),
+        "the wrapper body must order the subtest write before the parent write: {direct:#?}"
+    );
+    let projected_provider = super::super::concurrency::WorkspaceConcurrencyProvider::new(
+        &workspace,
+        Some(snapshot.clone()),
+        Some(summaries),
+    );
+    let mut projected_budget = SemanticBudget::default();
+    let projected = brokk_bifrost_flow::concurrency::concurrent_access_conflicts(
+        &projected_provider,
+        &summarized_root,
+        &mut SemanticRequest::new(&mut projected_budget, &cancellation),
+    )
+    .expect("projected wrapper report computes");
+    // Replayed summary accesses enumerate in a different position than
+    // directly expanded ones, so the shared pair lists its sites in the
+    // opposite order. The pair, its verdicts, and the report reasons must
+    // still agree exactly.
+    assert_eq!(
+        projected.conflicts.len(),
+        direct.conflicts.len(),
+        "fresh task summaries preserve the direct wrapper pairs: {projected:#?} vs {direct:#?}"
+    );
+    for conflict in &direct.conflicts {
+        assert!(
+            projected.conflicts.iter().any(|candidate| {
+                candidate.location == conflict.location
+                    && candidate.task_relation == conflict.task_relation
+                    && candidate.ordering == conflict.ordering
+                    && candidate.protection == conflict.protection
+                    && candidate.proven == conflict.proven
+                    && candidate.exhaustive == conflict.exhaustive
+                    && candidate.reasons == conflict.reasons
+                    && ((candidate.first == conflict.first && candidate.second == conflict.second)
+                        || (candidate.first == conflict.second
+                            && candidate.second == conflict.first))
+            }),
+            "fresh task summaries preserve the direct wrapper pair: {projected:#?} vs {direct:#?}"
+        );
+    }
+    assert_eq!(
+        projected.reasons, direct.reasons,
+        "fresh task summaries preserve the direct wrapper reasons"
+    );
+
+    // A wrapper that forwards its callable as a formal parameter cannot name
+    // the callback's targets, so the caller keeps the typed callable
+    // boundary instead of an ordering the wrapper cannot establish.
+    let mut forwarded_budget = SemanticBudget::default();
+    let forwarded = brokk_bifrost_flow::concurrency::concurrent_access_conflicts(
+        &projected_provider,
+        &forwarded_root,
+        &mut SemanticRequest::new(&mut forwarded_budget, &cancellation),
+    )
+    .expect("forwarding wrapper report computes");
+    assert!(
+        forwarded
+            .reasons
+            .contains(&brokk_bifrost_flow::concurrency::ConcurrencyOpenReason::UnresolvedTarget),
+        "a wrapper that forwards its callable keeps the typed callable boundary: {forwarded:#?}"
+    );
+    assert!(
+        !forwarded.conflicts.iter().any(|conflict| {
+            conflict.proven
+                && conflict.ordering
+                    == brokk_bifrost_flow::concurrency::ConcurrentOrdering::HappensBefore
+        }),
+        "a forwarded callable grants no ordering the wrapper cannot establish: {forwarded:#?}"
+    );
 }

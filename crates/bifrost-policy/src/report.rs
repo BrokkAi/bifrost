@@ -1098,6 +1098,7 @@ impl PolicyReportDiagnostic {
 #[serde(rename_all = "kebab-case")]
 pub enum PolicyReportDiagnosticCode {
     WorkspaceSnapshotDeadlineExceeded,
+    DiffBaseDeadlineExceeded,
     DiffBaseUnreliable,
     SuppressionLoadFailed,
     SuppressionAuditRetentionExceeded,
@@ -1485,6 +1486,7 @@ pub enum PolicyExecutionStage {
     WorkspaceSnapshot,
     PolicyRegistration,
     PolicyPreparation,
+    DiffBase,
     PolicyEvaluation,
     ReportConstruction,
 }
@@ -4118,6 +4120,10 @@ mod tests {
             serde_json::to_value(PolicyReportDiagnosticCode::WorkspaceSnapshotDeadlineExceeded)
                 .unwrap(),
             json!("workspace-snapshot-deadline-exceeded")
+        );
+        assert_eq!(
+            serde_json::to_value(PolicyReportDiagnosticCode::DiffBaseDeadlineExceeded).unwrap(),
+            json!("diff-base-deadline-exceeded")
         );
         assert_eq!(
             serde_json::to_value(PolicyReportDiagnosticCode::PacksLoadFailed).unwrap(),

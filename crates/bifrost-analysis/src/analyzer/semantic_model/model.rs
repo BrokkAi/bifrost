@@ -586,6 +586,9 @@ pub enum RuntimeCoverageLimitation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum RuntimeExposureActivation {
+    /// Intrinsically eligible within its model. This does not bypass pack
+    /// activation: a pack marked `safety.review_required` still needs an
+    /// explicit compatible enable control before its exposures can publish.
     Enabled,
     Disabled,
     ReviewRequired,
@@ -1684,6 +1687,30 @@ pub enum AuthoredConcurrencyEffect {
         callable: AuthoredSummaryInput,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         group: Option<AuthoredSummaryInput>,
+        /// The spawn condition this modeled call establishes itself.
+        ///
+        /// `None` is the plain spawn (`errgroup.Group.Go`,
+        /// `sync.WaitGroup.Go`, `time.AfterFunc`): the callable starts on
+        /// every path that reaches the call's continuation. `call_result_true`
+        /// is the conditional-spawn contract (`errgroup.Group.TryGo`): the
+        /// call starts the callable exactly when its boolean result reports
+        /// that it did, and starts nothing otherwise, so the spawned task is
+        /// an event on the paths where the call's result is established true
+        /// and no event on the paths where it is established false or never
+        /// consumed. The task's cardinality is therefore at most one per
+        /// call, and a group join covers whatever the call started.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        condition: Option<AuthoredTaskSpawnCondition>,
+        /// The timer object this spawn call returns, when the spawned
+        /// callback belongs to a cancellable timer (`time.AfterFunc`).
+        ///
+        /// Only a normal-return port can name it: the timer is the
+        /// construction call's own result, and its identity is what a later
+        /// `timer_stop` or `timer_reset` on the same object binds against.
+        /// Spawns without a timer (`errgroup.Group.Go`,
+        /// `sync.WaitGroup.Go`, `errgroup.Group.TryGo`) omit it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timer: Option<AuthoredSummaryOutput>,
     },
     TaskJoin {
         group: AuthoredSummaryInput,
@@ -1753,6 +1780,121 @@ pub enum AuthoredConcurrencyEffect {
         condition: AuthoredSummaryInput,
         waiters: AuthoredCondWaiters,
     },
+    /// One `sync.Map` entry operation on the (map, key) entry named by the
+    /// exact receiver and key inputs (issue #3370).
+    ///
+    /// The map's own state is internally synchronized and is never an
+    /// ordinary access, and a stored value keeps its own identity, so the
+    /// model carries the operation's read/write classification instead of an
+    /// ordinary-map approximation. Per the package documentation, a write
+    /// operation synchronizes before any read operation that observes its
+    /// effect; the solver binds the observation through structured guard
+    /// facts on the documented boolean results.
+    SyncMap {
+        map: AuthoredSummaryInput,
+        /// The key input naming the entry. `Clear` names no key because it
+        /// writes every entry of the map.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key: Option<AuthoredSummaryInput>,
+        operation: AuthoredSyncMapOperation,
+    },
+    /// One `(*time.Timer).Stop` call on the `timer` object (issue #3382).
+    ///
+    /// The cancellation contract is intrinsic to the effect: when the call's
+    /// boolean result is established true by a structured guard, the
+    /// `time.AfterFunc` callback for that exact timer did not and will not
+    /// run, so the guard's true arm never executes concurrently with it. The
+    /// false arm, dead paths, and unconsumed results establish nothing, and a
+    /// stop on another timer binds nothing. The stop itself orders nothing:
+    /// it is neither a join nor a lock, only proof of absence.
+    TimerStop {
+        timer: AuthoredSummaryInput,
+    },
+    /// One `(*time.Timer).Reset` call on the `timer` object (issue #3382).
+    ///
+    /// Reset re-arms the timer: for an `AfterFunc` timer it reschedules the
+    /// callback, or schedules it to run again. A reset therefore voids the
+    /// `timer_stop` cancellation for every path that passes through it after
+    /// the establishing stop. Like the stop, the reset orders nothing by
+    /// itself.
+    TimerReset {
+        timer: AuthoredSummaryInput,
+    },
+    /// One `testing.T.Run` call (issue #3383). `callable` names the subtest
+    /// callback and `group` names the parent test node. The callback runs as
+    /// one subtest task on every path that reaches the call; the call joins
+    /// that task and its subtest-cleanup subtree exactly when no execution
+    /// of the callback calls `Parallel` on its own parameter, and joins
+    /// nothing otherwise. Parallel siblings of one parent may run in
+    /// parallel with each other and with nothing else of the parent body.
+    SubtestRun {
+        callable: AuthoredSummaryInput,
+        group: AuthoredSummaryInput,
+    },
+    /// One `testing.T.Parallel` call (issue #3383). `receiver` names the test
+    /// node being marked. The call creates no task and orders nothing by
+    /// itself; the enclosing `Run` consumes it as classification evidence
+    /// for its callback. Only a call on the callback's own parameter marks
+    /// the subtest parallel.
+    SubtestParallel {
+        receiver: AuthoredSummaryInput,
+    },
+    /// One `testing.T.Cleanup` call (issue #3383). `callable` names the
+    /// registered callback and `group` names the test node whose completion
+    /// runs it. The callback runs as one deferred task after the test and
+    /// all its subtests complete, in last-added-first-called order among the
+    /// cleanups of one node, so the call joins the receiver's subtest
+    /// subtree before the cleanup body.
+    SubtestCleanup {
+        callable: AuthoredSummaryInput,
+        group: AuthoredSummaryInput,
+    },
+}
+
+/// The documented entry-level classification of one `sync.Map` operation
+/// (issue #3370).
+///
+/// Each variant states when the call writes the entry and when it observes
+/// it. An observation is claimed only where the call's documented boolean
+/// result is established true by a structured guard (`Load`, `LoadOrStore`,
+/// `LoadAndDelete`, `Swap`: ordinal 1; `CompareAndDelete`: ordinal 0), or
+/// unconditionally where the operation's comparison reads the entry
+/// (`CompareAndSwap`, `CompareAndDelete`). `Range`'s per-entry observation
+/// through its callback is deliberately not claimed.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthoredSyncMapOperation {
+    /// `Store(k, v)`: installs `v` at `k`, unconditionally, and observes nothing.
+    Store,
+    /// `Delete(k)`: removes the entry, unconditionally.
+    Delete,
+    /// `Clear()`: removes every entry of the map, unconditionally.
+    Clear,
+    /// `Load(k)`: observes the entry when its ordinal-1 boolean result is
+    /// established true; a miss observes nothing.
+    Load,
+    /// `Range(f)`: visits entries inside `f` without claiming per-entry
+    /// observation; the callback's value identity remains an open boundary.
+    Range,
+    /// `LoadOrStore(k, v)`: observes the entry when the ordinal-1 result is
+    /// established true, and installs `v` when it is established false.
+    LoadOrStore,
+    /// `LoadAndDelete(k)`: removes the entry unconditionally and observes it
+    /// when the ordinal-1 result is established true.
+    LoadAndDelete,
+    /// `Swap(k, v)`: installs `v` unconditionally and observes the entry when
+    /// the ordinal-1 result is established true.
+    Swap,
+    /// `CompareAndSwap(k, old, new)`: the comparison reads the entry
+    /// unconditionally, and installs `new` when the ordinal-1 result is
+    /// established true.
+    CompareAndSwap,
+    /// `CompareAndDelete(k, old)`: the comparison reads the entry
+    /// unconditionally, and removes it when the ordinal-0 result is
+    /// established true.
+    CompareAndDelete,
 }
 
 /// How many suspended waiters one notification can resume.
@@ -1787,6 +1929,22 @@ pub enum AuthoredLockMode {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum AuthoredLockCondition {
+    CallResultTrue,
+}
+
+/// The spawn condition a reviewed summary call establishes by its own result
+/// (issue #3371).
+///
+/// The only modeled condition is the conditional-spawn contract: the call
+/// starts the callable in a new goroutine exactly when it reports `true`.
+/// Consumers must bind the condition through structured branch facts about
+/// the call's result, never through the method or import spelling, and must
+/// keep the paths that establish the result false free of the spawned task.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthoredTaskSpawnCondition {
     CallResultTrue,
 }
 

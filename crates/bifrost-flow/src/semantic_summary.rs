@@ -24,11 +24,12 @@ use crate::dataflow::{
     SummaryConcurrencyAccessPath, SummaryConcurrencyAtomicOperation, SummaryConcurrencyCondWaiters,
     SummaryConcurrencyEffect, SummaryConcurrencyEffectKind, SummaryConcurrencyLockMode,
     SummaryConcurrencyLockOperation, SummaryConcurrencySubjectIdentity,
-    SummaryConcurrencyTargetCoverage, SummaryDependencyKey, SummaryDimension,
-    SummaryDimensionClaim, SummaryDimensionStatus, SummaryEffect, SummaryEffectKey,
-    SummaryEventKey, SummaryEvidence, SummaryExit, SummaryExitKind, SummaryIncompleteReason,
-    SummaryLocationKey, SummaryLockAcquisition, SummaryOrigin, SummaryPort, SummaryRecursiveEdge,
-    SummaryRecursiveGroupKey, SummaryTransfer, SummaryValidationError,
+    SummaryConcurrencySyncMapOperation, SummaryConcurrencyTargetCoverage, SummaryDependencyKey,
+    SummaryDimension, SummaryDimensionClaim, SummaryDimensionStatus, SummaryEffect,
+    SummaryEffectKey, SummaryEventKey, SummaryEvidence, SummaryExit, SummaryExitKind,
+    SummaryIncompleteReason, SummaryLocationKey, SummaryLockAcquisition, SummaryOrigin,
+    SummaryPort, SummaryRecursiveEdge, SummaryRecursiveGroupKey, SummaryTransfer,
+    SummaryValidationError,
 };
 use crate::hash::{HashMap, HashSet, map_with_capacity};
 
@@ -36,9 +37,10 @@ use brokk_bifrost_analysis::analyzer::semantic_model::{
     CompiledAtomicOperation, CompiledConcurrencyEffect, CompiledCondWaiters, CompiledLockCondition,
     CompiledLockMode, CompiledProcedureSummary, CompiledProcedureTarget, CompiledSummaryEffect,
     CompiledSummaryExitKind, CompiledSummaryInput, CompiledSummaryLocationKind,
-    CompiledSummaryOutput, CompiledSummaryTransfer, Completeness,
-    PROCEDURE_SUMMARY_CONTRACT_VERSION, ProcedureSummaryMatch, ProcedureSummaryMemberKey,
-    ResolvedActiveSemanticModels, SemanticModelMatchDisposition,
+    CompiledSummaryOutput, CompiledSummaryTransfer, CompiledSyncMapOperation,
+    CompiledTaskSpawnCondition, Completeness, PROCEDURE_SUMMARY_CONTRACT_VERSION,
+    ProcedureSummaryMatch, ProcedureSummaryMemberKey, ResolvedActiveSemanticModels,
+    SemanticModelMatchDisposition,
 };
 
 const LOCATION_KEY_DOMAIN: &[u8] = b"bifrost.semantic-model.procedure-summary.location.v1";
@@ -1213,21 +1215,37 @@ fn lower_concurrency_effect(
                 protocol: protocol.clone().into_boxed_str(),
             }
         }
-        CompiledConcurrencyEffect::TaskSpawn { callable, group } => {
-            SummaryConcurrencyEffectKind::TaskSpawn {
-                callable: crate::dataflow::SummaryConcurrencyCallable::Boundary(lower(callable)?),
-                target_coverage: SummaryConcurrencyTargetCoverage::Exhaustive,
-                group: group
-                    .as_ref()
-                    .map(|group| {
-                        Ok(crate::dataflow::SummaryConcurrencyTaskGroup {
-                            location: path(group)?,
-                            identity: identity(group),
-                        })
+        CompiledConcurrencyEffect::TaskSpawn {
+            callable,
+            group,
+            condition,
+            timer,
+        } => SummaryConcurrencyEffectKind::TaskSpawn {
+            callable: crate::dataflow::SummaryConcurrencyCallable::Boundary(lower(callable)?),
+            target_coverage: SummaryConcurrencyTargetCoverage::Exhaustive,
+            condition: match condition {
+                Some(CompiledTaskSpawnCondition::CallResultTrue) => {
+                    crate::dataflow::SummaryTaskSpawnCondition::CallResultTrue
+                }
+                None => crate::dataflow::SummaryTaskSpawnCondition::Unconditional,
+            },
+            group: group
+                .as_ref()
+                .map(|group| {
+                    Ok(crate::dataflow::SummaryConcurrencyTaskGroup {
+                        location: path(group)?,
+                        identity: identity(group),
                     })
-                    .transpose()?,
-            }
-        }
+                })
+                .transpose()?,
+            timer: timer
+                .as_ref()
+                .map(|timer| {
+                    lower_output(summary, binding, locations, timer)
+                        .map(SummaryConcurrencyAccessPath::port)
+                })
+                .transpose()?,
+        },
         CompiledConcurrencyEffect::TaskJoin { group } => SummaryConcurrencyEffectKind::TaskJoin {
             group: crate::dataflow::SummaryConcurrencyTaskGroup {
                 location: path(group)?,
@@ -1240,6 +1258,32 @@ fn lower_concurrency_effect(
                 identity: identity(once),
                 callable: crate::dataflow::SummaryConcurrencyCallable::Boundary(lower(callable)?),
                 target_coverage: SummaryConcurrencyTargetCoverage::Exhaustive,
+            }
+        }
+        CompiledConcurrencyEffect::SubtestRun { callable, group } => {
+            SummaryConcurrencyEffectKind::SubtestRun {
+                callable: crate::dataflow::SummaryConcurrencyCallable::Boundary(lower(callable)?),
+                target_coverage: SummaryConcurrencyTargetCoverage::Exhaustive,
+                group: crate::dataflow::SummaryConcurrencyTaskGroup {
+                    location: path(group)?,
+                    identity: identity(group),
+                },
+            }
+        }
+        CompiledConcurrencyEffect::SubtestParallel { receiver } => {
+            SummaryConcurrencyEffectKind::SubtestParallel {
+                receiver: path(receiver)?,
+                identity: identity(receiver),
+            }
+        }
+        CompiledConcurrencyEffect::SubtestCleanup { callable, group } => {
+            SummaryConcurrencyEffectKind::SubtestCleanup {
+                callable: crate::dataflow::SummaryConcurrencyCallable::Boundary(lower(callable)?),
+                target_coverage: SummaryConcurrencyTargetCoverage::Exhaustive,
+                group: crate::dataflow::SummaryConcurrencyTaskGroup {
+                    location: path(group)?,
+                    identity: identity(group),
+                },
             }
         }
         CompiledConcurrencyEffect::LockAcquire { lock, mode, .. }
@@ -1323,6 +1367,45 @@ fn lower_concurrency_effect(
                 },
             }
         }
+        CompiledConcurrencyEffect::TimerStop { timer } => SummaryConcurrencyEffectKind::TimerStop {
+            timer: path(timer)?,
+            identity: identity(timer),
+        },
+        CompiledConcurrencyEffect::TimerReset { timer } => {
+            SummaryConcurrencyEffectKind::TimerReset {
+                timer: path(timer)?,
+                identity: identity(timer),
+            }
+        }
+        CompiledConcurrencyEffect::SyncMap {
+            map,
+            key,
+            operation,
+        } => SummaryConcurrencyEffectKind::SyncMap {
+            map: path(map)?,
+            identity: identity(map),
+            key: key.as_ref().map(path).transpose()?,
+            operation: match operation {
+                CompiledSyncMapOperation::Store => SummaryConcurrencySyncMapOperation::Store,
+                CompiledSyncMapOperation::Delete => SummaryConcurrencySyncMapOperation::Delete,
+                CompiledSyncMapOperation::Clear => SummaryConcurrencySyncMapOperation::Clear,
+                CompiledSyncMapOperation::Load => SummaryConcurrencySyncMapOperation::Load,
+                CompiledSyncMapOperation::Range => SummaryConcurrencySyncMapOperation::Range,
+                CompiledSyncMapOperation::LoadOrStore => {
+                    SummaryConcurrencySyncMapOperation::LoadOrStore
+                }
+                CompiledSyncMapOperation::LoadAndDelete => {
+                    SummaryConcurrencySyncMapOperation::LoadAndDelete
+                }
+                CompiledSyncMapOperation::Swap => SummaryConcurrencySyncMapOperation::Swap,
+                CompiledSyncMapOperation::CompareAndSwap => {
+                    SummaryConcurrencySyncMapOperation::CompareAndSwap
+                }
+                CompiledSyncMapOperation::CompareAndDelete => {
+                    SummaryConcurrencySyncMapOperation::CompareAndDelete
+                }
+            },
+        },
     };
     Ok(SummaryEffect::new(
         SummaryEffectKey::Concurrency(SummaryConcurrencyEffect::modeled(event, effect)),

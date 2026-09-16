@@ -1,0 +1,131 @@
+{
+  "schema_version": 4,
+  "pack_id": "bifrost.node-runtime-values-typescript",
+  "version": "0.1.0",
+  "producer": {
+    "name": "bifrost-reviewed-node-models",
+    "version": "0.1.0"
+  },
+  "language": "typescript",
+  "ecosystem": "npm",
+  "compatibility": {
+    "bifrost": ">=0.8.0, <1.0.0",
+    "toolchains": []
+  },
+  "provenance": {
+    "source": "Node.js process API",
+    "revision": "v22.11.0"
+  },
+  "license": "Apache-2.0",
+  "completeness": "partial",
+  "safety": {
+    "generated_code_only": false,
+    "review_required": true
+  },
+  "shards": [
+    {
+      "id": "runtime.node-process-values",
+      "activation": [
+        {
+          "package": {
+            "name": "pkg:generic/nodejs.org/node@22.11.0"
+          },
+          "targets": [],
+          "configurations": [
+            "70db7f8c799decb554bc25e8bf410079c8b377f2852ee2a982d56db40f054056"
+          ],
+          "artifact_sha256": "24e5130fa7bc1eaab218a0c9cb05e03168fa381bb9e3babddc6a11f655799222"
+        }
+      ],
+      "payload": {
+        "kind": "declaration_facts",
+        "types": [],
+        "members": [],
+        "relations": []
+      },
+      "runtime_values": {
+        "exposures": [
+          {
+            "exposureId": "node-process-main",
+            "languages": ["typescript"],
+            "bindingName": "process",
+            "runtime": {
+              "runtimeFamily": "node",
+              "runtimeArtifact": "pkg:generic/nodejs.org/node@22.11.0",
+              "runtimeArtifactDigest": "24e5130fa7bc1eaab218a0c9cb05e03168fa381bb9e3babddc6a11f655799222",
+              "platform": "linux",
+              "architecture": "x64",
+              "realm": "main",
+              "moduleMode": "commonjs",
+              "initializationBoundary": "pristine-runtime-at-entry",
+              "hostAssumptions": ["closed-workspace-no-preloads"]
+            },
+            "runtimeProfileDigest": "70db7f8c799decb554bc25e8bf410079c8b377f2852ee2a982d56db40f054056",
+            "rootIdentity": {
+              "scheme": "csmi.runtime-global",
+              "schemeVersion": "0.1.0",
+              "descriptors": [
+                {
+                  "role": "runtime",
+                  "name": "node"
+                },
+                {
+                  "role": "global",
+                  "name": "process"
+                }
+              ]
+            },
+            "members": ["env", "argv"],
+            "activation": "enabled",
+            "evidence": {
+              "producer": "https://nodejs.org/dist/v22.11.0/node-v22.11.0.tar.gz",
+              "method": "reviewed-runtime-contract",
+              "inputsDigest": "24e5130fa7bc1eaab218a0c9cb05e03168fa381bb9e3babddc6a11f655799222"
+            },
+            "coverage": {
+              "status": "complete"
+            }
+          }
+        ],
+        "behaviors": [
+          {
+            "behaviorId": "node-process-argv-read",
+            "exposureId": "node-process-main",
+            "containerMember": "argv",
+            "acceptedKeys": "static-index",
+            "normalResult": "value-or-undefined",
+            "exceptionBehavior": "nonthrowing",
+            "mutationModel": "pristine-input-until-write",
+            "materialization": "eager",
+            "evidence": {
+              "producer": "https://github.com/nodejs/node/blob/v22.11.0/doc/api/process.md",
+              "method": "reviewed-runtime-contract",
+              "inputsDigest": "978ccf50488c3378fb7dc8e89945f3db4e613627af6a8ed63c6da367a04e478a"
+            },
+            "coverage": {
+              "status": "complete"
+            }
+          },
+          {
+            "behaviorId": "node-process-env-read",
+            "exposureId": "node-process-main",
+            "containerMember": "env",
+            "acceptedKeys": "static-property",
+            "normalResult": "value-or-undefined",
+            "exceptionBehavior": "nonthrowing",
+            "mutationModel": "pristine-input-until-write",
+            "materialization": "eager",
+            "evidence": {
+              "producer": "https://github.com/nodejs/node/blob/v22.11.0/doc/api/process.md",
+              "method": "reviewed-runtime-contract",
+              "inputsDigest": "978ccf50488c3378fb7dc8e89945f3db4e613627af6a8ed63c6da367a04e478a"
+            },
+            "coverage": {
+              "status": "complete"
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

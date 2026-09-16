@@ -499,6 +499,10 @@ pub enum SemanticValueKind {
     UnsignedInteger(u128),
     /// A compile-time constant whose payload is not represented structurally.
     Constant,
+    /// A compile-time string constant with its exact payload. Two values of
+    /// this kind denote the same constant exactly when their payloads are
+    /// equal, so consumers may compare the payloads as keys or labels.
+    ConstantString(Box<str>),
     Exception,
     Callable,
     AwaitResult,
@@ -594,6 +598,7 @@ impl SemanticValueKind {
             Self::Boolean(_) => "boolean",
             Self::UnsignedInteger(_) => "unsigned_integer",
             Self::Constant => "constant",
+            Self::ConstantString(_) => "constant_string",
             Self::Exception => "exception",
             Self::Callable => "callable",
             Self::AwaitResult => "await_result",
@@ -604,7 +609,11 @@ impl SemanticValueKind {
     pub const fn is_constant(&self) -> bool {
         matches!(
             self,
-            Self::Null | Self::Boolean(_) | Self::UnsignedInteger(_) | Self::Constant
+            Self::Null
+                | Self::Boolean(_)
+                | Self::UnsignedInteger(_)
+                | Self::Constant
+                | Self::ConstantString(_)
         )
     }
 }

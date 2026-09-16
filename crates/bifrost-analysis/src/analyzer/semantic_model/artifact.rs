@@ -614,6 +614,18 @@ pub enum CompiledConcurrencyEffect {
         callable: CompiledSummaryInput,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         group: Option<CompiledSummaryInput>,
+        /// The spawn condition this modeled call establishes itself. `None` is
+        /// an unconditional spawn; `call_result_true` is the
+        /// `errgroup.Group.TryGo` contract, where the callable starts exactly
+        /// when the call's boolean result reports that it did.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        condition: Option<CompiledTaskSpawnCondition>,
+        /// The timer object this spawn call returns, when the spawned
+        /// callback belongs to a cancellable timer (`time.AfterFunc`). A
+        /// later `timer_stop` or `timer_reset` on the same object binds
+        /// against this identity.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timer: Option<CompiledSummaryOutput>,
     },
     TaskJoin {
         group: CompiledSummaryInput,
@@ -677,6 +689,66 @@ pub enum CompiledConcurrencyEffect {
         condition: CompiledSummaryInput,
         waiters: CompiledCondWaiters,
     },
+    /// One `sync.Map` entry operation on the (map, key) entry named by the
+    /// exact receiver and key inputs. The compiled form carries the reviewed
+    /// classification; the solver binds observation and guard structure.
+    SyncMap {
+        map: CompiledSummaryInput,
+        /// The key input naming the entry; `Clear` names none.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key: Option<CompiledSummaryInput>,
+        operation: CompiledSyncMapOperation,
+    },
+    /// One `(*time.Timer).Stop` call: when the call's boolean result is
+    /// established true, the `time.AfterFunc` callback for `timer` did not
+    /// and will not run. The solver binds the guard structure.
+    TimerStop {
+        timer: CompiledSummaryInput,
+    },
+    /// One `(*time.Timer).Reset` call, which re-arms `timer` and voids the
+    /// `timer_stop` cancellation downstream of it.
+    TimerReset {
+        timer: CompiledSummaryInput,
+    },
+    /// One `testing.T.Run` call: `callable` is the subtest callback and
+    /// `group` is the parent test node (issue #3383). The solver spawns the
+    /// callback on every path and joins it at the call exactly when no
+    /// execution of the callback calls `Parallel` on its own parameter.
+    SubtestRun {
+        callable: CompiledSummaryInput,
+        group: CompiledSummaryInput,
+    },
+    /// One `testing.T.Parallel` call marking `receiver` (issue #3383). The
+    /// solver consumes it as classification evidence for the enclosing `Run`
+    /// callback; it creates no task and orders nothing by itself.
+    SubtestParallel {
+        receiver: CompiledSummaryInput,
+    },
+    /// One `testing.T.Cleanup` call: `callable` is the registered callback
+    /// and `group` is the test node whose completion runs it (issue #3383).
+    /// The solver spawns the callback as a deferred task and joins the
+    /// receiver's subtest subtree before its body.
+    SubtestCleanup {
+        callable: CompiledSummaryInput,
+        group: CompiledSummaryInput,
+    },
+}
+
+/// The documented entry-level classification of one `sync.Map` operation
+/// (issue #3370). See the authored form for the per-variant contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompiledSyncMapOperation {
+    Store,
+    Delete,
+    Clear,
+    Load,
+    Range,
+    LoadOrStore,
+    LoadAndDelete,
+    Swap,
+    CompareAndSwap,
+    CompareAndDelete,
 }
 
 /// How many suspended waiters one notification can resume.
@@ -697,6 +769,16 @@ pub enum CompiledLockMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CompiledLockCondition {
+    CallResultTrue,
+}
+
+/// The spawn condition a compiled summary call establishes by its own boolean
+/// result (issue #3371). `CallResultTrue` is `errgroup.Group.TryGo`: the
+/// callable starts in a new goroutine exactly when the call reports that it
+/// did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompiledTaskSpawnCondition {
     CallResultTrue,
 }
 
@@ -1179,6 +1261,30 @@ pub fn decode_shard_for_manifest(
     limits: &DecodeLimits,
 ) -> Result<CompiledShard, ArtifactError> {
     validate_manifest_inventory(manifest)?;
+    decode_present_shard_for_manifest(manifest, descriptor, bytes, limits)
+}
+
+/// Decode one shard of a manifest whose inventory the caller already validated.
+///
+/// [`validate_manifest_inventory`] proves properties of the whole manifest and
+/// never looks at one shard's bytes, so a reader that decodes every shard of a
+/// manifest validates it once and decodes the rest through this entry point
+/// (#3101). A caller that has not validated the inventory must not use it.
+pub fn decode_validated_shard_for_manifest(
+    manifest: &CompiledPackManifest,
+    descriptor: &CompiledShardDescriptor,
+    bytes: &[u8],
+    limits: &DecodeLimits,
+) -> Result<CompiledShard, ArtifactError> {
+    decode_present_shard_for_manifest(manifest, descriptor, bytes, limits)
+}
+
+fn decode_present_shard_for_manifest(
+    manifest: &CompiledPackManifest,
+    descriptor: &CompiledShardDescriptor,
+    bytes: &[u8],
+    limits: &DecodeLimits,
+) -> Result<CompiledShard, ArtifactError> {
     if !manifest
         .shards
         .iter()
@@ -2018,12 +2124,21 @@ fn authored_concurrency_effect_from_compiled(
                 protocol: protocol.clone(),
             }
         }
-        CompiledConcurrencyEffect::TaskSpawn { callable, group } => {
-            AuthoredConcurrencyEffect::TaskSpawn {
-                callable: authored_summary_input_from_compiled(callable),
-                group: group.as_ref().map(authored_summary_input_from_compiled),
-            }
-        }
+        CompiledConcurrencyEffect::TaskSpawn {
+            callable,
+            group,
+            condition,
+            timer,
+        } => AuthoredConcurrencyEffect::TaskSpawn {
+            callable: authored_summary_input_from_compiled(callable),
+            group: group.as_ref().map(authored_summary_input_from_compiled),
+            condition: condition.map(|condition| match condition {
+                CompiledTaskSpawnCondition::CallResultTrue => {
+                    AuthoredTaskSpawnCondition::CallResultTrue
+                }
+            }),
+            timer: timer.as_ref().map(authored_summary_output_from_compiled),
+        },
         CompiledConcurrencyEffect::TaskJoin { group } => AuthoredConcurrencyEffect::TaskJoin {
             group: authored_summary_input_from_compiled(group),
         },
@@ -2101,6 +2216,53 @@ fn authored_concurrency_effect_from_compiled(
                 },
             }
         }
+        CompiledConcurrencyEffect::SyncMap {
+            map,
+            key,
+            operation,
+        } => AuthoredConcurrencyEffect::SyncMap {
+            map: authored_summary_input_from_compiled(map),
+            key: key.as_ref().map(authored_summary_input_from_compiled),
+            operation: match operation {
+                CompiledSyncMapOperation::Store => AuthoredSyncMapOperation::Store,
+                CompiledSyncMapOperation::Delete => AuthoredSyncMapOperation::Delete,
+                CompiledSyncMapOperation::Clear => AuthoredSyncMapOperation::Clear,
+                CompiledSyncMapOperation::Load => AuthoredSyncMapOperation::Load,
+                CompiledSyncMapOperation::Range => AuthoredSyncMapOperation::Range,
+                CompiledSyncMapOperation::LoadOrStore => AuthoredSyncMapOperation::LoadOrStore,
+                CompiledSyncMapOperation::LoadAndDelete => AuthoredSyncMapOperation::LoadAndDelete,
+                CompiledSyncMapOperation::Swap => AuthoredSyncMapOperation::Swap,
+                CompiledSyncMapOperation::CompareAndSwap => {
+                    AuthoredSyncMapOperation::CompareAndSwap
+                }
+                CompiledSyncMapOperation::CompareAndDelete => {
+                    AuthoredSyncMapOperation::CompareAndDelete
+                }
+            },
+        },
+        CompiledConcurrencyEffect::TimerStop { timer } => AuthoredConcurrencyEffect::TimerStop {
+            timer: authored_summary_input_from_compiled(timer),
+        },
+        CompiledConcurrencyEffect::TimerReset { timer } => AuthoredConcurrencyEffect::TimerReset {
+            timer: authored_summary_input_from_compiled(timer),
+        },
+        CompiledConcurrencyEffect::SubtestRun { callable, group } => {
+            AuthoredConcurrencyEffect::SubtestRun {
+                callable: authored_summary_input_from_compiled(callable),
+                group: authored_summary_input_from_compiled(group),
+            }
+        }
+        CompiledConcurrencyEffect::SubtestParallel { receiver } => {
+            AuthoredConcurrencyEffect::SubtestParallel {
+                receiver: authored_summary_input_from_compiled(receiver),
+            }
+        }
+        CompiledConcurrencyEffect::SubtestCleanup { callable, group } => {
+            AuthoredConcurrencyEffect::SubtestCleanup {
+                callable: authored_summary_input_from_compiled(callable),
+                group: authored_summary_input_from_compiled(group),
+            }
+        }
     }
 }
 
@@ -2165,7 +2327,13 @@ fn authored_summary_effect_from_compiled(effect: &CompiledSummaryEffect) -> Auth
     }
 }
 
-fn validate_manifest_inventory(manifest: &CompiledPackManifest) -> Result<(), ArtifactError> {
+/// Prove the whole-manifest inventory invariants: no payload record id is
+/// defined twice across shards, and every referenced id is defined.
+///
+/// The cost is proportional to every id in the manifest, so a reader that
+/// decodes several shards of one manifest validates it once, not per shard
+/// (#3101).
+pub fn validate_manifest_inventory(manifest: &CompiledPackManifest) -> Result<(), ArtifactError> {
     let mut definitions = HashSet::new();
     let mut record_ids = HashSet::new();
     for descriptor in &manifest.shards {
@@ -3110,6 +3278,8 @@ mod tests {
         let spawn = AuthoredConcurrencyEffect::TaskSpawn {
             callable: AuthoredSummaryInput::Parameter { ordinal: 0 },
             group: Some(AuthoredSummaryInput::Receiver {}),
+            condition: None,
+            timer: None,
         };
         let lock = AuthoredConcurrencyEffect::LockAcquire {
             lock: AuthoredSummaryInput::Receiver {},
@@ -3153,6 +3323,8 @@ mod tests {
                 vec![AuthoredConcurrencyEffect::TaskSpawn {
                     callable: AuthoredSummaryInput::Receiver {},
                     group: None,
+                    condition: None,
+                    timer: None,
                 }],
                 "summary.invalid_task_callable",
             ),
@@ -3315,6 +3487,8 @@ mod tests {
         let spawn = AuthoredConcurrencyEffect::TaskSpawn {
             callable: AuthoredSummaryInput::Parameter { ordinal: 0 },
             group: None,
+            condition: None,
+            timer: None,
         };
 
         let cases = vec![

@@ -196,12 +196,11 @@ where
     /// until epoch reclamation finishes; a request during that grace period may
     /// upgrade the weak reference and make the same allocation resident again.
     fn revive(&self, key: &K) -> Option<Arc<V>> {
-        let value = self
+        let live = self
             .live
             .lock()
-            .expect("complete-value live-instance map mutex poisoned")
-            .get(key)
-            .and_then(Weak::upgrade)?;
+            .expect("complete-value live-instance map mutex poisoned");
+        let value = live.get(key).and_then(Weak::upgrade)?;
         self.entries.insert(key.clone(), Arc::clone(&value));
         #[cfg(any(test, feature = "test-support"))]
         self.revival_tracker
@@ -299,6 +298,24 @@ where
             return None;
         }
         self.entries.get(key).or_else(|| self.revive(key))
+    }
+
+    /// Remove one complete value and its live-instance identity.
+    ///
+    /// This is used when a derived owner discovers after publication that its
+    /// authority changed. Removing only the ready entry would let `revive`
+    /// resurrect the same invalid allocation on the next lookup.
+    ///
+    /// This does not cancel an in-flight materialization. An invalidation that
+    /// completes before a later publication is superseded by that publication;
+    /// an owner that detects stale authority must validate again after publish.
+    pub fn invalidate(&self, key: &K) {
+        let mut live = self
+            .live
+            .lock()
+            .expect("complete-value live-instance map mutex poisoned");
+        live.remove(key);
+        self.entries.invalidate(key);
     }
 
     /// Whether a same-key materialization is already running.
@@ -456,16 +473,17 @@ where
 {
     /// Retain and hand off one complete immutable value, then wake followers.
     pub fn publish_complete(self, value: Arc<V>) {
+        let mut live = self
+            .live
+            .lock()
+            .expect("complete-value live-instance map mutex poisoned");
+        // Keep the live-map lock through both operations. `invalidate` and
+        // `revive` use the same order, so an invalidated value cannot be
+        // reinserted after its weak identity was removed.
         self.entries.insert(self.key.clone(), Arc::clone(&value));
-        {
-            let mut live = self
-                .live
-                .lock()
-                .expect("complete-value live-instance map mutex poisoned");
-            live.insert(self.key.clone(), Arc::downgrade(&value));
-            if live.len() > LIVE_REGISTRY_SWEEP_KEYS {
-                live.retain(|_, weak| weak.strong_count() > 0);
-            }
+        live.insert(self.key.clone(), Arc::downgrade(&value));
+        if live.len() > LIVE_REGISTRY_SWEEP_KEYS {
+            live.retain(|_, weak| weak.strong_count() > 0);
         }
         self.flight
             .state
@@ -520,6 +538,7 @@ fn elapsed_ns(started: Instant) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Barrier;
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -830,6 +849,91 @@ mod tests {
         };
         assert!(Arc::ptr_eq(&held, &value));
         assert_eq!(cache.revival_census_for_test().operations, 1);
+    }
+
+    #[test]
+    fn exact_invalidation_removes_live_identity_and_prevents_resurrection() {
+        let cache = cache(1, 1);
+        let cancellation = CancellationToken::default();
+        let key = "invalid".to_string();
+
+        let (CompleteValueAcquisition::Leader { permit }, _) = cache.acquire(&key, &cancellation)
+        else {
+            panic!("a new key must lead")
+        };
+        let invalid = Arc::new(29);
+        permit.publish_complete(Arc::clone(&invalid));
+        cache.invalidate(&key);
+
+        let (acquisition, _) = cache.acquire(&key, &cancellation);
+        assert!(matches!(
+            acquisition,
+            CompleteValueAcquisition::Leader { .. }
+        ));
+    }
+
+    #[test]
+    fn publication_holds_the_live_identity_lock_through_ready_insertion() {
+        let insertion_reached = Arc::new(Barrier::new(2));
+        let insertion_release = Arc::new(Barrier::new(2));
+        let weigher_reached = Arc::clone(&insertion_reached);
+        let weigher_release = Arc::clone(&insertion_release);
+        let cache = CompleteValueCache::new(1, move |_: &String, _: &Arc<usize>| {
+            weigher_reached.wait();
+            weigher_release.wait();
+            1
+        });
+        let cancellation = CancellationToken::default();
+        let key = "publication-order".to_string();
+        let (CompleteValueAcquisition::Leader { permit }, _) = cache.acquire(&key, &cancellation)
+        else {
+            panic!("a new key must lead")
+        };
+
+        let publisher = thread::spawn(move || permit.publish_complete(Arc::new(30)));
+        insertion_reached.wait();
+        let publication_holds_live = cache.live.try_lock().is_err();
+        insertion_release.wait();
+        publisher.join().unwrap();
+        assert!(
+            publication_holds_live,
+            "publication must acquire the live identity lock before inserting the ready entry"
+        );
+    }
+
+    #[test]
+    fn publication_after_invalidation_completes_the_existing_flight() {
+        let cache = cache(1, 1);
+        let cancellation = CancellationToken::default();
+        let key = "in-flight".to_string();
+
+        let (CompleteValueAcquisition::Leader { permit }, _) = cache.acquire(&key, &cancellation)
+        else {
+            panic!("a new key must lead")
+        };
+
+        cache.invalidate(&key);
+        let follower_cache = cache.clone();
+        let follower_key = key.clone();
+        let follower_cancellation = cancellation.clone();
+        let follower = thread::spawn(move || {
+            follower_cache
+                .acquire(&follower_key, &follower_cancellation)
+                .0
+        });
+        wait_for_waiter(&cache);
+
+        let published = Arc::new(31);
+        permit.publish_complete(Arc::clone(&published));
+
+        let CompleteValueAcquisition::Cached { value } = follower.join().unwrap() else {
+            panic!("the existing flight must complete after an earlier invalidation")
+        };
+        assert!(Arc::ptr_eq(&published, &value));
+        let ready = cache
+            .get_ready(&key, &cancellation)
+            .expect("the later publication must remain ready");
+        assert!(Arc::ptr_eq(&published, &ready));
     }
 
     #[test]

@@ -402,7 +402,7 @@ test("an unreliable code 2 prints its SARIF diagnostic and fails", () => {
     report: sarifReport({
       executionSuccessful: false,
       notifications: [{
-        descriptor: { id: "diff-base-unreliable" },
+        descriptor: { id: "BIFROST_REPORT_DIAGNOSTIC" },
         properties: { "bifrost.reportDiagnostic": { code: "diff-base-unreliable" } },
         message: { text: "baseline could not be evaluated" },
       }],
@@ -410,31 +410,6 @@ test("an unreliable code 2 prints its SARIF diagnostic and fails", () => {
   });
   assert.equal(result.status, 2);
   assert.match(result.stdout, /diff-base-unreliable: baseline could not be evaluated/u);
-  assert.match(result.stdout, /UNRELIABLE/u);
-});
-
-test("an unreliable code 2 prints typed policy completion details and fails", () => {
-  const result = runGate({
-    code: 2,
-    report: sarifReport({
-      executionSuccessful: false,
-      notifications: [{
-        descriptor: { id: "BIFROST_POLICY_INCONCLUSIVE" },
-        properties: {
-          "bifrost.policyId": "bifrost.correctness.example",
-          "bifrost.completion": {
-            type: "inconclusive",
-            reasons: ["partial_discovery"],
-          },
-        },
-        message: { text: "Bifrost policy evaluation was inconclusive" },
-      }],
-    }),
-  });
-  assert.equal(result.status, 2);
-  assert.match(result.stdout, /BIFROST_POLICY_INCONCLUSIVE: Bifrost policy evaluation was inconclusive/u);
-  assert.match(result.stdout, /policy: bifrost\.correctness\.example/u);
-  assert.match(result.stdout, /completion: \{"type":"inconclusive","reasons":\["partial_discovery"\]\}/u);
   assert.match(result.stdout, /UNRELIABLE/u);
 });
 

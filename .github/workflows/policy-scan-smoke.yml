@@ -45,11 +45,6 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            # This gate compiles the full policy runner before exercising the
-            # action. Two independent spot instances were reclaimed during
-            # bifrost-flow compilation while qualifying v0.11.4, both with
-            # exit 143 and no compiler diagnostic. Keep this required smoke on
-            # stable capacity instead of accepting an infrastructure lottery.
             runner: ubuntu-latest
           - os: windows-latest
             runner: windows-latest
