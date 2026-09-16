@@ -22,3 +22,5 @@ pub mod resolution;
 pub mod rewrite_path;
 pub mod routes;
 pub mod spec;
+
+pub mod collector;

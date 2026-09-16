@@ -1287,6 +1287,24 @@ impl StructuredTypeName {
         self.absolute
     }
 
+    pub fn estimated_retained_bytes(&self) -> usize {
+        self.path
+            .capacity()
+            .saturating_mul(std::mem::size_of::<String>())
+            .saturating_add(
+                self.lexical_scope
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<String>()),
+            )
+            .saturating_add(
+                self.path
+                    .iter()
+                    .chain(&self.lexical_scope)
+                    .map(String::capacity)
+                    .sum(),
+            )
+    }
+
     fn is_valid(&self) -> bool {
         let Some(component_count) = self.path.len().checked_add(self.lexical_scope.len()) else {
             return false;
@@ -2868,7 +2886,7 @@ impl ProjectFile {
         let extension = rel_path.extension().and_then(|ext| ext.to_str());
         let language = extension.map_or(Language::None, Language::from_extension);
         // A file with no extension qualifies: no extension list can name it.
-        let unclaimed_extension = extension.is_none_or(|ext| !Language::is_source_extension(ext));
+        let unclaimed_extension = crate::analyzer::common::unclaimed_extension(extension);
         Self(Arc::new(ProjectFileInner {
             root,
             rel_path,
@@ -2900,12 +2918,10 @@ impl ProjectFile {
     /// See `analyzer::common::declaration_language_for_file`, which is where
     /// the rule is explained and which delegates here.
     pub fn declaration_language(&self) -> Language {
-        match self.0.language {
-            Language::None if self.0.unclaimed_extension => {
-                crate::analyzer::common::INCLUDE_CLAIMING_LANGUAGE
-            }
-            language => language,
-        }
+        crate::analyzer::common::declaration_language_of(
+            self.0.language,
+            self.0.unclaimed_extension,
+        )
     }
 
     /// Whether two files sit under the same workspace root. Interning makes the
@@ -5617,5 +5633,34 @@ mod identity_cost_tests {
             extensionless.declaration_language(),
             crate::analyzer::common::INCLUDE_CLAIMING_LANGUAGE
         );
+    }
+
+    /// The path-only answer agrees with the file answer on every shape the
+    /// registry distinguishes: an extension a language claims, a
+    /// reference-only sibling extension no analyzer parses, and an extension
+    /// no list claims at all, which include inference adopts (#1837, #3391).
+    #[test]
+    fn declaration_language_for_rel_path_agrees_with_the_file() {
+        for path in [
+            "src/renderer.cc",
+            "src/renderer.hpp",
+            "pkg/module.py",
+            "crates/engine/src/lib.rs",
+            "web/src/App.tsx",
+            "web/src/main.mjs",
+            "src/main/java/app/Widget.java",
+            "src/util/Helper.kt",
+            "src/Widget.vue",
+            "third_party/tbb/include/mutex",
+        ] {
+            let file = ProjectFile::new(absolute_root(), path);
+            assert_eq!(
+                file.declaration_language(),
+                crate::analyzer::common::declaration_language_for_rel_path(std::path::Path::new(
+                    path
+                )),
+                "{path}"
+            );
+        }
     }
 }

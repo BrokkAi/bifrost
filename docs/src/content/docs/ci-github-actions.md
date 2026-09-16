@@ -97,6 +97,8 @@ does not contain the CLI threshold decision. Library callers with a
 | `fail-on` | `warning` | Severity gate: `never`, `finding`, `note`, `warning`, or `error`. |
 | `diff-base` | empty | Git revision to diff against. Only findings absent from that revision gate. |
 | `sarif-file` | `bifrost-policy.sarif` | SARIF output path, relative to `working-directory`. |
+| `policy-timings` | `false` | Collect per-policy timings; requires a runner supporting `--policy-timings`. |
+| `artifact-name` | empty | Upload the SARIF report as an artifact before gating; use a unique name per scan. |
 | `upload` | `true` | Upload the SARIF file to code scanning. |
 | `category` | `bifrost-policy` | Code-scanning category. Use one category per scan configuration. |
 | `cache` | `true` | Restore and save the analyzer cache between runs. |
@@ -106,13 +108,38 @@ The action exposes these outputs for later steps:
 
 | Output | Meaning |
 | --- | --- |
+| `analyzer-cache-hit` | Whether an exact analyzer cache entry was restored; empty when caching is disabled. |
 | `exit-code` | Raw bifrost policy exit code (0, 1, or 2). |
 | `sarif-file` | Path of the SARIF report, relative to the checkout. |
 | `bifrost-bin` | Absolute path of the bifrost executable the run used. |
 
 ## Analyzer cache
 
-The action caches `.bifrost/cache` at the checkout root. Cache entries are separated by runner OS, runner architecture, and the selected Bifrost version, which avoids cross-architecture and cross-version restores. The database keys rows by Git blob object ID, so a cache saved on one branch stays valid for every file that other branches did not change. A pull-request run restores the most recent cache and re-analyzes only the files it changed. The cache saves when the job completes successfully, so a gate that fails does not write one. Keep the workflow enabled and green on the default branch so pull requests always find a warm cache to restore.
+With `cache: true`, the action selects an isolated analyzer cache root and uses
+that same path for restore, execution, and save, overriding inherited
+`BIFROST_CACHE_ROOT` and `BIFROST_CACHE_DIR` for the scan. `cache: false` leaves
+those environment settings untouched. Cache entries are separated by runner OS,
+architecture, version, exact compiled-input build identity, and working directory.
+There is no fallback to a different build identity. Bifrost still validates its
+schema and analyzer epochs and keys stored content by Git blob identity.
+
+The cache is saved after a scan produces a report, including when its policy gate
+fails. A cache hit reuses the existing immutable entry. Build changes can still
+require a cold scan; this cache does not certify that a policy result is complete.
+
+The action logs execution, policy work, completeness, and incremental evidence
+from its single SARIF scan. `policy-timings: true` adds per-policy timing details
+and logs the runner's measured aggregate stage timings on stderr. Successful
+canonical reports intentionally keep aggregate elapsed values at zero for
+deterministic serialization; zero does not mean the scan did no work. For diff
+scans, per-policy work describes the head evaluation. Aggregate stage timings
+include baseline evaluation as `diff_base` when that phase is reached; the stderr
+record then reports `scope: base_and_head` and `base_timing_included: true`.
+`policy_work_scope` remains `head`. The retained stages show which phases were
+measured; `base_and_head` does not imply that head evaluation ran if the request
+stopped during baseline evaluation. Set `artifact-name` to retain the report and opt-in
+stderr log even when the gate fails. This artifact upload is separate from code-scanning
+upload and works for repositories without GitHub Code Security.
 
 ## New findings on pull requests
 

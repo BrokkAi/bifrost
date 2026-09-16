@@ -94,6 +94,16 @@ impl CodeQueryResponse {
         }
     }
 
+    /// The mutable counterpart of [`Self::result`], for hosts that attach
+    /// session-state diagnostics to the envelope after execution.
+    pub fn result_mut(&mut self) -> Option<&mut CodeQueryResult> {
+        match self {
+            Self::Results(result) => Some(result),
+            Self::Profile(profile) => Some(&mut profile.result),
+            Self::Explain(_) => None,
+        }
+    }
+
     /// Render the complete structured report without first erasing its typed
     /// field order through `serde_json::Value`.
     #[doc(hidden)]
@@ -226,7 +236,12 @@ impl CodeQueryResult {
     /// retained flow row may present itself as a complete clean negative. The
     /// reason states that the query envelope, rather than the flow solve,
     /// imposed the cap.
-    pub(crate) fn cap_flow_status_by_run(&mut self) {
+    ///
+    /// Execution runs this before publishing. A host that attaches a
+    /// session-state diagnostic to the envelope afterwards (for example the
+    /// MCP host's pending semantic-pack acquisition marker, #3401) re-runs it
+    /// here, so the cap still has exactly one derivation.
+    pub fn cap_flow_status_by_run(&mut self) {
         let (status, reason) = match self.completion() {
             CodeQueryCompletion::Complete | CodeQueryCompletion::ProvenSubset { .. } => return,
             CodeQueryCompletion::Cancelled => (

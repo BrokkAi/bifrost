@@ -22,6 +22,9 @@ use super::resolution::{
 };
 use super::routes::{CuratedExportSurface, IdentityRouteSupport, RouteHopKind};
 use crate::analyzer::model::AmbientUseRole;
+use crate::analyzer::source_facts::{
+    SourceOccurrenceId, SourceOccurrenceProvenance, SourceOccurrenceSink,
+};
 use crate::analyzer::tree_walk::ParentIndex;
 use crate::analyzer::{Language, Range};
 use crate::cancellation::CancellationToken;
@@ -447,43 +450,59 @@ impl CompiledKinds {
     }
 }
 
-/// Collects the name and role edges for one fact during extraction. Resolves
-/// target nodes to fact ids through the tree-node→fact map built in the first
-/// extraction pass.
+/// A role edge captured before the coordinated structural walk has seen every
+/// normalized node. The collector resolves `target_node` against the complete
+/// AST-node key map when extraction finishes.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy)]
+pub struct PendingRoleTarget {
+    pub role: Role,
+    pub spread: bool,
+    pub keyword: Option<SourceOccurrenceId>,
+    pub target_node: usize,
+    pub occurrence: SourceOccurrenceId,
+    pub name: Option<SourceOccurrenceId>,
+}
+
+/// An occurrence-role classification captured before the collector has built
+/// the complete AST-node key map.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy)]
+pub struct PendingOccurrenceRole {
+    pub target_node: usize,
+    pub role: OccurrenceRole,
+}
+
+/// Collects the name and role edges for one fact during extraction. Target
+/// nodes remain exact tree-sitter node keys until the structural collector has
+/// seen every event in the language-owned walk.
 pub struct RoleSink<'a> {
-    fact_by_ts_node: &'a HashMap<usize, u32>,
-    /// AST parents for the tree being extracted.
-    ///
-    /// Specs ask "what encloses this node?" constantly -- every spec in the
-    /// fleet calls `Node::parent` or `nearest_ancestor` -- and tree-sitter has
-    /// no parent pointer, so each such call re-descends from the root and costs
-    /// the node's position in the tree. Extraction visits every fact node, so
-    /// that is quadratic in file size: on goqu's vendored 248k-line
-    /// `sqlite3-binding.c` it was 97% of process CPU and timed out 100 probes.
-    /// The driver builds this index once per file instead.
     parents: &'a ParentIndex<'a>,
-    name: Option<Span>,
-    roles: &'a mut Vec<RoleTarget>,
-    /// Per-node occurrence-role classifications emitted during this walk,
-    /// addressed by fact id rather than by the emitting fact. Extraction
-    /// buckets them into the file's occurrence-role rows once the walk ends.
-    occurrence_roles: &'a mut Vec<(u32, OccurrenceRole)>,
+    output: RoleSinkOutput<'a>,
     max_roles: usize,
     cancellation: Option<&'a CancellationToken>,
     stop: Option<RoleSinkStop>,
+}
+
+enum RoleSinkOutput<'a> {
+    Source {
+        source_facts: &'a mut dyn SourceOccurrenceSink,
+        name: Option<SourceOccurrenceId>,
+        roles: Vec<PendingRoleTarget>,
+        occurrence_roles: Vec<PendingOccurrenceRole>,
+    },
+    Spans {
+        fact_by_ts_node: &'a HashMap<usize, u32>,
+        name: Option<Span>,
+        roles: &'a mut Vec<RoleTarget>,
+        occurrence_roles: &'a mut Vec<(u32, OccurrenceRole)>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoleSinkStop {
     Exceeded,
     Cancelled,
-}
-
-fn span_of(node: Node<'_>) -> Span {
-    Span {
-        start_byte: node.start_byte(),
-        end_byte: node.end_byte(),
-    }
 }
 
 impl<'a> RoleSink<'a> {
@@ -496,14 +515,37 @@ impl<'a> RoleSink<'a> {
         parents: &'a ParentIndex<'a>,
     ) -> Self {
         Self {
-            fact_by_ts_node,
-            name: None,
-            roles,
-            occurrence_roles,
+            parents,
+            output: RoleSinkOutput::Spans {
+                fact_by_ts_node,
+                name: None,
+                roles,
+                occurrence_roles,
+            },
             max_roles,
             cancellation,
             stop: None,
+        }
+    }
+
+    /// Capture canonical source identities for a coordinated producer.
+    pub fn for_source(
+        source_facts: &'a mut dyn SourceOccurrenceSink,
+        max_roles: usize,
+        cancellation: Option<&'a CancellationToken>,
+        parents: &'a ParentIndex<'a>,
+    ) -> Self {
+        Self {
             parents,
+            output: RoleSinkOutput::Source {
+                source_facts,
+                name: None,
+                roles: Vec::new(),
+                occurrence_roles: Vec::new(),
+            },
+            max_roles,
+            cancellation,
+            stop: None,
         }
     }
 
@@ -529,19 +571,61 @@ impl<'a> RoleSink<'a> {
     /// classification for a node the kind table does not admit has nowhere to
     /// live. Adapters extend their kind table rather than emitting here.
     pub fn occurrence_role(&mut self, target: Node<'_>, role: OccurrenceRole) {
-        let node = self.fact_by_ts_node.get(&target.id()).copied();
-        debug_assert!(
-            node.is_some(),
-            "occurrence role {role:?} emitted for non-fact node {:?}; add its kind to the kind table",
-            target.kind()
-        );
-        if let Some(node) = node {
-            self.occurrence_roles.push((node, role));
+        match &mut self.output {
+            RoleSinkOutput::Source {
+                source_facts,
+                occurrence_roles,
+                ..
+            } => {
+                source_facts.intern_node(target);
+                occurrence_roles.push(PendingOccurrenceRole {
+                    target_node: target.id(),
+                    role,
+                });
+            }
+            RoleSinkOutput::Spans {
+                fact_by_ts_node,
+                occurrence_roles,
+                ..
+            } => {
+                let node = fact_by_ts_node.get(&target.id()).copied();
+                debug_assert!(
+                    node.is_some(),
+                    "occurrence role {role:?} emitted for non-fact node {:?}; add its kind to the kind table",
+                    target.kind()
+                );
+                if let Some(node) = node {
+                    occurrence_roles.push((node, role));
+                }
+            }
         }
     }
 
     pub fn into_parts(self) -> (Option<Span>, Option<RoleSinkStop>) {
-        (self.name, self.stop)
+        let RoleSinkOutput::Spans { name, .. } = self.output else {
+            panic!("source sink requires source finalization")
+        };
+        (name, self.stop)
+    }
+
+    pub fn into_source_parts(
+        self,
+    ) -> (
+        Option<SourceOccurrenceId>,
+        Vec<PendingRoleTarget>,
+        Vec<PendingOccurrenceRole>,
+        Option<RoleSinkStop>,
+    ) {
+        let RoleSinkOutput::Source {
+            name,
+            roles,
+            occurrence_roles,
+            ..
+        } = self.output
+        else {
+            panic!("span sink requires span finalization")
+        };
+        (name, roles, occurrence_roles, self.stop)
     }
 
     /// Poll cancellation and the role-edge admission cap before adapters
@@ -557,7 +641,11 @@ impl<'a> RoleSink<'a> {
             self.stop = Some(RoleSinkStop::Cancelled);
             return false;
         }
-        if self.roles.len() >= self.max_roles {
+        let count = match &self.output {
+            RoleSinkOutput::Source { roles, .. } => roles.len(),
+            RoleSinkOutput::Spans { roles, .. } => roles.len(),
+        };
+        if count >= self.max_roles {
             self.stop = Some(RoleSinkStop::Exceeded);
             return false;
         }
@@ -566,7 +654,12 @@ impl<'a> RoleSink<'a> {
 
     /// Set the fact's own name from the given node's span.
     pub fn set_name(&mut self, name_node: Node<'_>) {
-        self.name = Some(span_of(name_node));
+        match &mut self.output {
+            RoleSinkOutput::Source {
+                source_facts, name, ..
+            } => *name = Some(source_facts.intern_node(name_node)),
+            RoleSinkOutput::Spans { name, .. } => *name = Some(span_of(name_node)),
+        }
     }
 
     /// Attach a role edge without a derived name.
@@ -576,13 +669,13 @@ impl<'a> RoleSink<'a> {
 
     /// Attach a role edge whose name is the span of `name_node`.
     pub fn role_named(&mut self, role: Role, target: Node<'_>, name_node: Node<'_>) {
-        let _ = self.push(role, false, None, target, Some(span_of(name_node)));
+        let _ = self.push(role, false, None, target, Some(name_node));
     }
 
     /// Attach an argument role, preserving whether it came from a
     /// spread/unpack expression.
     pub fn argument_maybe_named(&mut self, target: Node<'_>, name: Option<Node<'_>>, spread: bool) {
-        let _ = self.push(Role::Arg, spread, None, target, name.map(span_of));
+        let _ = self.push(Role::Arg, spread, None, target, name);
     }
 
     /// Attach a role edge with a derived name when the language spec found
@@ -597,34 +690,117 @@ impl<'a> RoleSink<'a> {
 
     /// Attach a role edge whose name is a precise span inside `target`.
     pub fn role_named_span(&mut self, role: Role, target: Node<'_>, name: Span) {
-        let _ = self.push(role, false, None, target, Some(name));
+        let _ = self.push_span(role, false, None, target, name);
     }
 
     /// Attach a keyword-argument edge (`shell=True` → keyword `shell`,
     /// target the value node).
     pub fn kwarg(&mut self, keyword_node: Node<'_>, value: Node<'_>) {
-        let _ = self.push(Role::Kwarg, false, Some(span_of(keyword_node)), value, None);
+        let _ = self.push(Role::Kwarg, false, Some(keyword_node), value, None);
     }
 
     fn push(
         &mut self,
         role: Role,
         spread: bool,
-        keyword: Option<Span>,
+        keyword: Option<Node<'_>>,
         target: Node<'_>,
-        name: Option<Span>,
+        name: Option<Node<'_>>,
     ) -> bool {
         if !self.should_continue() {
             return false;
         }
-        self.roles.push(RoleTarget {
-            role,
-            spread,
-            keyword,
-            node: self.fact_by_ts_node.get(&target.id()).copied(),
-            span: span_of(target),
-            name,
-        });
+        match &mut self.output {
+            RoleSinkOutput::Source {
+                source_facts,
+                roles,
+                ..
+            } => {
+                let keyword = keyword.map(|node| source_facts.intern_node(node));
+                let occurrence = source_facts.intern_node(target);
+                let name = name.map(|node| source_facts.intern_node(node));
+                roles.push(PendingRoleTarget {
+                    role,
+                    spread,
+                    keyword,
+                    target_node: target.id(),
+                    occurrence,
+                    name,
+                });
+            }
+            RoleSinkOutput::Spans {
+                fact_by_ts_node,
+                roles,
+                ..
+            } => {
+                roles.push(RoleTarget {
+                    role,
+                    spread,
+                    keyword: keyword.map(span_of),
+                    node: fact_by_ts_node.get(&target.id()).copied(),
+                    span: span_of(target),
+                    name: name.map(span_of),
+                });
+            }
+        }
         true
+    }
+
+    fn push_span(
+        &mut self,
+        role: Role,
+        spread: bool,
+        keyword: Option<Node<'_>>,
+        target: Node<'_>,
+        name: Span,
+    ) -> bool {
+        if !self.should_continue() {
+            return false;
+        }
+        match &mut self.output {
+            RoleSinkOutput::Source {
+                source_facts,
+                roles,
+                ..
+            } => {
+                let keyword = keyword.map(|node| source_facts.intern_node(node));
+                let occurrence = source_facts.intern_node(target);
+                let name = source_facts.intern_subspan_bytes(
+                    name.start_byte,
+                    name.end_byte,
+                    SourceOccurrenceProvenance::ExplicitSubspan,
+                );
+                roles.push(PendingRoleTarget {
+                    role,
+                    spread,
+                    keyword,
+                    target_node: target.id(),
+                    occurrence,
+                    name: Some(name),
+                });
+            }
+            RoleSinkOutput::Spans {
+                fact_by_ts_node,
+                roles,
+                ..
+            } => {
+                roles.push(RoleTarget {
+                    role,
+                    spread,
+                    keyword: keyword.map(span_of),
+                    node: fact_by_ts_node.get(&target.id()).copied(),
+                    span: span_of(target),
+                    name: Some(name),
+                });
+            }
+        }
+        true
+    }
+}
+
+fn span_of(node: Node<'_>) -> Span {
+    Span {
+        start_byte: node.start_byte(),
+        end_byte: node.end_byte(),
     }
 }

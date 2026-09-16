@@ -460,3 +460,138 @@ test("unexpected statuses and missing or invalid SARIF fail closed", () => {
   assert.equal(wrongShape.status, 1);
   assert.match(wrongShape.stdout, /invalid SARIF report/u);
 });
+
+function actionScript(name) {
+  const action = fs.readFileSync('.github/actions/policy-scan/action.yml', 'utf8');
+  const start = action.indexOf(`    - name: ${name}\n`);
+  assert.notEqual(start, -1);
+  const end = action.indexOf('\n    - name:', start + 1);
+  const step = action.slice(start, end === -1 ? undefined : end);
+  return step.slice(step.indexOf('      run: |\n') + '      run: |\n'.length)
+    .split('\n').filter(line => line === '' || line.startsWith('        '))
+    .map(line => line.slice(8)).join('\n');
+}
+
+function runActionScript(name, env, cwd) {
+  const result = spawnSync('bash', ['-c', actionScript(name)], {
+    encoding: 'utf8', cwd, env: { ...process.env, ...env },
+  });
+  assert.equal(result.status, 0, result.stderr + result.stdout);
+  return result;
+}
+
+test('managed cache follows the scan through nested roots and ignores inherited overrides', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'policy action '));
+  try {
+    const nested = path.join(dir, 'nested root');
+    fs.mkdirSync(nested);
+    const binary = path.join(dir, 'fake bifrost');
+    const capture = path.join(dir, 'capture');
+    const output = path.join(dir, 'output');
+    fs.writeFileSync(binary, `#!/usr/bin/env bash
+if [ "$1" = --build-identity ]; then printf '%s\\n' "\${FAKE_IDENTITY:-$(printf 'a%.0s' {1..40})}"; exit 0; fi
+printf '%s\\n' "$PWD" "\${BIFROST_CACHE_ROOT:-}" "\${BIFROST_CACHE_DIR:-}" "$@" > "$CAPTURE"
+printf '%s\\n' '{"version":"2.1.0","runs":[]}' > report.sarif
+echo 'fake analyzer diagnostic' >&2
+exit 2
+`, { mode: 0o755 });
+    const env = {
+      RUNNER_TEMP: dir, GITHUB_WORKSPACE: dir, BIFROST_BIN: binary, GITHUB_OUTPUT: output,
+      WORKDIR: 'nested root', CAPTURE: capture,
+      BIFROST_CACHE_ROOT: 'inherited root', BIFROST_CACHE_DIR: 'inherited exact',
+    };
+    runActionScript('Resolve analyzer cache identity', env, dir);
+    const outputs = Object.fromEntries(fs.readFileSync(output, 'utf8').trim().split('\n').map(line => {
+      const index = line.indexOf('='); return [line.slice(0, index), line.slice(index + 1)];
+    }));
+    assert.match(outputs['workspace-key'], /^[0-9a-f]{64}$/);
+    assert.ok(fs.statSync(outputs['cache-root']).isDirectory());
+    const relocated = path.join(dir, 'another checkout');
+    fs.mkdirSync(relocated);
+    const readOutputs = () => Object.fromEntries(fs.readFileSync(output, 'utf8').trim().split('\n').map(line => {
+      const index = line.indexOf('='); return [line.slice(0, index), line.slice(index + 1)];
+    }));
+    runActionScript('Resolve analyzer cache identity', { ...env, GITHUB_WORKSPACE: relocated }, dir);
+    const repeated = readOutputs();
+    assert.equal(repeated['cache-path'], outputs['cache-path'], 'cache archive input must survive checkout relocation');
+    assert.notEqual(repeated['cache-root'], outputs['cache-root']);
+    runActionScript('Resolve analyzer cache identity', { ...env, WORKDIR: 'another root' }, dir);
+    assert.notEqual(readOutputs()['workspace-key'], outputs['workspace-key']);
+    assert.notEqual(readOutputs()['cache-path'], outputs['cache-path']);
+    runActionScript('Resolve analyzer cache identity', { ...env, FAKE_IDENTITY: 'b'.repeat(40) }, dir);
+    assert.notEqual(readOutputs().value, outputs.value);
+    assert.notEqual(readOutputs()['cache-path'], outputs['cache-path']);
+    const invalid = spawnSync('bash', ['-c', actionScript('Resolve analyzer cache identity')], {
+      encoding: 'utf8', cwd: dir, env: { ...process.env, ...env, FAKE_IDENTITY: 'invalid' },
+    });
+    assert.equal(invalid.status, 1);
+    assert.match(invalid.stdout, /invalid build identity/);
+
+
+    const scanEnv = {
+      ...env, SARIF_FILE: 'report.sarif', FAIL_ON: 'warning', POLICY_PACKS: '',
+      POLICY_IDS: 'rule.one', POLICY_CATEGORIES: '', POLICY_FILES: '', DIFF_BASE: 'abc123',
+      POLICY_TIMINGS: 'true', MANAGED_CACHE: 'true', MANAGED_CACHE_ROOT: outputs['cache-root'],
+    };
+    runActionScript('Run policies', scanEnv, dir);
+    const args = fs.readFileSync(capture, 'utf8').split('\n');
+    assert.deepEqual(args.slice(0, 3), [fs.realpathSync(nested), outputs['cache-root'], `${outputs['cache-root']}/analyzer`]);
+    assert.ok(args.includes('--policy-timings'));
+    assert.match(fs.readFileSync(path.join(nested, 'report.sarif.stderr.log'), 'utf8'), /fake analyzer diagnostic/);
+    assert.ok(args.includes('--diff-base'));
+    assert.match(fs.readFileSync(output, 'utf8'), /exit-code=2\nsarif-file=nested root\/report.sarif\nhas-sarif=true/u);
+    runActionScript('Run policies', { ...scanEnv, MANAGED_CACHE: 'false', POLICY_TIMINGS: 'false' }, dir);
+    const unmanaged = fs.readFileSync(capture, 'utf8').split('\n');
+    assert.deepEqual(unmanaged.slice(1, 3), ['inherited root', 'inherited exact']);
+    assert.ok(!unmanaged.includes('--policy-timings'));
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('scan evidence includes policy incompleteness and is retained before gating', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'policy-evidence.'));
+  try {
+    const report = sarifReport({ executionSuccessful: false });
+    const properties = report.runs[0].properties;
+    properties['bifrost.execution'] = { total_elapsed_ms: 51 };
+    properties['bifrost.incremental'] = { widened_units: 2 };
+    properties['bifrost.policyRuns'] = [{ policyId: 'python.rule', completion: { type: 'inconclusive', reasons: ['budget_exhausted'] }, diagnostics: ['budget exhausted'] }];
+    const reportPath = path.join(dir, 'report.sarif');
+    fs.writeFileSync(reportPath, JSON.stringify(report));
+    const summary = runActionScript('Summarize policy execution', { SARIF_PATH: reportPath, DIFF_BASE: 'abc' }, dir);
+    assert.match(summary.stdout, /"policy_work_scope": "head"/);
+    assert.match(summary.stdout, /aggregate stages include diff_base when reached/);
+    assert.match(summary.stdout, /total_elapsed_ms/);
+    assert.match(summary.stdout, /widened_units/);
+    assert.match(summary.stdout, /budget exhausted/);
+    const gate = runGate({ code: 2, report });
+    assert.equal(gate.status, 2);
+    assert.match(gate.stdout, /python.rule/);
+    const action = fs.readFileSync('.github/actions/policy-scan/action.yml', 'utf8');
+    assert.ok(action.indexOf('name: Retain SARIF report') < action.indexOf('name: Gate on the exit code'));
+    assert.match(action, /name: Retain SARIF report\n\s+if: always\(\)/);
+    assert.match(action, /name: Save analyzer cache\n\s+if: always\(\).*cache-hit != 'true'.*has-sarif == 'true'/);
+    assert.match(action, /path: \$\{\{ steps\.analyzer-cache-identity\.outputs\.cache-path \}\}/);
+    assert.match(action, /key: \$\{\{ steps\.analyzer-cache\.outputs\.cache-primary-key \}\}/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a supplied semantic-pack executable bypasses Cargo and preserves arguments', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pack helper '));
+  try {
+    const bin = path.join(dir, 'pack tool');
+    const capture = path.join(dir, 'args');
+    fs.writeFileSync(bin, '#!/usr/bin/env bash\nprintf "%s\\n" "$@" > "$CAPTURE"\n', { mode: 0o755 });
+    fs.writeFileSync(path.join(dir, 'cargo'), '#!/usr/bin/env bash\necho unexpected-cargo >&2\nexit 99\n', { mode: 0o755 });
+    const result = spawnSync('bash', ['-c', 'source scripts/lib/semantic-pack-tool.sh; run_semantic_pack_tool generate "output with spaces" spec.json'], {
+      encoding: 'utf8', env: { ...process.env, BIFROST_SEMANTIC_PACK_BIN: bin, CAPTURE: capture, PATH: `${dir}${path.delimiter}${process.env.PATH}` },
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(fs.readFileSync(capture, 'utf8').trimEnd().split('\n'), ['generate', 'output with spaces', 'spec.json']);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

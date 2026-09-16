@@ -1166,6 +1166,7 @@ pub(super) fn append_diagnostic_terminations(
             }
             CodeQueryDiagnosticCode::SemanticResultsOmitted
             | CodeQueryDiagnosticCode::SemanticAnalysisPartial
+            | CodeQueryDiagnosticCode::SemanticPackAcquisitionPending
             | CodeQueryDiagnosticCode::CallBindingDispatchPartial
             | CodeQueryDiagnosticCode::CallBindingSelectorRejected
             | CodeQueryDiagnosticCode::SemanticProviderFailed

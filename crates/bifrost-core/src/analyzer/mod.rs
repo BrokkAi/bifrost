@@ -51,3 +51,6 @@ pub use model::{
     SemanticDiagnostic, SemanticDiagnosticDomain, SemanticDiagnosticIncompleteReason,
     SemanticDiagnosticOutcome, SemanticDiagnosticReport, SemanticDiagnosticReportStatus,
 };
+
+pub mod java_facts;
+pub mod source_facts;

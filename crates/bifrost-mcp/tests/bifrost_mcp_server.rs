@@ -173,7 +173,7 @@ fn fake_jdk_home(root: &std::path::Path, version: &str) -> PathBuf {
 fn run_pack_activation_policy(
     project: &common::BuiltInlineTestProject,
     java_home: &std::path::Path,
-) -> (Value, Value) {
+) -> (Value, Value, Value) {
     let mut child = mcp_server_command(project.root(), "searchtools", &[])
         .env("JAVA_HOME", java_home)
         .spawn()
@@ -197,6 +197,22 @@ fn run_pack_activation_policy(
                     "occurrences": { "role": ["receiver_position"] },
                     "steps": [{ "op": "candidates_of", "outcome": ["selected"] }]
                 }
+            }
+        }),
+    );
+    // Readiness observed between the query and the policy call, so it says
+    // what the query itself awaited: nothing here settled the warm first.
+    let workspace_status = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1869,
+            "method": "tools/call",
+            "params": {
+                "name": "get_active_workspace",
+                "arguments": {}
             }
         }),
     );
@@ -224,6 +240,7 @@ fn run_pack_activation_policy(
     assert_eq!(response["result"]["isError"], false, "{response:#}");
     (
         candidates["result"]["structuredContent"].clone(),
+        workspace_status["result"]["structuredContent"].clone(),
         response["result"]["structuredContent"].clone(),
     )
 }
@@ -254,7 +271,8 @@ fn mcp_bound_policy_reports_exact_pack_activation_and_honest_near_misses() {
     let homes = TempDir::new().expect("fake JDK home root");
     let jdk21 = fake_jdk_home(homes.path(), "21.0.2");
     let compatible = pack_activation_project(r#"["jvm"]"#, true);
-    let (compatible_candidates, compatible_run) = run_pack_activation_policy(&compatible, &jdk21);
+    let (compatible_candidates, compatible_readiness, compatible_run) =
+        run_pack_activation_policy(&compatible, &jdk21);
     assert_eq!(compatible_run["exit_status"], 0, "{compatible_run:#}");
     assert_eq!(
         compatible_run["report"]["runs"][0]["completion"]["type"], "complete",
@@ -265,6 +283,11 @@ fn mcp_bound_policy_reports_exact_pack_activation_and_honest_near_misses() {
         "configured"
     );
     assert_eq!(compatible_run["report"]["packs"]["complete"], true);
+    assert_eq!(
+        compatible_readiness["semantic_packs_ready"], true,
+        "the query awaited the installed stage, and the installed fixture pack leaves no \
+         expensive acquisition outstanding, so the warm must read settled right after it: {compatible_readiness:#}"
+    );
     assert!(
         compatible_candidates["results"]
             .as_array()
@@ -280,7 +303,7 @@ fn mcp_bound_policy_reports_exact_pack_activation_and_honest_near_misses() {
     );
 
     let no_pack = pack_activation_project(r#"["jvm"]"#, false);
-    let (_, no_pack_run) = run_pack_activation_policy(&no_pack, &jdk21);
+    let (_, _, no_pack_run) = run_pack_activation_policy(&no_pack, &jdk21);
     assert_eq!(no_pack_run["exit_status"], 2, "{no_pack_run:#}");
     assert_eq!(
         no_pack_run["report"]["runs"][0]["completion"]["type"],
@@ -289,7 +312,7 @@ fn mcp_bound_policy_reports_exact_pack_activation_and_honest_near_misses() {
 
     let incompatible = pack_activation_project(r#"["jvm"]"#, true);
     let jdk17 = fake_jdk_home(homes.path(), "17.0.10");
-    let (_, incompatible_run) = run_pack_activation_policy(&incompatible, &jdk17);
+    let (_, _, incompatible_run) = run_pack_activation_policy(&incompatible, &jdk17);
     assert_eq!(incompatible_run["exit_status"], 2, "{incompatible_run:#}");
     assert!(
         incompatible_run["report"]["packs"]["decisions"]
@@ -301,7 +324,7 @@ fn mcp_bound_policy_reports_exact_pack_activation_and_honest_near_misses() {
     );
 
     let disabled = pack_activation_project("[]", true);
-    let (_, disabled_run) = run_pack_activation_policy(&disabled, &jdk21);
+    let (_, _, disabled_run) = run_pack_activation_policy(&disabled, &jdk21);
     assert_eq!(disabled_run["exit_status"], 2, "{disabled_run:#}");
     assert_eq!(
         disabled_run["report"]["packs"]["dependency_mode"],
@@ -318,7 +341,7 @@ fn mcp_bound_policy_reports_exact_pack_activation_and_honest_near_misses() {
         "not a catalog directory",
     )
     .expect("create invalid configured catalog path");
-    let (_, failed_run) = run_pack_activation_policy(&failed, &jdk21);
+    let (_, _, failed_run) = run_pack_activation_policy(&failed, &jdk21);
     assert_eq!(failed_run["exit_status"], 2, "{failed_run:#}");
     assert_eq!(failed_run["report"]["packs"]["complete"], false);
     assert!(

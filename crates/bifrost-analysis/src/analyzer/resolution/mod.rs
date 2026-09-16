@@ -510,3 +510,113 @@ pub use fact_resolution::{
     FactCallableReceiverTargetDisposition, FactProjectedFrontier, FactReadSession,
     FactReferenceReceiverGap, FactResolutionAnswer,
 };
+
+#[cfg(test)]
+pub(crate) fn rich_java_resolution_facts_for_test()
+-> brokk_bifrost_core::analyzer::resolution_facts::FileResolutionFacts {
+    const SOURCE: &str = r#"
+package com.acme;
+import dep.A;
+import dep.*;
+import static dep.Owner.FIELD;
+import static dep.Owner.*;
+
+public class Outer extends HierarchyBase {
+    public class Nested {}
+    public static int FIELD;
+    public int qualifiedField;
+
+    public static int method(int parameter) {
+        return parameter;
+    }
+
+    public int use(A value) {
+        int sourceOrderLocal = FIELD;
+        this.qualifiedField = sourceOrderLocal;
+        return method(value.hashCode());
+    }
+}
+"#;
+    let root = std::env::current_dir().expect("test working directory");
+    let file = brokk_bifrost_core::analyzer::ProjectFile::new(root, "RichResolution.java");
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_java::LANGUAGE.into())
+        .expect("Java grammar must match the shared tree-sitter runtime");
+    let tree = parser
+        .parse(SOURCE, None)
+        .expect("rich Java resolution fixture must parse");
+    brokk_bifrost_jvm::java::declarations::parse_java_file(&file, SOURCE, &tree)
+        .native_source
+        .expect("Java native/source production")
+        .into_parts()
+        .0
+}
+
+#[cfg(test)]
+mod java_parser_session_tests {
+    use super::*;
+    use brokk_bifrost_core::analyzer::{Language, ProjectFile};
+    use brokk_bifrost_core::cancellation::CancellationToken;
+
+    #[test]
+    fn parsed_java_point_value_and_call_survive_repeated_session_reads() {
+        let source = "class A { static int identity(int value) { return value; } int use() { int local = 1; return identity(local); } }";
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_java::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let file = ProjectFile::new(std::env::temp_dir(), "Session.java");
+        let parsed = brokk_bifrost_jvm::java::declarations::parse_java_file(&file, source, &tree);
+        let packet = parsed.native_source.expect("real Java producer");
+        let facts = packet.resolution_facts();
+        let fragment = BindingFragmentId::from_digest([41; 32]);
+        let lexical = lower_file_resolution_facts(fragment, Language::Java, facts);
+        let typed = lower_typed_resolution_facts(fragment, Language::Java, facts);
+        let service = PreloadedFactSource::from_lowered_fragments([lexical.clone()], [typed]);
+        let cancellation = CancellationToken::default();
+        let mut session = FactReadSession::new(&service, &cancellation);
+        for name in ["value", "local", "identity"] {
+            let identifier = facts.identifiers.iter().find(|identifier| {
+                facts.names[identifier.name.index()].spelling == name
+                    && identifier.role == brokk_bifrost_core::analyzer::resolution_facts::ResolutionIdentifierRole::Reference
+            }).expect("source reference");
+            let reference = lexical
+                .semantics()
+                .iter()
+                .find(|semantic| {
+                    semantic.site() == identifier.site
+                        && semantic.role() == LoweredSemanticRole::Reference
+                })
+                .unwrap()
+                .semantic();
+            let answer = session.resolve_reference(reference).unwrap();
+            let repeated = session.resolve_reference(reference).unwrap();
+            let fresh = FactReadSession::new(&service, &cancellation)
+                .resolve_reference(reference)
+                .unwrap();
+            assert_eq!(answer, repeated);
+            assert_eq!(answer, fresh);
+            let declaration = facts.identifiers.iter().find(|identifier| facts.names[identifier.name.index()].spelling == name && identifier.role == brokk_bifrost_core::analyzer::resolution_facts::ResolutionIdentifierRole::Declaration).expect("source declaration");
+            let target = lexical
+                .semantics()
+                .iter()
+                .find(|semantic| {
+                    semantic.site() == declaration.site
+                        && semantic.role() == LoweredSemanticRole::Definition
+                })
+                .unwrap()
+                .semantic();
+            assert_eq!(answer.binding().targets(), &[target], "{name}: {answer:?}");
+            assert!(
+                answer
+                    .projected_frontiers()
+                    .iter()
+                    .any(|frontier| !frontier.possible_values().is_empty()),
+                "{name}: {answer:?}"
+            );
+        }
+        assert!(facts.gaps.iter().any(|gap| gap.kind == brokk_bifrost_core::analyzer::resolution_facts::ResolutionGapKind::UnsupportedPlacementBoundary));
+    }
+}

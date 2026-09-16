@@ -26,8 +26,13 @@ type CatalogDeclaration = (CodeUnit, Option<Range>);
 /// every node still knows the language it was declared in (see
 /// [`WorkspaceUsageNode::source_language`]), and each language keeps its own
 /// resolver.
+///
+/// This is also the registry a consumer outside this crate asks when it needs
+/// to know whether two files' declarations can name one another: the honesty
+/// checker in `brokk-bifrost` scopes an identity match to the claim's candidate
+/// space (#3391) rather than re-deriving the language families.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) enum UsageEcosystem {
+pub enum UsageEcosystem {
     JavaScriptTypeScript,
     Python,
     Go,
@@ -44,7 +49,7 @@ impl UsageEcosystem {
     /// The registry is the single owner of this mapping. An unregistered language --
     /// only `Language::None` -- is `Unknown`, whose declarations become graph nodes with
     /// no edges because no pass ever claims that ecosystem.
-    pub(crate) fn of(language: Language) -> Self {
+    pub fn of(language: Language) -> Self {
         language_support(language).map_or(Self::Unknown, LanguageSupport::ecosystem)
     }
 

@@ -113,3 +113,20 @@ threads-required = "num-cpus"
 [[profile.default.overrides]]
 filter = 'test(persisted_open_populates_a_cache_the_reopen_hydrates_from) | test(cli_reruns_and_one_file_edit_stay_in_the_interactive_latency_class) | test(light_lookup_overtakes_long_usage_scan) | test(c_wide_translation_unit_indexes_in_linear_time) | test(large_rust_file_definition_and_hover_stay_interactive) | test(deeply_nested_javascript_extraction_is_linear) | test(exact_go_source_set_produces_and_compiles_api_pack) | test(bifrost_lsp_server_formatting_shutdown_cancels_active_formatter) | test(explicit_file_fifo_is_rejected_without_blocking) | test(directory_entries_reject_fifo_replacement_without_blocking)'
 threads-required = "num-cpus"
+
+# issue_3006_release_zero_config runs only under `--cfg scheduled_tests` (the
+# hourly os-matrix legs and ad hoc --run-ignored runs): a real `bifrost scan`
+# that produces the zero-configuration JDK pack from a real JDK's jmods under
+# BIFROST_PARALLELISM=1, inside a fresh ScratchCacheDir so no earlier test's
+# catalog can warm it. It is the heaviest single test in the suite, and the
+# rest of nextest saturates the shared hourly runner around it: same code on
+# the same aarch64 runner class passed in 178.5 s and 131.8 s, then took
+# 564.4 s on the last green hourly (94% of the 600 s kill threshold) and
+# TIMEOUT at >600 s in run 35017405309 (issue #3401). A 4.5x load-driven
+# spread on identical code is CPU starvation, not a hang; reserve the box so
+# the profile-wide terminate-after = 10 stays a hang detector instead of a
+# load gauge. The reservation costs nothing per push: without scheduled_tests
+# the test is ignored and never runs.
+[[profile.default.overrides]]
+filter = 'test(issue_3006_release_zero_config)'
+threads-required = "num-cpus"

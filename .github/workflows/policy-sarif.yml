@@ -37,12 +37,19 @@ jobs:
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: policy-sarif
+          cache-on-failure: true
 
-      - name: Build the release policy runner
-        run: cargo build --locked --release --bin bifrost
+      # Build both binaries with one feature graph. Running Cargo again for the
+      # pack generator rebuilt shared dependencies with release-tooling enabled.
+      - name: Build the release policy runner and semantic-pack tool
+        run: >-
+          cargo build --locked --release --bin bifrost --bin bifrost-semantic-pack
+          -p brokk-bifrost -p brokk-bifrost-semantic-packs
+          --features brokk-bifrost-semantic-packs/release-tooling
 
       - name: Generate and install pinned Python semantic pack
         env:
+          BIFROST_SEMANTIC_PACK_BIN: ${{ github.workspace }}/target/release/bifrost-semantic-pack
           CACHE_ROOT: ${{ runner.temp }}/bifrost-python-semantic-pack-cache
         run: |
           bash scripts/public/build-pinned-python-semantic-packs.sh \
@@ -56,6 +63,8 @@ jobs:
           BIFROST_SEMANTIC_PACK_CACHE_ROOT: ${{ runner.temp }}/bifrost-python-semantic-pack-cache
         with:
           version: local
+          policy-timings: true
+          artifact-name: bifrost-code-smells-report
           category: bifrost-code-smells
           diff-base: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
           # The private source repository does not have GitHub Code Security enabled.

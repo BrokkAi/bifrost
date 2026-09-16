@@ -53,6 +53,14 @@ inputs:
     description: SARIF output path, relative to working-directory.
     required: false
     default: bifrost-policy.sarif
+  policy-timings:
+    description: Collect per-policy timing details (requires a runner supporting --policy-timings).
+    required: false
+    default: 'false'
+  artifact-name:
+    description: Retain the SARIF report as an artifact before gating. Empty disables artifact upload; use a unique name for each scan in a job.
+    required: false
+    default: ''
   upload:
     description: Upload the SARIF file to GitHub code scanning.
     required: false
@@ -62,7 +70,7 @@ inputs:
     required: false
     default: bifrost-policy
   cache:
-    description: Restore and save the .bifrost/cache analyzer database.
+    description: Restore and save a dedicated analyzer cache, scoped to this working directory and exact build.
     required: false
     default: 'true'
   working-directory:
@@ -71,6 +79,9 @@ inputs:
     default: '.'
 
 outputs:
+  analyzer-cache-hit:
+    description: Whether the analyzer cache restored an exact entry (empty when caching is disabled).
+    value: ${{ steps.analyzer-cache.outputs.cache-hit }}
   exit-code:
     description: Raw bifrost policy exit code (0, 1, or 2).
     value: ${{ steps.run.outputs.exit-code }}
@@ -148,6 +159,7 @@ runs:
       shell: bash
       env:
         BIFROST_BIN: ${{ steps.install.outputs.bifrost_bin }}
+        WORKDIR: ${{ inputs.working-directory }}
       run: |
         set -euo pipefail
         identity=$("${BIFROST_BIN}" --build-identity)
@@ -156,13 +168,27 @@ runs:
           exit 1
         fi
         echo "value=${identity}" >> "${GITHUB_OUTPUT}"
+        if command -v sha256sum >/dev/null 2>&1; then
+          workspace_key=$(printf '%s' "${WORKDIR}" | sha256sum | cut -d ' ' -f 1)
+        else
+          workspace_key=$(printf '%s' "${WORKDIR}" | shasum -a 256 | cut -d ' ' -f 1)
+        fi
+        echo "workspace-key=${workspace_key}" >> "${GITHUB_OUTPUT}"
+        # The cached path participates in GitHub's cache version: keep it
+        # workspace-relative and stable across invocations and runner locations.
+        # Scope this action-owned root by the build and selected workspace.
+        cache_path=".bifrost/cache/policy-action/${identity}/${workspace_key}"
+        mkdir -p "${GITHUB_WORKSPACE}/${cache_path}"
+        echo "cache-path=${cache_path}" >> "${GITHUB_OUTPUT}"
+        echo "cache-root=${GITHUB_WORKSPACE}/${cache_path}" >> "${GITHUB_OUTPUT}"
 
-    - name: Analyzer cache
+    - name: Restore analyzer cache
+      id: analyzer-cache
       if: inputs.cache == 'true'
-      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
       with:
-        path: .bifrost/cache
-        key: bifrost-policy-cache-${{ runner.os }}-${{ runner.arch }}-${{ inputs.version }}-${{ steps.analyzer-cache-identity.outputs.value }}
+        path: ${{ steps.analyzer-cache-identity.outputs.cache-path }}
+        key: bifrost-policy-cache-${{ runner.os }}-${{ runner.arch }}-${{ inputs.version }}-${{ steps.analyzer-cache-identity.outputs.value }}-${{ steps.analyzer-cache-identity.outputs.workspace-key }}
 
     - name: Run policies
       id: run
@@ -176,19 +202,37 @@ runs:
         POLICY_CATEGORIES: ${{ inputs.policy-categories }}
         POLICY_FILES: ${{ inputs.policy-files }}
         DIFF_BASE: ${{ inputs.diff-base }}
+        MANAGED_CACHE: ${{ inputs.cache }}
+        MANAGED_CACHE_ROOT: ${{ steps.analyzer-cache-identity.outputs.cache-root }}
+        POLICY_TIMINGS: ${{ inputs.policy-timings }}
         BIFROST_BIN: ${{ steps.install.outputs.bifrost_bin }}
       run: |
-        set -uo pipefail
+        set -euo pipefail
         cd "${WORKDIR}"
+        if [ "${MANAGED_CACHE:-false}" = true ]; then
+          export BIFROST_CACHE_ROOT="${MANAGED_CACHE_ROOT}"
+          # Avoid the default repository child hash changing with the runner's
+          # absolute checkout path. The action key already scopes this workspace.
+          export BIFROST_CACHE_DIR="${MANAGED_CACHE_ROOT}/analyzer"
+        fi
         args=(--root . --format sarif --output "${SARIF_FILE}" --fail-on "${FAIL_ON}")
         for p in ${POLICY_PACKS}; do args+=(--policy-pack "${p}"); done
         for p in ${POLICY_IDS}; do args+=(--policy-id "${p}"); done
         for p in ${POLICY_CATEGORIES}; do args+=(--policy-category "${p}"); done
         for p in ${POLICY_FILES}; do args+=(--policy-file "${p}"); done
         if [ -n "${DIFF_BASE}" ]; then args+=(--diff-base "${DIFF_BASE}"); fi
+        if [ "${POLICY_TIMINGS:-false}" = true ]; then args+=(--policy-timings); fi
         set +e
-        "${BIFROST_BIN}" "${args[@]}"
-        code=$?
+        if [ "${POLICY_TIMINGS:-false}" = true ]; then
+          # Capture stderr without a pipeline so the analyzer status is exact.
+          "${BIFROST_BIN}" "${args[@]}" 2> "${SARIF_FILE}.stderr.log"
+          code=$?
+          cat "${SARIF_FILE}.stderr.log" >&2
+          echo "stderr-file=${WORKDIR}/${SARIF_FILE}.stderr.log" >> "${GITHUB_OUTPUT}"
+        else
+          "${BIFROST_BIN}" "${args[@]}"
+          code=$?
+        fi
         set -e
         echo "exit-code=${code}" >> "${GITHUB_OUTPUT}"
         echo "sarif-file=${WORKDIR}/${SARIF_FILE}" >> "${GITHUB_OUTPUT}"
@@ -197,6 +241,49 @@ runs:
         else
           echo "has-sarif=false" >> "${GITHUB_OUTPUT}"
         fi
+
+    # Save after the analyzer exits, even when its policy gate will fail. Never
+    # restore another producer's build identity as a cache fallback.
+    - name: Save analyzer cache
+      if: always() && inputs.cache == 'true' && steps.analyzer-cache.outputs.cache-hit != 'true' && steps.run.outputs.has-sarif == 'true'
+      uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      with:
+        path: ${{ steps.analyzer-cache-identity.outputs.cache-path }}
+        key: ${{ steps.analyzer-cache.outputs.cache-primary-key }}
+
+    - name: Retain SARIF report
+      if: always() && inputs.artifact-name != '' && steps.run.outputs.has-sarif == 'true'
+      uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+      with:
+        name: ${{ inputs.artifact-name }}
+        path: |
+          ${{ steps.run.outputs.sarif-file }}
+          ${{ steps.run.outputs.stderr-file }}
+        if-no-files-found: error
+
+    - name: Summarize policy execution
+      if: always() && steps.run.outputs.has-sarif == 'true'
+      shell: bash
+      env:
+        SARIF_PATH: ${{ steps.run.outputs.sarif-file }}
+        DIFF_BASE: ${{ inputs.diff-base }}
+      run: |
+        set -euo pipefail
+        echo '::group::Bifrost policy execution evidence'
+        # Per-policy work describes the head; aggregate stages can include diff_base.
+        # JSON escaping keeps source-controlled diagnostics inert in the log.
+        jq --arg diff_base "${DIFF_BASE}" '
+          .runs[] | .properties | {
+            policy_work_scope: (if $diff_base == "" then "workspace" else "head" end),
+            timing_note: "aggregate stages include diff_base when reached; measured stages and actual coverage are in opt-in stderr, successful canonical times may be zero",
+            execution: .["bifrost.execution"],
+            incremental: .["bifrost.incremental"],
+            policy_runs: .["bifrost.policyRuns"],
+            report_diagnostics: .["bifrost.reportDiagnostics"],
+            diff_baseline: .["bifrost.diffBaseline"]
+          }
+        ' "${SARIF_PATH}"
+        echo '::endgroup::'
 
     - name: Upload SARIF to code scanning
       if: inputs.upload == 'true' && steps.run.outputs.has-sarif == 'true'
@@ -233,6 +320,7 @@ runs:
         gh api "repos/${GITHUB_REPOSITORY}/code-scanning/sarifs" --input "${body}"
 
     - name: Gate on the exit code
+      if: always()
       shell: bash
       env:
         CODE: ${{ steps.run.outputs.exit-code }}
@@ -331,7 +419,7 @@ runs:
           2)
             echo "::group::Bifrost policy report diagnostics"
             if diagnostics=$(jq -r '
-              .runs[].invocations[]?.toolExecutionNotifications[]?
+              (.runs[].invocations[]?.toolExecutionNotifications[]?
               | if .properties["bifrost.reportDiagnostic"] != null then
                   .properties["bifrost.reportDiagnostic"] as $diagnostic
                   | "\($diagnostic.code // .descriptor.id // "unknown"): \(.message.text // "<no-message>")"
@@ -340,19 +428,22 @@ runs:
                   | "\(.descriptor.id // "unknown"): \(.message.text // "<no-message>")"
                     + " [policy: \(.properties["bifrost.policyId"] // "unknown"); completion: \($completion | tojson)]"
                 else empty
-                end
+                end),
+              (.runs[].properties["bifrost.policyRuns"][]?
+                | select(.completion.type != "complete" or ((.diagnostics // []) | length) > 0)
+                | "policy: " + tojson)
             ' "${SARIF_PATH}"); then
               if [ -n "${diagnostics}" ]; then
                 printf '%s\n' "${diagnostics}"
               else
-                echo "No report diagnostics were emitted in ${SARIF_PATH}."
+                echo "No report or policy diagnostics were emitted in ${SARIF_PATH}."
               fi
             else
               echo "::endgroup::"
               echo "::error::unable to extract report diagnostics from ${SARIF_PATH}."
               exit 1
             fi
-            echo "::error::Bifrost policy scan is UNRELIABLE. The run could not prove its own completeness. Read the report diagnostics. Do not treat this result as clean."
+            echo "::error::Bifrost policy scan is UNRELIABLE. The run could not prove its own completeness. Read the report and policy diagnostics. Do not treat this result as clean."
             echo "::endgroup::"
             exit 2
             ;;

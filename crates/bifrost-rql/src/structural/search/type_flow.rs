@@ -557,16 +557,19 @@ impl TypeFlowQueryState {
                 let mut field_slot_budget =
                     SemanticBudget::new_child(field_slot_limits, &parent_scope);
                 let field_slot_cache = self.summary_state.field_slot_indexes();
-                let acquired = FieldSlotIndex::acquire(
-                    workspace,
-                    adapter,
-                    provider_behavior,
-                    active_semantic_model_snapshot.clone(),
-                    &field_slot_cache,
-                    self.value_flow_cache.clone(),
-                    &mut field_slot_budget,
-                    cancellation,
-                );
+                let acquired = {
+                    let _timing = crate::profiling::scope("type_flow.field_slot_acquire");
+                    FieldSlotIndex::acquire(
+                        workspace,
+                        adapter,
+                        provider_behavior,
+                        active_semantic_model_snapshot.clone(),
+                        &field_slot_cache,
+                        self.value_flow_cache.clone(),
+                        &mut field_slot_budget,
+                        cancellation,
+                    )
+                };
                 // Capture the paid identities before consuming the child
                 // charge. Applying its scalar work below can fail when the
                 // query's aggregate accounting limit is intentionally smaller

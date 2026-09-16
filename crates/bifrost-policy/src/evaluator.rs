@@ -129,7 +129,8 @@ use super::projection::{
 use super::resolved::{LoadedPolicy, ResolvedTaintPolicySpec, ResolvedTypestatePolicySpec};
 use super::retained::RetainedSize;
 use super::unit_execution::{
-    SeedPartition, UnitAttempt, UnitQueryExecution, UnitReuse, recompute_unit, sliced_query_units,
+    SeedPartition, UnitAttempt, UnitQueryExecution, UnitReuse, query_slicing_widen_reason,
+    recompute_unit, sliced_query_units,
 };
 use super::units::{
     PolicyIncrementalContext, PolicyIncrementalRun, PolicyUnitProduct, UnitPartition, WidenReason,
@@ -4689,6 +4690,7 @@ pub(super) fn incomplete_reason_for_code(code: &CodeQueryDiagnosticCode) -> Poli
         | CodeQueryDiagnosticCode::CallBindingSelectorRejected
         | CodeQueryDiagnosticCode::SemanticBudgetExhausted
         | CodeQueryDiagnosticCode::SemanticProviderFailed
+        | CodeQueryDiagnosticCode::SemanticPackAcquisitionPending
         | CodeQueryDiagnosticCode::UnresolvedProtocolReference
         | CodeQueryDiagnosticCode::TypestateRegistrationStale
         | CodeQueryDiagnosticCode::TypestateHandleStale

@@ -1,4 +1,3 @@
-#[cfg(test)]
 use crate::analyzer::Language;
 #[cfg(test)]
 use crate::policy::{
@@ -13,8 +12,8 @@ use crate::{
     analyzer::IndexWarmer,
     analyzer::packs_document::{
         WORKSPACE_PACKS_DOCUMENT_PATH, WorkspaceActivationSources, WorkspacePacksActivation,
-        WorkspacePacksConfig, activate_workspace_semantic_sources_in_catalog,
-        bootstrap_semantic_model_catalog,
+        WorkspacePacksConfig, activate_installed_workspace_semantic_sources_in_catalog,
+        activate_workspace_semantic_sources_in_catalog, bootstrap_semantic_model_catalog,
         install_semantic_model_catalog_bootstrap as install_shared_semantic_model_catalog_bootstrap,
         intrinsic_language_evidence, load_workspace_packs_config_at,
         open_ambient_semantic_pack_catalog, workspace_pack_ecosystems,
@@ -235,6 +234,19 @@ struct WorkspacePackActivationState {
     activation: Option<Arc<WorkspacePacksActivation>>,
     ecosystems: Vec<crate::analyzer::DependencyPackEcosystem>,
     failure: Option<String>,
+    /// Dependencies whose exact acquisition the expensive stage of the warm
+    /// still owes. Non-empty only on an interim, installed-stage state, so a
+    /// query holding it can say which packs its answer could still gain
+    /// (issue #3401). A settled state always has this empty.
+    pending_acquisitions: Vec<crate::analyzer::semantic_model::PendingDependencyPackAcquisition>,
+}
+
+/// The installed-pack stage's answer for one session: either the final
+/// activation, when nothing expensive is outstanding, or the interim
+/// activation whose pending acquisitions the warm thread still owes.
+enum InstalledPackStageOutcome {
+    Settled(WorkspacePackActivationState),
+    AcquisitionPending(WorkspacePackActivationState),
 }
 
 fn activate_configured_semantic_models(
@@ -246,106 +258,248 @@ fn activate_configured_semantic_models(
     let packs_config = load_workspace_packs_config_at(workspace_root)
         .map_err(|error| format!("failed to load workspace packs document: {error}"))?
         .map(Arc::new);
-    let explicit_legacy = configured.as_ref().is_some_and(|configured| {
-        configured.catalog_root.is_some() || !configured.evidence.is_empty()
-    });
-    if !explicit_legacy {
-        // This is the ordinary MCP path. Bootstrap alone is not a legacy
-        // override: it contributes reviewed records to the same catalog and
-        // one shared transaction as the ambient/default dependency route.
-        let workspace_models = configured
-            .as_ref()
-            .is_some_and(|configured| configured.workspace_models);
-        let ecosystems = workspace_pack_ecosystems(workspace, packs_config.as_deref());
-        // Intrinsic shipped packs are independent of the dependency and
-        // workspace-local routes, so even an explicit empty ecosystem list
-        // must reach the shared bootstrap below.
-        let catalog = {
-            let _scope = profiling::scope("semantic_pack.open_catalog");
-            match packs_config.as_ref().and_then(|config| config.catalog()) {
-                Some(relative) => match SemanticPackCatalog::open(
-                    &workspace_root.join(relative),
-                    CatalogOpenMode::ReadWrite,
-                    CatalogOptions::default(),
-                ) {
-                    Ok(catalog) => catalog,
-                    Err(error) => {
-                        return Ok(WorkspacePackActivationState {
-                            config: packs_config,
-                            activation: None,
-                            ecosystems,
-                            failure: Some(format!(
-                                "failed to open workspace semantic-pack catalog: {error}"
-                            )),
-                        });
-                    }
-                },
-                None => match open_ambient_semantic_pack_catalog(
-                    workspace,
-                    workspace_root,
-                    CatalogOptions::default(),
-                ) {
-                    Ok(catalog) => catalog,
-                    Err(error) => {
-                        return Ok(WorkspacePackActivationState {
-                            config: packs_config,
-                            activation: None,
-                            ecosystems,
-                            failure: Some(format!(
-                                "failed to open generated semantic-pack catalog: {error}"
-                            )),
-                        });
-                    }
-                },
-            }
-        };
-        let mut additional_evidence = Vec::new();
-        match bootstrap_semantic_model_catalog(&catalog) {
-            Ok(true) => additional_evidence.extend(intrinsic_language_evidence(workspace)),
-            Ok(false) => {}
-            Err(error) => {
-                return Ok(WorkspacePackActivationState {
-                    config: packs_config,
-                    activation: None,
-                    ecosystems,
-                    failure: Some(format!(
-                        "failed to register the MCP semantic-pack catalog bootstrap: {error}"
-                    )),
-                });
+    if configured_explicit_legacy(&configured) {
+        return activate_legacy_configured_semantic_models(
+            workspace_root,
+            workspace,
+            configured,
+            packs_config,
+        );
+    }
+    // This is the ordinary MCP path. Bootstrap alone is not a legacy
+    // override: it contributes reviewed records to the same catalog and
+    // one shared transaction as the ambient/default dependency route.
+    let SessionPackCatalogPrelude {
+        workspace_models,
+        ecosystems,
+        catalog,
+        additional_evidence,
+    } = match open_session_pack_catalog(workspace_root, workspace, &configured, &packs_config) {
+        Ok(prelude) => prelude,
+        Err(failure_state) => return Ok(failure_state),
+    };
+    let activation = match activate_workspace_semantic_sources_in_catalog(
+        workspace,
+        &AnalyzerConfig::default(),
+        &catalog,
+        WorkspaceActivationSources {
+            catalog_root: workspace_root,
+            workspace_model_root: workspace_models.then_some(workspace_root),
+            config: packs_config.as_deref(),
+            intrinsic_shipped_models: false,
+        },
+        &additional_evidence,
+        &CancellationToken::default(),
+    ) {
+        Ok(activation) => activation.map(Arc::new),
+        Err(error) => {
+            return Ok(WorkspacePackActivationState {
+                config: packs_config,
+                activation: None,
+                ecosystems,
+                failure: Some(format!(
+                    "workspace semantic-pack activation failed: {error}"
+                )),
+                pending_acquisitions: Vec::new(),
+            });
+        }
+    };
+    Ok(WorkspacePackActivationState {
+        config: packs_config,
+        activation,
+        ecosystems,
+        failure: None,
+        pending_acquisitions: Vec::new(),
+    })
+}
+
+/// The installed-pack stage of [`activate_configured_semantic_models`]: the
+/// same document load, catalog open, bootstrap, and discovery, but dependency
+/// preparation resolves only against packs already installed in the catalog.
+/// Nothing is fetched, verified, extracted, read as a dependency artifact, or
+/// generated from a local toolchain; the acquisitions that remain come back
+/// named on the interim state (issue #3401, the #3372 family).
+fn activate_configured_semantic_models_installed_stage(
+    workspace_root: &Path,
+    workspace: &WorkspaceAnalyzer,
+    configured: Option<ConfiguredSemanticModels>,
+) -> Result<InstalledPackStageOutcome, String> {
+    let _scope = profiling::scope("semantic_pack.activate_installed");
+    let packs_config = load_workspace_packs_config_at(workspace_root)
+        .map_err(|error| format!("failed to load workspace packs document: {error}"))?
+        .map(Arc::new);
+    if configured_explicit_legacy(&configured) {
+        // The legacy host-supplied route only ever reads local catalogs and
+        // host-supplied evidence, so it is whole in the installed stage by
+        // construction.
+        return activate_legacy_configured_semantic_models(
+            workspace_root,
+            workspace,
+            configured,
+            packs_config,
+        )
+        .map(InstalledPackStageOutcome::Settled);
+    }
+    let SessionPackCatalogPrelude {
+        workspace_models,
+        ecosystems,
+        catalog,
+        additional_evidence,
+    } = match open_session_pack_catalog(workspace_root, workspace, &configured, &packs_config) {
+        Ok(prelude) => prelude,
+        Err(failure_state) => return Ok(InstalledPackStageOutcome::Settled(failure_state)),
+    };
+    match activate_installed_workspace_semantic_sources_in_catalog(
+        workspace,
+        &AnalyzerConfig::default(),
+        &catalog,
+        WorkspaceActivationSources {
+            catalog_root: workspace_root,
+            workspace_model_root: workspace_models.then_some(workspace_root),
+            config: packs_config.as_deref(),
+            intrinsic_shipped_models: false,
+        },
+        &additional_evidence,
+        &CancellationToken::default(),
+    ) {
+        Ok(Some(installed)) => {
+            let state = WorkspacePackActivationState {
+                config: packs_config,
+                activation: Some(Arc::new(installed.activation)),
+                ecosystems,
+                failure: None,
+                pending_acquisitions: installed.pending,
+            };
+            if state.pending_acquisitions.is_empty() {
+                Ok(InstalledPackStageOutcome::Settled(state))
+            } else {
+                Ok(InstalledPackStageOutcome::AcquisitionPending(state))
             }
         }
-        let activation = match activate_workspace_semantic_sources_in_catalog(
-            workspace,
-            &AnalyzerConfig::default(),
-            &catalog,
-            WorkspaceActivationSources {
-                catalog_root: workspace_root,
-                workspace_model_root: workspace_models.then_some(workspace_root),
-                config: packs_config.as_deref(),
-                intrinsic_shipped_models: false,
+        Ok(None) => Ok(InstalledPackStageOutcome::Settled(
+            WorkspacePackActivationState {
+                config: packs_config,
+                activation: None,
+                ecosystems,
+                failure: None,
+                pending_acquisitions: Vec::new(),
             },
-            &additional_evidence,
-            &CancellationToken::default(),
-        ) {
-            Ok(activation) => activation.map(Arc::new),
-            Err(error) => {
-                return Ok(WorkspacePackActivationState {
-                    config: packs_config,
-                    activation: None,
-                    ecosystems,
-                    failure: Some(format!(
-                        "workspace semantic-pack activation failed: {error}"
-                    )),
-                });
-            }
-        };
-        return Ok(WorkspacePackActivationState {
-            config: packs_config,
-            activation,
-            ecosystems,
-            failure: None,
-        });
+        )),
+        Err(error) => Ok(InstalledPackStageOutcome::Settled(
+            WorkspacePackActivationState {
+                config: packs_config,
+                activation: None,
+                ecosystems,
+                failure: Some(format!(
+                    "workspace semantic-pack activation failed: {error}"
+                )),
+                pending_acquisitions: Vec::new(),
+            },
+        )),
     }
+}
+
+fn configured_explicit_legacy(configured: &Option<ConfiguredSemanticModels>) -> bool {
+    configured.as_ref().is_some_and(|configured| {
+        configured.catalog_root.is_some() || !configured.evidence.is_empty()
+    })
+}
+
+/// The catalog handle and bootstrap evidence both activation stages start
+/// from. Opening the catalog and running its bootstrap are local work --
+/// neither fetches, verifies, extracts, or generates anything -- so the
+/// installed-pack stage awaits them (issue #3401).
+struct SessionPackCatalogPrelude {
+    workspace_models: bool,
+    ecosystems: Vec<crate::analyzer::DependencyPackEcosystem>,
+    catalog: SemanticPackCatalog,
+    additional_evidence: Vec<SemanticModelActivationEvidence>,
+}
+
+fn open_session_pack_catalog(
+    workspace_root: &Path,
+    workspace: &WorkspaceAnalyzer,
+    configured: &Option<ConfiguredSemanticModels>,
+    packs_config: &Option<Arc<WorkspacePacksConfig>>,
+) -> Result<SessionPackCatalogPrelude, WorkspacePackActivationState> {
+    let workspace_models = configured
+        .as_ref()
+        .is_some_and(|configured| configured.workspace_models);
+    let ecosystems = workspace_pack_ecosystems(workspace, packs_config.as_deref());
+    // Intrinsic shipped packs are independent of the dependency and
+    // workspace-local routes, so even an explicit empty ecosystem list
+    // must reach the shared bootstrap below.
+    let catalog = {
+        let _scope = profiling::scope("semantic_pack.open_catalog");
+        match packs_config.as_ref().and_then(|config| config.catalog()) {
+            Some(relative) => match SemanticPackCatalog::open(
+                &workspace_root.join(relative),
+                CatalogOpenMode::ReadWrite,
+                CatalogOptions::default(),
+            ) {
+                Ok(catalog) => catalog,
+                Err(error) => {
+                    return Err(WorkspacePackActivationState {
+                        config: packs_config.clone(),
+                        activation: None,
+                        ecosystems,
+                        failure: Some(format!(
+                            "failed to open workspace semantic-pack catalog: {error}"
+                        )),
+                        pending_acquisitions: Vec::new(),
+                    });
+                }
+            },
+            None => match open_ambient_semantic_pack_catalog(
+                workspace,
+                workspace_root,
+                CatalogOptions::default(),
+            ) {
+                Ok(catalog) => catalog,
+                Err(error) => {
+                    return Err(WorkspacePackActivationState {
+                        config: packs_config.clone(),
+                        activation: None,
+                        ecosystems,
+                        failure: Some(format!(
+                            "failed to open generated semantic-pack catalog: {error}"
+                        )),
+                        pending_acquisitions: Vec::new(),
+                    });
+                }
+            },
+        }
+    };
+    let mut additional_evidence = Vec::new();
+    match bootstrap_semantic_model_catalog(&catalog) {
+        Ok(true) => additional_evidence.extend(intrinsic_language_evidence(workspace)),
+        Ok(false) => {}
+        Err(error) => {
+            return Err(WorkspacePackActivationState {
+                config: packs_config.clone(),
+                activation: None,
+                ecosystems,
+                failure: Some(format!(
+                    "failed to register the MCP semantic-pack catalog bootstrap: {error}"
+                )),
+                pending_acquisitions: Vec::new(),
+            });
+        }
+    }
+    Ok(SessionPackCatalogPrelude {
+        workspace_models,
+        ecosystems,
+        catalog,
+        additional_evidence,
+    })
+}
+
+fn activate_legacy_configured_semantic_models(
+    workspace_root: &Path,
+    workspace: &WorkspaceAnalyzer,
+    configured: Option<ConfiguredSemanticModels>,
+    packs_config: Option<Arc<WorkspacePacksConfig>>,
+) -> Result<WorkspacePackActivationState, String> {
     if packs_config.is_some() {
         let ecosystems = workspace_pack_ecosystems(workspace, packs_config.as_deref());
         return Ok(WorkspacePackActivationState {
@@ -356,6 +510,7 @@ fn activate_configured_semantic_models(
                 "workspace packs document cannot be combined with legacy semantic-pack environment configuration"
                     .to_owned(),
             ),
+            pending_acquisitions: Vec::new(),
         });
     }
     let configured = configured.unwrap_or(ConfiguredSemanticModels {
@@ -464,6 +619,7 @@ fn activate_configured_semantic_models(
                 activation: None,
                 ecosystems: Vec::new(),
                 failure: None,
+                pending_acquisitions: Vec::new(),
             })
         }
         SemanticModelRuntimeOutcome::Incomplete { report, .. } => Err(format!(
@@ -1143,22 +1299,30 @@ enum StartupIndexWarm {
     OnDemand,
 }
 
-/// The semantic-pack activation a session performs once, and whether it has
-/// settled.
+/// The semantic-pack activation a session performs once, published in two
+/// stages.
 ///
 /// Activation resolves the workspace's dependency evidence against the pack
-/// catalog. That can read a local toolchain, download and verify a release
-/// bundle, produce a generated pack, and decode whole packs into the active
-/// model set, so it is measured in seconds on a JVM workspace with a local JDK
-/// while the analyzer snapshot itself is ready in hundreds of milliseconds.
+/// catalog. The full transaction can read a local toolchain, download and
+/// verify a release bundle, produce a generated pack, and decode whole packs
+/// into the active model set, so it is measured in seconds to minutes on a
+/// JVM workspace with a local JDK while the analyzer snapshot itself is ready
+/// in hundreds of milliseconds.
 ///
 /// It is therefore a warm-up for the session, not part of publishing its
 /// analyzer: a deferred build starts it on its own thread and reports the
 /// workspace ready as soon as the analyzer is installed (issue #3372, the
-/// #2377 family). The settled state is published here, and the consumers that
-/// hand it to the runtime -- policy evaluation and a scope refresh -- wait for
-/// it. A session assembled synchronously starts settled, so a one-shot
-/// invocation and a test fixture keep the previous behavior exactly.
+/// #2377 family). The warm's first, installed stage is the cheap part --
+/// opening the catalog and resolving the packs already installed for this
+/// workspace, never fetching, verifying, extracting, or generating -- and it
+/// is what the query path awaits, so a resolution answer is deterministic
+/// instead of whichever side of the warm it landed on (issue #3401). When
+/// that stage leaves acquisitions outstanding the warm continues to the full
+/// activation on the same thread and publishes its result over the interim
+/// one. The consumers that hand the exact final activation to the runtime --
+/// policy evaluation and a scope refresh -- wait for that settle. A session
+/// assembled synchronously starts settled, so a one-shot invocation and a
+/// test fixture keep the previous behavior exactly.
 struct SemanticPackWarm {
     state: Mutex<PackWarmState>,
     settled: Condvar,
@@ -1172,7 +1336,27 @@ struct SemanticPackWarm {
 
 enum PackWarmState {
     Pending,
+    AcquisitionPending(Arc<WorkspacePackActivationState>),
     Settled(Option<Arc<WorkspacePackActivationState>>),
+}
+
+/// The session's pack activation as one query snapshot observes it (issue
+/// #3401). The two non-settled states are what a `query_code` answer marks
+/// with the pending-acquisition diagnostic.
+#[derive(Clone)]
+enum SessionPackActivation {
+    /// The warm finished: this is the session's exact final activation, or
+    /// its stated failure (`Some` carrying `failure`), or the
+    /// reported-unavailable case (`None`).
+    Settled(Option<Arc<WorkspacePackActivationState>>),
+    /// The installed stage settled and the snapshot awaited it; the expensive
+    /// stage is still running, so the active set can still gain the pending
+    /// acquisitions this state names.
+    AcquisitionPending(Arc<WorkspacePackActivationState>),
+    /// Even the installed stage had not settled and the request did not wait
+    /// for it (it had already recorded its timeout), so the answer may be
+    /// pack-blind.
+    WarmPending,
 }
 
 impl SemanticPackWarm {
@@ -1198,7 +1382,8 @@ impl SemanticPackWarm {
         }
     }
 
-    /// Start the activation on its own thread and publish what it returns.
+    /// Start the staged activation on its own thread and publish what it
+    /// returns.
     fn spawn(project_root: PathBuf, analyzer: WorkspaceAnalyzer) -> Result<Arc<Self>, String> {
         let warm = Arc::new(Self::pending());
         start_pack_warm_worker(Arc::clone(&warm), project_root, analyzer)?;
@@ -1222,25 +1407,45 @@ impl SemanticPackWarm {
         Ok(warm)
     }
 
-    /// The activation state, or `None` while the warm is still running.
-    fn state(&self) -> Option<Arc<WorkspacePackActivationState>> {
+    /// The activation as a query snapshot observes it right now.
+    fn snapshot_phase(&self) -> SessionPackActivation {
+        match &*self
+            .state
+            .lock()
+            .expect("semantic-pack warm mutex poisoned")
+        {
+            PackWarmState::Pending => SessionPackActivation::WarmPending,
+            PackWarmState::AcquisitionPending(state) => {
+                SessionPackActivation::AcquisitionPending(Arc::clone(state))
+            }
+            PackWarmState::Settled(state) => SessionPackActivation::Settled(state.clone()),
+        }
+    }
+
+    /// The best-known activation state, for scope-change detection that only
+    /// reads the attempted-ecosystem set: the interim state when that is all
+    /// the warm has published.
+    fn best_known_state(&self) -> Option<Arc<WorkspacePackActivationState>> {
         match &*self
             .state
             .lock()
             .expect("semantic-pack warm mutex poisoned")
         {
             PackWarmState::Pending => None,
+            PackWarmState::AcquisitionPending(state) => Some(Arc::clone(state)),
             PackWarmState::Settled(state) => state.clone(),
         }
     }
 
+    /// Whether the warm has fully settled, expensive stage included. This is
+    /// what `get_active_workspace` reports as `semantic_packs_ready`.
     fn is_ready(&self) -> bool {
-        !matches!(
+        matches!(
             *self
                 .state
                 .lock()
                 .expect("semantic-pack warm mutex poisoned"),
-            PackWarmState::Pending
+            PackWarmState::Settled(_)
         )
     }
 
@@ -1250,8 +1455,10 @@ impl SemanticPackWarm {
         (settled_ns != 0).then(|| Duration::from_nanos(settled_ns))
     }
 
-    /// Block until the warm settles and return its state.
-    fn wait(&self) -> Option<Arc<WorkspacePackActivationState>> {
+    /// Block until the installed stage has published. Returning says nothing
+    /// about the expensive stage; callers that need the exact final set use
+    /// [`Self::wait`].
+    fn wait_for_installed_stage(&self) {
         let mut state = self
             .state
             .lock()
@@ -1262,13 +1469,48 @@ impl SemanticPackWarm {
                 .wait(state)
                 .expect("semantic-pack warm mutex poisoned");
         }
-        match &*state {
-            PackWarmState::Pending => unreachable!("the wait loop leaves only a settled state"),
-            PackWarmState::Settled(state) => state.clone(),
+    }
+
+    /// Block until the warm settles and return its final state.
+    fn wait(&self) -> Option<Arc<WorkspacePackActivationState>> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("semantic-pack warm mutex poisoned");
+        loop {
+            match &*state {
+                PackWarmState::Settled(state) => return state.clone(),
+                _ => {
+                    state = self
+                        .settled
+                        .wait(state)
+                        .expect("semantic-pack warm mutex poisoned");
+                }
+            }
         }
     }
 
-    fn publish(&self, state: Option<Arc<WorkspacePackActivationState>>) {
+    /// Publish the installed stage's interim activation: queries that awaited
+    /// it proceed from here while the expensive stage keeps running.
+    fn publish_acquisition_pending(&self, state: Arc<WorkspacePackActivationState>) {
+        debug_assert!(
+            !state.pending_acquisitions.is_empty(),
+            "an acquisition-pending warm state must name its outstanding acquisitions"
+        );
+        *self
+            .state
+            .lock()
+            .expect("semantic-pack warm mutex poisoned") = PackWarmState::AcquisitionPending(state);
+        self.settled.notify_all();
+    }
+
+    fn publish_final(&self, state: Option<Arc<WorkspacePackActivationState>>) {
+        if let Some(state) = &state {
+            debug_assert!(
+                state.pending_acquisitions.is_empty(),
+                "a settled warm state cannot keep pending acquisitions"
+            );
+        }
         self.settled_ns
             .store(duration_ns(self.started_at.elapsed()), Ordering::Relaxed);
         *self
@@ -1302,8 +1544,25 @@ fn start_pack_warm_worker(
             if let Some(hold) = &warm.hold {
                 hold.park_until_released();
             }
-            let state = activate_session_semantic_packs(&project_root, &analyzer);
-            warm.publish(state);
+            // The installed stage is what the query path awaits: catalog open
+            // and the packs already installed for this workspace, with nothing
+            // fetched, verified, extracted, or generated. Only when that stage
+            // leaves acquisitions outstanding does the warm continue to the
+            // full activation (issue #3401).
+            match activate_session_installed_semantic_packs(&project_root, &analyzer) {
+                None => warm.publish_final(None),
+                Some(InstalledPackStageOutcome::Settled(state)) => {
+                    warm.publish_final(Some(Arc::new(state)))
+                }
+                Some(InstalledPackStageOutcome::AcquisitionPending(state)) => {
+                    warm.publish_acquisition_pending(Arc::new(state));
+                    #[cfg(test)]
+                    if let Some(hold) = &warm.hold {
+                        hold.park_expensive_stage_until_released();
+                    }
+                    warm.publish_final(activate_session_semantic_packs(&project_root, &analyzer));
+                }
+            }
         })
         .map_err(|error| format!("Failed to spawn semantic-pack warm thread: {error}"))?;
     Ok(())
@@ -1314,6 +1573,48 @@ fn start_pack_warm_worker(
 struct PackWarmHold {
     released: Mutex<bool>,
     progress: Condvar,
+    /// When set, parks the warm again between its installed stage and the
+    /// expensive acquisition stage, so a test can observe a query answered
+    /// against the interim activation with production still outstanding.
+    expensive_stage: Option<Arc<ExpensiveStageHold>>,
+}
+
+/// The second latch of a [`PackWarmHold`]: parks the warm's expensive stage.
+#[cfg(test)]
+struct ExpensiveStageHold {
+    released: Mutex<bool>,
+    progress: Condvar,
+}
+
+#[cfg(test)]
+impl ExpensiveStageHold {
+    fn new() -> Self {
+        Self {
+            released: Mutex::new(false),
+            progress: Condvar::new(),
+        }
+    }
+
+    fn park_until_released(&self) {
+        let mut released = self
+            .released
+            .lock()
+            .expect("expensive-stage hold mutex poisoned");
+        while !*released {
+            released = self
+                .progress
+                .wait(released)
+                .expect("expensive-stage hold mutex poisoned");
+        }
+    }
+
+    fn release(&self) {
+        *self
+            .released
+            .lock()
+            .expect("expensive-stage hold mutex poisoned") = true;
+        self.progress.notify_all();
+    }
 }
 
 #[cfg(test)]
@@ -1322,7 +1623,18 @@ impl PackWarmHold {
         Self {
             released: Mutex::new(false),
             progress: Condvar::new(),
+            expensive_stage: None,
         }
+    }
+
+    fn new_holding_expensive_stage() -> (Self, Arc<ExpensiveStageHold>) {
+        let expensive_stage = Arc::new(ExpensiveStageHold::new());
+        let hold = Self {
+            released: Mutex::new(false),
+            progress: Condvar::new(),
+            expensive_stage: Some(Arc::clone(&expensive_stage)),
+        };
+        (hold, expensive_stage)
     }
 
     fn park_until_released(&self) {
@@ -1332,6 +1644,12 @@ impl PackWarmHold {
                 .progress
                 .wait(released)
                 .expect("pack warm hold mutex poisoned");
+        }
+    }
+
+    fn park_expensive_stage_until_released(&self) {
+        if let Some(expensive_stage) = &self.expensive_stage {
+            expensive_stage.park_until_released();
         }
     }
 
@@ -1366,7 +1684,7 @@ struct WorkspaceQueryScope {
     source_snapshot: Arc<WorkspaceAnalyzer>,
     snapshot: Arc<WorkspaceAnalyzer>,
     document_root: Arc<WorkspaceRoot>,
-    pack_activation: Option<Arc<WorkspacePackActivationState>>,
+    pack_activation: SessionPackActivation,
     context: Arc<crate::analyzer::AnalyzerQueryContext>,
 }
 
@@ -2149,7 +2467,7 @@ impl WorkspaceQueryScope {
     fn new(
         source_snapshot: Arc<WorkspaceAnalyzer>,
         document_root: Arc<WorkspaceRoot>,
-        pack_activation: Option<Arc<WorkspacePackActivationState>>,
+        pack_activation: SessionPackActivation,
     ) -> Self {
         let context = Arc::new(crate::analyzer::AnalyzerQueryContext::default());
         Self::with_context(source_snapshot, document_root, pack_activation, context)
@@ -2158,7 +2476,7 @@ impl WorkspaceQueryScope {
     fn with_context(
         source_snapshot: Arc<WorkspaceAnalyzer>,
         document_root: Arc<WorkspaceRoot>,
-        pack_activation: Option<Arc<WorkspacePackActivationState>>,
+        pack_activation: SessionPackActivation,
         context: Arc<crate::analyzer::AnalyzerQueryContext>,
     ) -> Self {
         let snapshot = Arc::new(source_snapshot.as_ref().clone());
@@ -2226,6 +2544,263 @@ impl Drop for WorkspaceQueryScope {
     }
 }
 
+/// Attach the session's pack-acquisition-pending marker to a `query_code`
+/// response (issue #3401).
+///
+/// The marker fires exactly when the answer could have used the packs the
+/// session is still acquiring: the query's selected languages -- or the
+/// workspace's, when the query does not select -- must intersect the
+/// languages the pending acquisitions serve, or the snapshot must not know
+/// the warm's state at all (`WarmPending`, the request whose budget was
+/// already spent). The diagnostic's impact is `incomplete`, so the envelope's
+/// own completion derives `incomplete`: an answer produced without the packs
+/// it could have used is never reported as complete. After the diagnostic
+/// lands, the flow-status cap re-derives so no retained flow row presents a
+/// clean complete negative under it.
+fn mark_pack_acquisition_pending(
+    pack_activation: &SessionPackActivation,
+    query_languages: Option<&Value>,
+    workspace_languages: &std::collections::BTreeSet<Language>,
+    response: &mut crate::rql::CodeQueryResponse,
+) {
+    let message = match pack_activation {
+        SessionPackActivation::Settled(_) => return,
+        SessionPackActivation::AcquisitionPending(state) => {
+            let selected: Vec<Language> = match query_languages {
+                Some(Value::Array(labels)) => labels
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .filter_map(Language::from_config_label)
+                    .collect(),
+                _ => workspace_languages.iter().copied().collect(),
+            };
+            if selected.is_empty()
+                || !state.pending_acquisitions.iter().any(|pending| {
+                    pending
+                        .ecosystem
+                        .languages()
+                        .iter()
+                        .any(|language| selected.contains(language))
+                })
+            {
+                return;
+            }
+            pack_acquisition_pending_message(&state.pending_acquisitions)
+        }
+        SessionPackActivation::WarmPending => "the session's semantic-pack warm has not \
+             published its installed stage and this request did not wait for it, so this \
+             answer may be missing every row semantic packs would add; get_active_workspace \
+             reports semantic_packs_ready when activation settles"
+            .to_owned(),
+    };
+    let Some(result) = response.result_mut() else {
+        return;
+    };
+    result.diagnostics.push(crate::rql::CodeQueryDiagnostic {
+        code: crate::rql::CodeQueryDiagnosticCode::SemanticPackAcquisitionPending,
+        impact: crate::rql::CodeQueryDiagnosticImpact::Incomplete,
+        branch: Vec::new(),
+        language: "workspace",
+        message,
+        exhausted_roots: Vec::new(),
+    });
+    result.cap_flow_status_by_run();
+}
+
+/// The pending-state message: which ecosystems still owe acquisitions, the
+/// dependencies behind them, and what the answer's reader should do about it.
+fn pack_acquisition_pending_message(
+    pending: &[crate::analyzer::semantic_model::PendingDependencyPackAcquisition],
+) -> String {
+    const MAX_NAMED_DEPENDENCIES: usize = 5;
+    let mut ecosystems: Vec<&'static str> = pending
+        .iter()
+        .map(|entry| entry.ecosystem.label())
+        .collect();
+    ecosystems.sort_unstable();
+    ecosystems.dedup();
+    let mut message = format!(
+        "semantic-pack acquisition is still running for {}",
+        ecosystems.join(", ")
+    );
+    let named: Vec<&str> = pending
+        .iter()
+        .take(MAX_NAMED_DEPENDENCIES)
+        .map(|entry| entry.dependency_id.as_str())
+        .collect();
+    if pending.len() > MAX_NAMED_DEPENDENCIES {
+        message.push_str(&format!(
+            " ({} and {} more)",
+            named.join(", "),
+            pending.len() - named.len()
+        ));
+    } else if !named.is_empty() {
+        message.push_str(&format!(" ({})", named.join(", ")));
+    }
+    message.push_str(
+        "; this answer used only the packs already installed in the workspace catalog and may \
+         be missing rows those packs add; get_active_workspace reports semantic_packs_ready \
+         when the set is final",
+    );
+    message
+}
+
+#[cfg(test)]
+mod pack_acquisition_pending_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn pending_state(entries: &[(&str, &str)]) -> Arc<WorkspacePackActivationState> {
+        Arc::new(WorkspacePackActivationState {
+            config: None,
+            activation: None,
+            ecosystems: Vec::new(),
+            failure: None,
+            pending_acquisitions: entries
+                .iter()
+                .map(|(ecosystem, dependency_id)| {
+                    crate::analyzer::semantic_model::PendingDependencyPackAcquisition {
+                        ecosystem: crate::analyzer::DependencyPackEcosystem::from_label(ecosystem)
+                            .expect("a known ecosystem label"),
+                        dependency_id: (*dependency_id).to_owned(),
+                    }
+                })
+                .collect(),
+        })
+    }
+
+    fn marked_codes(
+        response: &crate::rql::CodeQueryResponse,
+    ) -> Vec<crate::rql::CodeQueryDiagnosticCode> {
+        response
+            .result()
+            .map(|result| {
+                result
+                    .diagnostics
+                    .iter()
+                    .map(|diagnostic| diagnostic.code)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn mark(
+        pack_activation: &SessionPackActivation,
+        query_languages: Option<&Value>,
+        workspace_languages: &[Language],
+    ) -> crate::rql::CodeQueryResponse {
+        let mut response =
+            crate::rql::CodeQueryResponse::Results(crate::rql::CodeQueryResult::default());
+        mark_pack_acquisition_pending(
+            pack_activation,
+            query_languages,
+            &workspace_languages.iter().copied().collect(),
+            &mut response,
+        );
+        response
+    }
+
+    #[test]
+    fn a_query_over_a_pending_language_carries_the_typed_pending_state() {
+        let phase = SessionPackActivation::AcquisitionPending(pending_state(&[
+            ("jvm", "jdk:25.0.4.1"),
+            ("npm", "lodash"),
+        ]));
+        let response = mark(
+            &phase,
+            Some(&json!(["java"])),
+            &[Language::Java, Language::JavaScript],
+        );
+        let result = response.result().expect("results response");
+        let diagnostic = result
+            .diagnostics
+            .iter()
+            .find(|diagnostic| {
+                diagnostic.code
+                    == crate::rql::CodeQueryDiagnosticCode::SemanticPackAcquisitionPending
+            })
+            .expect("the pending acquisition must be named: {result:?}");
+        assert_eq!(
+            diagnostic.impact,
+            crate::rql::CodeQueryDiagnosticImpact::Incomplete
+        );
+        assert_eq!(diagnostic.language, "workspace");
+        assert!(
+            diagnostic.message.contains("jvm")
+                && diagnostic.message.contains("jdk:25.0.4.1")
+                && diagnostic.message.contains("npm")
+                && diagnostic.message.contains("lodash"),
+            "the message names the pending ecosystems and dependencies: {}",
+            diagnostic.message
+        );
+        assert_eq!(
+            result.completion(),
+            crate::rql::CodeQueryCompletion::Incomplete {
+                codes: vec![crate::rql::CodeQueryDiagnosticCode::SemanticPackAcquisitionPending],
+            },
+            "an answer produced without the packs it could have used is never complete"
+        );
+    }
+
+    #[test]
+    fn a_query_outside_the_pending_languages_is_unmarked() {
+        let phase = SessionPackActivation::AcquisitionPending(pending_state(&[("jvm", "jdk:25")]));
+        let response = mark(
+            &phase,
+            Some(&json!(["rust"])),
+            &[Language::Java, Language::Rust],
+        );
+        assert!(
+            !marked_codes(&response)
+                .contains(&crate::rql::CodeQueryDiagnosticCode::SemanticPackAcquisitionPending),
+            "a rust-only query cannot have used the pending jdk pack"
+        );
+
+        // The same holds for an unfiltered query on a workspace with no
+        // pending language.
+        let response = mark(&phase, None, &[Language::Rust]);
+        assert!(marked_codes(&response).is_empty());
+    }
+
+    #[test]
+    fn an_unfiltered_query_marks_when_the_workspace_uses_a_pending_language() {
+        let phase = SessionPackActivation::AcquisitionPending(pending_state(&[("npm", "lodash")]));
+        let response = mark(&phase, None, &[Language::JavaScript, Language::Rust]);
+        assert!(
+            marked_codes(&response)
+                .contains(&crate::rql::CodeQueryDiagnosticCode::SemanticPackAcquisitionPending)
+        );
+    }
+
+    #[test]
+    fn a_warm_the_request_could_not_wait_for_marks_any_answer() {
+        let response = mark(
+            &SessionPackActivation::WarmPending,
+            Some(&json!(["rust"])),
+            &[Language::Rust],
+        );
+        assert!(
+            marked_codes(&response)
+                .contains(&crate::rql::CodeQueryDiagnosticCode::SemanticPackAcquisitionPending),
+            "an answer whose pack state is unknown is never reported as complete"
+        );
+    }
+
+    #[test]
+    fn a_settled_session_never_marks() {
+        let settled_none = mark(
+            &SessionPackActivation::Settled(None),
+            Some(&json!(["java"])),
+            &[Language::Java],
+        );
+        assert!(marked_codes(&settled_none).is_empty());
+
+        let settled = SessionPackActivation::Settled(Some(pending_state(&[])));
+        let response = mark(&settled, Some(&json!(["java"])), &[Language::Java]);
+        assert!(marked_codes(&response).is_empty());
+    }
+}
+
 enum ObservedSource {
     Present(String),
     Missing,
@@ -2267,16 +2842,21 @@ fn stale_symbol_source_files(
 }
 
 impl WorkspaceSession {
-    /// The semantic-pack activation this session has settled on, or `None`
-    /// while a deferred warm is still running.
-    fn pack_activation(&self) -> Option<Arc<WorkspacePackActivationState>> {
-        self.semantic_packs.state()
+    /// The pack activation as a query snapshot observes it: the settled exact
+    /// state, the installed stage the expensive warm still supplements, or a
+    /// warm that has not published even its installed stage (issue #3401).
+    fn pack_activation(&self) -> SessionPackActivation {
+        self.semantic_packs.snapshot_phase()
     }
 
     fn pack_activation_scope_changed(&self) -> bool {
-        self.pack_activation().as_ref().is_some_and(|state| {
-            workspace_pack_ecosystems(&self.snapshot, state.config.as_deref()) != state.ecosystems
-        })
+        self.semantic_packs
+            .best_known_state()
+            .as_ref()
+            .is_some_and(|state| {
+                workspace_pack_ecosystems(&self.snapshot, state.config.as_deref())
+                    != state.ecosystems
+            })
     }
 
     /// Re-run the shared activation transaction after dependency inputs or the
@@ -2290,10 +2870,11 @@ impl WorkspaceSession {
             .invalidate_dependency_pack_state(&crate::analyzer::DependencyPackEcosystem::ALL);
         let root = self.snapshot.analyzer().project().root();
         self.semantic_packs.wait();
-        self.semantic_packs.publish(activate_session_semantic_packs(
-            root,
-            self.snapshot.as_ref(),
-        ));
+        self.semantic_packs
+            .publish_final(activate_session_semantic_packs(
+                root,
+                self.snapshot.as_ref(),
+            ));
     }
 
     /// Queue a background warm of the current snapshot's lazy query indexes.
@@ -2800,16 +3381,17 @@ impl SearchToolsService {
             }
             let result = {
                 let runtime = CodeIntelligenceRuntime::new(&snapshot, &self.flow_state, None);
-                let runtime = match snapshot.pack_activation.as_deref() {
-                    Some(state) => {
-                        runtime.with_host_activation_context(PolicyHostActivationContext::new(
+                // Policy settled the full warm before snapshotting, so the
+                // exact final activation is the state this scope carries.
+                let runtime = match &snapshot.pack_activation {
+                    SessionPackActivation::Settled(Some(state)) => runtime
+                        .with_host_activation_context(PolicyHostActivationContext::new(
                             state.config.as_deref(),
                             state.activation.as_deref(),
                             &state.ecosystems,
                             state.failure.as_deref(),
-                        ))
-                    }
-                    None => runtime,
+                        )),
+                    _ => runtime,
                 };
                 runtime
                     .evaluate_policy_inputs(root, policy_inputs, options)
@@ -3799,10 +4381,11 @@ impl SearchToolsService {
     ) -> Result<(crate::rql::CodeQueryResponse, QueryCodeExecutionTiming), SearchToolsServiceError>
     {
         let input_decode_started = Instant::now();
+        let query_languages = arguments.get("languages").cloned();
         let query = Self::decode_query_code_input(snapshot, arguments)?;
         let input_decode_ns = duration_ns(input_decode_started.elapsed());
         let query_execution_started = Instant::now();
-        let response = CodeIntelligenceRuntime::new(snapshot, &self.flow_state, cancellation)
+        let mut response = CodeIntelligenceRuntime::new(snapshot, &self.flow_state, cancellation)
             .execute_query_with_all_analysis_registrations(
                 workspace_generation,
                 query_protocols,
@@ -3811,6 +4394,12 @@ impl SearchToolsService {
                 &query,
                 self.query_execution_limits(snapshot),
             );
+        mark_pack_acquisition_pending(
+            &snapshot.pack_activation,
+            query_languages.as_ref(),
+            &snapshot.analyzer().languages(),
+            &mut response,
+        );
         Ok((
             response,
             QueryCodeExecutionTiming {
@@ -5016,13 +5605,15 @@ impl SearchToolsService {
         ))
     }
 
-    /// Wait for a deferred semantic-pack warm, then report.
+    /// Wait for a deferred semantic-pack warm to settle fully, then report.
     ///
     /// Policy evaluation hands the settled activation to the runtime, so it
     /// waits here rather than reading whatever the session happened to have
-    /// when its snapshot was taken. Nothing else does: the warm is optional
-    /// work with an honest session state, and the readiness barrier that
-    /// publishes the session deliberately excludes it (issue #3372).
+    /// when its snapshot was taken. Nothing else waits for the full settle:
+    /// the query path awaits only the warm's cheap installed stage
+    /// ([`Self::settle_installed_pack_stage`], issue #3401), and the readiness
+    /// barrier that publishes the session deliberately excludes the warm
+    /// entirely (issue #3372).
     ///
     /// Two callers do not wait. One whose budget is already gone reports its
     /// deadline through the snapshot path, and one whose workspace is still
@@ -5048,11 +5639,52 @@ impl SearchToolsService {
         Ok(())
     }
 
+    /// Wait for the warm's installed stage, then report.
+    ///
+    /// Every query tool reaches its snapshot through
+    /// [`Self::snapshot_for_query_with_cancellation`], and the analyzer overlay
+    /// the snapshot clones is what the installed stage publishes, so the answer
+    /// a tool gives is deterministic instead of whichever side of the warm it
+    /// happened to land on (issue #3401). The wait is bounded by construction:
+    /// the installed stage opens the catalog and resolves the packs already
+    /// installed for this workspace, and never fetches, verifies, extracts, or
+    /// generates, so it cannot reintroduce the #3372 first-request latency.
+    ///
+    /// A request that has already recorded its timeout does not wait; its
+    /// scope reports the warm as pending instead, which is the same canonical
+    /// answer it would have reached before this stage existed, now with the
+    /// pending state named in the result. The probe deliberately stops at the
+    /// recorded flag: `CancellationToken::is_cancelled` is itself an
+    /// observable checkpoint for simulated cancellation, and a new checkpoint
+    /// on every request path would move where existing cancellation budgets
+    /// fire. A cancelled-but-not-yet-timed-out request simply waits for this
+    /// bounded stage and reports through its own later checkpoints. The
+    /// session lock is released before waiting, exactly as in
+    /// [`Self::settle_pack_activation`].
+    fn settle_installed_pack_stage(
+        &self,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<(), SearchToolsServiceError> {
+        if cancellation.is_some_and(CancellationToken::is_timed_out) {
+            return Ok(());
+        }
+        let semantic_packs = {
+            let guard = self.read_session()?;
+            match guard.as_ref() {
+                Some(session) => Arc::clone(&session.semantic_packs),
+                None => return Ok(()),
+            }
+        };
+        semantic_packs.wait_for_installed_stage();
+        Ok(())
+    }
+
     fn snapshot_for_query_with_cancellation(
         &self,
         cancellation: Option<&CancellationToken>,
     ) -> Result<WorkspaceQueryScope, SearchToolsServiceError> {
         self.ensure_ready_with_cancellation(cancellation)?;
+        self.settle_installed_pack_stage(cancellation)?;
         self.snapshot_for_query()
     }
 
@@ -5709,16 +6341,17 @@ impl SearchToolsService {
         let result = (|| {
             let _scope = profiling::scope("run_policy.evaluate_policy_inputs");
             let runtime = CodeIntelligenceRuntime::new(&snapshot, &self.flow_state, cancellation);
-            let runtime = match snapshot.pack_activation.as_deref() {
-                Some(state) => {
-                    runtime.with_host_activation_context(PolicyHostActivationContext::new(
+            // Policy settled the full warm before snapshotting, so the exact
+            // final activation is the state this scope carries.
+            let runtime = match &snapshot.pack_activation {
+                SessionPackActivation::Settled(Some(state)) => runtime
+                    .with_host_activation_context(PolicyHostActivationContext::new(
                         state.config.as_deref(),
                         state.activation.as_deref(),
                         &state.ecosystems,
                         state.failure.as_deref(),
-                    ))
-                }
-                None => runtime,
+                    )),
+                _ => runtime,
             };
             // The head evaluation is the other long stretch of a policy
             // request: name it so a budgeted host reports the phase that spent
@@ -6011,6 +6644,25 @@ fn activate_session_semantic_packs(
     }
 }
 
+/// The installed-pack stage of [`activate_session_semantic_packs`]: the cheap
+/// stage of the session's activation, which the query path awaits (issue
+/// #3401). An unavailable activation reports the same stated stderr failure
+/// and `None` as the full stage.
+fn activate_session_installed_semantic_packs(
+    project_root: &Path,
+    workspace: &WorkspaceAnalyzer,
+) -> Option<InstalledPackStageOutcome> {
+    match configured_semantic_models().and_then(|configured| {
+        activate_configured_semantic_models_installed_stage(project_root, workspace, configured)
+    }) {
+        Ok(outcome) => Some(outcome),
+        Err(error) => {
+            eprintln!("bifrost: workspace semantic-pack activation unavailable: {error}");
+            None
+        }
+    }
+}
+
 /// Assemble a `WorkspaceSession` from a built project + analyzer: wrap the
 /// analyzer in an `Arc`, start the file watcher (per `update_strategy`), and
 /// create the session state.
@@ -6050,7 +6702,11 @@ fn assemble_session(
 /// toolchain work. Activation is warm-up work: the analyzer snapshot answers
 /// queries without it, its failure is already a stated session state, and the
 /// consumers that need the settled activation (policy evaluation, a pack-scope
-/// refresh) wait for it themselves (issue #3372).
+/// refresh) wait for it themselves (issue #3372). The warm itself is staged:
+/// its cheap installed stage is what the query path awaits, so a resolution
+/// answer is deterministic, while the expensive acquisitions it could not
+/// settle stay on the warm thread and are named on every answer produced in
+/// the meantime (issue #3401).
 fn assemble_session_deferred(
     project: Arc<dyn Project>,
     workspace: WorkspaceAnalyzer,
@@ -7498,31 +8154,7 @@ mod watcher_startup_tests {
     fn workspace_readiness_publishes_before_semantic_pack_activation_settles() {
         let (_temp, root) = workspace("Warm.java", "class Warm {}\n");
         let hold = Arc::new(PackWarmHold::new());
-        let holder = Arc::clone(&hold);
-        let build_root = root.clone();
-        let watcher_starter = production_watcher_starter();
-        let handle = std::thread::Builder::new()
-            .name("bifrost-index-build".to_string())
-            .spawn(
-                move || -> Result<(u64, PathBuf, WorkspaceSession), String> {
-                    let (project, workspace) = build_persisted_workspace(
-                        build_root.clone(),
-                        None,
-                        UpdateStrategy::Manual,
-                    )?;
-                    let session = assemble_session_deferred_held(
-                        project,
-                        workspace,
-                        UpdateStrategy::Manual,
-                        StartupIndexWarm::OnDemand,
-                        &watcher_starter,
-                        holder,
-                    )?;
-                    Ok((1, build_root, session))
-                },
-            )
-            .unwrap();
-        let service = service_with_pending_build(root, handle);
+        let service = service_with_held_warm(root, Arc::clone(&hold));
 
         let deadline = Some(Instant::now() + Duration::from_secs(30));
         service
@@ -7551,6 +8183,159 @@ mod watcher_startup_tests {
             session.semantic_packs.duration().is_some(),
             "a settled warm reports how long it ran, so a profile can name it"
         );
+    }
+
+    /// Issue #3401: a `query_code` that could have used the packs the
+    /// expensive stage is still acquiring awaits the installed stage and then
+    /// answers with the pending state named in its own diagnostics, never as
+    /// a silently pack-blind complete result. Once the warm settles, the
+    /// identical query carries no marker.
+    ///
+    /// The fixture's `node_modules/lodash` is a producible npm dependency the
+    /// empty ambient catalog cannot settle from installed packs, so the
+    /// warm's installed stage publishes an interim activation with the
+    /// acquisition pending. The hold parks the expensive stage there: the
+    /// query returning at all proves it did not wait for production.
+    #[test]
+    fn query_code_marks_pending_pack_acquisition_until_the_warm_settles() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("workspace");
+        std::fs::create_dir_all(root.join("node_modules/lodash")).unwrap();
+        std::fs::write(
+            root.join("app.js"),
+            "const _ = require('lodash');\nconsole.log(_.trim(' x '));\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{ "name": "app", "version": "1.0.0", "dependencies": { "lodash": "4.17.21" } }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("package-lock.json"),
+            r#"{
+              "name": "app",
+              "version": "1.0.0",
+              "lockfileVersion": 3,
+              "packages": {
+                "": { "name": "app", "version": "1.0.0", "dependencies": { "lodash": "4.17.21" } },
+                "node_modules/lodash": { "version": "4.17.21" }
+              }
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("node_modules/lodash/package.json"),
+            r#"{ "name": "lodash", "version": "4.17.21", "main": "index.js" }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("node_modules/lodash/index.js"),
+            "exports.trim = function (value) { return value.trim(); };\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("node_modules/lodash/index.d.ts"),
+            "export declare function trim(value: string): string;\n",
+        )
+        .unwrap();
+        let root = root.canonicalize().unwrap().normalize();
+
+        let query = || {
+            json!({
+                "schema_version": 1,
+                "languages": ["javascript"],
+                "match": {"kind": "call", "callee": {"name": "trim"}},
+            })
+        };
+        let (hold, expensive_stage) = PackWarmHold::new_holding_expensive_stage();
+        let hold = Arc::new(hold);
+        let service = service_with_held_warm(root, Arc::clone(&hold));
+
+        hold.release();
+        // Preparation waits for the installed stage, so when it returns the
+        // session has published its interim activation while the expensive
+        // stage is still parked. The query returning at all, rather than
+        // blocking behind the parked production, is the #3372 half of the
+        // contract; the diagnostic it carries is the #3401 half.
+        let prepared = service
+            .prepare_query_code(query(), None)
+            .expect("prepare query against the interim activation");
+        let output = service
+            .execute_prepared_query_code(prepared, None)
+            .expect("execute query against the interim activation");
+        let ToolOutput::Structured { structured, .. } = output else {
+            panic!("query_code should return structured output");
+        };
+        let diagnostics = structured["diagnostics"]
+            .as_array()
+            .expect("the interim answer must carry the pending diagnostic");
+        assert!(
+            diagnostics.iter().any(|diagnostic| {
+                diagnostic["code"] == "semantic_pack_acquisition_pending"
+                    && diagnostic["impact"] == "incomplete"
+            }),
+            "the interim answer names its pending acquisition: {structured:#}"
+        );
+
+        expensive_stage.release();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !pack_warm_ready(&service) {
+            assert!(
+                Instant::now() < deadline,
+                "the released expensive stage never settled"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let prepared = service
+            .prepare_query_code(query(), None)
+            .expect("prepare query against the settled activation");
+        let output = service
+            .execute_prepared_query_code(prepared, None)
+            .expect("execute query against the settled activation");
+        let ToolOutput::Structured { structured, .. } = output else {
+            panic!("query_code should return structured output");
+        };
+        let still_marked = structured["diagnostics"]
+            .as_array()
+            .is_some_and(|diagnostics| {
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic["code"] == "semantic_pack_acquisition_pending")
+            });
+        assert!(
+            !still_marked,
+            "the settled answer carries no pending marker: {structured:#}"
+        );
+    }
+
+    /// A service whose deferred build assembles its session with the pack
+    /// warm parked on `hold`, so a test decides when each warm stage runs.
+    fn service_with_held_warm(root: PathBuf, hold: Arc<PackWarmHold>) -> SearchToolsService {
+        let build_root = root.clone();
+        let watcher_starter = production_watcher_starter();
+        let handle = std::thread::Builder::new()
+            .name("bifrost-index-build".to_string())
+            .spawn(
+                move || -> Result<(u64, PathBuf, WorkspaceSession), String> {
+                    let (project, workspace) = build_persisted_workspace(
+                        build_root.clone(),
+                        None,
+                        UpdateStrategy::Manual,
+                    )?;
+                    let session = assemble_session_deferred_held(
+                        project,
+                        workspace,
+                        UpdateStrategy::Manual,
+                        StartupIndexWarm::OnDemand,
+                        &watcher_starter,
+                        hold,
+                    )?;
+                    Ok((1, build_root, session))
+                },
+            )
+            .unwrap();
+        service_with_pending_build(root, handle)
     }
 
     /// A service whose deferred build is the caller's handle, so a test can
@@ -7951,7 +8736,11 @@ mod analyzer_failure_boundary_tests {
         let (_project, workspace) = build_ephemeral_workspace(root.clone(), None).unwrap();
         let document_root =
             Arc::new(WorkspaceRoot::open(workspace.analyzer().project().root()).unwrap());
-        let scope = WorkspaceQueryScope::new(Arc::new(workspace), document_root, None);
+        let scope = WorkspaceQueryScope::new(
+            Arc::new(workspace),
+            document_root,
+            SessionPackActivation::Settled(None),
+        );
 
         let service = SearchToolsService::new_manual_ephemeral(root).unwrap();
         let interactive = service.query_execution_limits(&scope);
@@ -8007,7 +8796,11 @@ mod analyzer_failure_boundary_tests {
         let (_project, workspace) = build_ephemeral_workspace(root, None).unwrap();
         let document_root =
             Arc::new(WorkspaceRoot::open(workspace.analyzer().project().root()).unwrap());
-        let scope = WorkspaceQueryScope::new(Arc::new(workspace), document_root, None);
+        let scope = WorkspaceQueryScope::new(
+            Arc::new(workspace),
+            document_root,
+            SessionPackActivation::Settled(None),
+        );
         scope
             .context
             .record_store_error(StoreError::new("injected store failure"));

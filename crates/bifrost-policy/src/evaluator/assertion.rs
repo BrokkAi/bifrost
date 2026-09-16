@@ -2203,21 +2203,37 @@ fn evaluate_relational_assertion_policy(
         );
     };
     let mut attempt = UnitAttempt::default();
-    let sliced = sliced_relational_bindings(
-        policy,
-        plan,
-        &binding_queries,
-        incremental,
-        context,
-        budget,
-        &mut attempt,
-    );
+    let sliced = {
+        let _timing = brokk_bifrost_analysis::profiling::scope_with(|| {
+            format!(
+                "policy.relational_sliced_bindings[{}]",
+                policy.definition().metadata.id
+            )
+        });
+        sliced_relational_bindings(
+            policy,
+            plan,
+            &binding_queries,
+            incremental,
+            context,
+            budget,
+            &mut attempt,
+        )
+    };
     let (executed, reason) = match sliced {
         Ok(executed) => (executed, None),
-        Err(reason) => (
-            whole_relational_bindings(&binding_queries, context, budget),
-            Some(reason),
-        ),
+        Err(reason) => {
+            let _timing = brokk_bifrost_analysis::profiling::scope_with(|| {
+                format!(
+                    "policy.relational_fallback_bindings[{}]",
+                    policy.definition().metadata.id
+                )
+            });
+            (
+                whole_relational_bindings(&binding_queries, context, budget),
+                Some(reason),
+            )
+        }
     };
     let review = attempt.into_run(policy.definition().metadata.id.clone(), reason);
     note_incremental_run(&review, incremental);
@@ -2286,6 +2302,11 @@ fn sliced_relational_bindings(
     budget: &PolicyBudget,
     attempt: &mut UnitAttempt,
 ) -> Result<Vec<ExecutedQueryRows>, WidenReason> {
+    // Check every binding before executing any units: a later workspace
+    // prepass would otherwise discard earlier sliced work and run it again.
+    if let Some(reason) = queries.iter().find_map(query_slicing_widen_reason) {
+        return Err(reason);
+    }
     let limits = budget.query_limits();
     let workspace_files = context.analyzer.analyzed_files();
     let execution = UnitQueryExecution {

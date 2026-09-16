@@ -21,10 +21,11 @@ use brokk_bifrost::policy::{
     HumanRenderDetail, HumanRenderOptions, NearMissCandidates, POLICY_EXIT_CLEAN,
     POLICY_EXIT_UNRELIABLE, PolicyBaselineDocument, PolicyBaselineOptions, PolicyBaselineSource,
     PolicyBatchOutcome, PolicyEvaluationDate, PolicyEvaluationInput, PolicyEvaluationOptions,
-    PolicyFailOn, PolicyFindingId, PolicyRenderError, PolicyScopeOptions, PolicyScopeSource,
-    PolicySuppressionOptions, PolicySuppressionSource, SarifToolIdentity, built_in_policy_catalog,
-    escape_terminal_text, evaluate_policy_inputs, explain_policy_inputs, rank_policy_near_misses,
-    relation_schema_catalog, write_policy_human, write_policy_json, write_policy_sarif_for_outcome,
+    PolicyExecutionStage, PolicyFailOn, PolicyFindingId, PolicyRenderError, PolicyScopeOptions,
+    PolicyScopeSource, PolicySuppressionOptions, PolicySuppressionSource, SarifToolIdentity,
+    built_in_policy_catalog, escape_terminal_text, evaluate_policy_inputs, explain_policy_inputs,
+    rank_policy_near_misses, relation_schema_catalog, write_policy_human, write_policy_json,
+    write_policy_sarif_for_outcome,
 };
 use brokk_bifrost::rmcp_host::{
     NamedWorkspace, run_named_workspace_stdio_server_with_build_identity,
@@ -165,6 +166,7 @@ fn has_policy_syntax(args: &[String]) -> bool {
                 | "--evaluation-date"
                 | "--diff-base"
                 | "--no-incremental"
+                | "--policy-timings"
                 | "--output"
                 | "--color"
                 | "--verbose"
@@ -288,6 +290,7 @@ fn run_inner(
     // Reuse is on by default; the switch exists to take it away for a run that
     // needs to compare against the full dual-snapshot evaluation.
     let mut policy_incremental = true;
+    let mut policy_timings = false;
     let mut policy_output: Option<PathBuf> = None;
     let mut policy_verbose = false;
     let mut policy_verbose_seen = false;
@@ -544,6 +547,12 @@ fn run_inner(
                 }
                 policy_incremental = false;
             }
+            "--policy-timings" => {
+                if policy_timings {
+                    return Err("--policy-timings may only be provided once".to_string());
+                }
+                policy_timings = true;
+            }
             "--evaluation-date" => {
                 let value = args
                     .next()
@@ -677,6 +686,7 @@ fn run_inner(
                 || policy_evaluation_date.is_some()
                 || policy_diff_base.is_some()
                 || !policy_incremental
+                || policy_timings
                 || policy_output.is_some()
                 || policy_verbose_seen
                 || policy_color_seen
@@ -750,6 +760,7 @@ fn run_inner(
                 || accept_current
                 || policy_evaluation_date.is_some()
                 || policy_diff_base.is_some()
+                || policy_timings
                 || policy_verbose_seen
                 || policy_color_seen
                 || !tool_sources.is_empty()
@@ -831,6 +842,7 @@ fn run_inner(
                 accept_current,
                 diff_base: policy_diff_base,
                 incremental: policy_incremental,
+                policy_timings,
                 output: policy_output,
                 verbose: policy_verbose,
                 color: policy_color,
@@ -1172,6 +1184,7 @@ fn run_scan(mut args: impl Iterator<Item = String>) -> Result<CliRunResult, Stri
             // The scan entry point has no --no-incremental flag; the incremental
             // diff-base review is on by default, as on the policy path.
             incremental: true,
+            policy_timings: false,
             output,
             verbose,
             color,
@@ -1542,6 +1555,7 @@ struct PolicyModeRequest {
     accept_current: bool,
     diff_base: Option<String>,
     incremental: bool,
+    policy_timings: bool,
     output: Option<PathBuf>,
     verbose: bool,
     color: PolicyColorMode,
@@ -1572,7 +1586,8 @@ fn run_policy_mode(request: PolicyModeRequest, policy_inputs: &[PolicyEvaluation
             .with_baseline(request.baseline.clone())
             .with_required_schema_versions(request.require_explicit_schema_versions)
             .with_fail_on(request.fail_on)
-            .with_incremental(request.incremental);
+            .with_incremental(request.incremental)
+            .with_policy_timings(request.policy_timings);
     if let Some(revision) = request.diff_base.clone() {
         options = options.with_diff_base(revision);
     }
@@ -1619,6 +1634,28 @@ fn run_policy_mode(request: PolicyModeRequest, policy_inputs: &[PolicyEvaluation
                 "bifrost: the policy run was not reliable and exhaustive; no baseline was written"
             );
         }
+    }
+    if request.policy_timings {
+        let base_timing_included = outcome
+            .stage_attribution()
+            .iter()
+            .any(|timing| timing.stage() == PolicyExecutionStage::DiffBase);
+        let policy_work_scope = if request.diff_base.is_some() {
+            "head"
+        } else {
+            "workspace"
+        };
+        eprintln!(
+            "bifrost: policy stage timings {}",
+            json!({
+                "kind": "bifrost.policy-stage-timings",
+                "schema_version": 1,
+                "scope": if base_timing_included { "base_and_head" } else { policy_work_scope },
+                "base_timing_included": base_timing_included,
+                "policy_work_scope": policy_work_scope,
+                "stages": outcome.stage_attribution(),
+            })
+        );
     }
     let output_path = request.output.as_deref();
     let human_options = HumanRenderOptions::new(
@@ -2033,6 +2070,7 @@ OPTIONS:
                            previous run published in this repository's analyzer cache. Reuse is on
                            by default and produces the same findings; this switch is for comparing
                            against the full dual-snapshot evaluation when diagnosing a difference
+    --policy-timings       Include each policy's evaluation elapsed time in its report work metrics
     --require-explicit-schema-versions
                            Reject inferred policy and RQL schema versions
     --explain-finding ID   Explain why the selected policy's run produced the finding with this
@@ -2772,6 +2810,15 @@ mod row_schema_listing_cli_tests {
     }
 
     #[test]
+    fn policy_timings_are_policy_syntax_and_reject_duplicates() {
+        assert!(has_policy_syntax(&["--policy-timings".to_string()]));
+        assert_eq!(
+            run_error(&["--policy-timings", "--policy-timings"]),
+            "--policy-timings may only be provided once"
+        );
+    }
+
+    #[test]
     fn the_listing_refuses_selection_evaluation_and_explanation_options() {
         for options in [
             vec!["--policy-file", "policies/p.rqlp"],
@@ -2781,6 +2828,7 @@ mod row_schema_listing_cli_tests {
             vec!["--fail-on", "error"],
             vec!["--accept-current"],
             vec!["--diff-base", "HEAD"],
+            vec!["--policy-timings"],
         ] {
             let mut args = vec!["--list-row-schemas"];
             args.extend(options.iter().copied());

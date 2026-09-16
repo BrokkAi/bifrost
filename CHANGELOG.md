@@ -5,6 +5,36 @@ analysis behavior, integrations, and release artifacts. It is curated from the
 complete private release range because the public open-core repository is a
 projection and its commit history does not contain every source commit.
 
+## Unreleased
+
+### Added
+
+- Go concurrency analysis now models `testing.T.Run` subtests and
+  `sync.Cond` synchronization, preserving joins, parallel-sibling behavior,
+  cleanup ordering, and explicit unsupported boundaries through reviewed
+  semantic packs.
+
+### Changed
+
+- Policy CI and incremental type-flow evaluation now reuse prepared workspace
+  and analyzer-cache state across policy units while retaining timing,
+  cancellation, and incomplete-run evidence in CLI/SARIF reports.
+- Semantic-pack acquisition records a bounded machine-local negative cache for
+  verified-but-unusable generated productions, avoiding repeated downloads and
+  extraction while preserving curated-pack installation and typed diagnostics.
+- The analyzer's forward fact-resolution engine restores unbudgeted lexical and
+  typed preload sessions with cancellation and explicit incompleteness.
+
+### Fixed
+
+- MCP request admission and execution now share one resolved request budget,
+  so fallback-ladder timeouts return typed diagnostics instead of panicking.
+- Cross-language I4 claim checks now restrict identity contradictions to the
+  claim's resolution ecosystem, avoiding false contradictions from unrelated
+  language declarations.
+- Release smoke tests now pass the resolved release tag when verifying the
+  published DeepSeek Harness checksum.
+
 ## [0.11.4] - 2026-09-15
 
 ### Added

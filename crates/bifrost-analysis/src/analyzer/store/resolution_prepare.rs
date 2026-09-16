@@ -1690,6 +1690,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn parsed_java_bundle_is_storage_local_across_a_to_b_to_a() {
+        let facts = crate::analyzer::resolution::rich_java_resolution_facts_for_test();
+        let cancellation = CancellationToken::default();
+        let bundles = [1_u8, 2, 1].map(|fragment_byte| {
+            assert!(
+                facts.definition_units.is_empty(),
+                "parser fixture has no native unit crosswalk yet"
+            );
+            let ResolutionInteriorPreparation::Prepared(bundle) = prepare_resolution_bundle(
+                BindingFragmentId::from_digest([fragment_byte; 32]),
+                Language::Java,
+                &facts,
+                &HashMap::default(),
+                &cancellation,
+            ) else {
+                panic!("uncancelled parsed Java preparation must finish")
+            };
+            *bundle
+        });
+
+        assert_eq!(bundles[0], bundles[1]);
+        assert_eq!(bundles[0], bundles[2]);
+        assert_eq!(bundles[0].producer_epoch(), "resolution-bundle-java-v11");
+        assert!(
+            bundles[0]
+                .family_counts()
+                .find(|(name, _)| *name == "partial_paths")
+                .unwrap()
+                .1
+                > 1
+        );
+    }
+
     fn assert_normalized_fixture_premises(facts: &FileResolutionFacts) {
         use brokk_bifrost_core::analyzer::resolution_facts::*;
         use brokk_bifrost_core::analyzer::structural::resolution::HoistingClass;
@@ -1887,6 +1921,80 @@ mod tests {
             BindingFragmentId::from_digest([3; 32]),
             Language::Java,
             &normalized_java_bundle_facts_for_test(),
+        );
+        let keys = ResolutionLocalKeys::new(&lowered, &CancellationToken::default())
+            .expect("uncancelled key construction");
+        let catalog = lowered.identities();
+        assert!(!catalog.semantics().is_empty());
+        assert!(!catalog.nodes().is_empty());
+        assert!(!catalog.paths().is_empty());
+        assert!(!catalog.stack_variables().is_empty());
+
+        for (index, &(mounted, expected)) in catalog.semantics().iter().enumerate() {
+            let key = keys.semantic(mounted);
+            assert_eq!(key, dense_key(index));
+            assert_eq!(
+                catalog_identity_at(catalog.semantics(), mounted, key, "semantic test catalog"),
+                expected
+            );
+        }
+        for (index, &(mounted, expected)) in catalog.nodes().iter().enumerate() {
+            let key = keys.node(mounted);
+            assert_eq!(key, dense_key(index));
+            assert_eq!(
+                catalog_identity_at(catalog.nodes(), mounted, key, "node test catalog"),
+                expected
+            );
+        }
+        for (index, &(mounted, expected)) in catalog.paths().iter().enumerate() {
+            let key = keys.path(mounted);
+            assert_eq!(key, dense_key(index));
+            assert_eq!(
+                catalog_identity_at(catalog.paths(), mounted, key, "path test catalog"),
+                expected
+            );
+        }
+        for (index, &(mounted, expected)) in catalog.stack_variables().iter().enumerate() {
+            let key = keys.variable(mounted);
+            assert_eq!(key, dense_key(index));
+            assert_eq!(
+                catalog_identity_at(
+                    catalog.stack_variables(),
+                    mounted,
+                    key,
+                    "stack-variable test catalog",
+                ),
+                expected
+            );
+        }
+
+        assert_eq!(
+            keys.node_coordinate(BindingNodeId::universal_root()),
+            PreparedNodeCoordinate {
+                local_key: PreparedResolutionValue::Null,
+                boundary_key: BindingNodeId::UNIVERSAL_ROOT_BOUNDARY_KEY.into(),
+            }
+        );
+        let local_node = lowered.lexical().nodes()[0].0;
+        assert_eq!(
+            keys.node_coordinate(local_node),
+            PreparedNodeCoordinate {
+                local_key: keys.node(local_node).into(),
+                boundary_key: PreparedResolutionValue::Null,
+            }
+        );
+        let unknown = BindingNodeId::hash_bytes(b"unknown-non-root-node");
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| keys.node_coordinate(unknown))).is_err(),
+            "only the exact universal root may bypass the local identity catalog"
+        );
+    }
+    #[test]
+    fn parsed_java_local_keys_are_exact_indexes_into_descriptor_sorted_catalogs() {
+        let lowered = lower_resolution_facts_with_identity_catalog(
+            BindingFragmentId::from_digest([3; 32]),
+            Language::Java,
+            &crate::analyzer::resolution::rich_java_resolution_facts_for_test(),
         );
         let keys = ResolutionLocalKeys::new(&lowered, &CancellationToken::default())
             .expect("uncancelled key construction");

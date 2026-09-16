@@ -9,6 +9,31 @@
 use super::ir::{CodeQueryPlan, CodeQueryPlanSource};
 use super::schema::QueryStepOp;
 
+impl CodeQueryPlan {
+    /// Whether execution needs the class-set workspace field-index prepass.
+    ///
+    /// This is an execution requirement, separate from whether result rows
+    /// distribute over seeds. Until that prepass can be shared with complete
+    /// dependency and budget replay, running each seed independently repeats
+    /// the whole workspace preparation.
+    pub fn requires_workspace_field_index(&self) -> bool {
+        let mut pending = vec![self];
+        while let Some(plan) = pending.pop() {
+            if plan
+                .steps
+                .iter()
+                .any(|step| matches!(step.op(), QueryStepOp::ClassSet | QueryStepOp::AbsentMember))
+            {
+                return true;
+            }
+            if let CodeQueryPlanSource::Set { branches, .. } = &plan.source {
+                pending.extend(branches);
+            }
+        }
+        false
+    }
+}
+
 /// How one plan's execution may be partitioned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlanPartitioning {
@@ -181,6 +206,50 @@ mod tests {
         CodeQuery::from_json(&query)
             .expect("query should parse")
             .plan
+    }
+
+    #[test]
+    fn field_index_requirement_is_separate_from_seed_partitionability() {
+        for operation in ["class_set", "absent_member"] {
+            let plan = plan(json!({
+                "match": { "kind": "function" },
+                "steps": [{ "op": "procedure_of" }, { "op": operation }]
+            }));
+            assert!(plan.requires_workspace_field_index());
+            assert_eq!(PlanPartitioning::classify(&plan), PlanPartitioning::BySeed);
+        }
+    }
+
+    #[test]
+    fn nested_set_branch_retains_its_workspace_field_requirement() {
+        let field = json!({
+            "match": { "kind": "function" },
+            "steps": [{ "op": "procedure_of" }, { "op": "class_set" }, { "op": "file_of" }]
+        });
+        let simple = json!({ "match": { "kind": "function" }, "steps": [{ "op": "file_of" }] });
+        let plan = plan(json!({
+            "union": [simple.clone(), { "union": [simple, field] }]
+        }));
+        assert!(plan.requires_workspace_field_index());
+        assert_eq!(
+            PlanPartitioning::classify(&plan),
+            PlanPartitioning::BySeedUnion
+        );
+    }
+
+    #[test]
+    fn ordinary_derived_queries_do_not_require_workspace_field_preparation() {
+        let plan = plan(json!({
+            "union": [
+                { "match": { "kind": "function" }, "steps": [{ "op": "enclosing_decl" }, { "op": "callers" }, { "op": "file_of" }] },
+                { "match": { "kind": "function" }, "steps": [{ "op": "file_of" }] }
+            ]
+        }));
+        assert!(!plan.requires_workspace_field_index());
+        assert_eq!(
+            PlanPartitioning::classify(&plan),
+            PlanPartitioning::BySeedUnion
+        );
     }
 
     #[test]

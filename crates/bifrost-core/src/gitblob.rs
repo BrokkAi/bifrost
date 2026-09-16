@@ -223,6 +223,14 @@ fn machine_cache_root() -> Option<PathBuf> {
     )
 }
 
+/// The machine-local cache root for callers outside this module.
+///
+/// This is the public form of [`machine_cache_root`], including the
+/// `BIFROST_CACHE_ROOT` override. It resolves a location and creates nothing.
+pub fn machine_cache_dir() -> Option<PathBuf> {
+    machine_cache_root()
+}
+
 fn machine_cache_root_with_overrides(cache_root: Option<std::ffi::OsString>) -> Option<PathBuf> {
     match cache_root {
         Some(cache_root) => Some(PathBuf::from(cache_root)),

@@ -51,6 +51,7 @@ code_query_labeled_enum! {
         CallBindingSelectorRejected => "call_binding_selector_rejected",
         SemanticBudgetExhausted => "semantic_budget_exhausted",
         SemanticProviderFailed => "semantic_provider_failed",
+        SemanticPackAcquisitionPending => "semantic_pack_acquisition_pending",
         UnresolvedProtocolReference => "unresolved_protocol_reference",
         TypestateRegistrationStale => "typestate_registration_stale",
         TypestateHandleStale => "typestate_handle_stale",

@@ -2855,6 +2855,10 @@ reasons:
   policies are always evaluated whole in this version.
 - `plan_crosses_seeds`: the query's rows are not the concatenation of its
   per-seed-file rows, so no per-file result exists.
+- `workspace_preparation_required`: the query contains `class-set` or
+  `absent-member`, which needs a workspace field index. The policy runs whole
+  before any file units are attempted, avoiding repeated index preparation.
+  These bindings forgo per-file reuse; recorded base findings can still be reused.
 - `unit_unbounded`: a unit read something the run could not name, so its
   inputs cannot be verified later.
 - `unit_not_exhaustive`: a unit ran under a bounded budget or was truncated,

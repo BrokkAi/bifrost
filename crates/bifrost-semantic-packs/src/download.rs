@@ -21,7 +21,7 @@ use std::fs::{self, OpenOptions};
 use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use brokk_bifrost_analysis::analyzer::semantic_model::{
     AcquisitionReceiptLookup, AcquisitionReceiptRelease, AcquisitionReceiptRequest,
@@ -29,9 +29,10 @@ use brokk_bifrost_analysis::analyzer::semantic_model::{
     SemanticPackCatalog,
 };
 use flate2::read::GzDecoder;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tar::Archive;
-use tempfile::Builder as TempDirBuilder;
+use tempfile::{Builder as TempDirBuilder, NamedTempFile};
 
 const RELEASE_REPOSITORY: &str = "BrokkAi/bifrost";
 const RELEASE_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -49,6 +50,9 @@ const CHECKSUM_NAME: &str = concat!(
 const EXPECTED_TOP_LEVEL: &str = "bifrost-semantic-packs";
 const DOWNLOAD_MODE_ENV: &str = "BIFROST_SEMANTIC_PACK_DOWNLOAD";
 const DOWNLOAD_CACHE_DIR: &str = "semantic-pack-downloads";
+const NEGATIVE_CACHE_DIR: &str = "semantic-pack-negative-cache";
+const NEGATIVE_CACHE_SCHEMA_VERSION: u32 = 1;
+const NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 const USER_AGENT_PREFIX: &str = "brokk-bifrost-semantic-packs";
 const MAX_REDIRECTS: u32 = 3;
 const GLOBAL_TIMEOUT: Duration = Duration::from_secs(30);
@@ -70,6 +74,54 @@ struct AttemptKey {
 
 static ATTEMPTED_REQUESTS: OnceLock<Mutex<HashSet<AttemptKey>>> = OnceLock::new();
 static RELEASE_CHECKSUM: OnceLock<Mutex<Option<Vec<u8>>>> = OnceLock::new();
+
+/// The request and immutable release identity that key one negative-cache
+/// entry. `path` is absent only when this host has no machine-local cache root.
+struct NegativeCacheIdentity<'a> {
+    request_digest: &'a str,
+    release_digest: &'a str,
+    path: Option<&'a Path>,
+}
+
+impl<'a> NegativeCacheIdentity<'a> {
+    fn path(&self) -> Option<&'a Path> {
+        self.path
+    }
+}
+
+/// The machine-local half of acquisition absence. The catalog receipt remains
+/// authoritative for the catalog that observed the failed install; this entry
+/// carries the same immutable release and build identity to a fresh catalog.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct NegativeCacheEntry {
+    schema_version: u32,
+    request_digest: String,
+    release_repository: String,
+    release_tag: String,
+    archive_name: String,
+    archive_digest: String,
+    bundle_schema_version: u32,
+    bundle_generator_name: String,
+    bundle_generator_version: String,
+    semantic_schema_version: u32,
+    generated_cache_version: u32,
+    client_epoch: u32,
+    release_digest: String,
+    created_at: i64,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone)]
+enum TestNegativeCache {
+    Disabled,
+    Root(PathBuf),
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_NEGATIVE_CACHE: std::cell::RefCell<Option<TestNegativeCache>> =
+        const { std::cell::RefCell::new(Some(TestNegativeCache::Disabled)) };
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DownloadMode {
@@ -120,9 +172,165 @@ fn acquire_with_mode(
     if mode == DownloadMode::Off {
         return Ok(());
     }
-    acquire_with_transport(catalog, request, transport)
+    acquire_with_negative_cache(catalog, request, transport, None)
 }
 
+#[cfg(test)]
+fn acquire_with_negative_cache(
+    catalog: &SemanticPackCatalog,
+    request: &AcquisitionRequest<'_>,
+    transport: &dyn HttpTransport,
+    negative_cache_root: Option<&Path>,
+) -> Result<(), DownloadError> {
+    TEST_NEGATIVE_CACHE.with(|root| {
+        *root.borrow_mut() = Some(
+            negative_cache_root
+                .map(|path| TestNegativeCache::Root(path.to_path_buf()))
+                .unwrap_or(TestNegativeCache::Disabled),
+        );
+    });
+    let result = acquire_with_transport(catalog, request, transport);
+    TEST_NEGATIVE_CACHE.with(|root| {
+        *root.borrow_mut() = Some(TestNegativeCache::Disabled);
+    });
+    result
+}
+
+fn negative_cache_root() -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some(cache) = TEST_NEGATIVE_CACHE.with(|cache| cache.borrow().clone()) {
+        return match cache {
+            TestNegativeCache::Disabled => None,
+            TestNegativeCache::Root(root) => Some(root),
+        };
+    }
+    brokk_bifrost_analysis::gitblob::machine_cache_dir()
+}
+
+fn negative_cache_path(
+    request_digest: &str,
+    release_digest: &str,
+) -> Result<Option<PathBuf>, DownloadError> {
+    let Some(root) = negative_cache_root() else {
+        return Ok(None);
+    };
+    Ok(Some(
+        root.join(NEGATIVE_CACHE_DIR)
+            .join(format!("{release_digest}-{request_digest}.json")),
+    ))
+}
+
+fn negative_cache_now() -> i64 {
+    i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time is after the Unix epoch")
+            .as_secs(),
+    )
+    .expect("Unix seconds fit in i64")
+}
+
+fn negative_cache_entry(
+    request_digest: &str,
+    release_digest: &str,
+    release: &AcquisitionReceiptRelease,
+    created_at: i64,
+) -> NegativeCacheEntry {
+    NegativeCacheEntry {
+        schema_version: NEGATIVE_CACHE_SCHEMA_VERSION,
+        request_digest: request_digest.to_owned(),
+        release_repository: release.repository.clone(),
+        release_tag: release.tag.clone(),
+        archive_name: release.archive_name.clone(),
+        archive_digest: release.archive_digest.clone(),
+        bundle_schema_version: release.bundle_schema_version,
+        bundle_generator_name: release.bundle_generator_name.clone(),
+        bundle_generator_version: release.bundle_generator_version.clone(),
+        semantic_schema_version: release.semantic_schema_version,
+        generated_cache_version: release.generated_cache_version,
+        client_epoch: release.client_epoch,
+        release_digest: release_digest.to_owned(),
+        created_at,
+    }
+}
+
+fn negative_cache_contains(
+    path: &Path,
+    request_digest: &str,
+    release_digest: &str,
+    release: &AcquisitionReceiptRelease,
+) -> bool {
+    let Ok(bytes) = fs::read(path) else {
+        return false;
+    };
+    let Ok(entry) = serde_json::from_slice::<NegativeCacheEntry>(&bytes) else {
+        return false;
+    };
+    if entry != negative_cache_entry(request_digest, release_digest, release, entry.created_at) {
+        return false;
+    }
+    let now = negative_cache_now();
+    entry.created_at <= now && now - entry.created_at < NEGATIVE_CACHE_TTL.as_secs() as i64
+}
+
+fn record_negative_cache(
+    path: &Path,
+    request_digest: &str,
+    release_digest: &str,
+    release: &AcquisitionReceiptRelease,
+) -> Result<(), DownloadError> {
+    let parent = path
+        .parent()
+        .expect("a negative-cache file path has a parent");
+    fs::create_dir_all(parent).map_err(|error| {
+        DownloadError::new(format!(
+            "create semantic-pack negative cache {}: {error}",
+            parent.display()
+        ))
+    })?;
+    let temporary = NamedTempFile::new_in(parent).map_err(|error| {
+        DownloadError::new(format!(
+            "create semantic-pack negative cache entry: {error}"
+        ))
+    })?;
+    let created_at = negative_cache_now();
+    serde_json::to_writer_pretty(
+        temporary.as_file(),
+        &negative_cache_entry(request_digest, release_digest, release, created_at),
+    )
+    .map_err(|error| {
+        DownloadError::new(format!("write semantic-pack negative cache entry: {error}"))
+    })?;
+    temporary
+        .as_file()
+        .sync_all()
+        .map_err(|error| DownloadError::new(format!("sync negative cache entry: {error}")))?;
+    if let Err(error) = temporary.persist(path) {
+        // Another process may have published the identical request/release
+        // entry between the persist attempt and its rename. Only identical
+        // content is a successful race; anything else reports the failure.
+        let identical = fs::read(path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<NegativeCacheEntry>(&bytes).ok())
+            .is_some_and(|existing| {
+                let expected = negative_cache_entry(
+                    request_digest,
+                    release_digest,
+                    release,
+                    existing.created_at,
+                );
+                existing == expected
+            });
+        if !identical {
+            return Err(DownloadError::new(format!(
+                "publish semantic-pack negative cache {}: {}",
+                path.display(),
+                error.error
+            )));
+        }
+    }
+    Ok(())
+}
 fn canonical_catalog_root(catalog: &SemanticPackCatalog) -> Result<PathBuf, DownloadError> {
     fs::canonicalize(catalog.root()).map_err(|error| {
         DownloadError::new(format!(
@@ -226,7 +434,17 @@ fn acquire_with_transport(
     };
     let expected_digest = parse_checksum_sidecar(&checksum, ARCHIVE_NAME)?;
     let receipt_request = receipt_request(request);
+    let receipt_request_digest = receipt_request.digest();
     let release = receipt_release(&expected_digest);
+    let release_digest = release.digest().map_err(|error| {
+        DownloadError::new(format!("build acquisition release identity: {error}"))
+    })?;
+    let negative_cache_path = negative_cache_path(&receipt_request_digest, &release_digest)?;
+    let negative_cache = NegativeCacheIdentity {
+        request_digest: &receipt_request_digest,
+        release_digest: &release_digest,
+        path: negative_cache_path.as_deref(),
+    };
     let lookup = {
         let _scope =
             brokk_bifrost_analysis::profiling::scope("semantic_pack.acquire_bundle.receipt_lookup");
@@ -246,9 +464,26 @@ fn acquire_with_transport(
     // prevents a catalog-root symlink from redirecting the cache elsewhere.
     let catalog_root = canonical_catalog_root(catalog)?;
     let cache_dir = cache_dir(&catalog_root, &expected_digest);
+    if let Some(path) = negative_cache.path()
+        && negative_cache_contains(path, &receipt_request_digest, &release_digest, &release)
+    {
+        brokk_bifrost_analysis::profiling::note_with(|| {
+            format!(
+                "semantic_pack.acquire_bundle.negative_cache request_digest={receipt_request_digest} archive_digest={expected_digest}"
+            )
+        });
+        return Err(negative_cache_error(request));
+    }
 
     if cache_dir.exists() {
-        verify_and_install_bundle(&cache_dir, catalog, request, &receipt_request, &release)?;
+        verify_and_install_bundle(
+            &cache_dir,
+            catalog,
+            request,
+            &receipt_request,
+            &release,
+            &negative_cache,
+        )?;
         return Ok(());
     }
 
@@ -315,7 +550,14 @@ fn acquire_with_transport(
         verified, catalog, &release,
     )
     .map_err(|error| DownloadError::new(format!("install semantic-pack bundle: {error}")))?;
-    finish_acquisition(catalog, request, &receipt_request, &release, proof)
+    finish_acquisition(
+        catalog,
+        request,
+        &receipt_request,
+        &release,
+        proof,
+        &negative_cache,
+    )
 }
 
 fn release_asset_url(asset_name: &str) -> String {
@@ -344,6 +586,7 @@ fn verify_and_install_bundle(
     request: &AcquisitionRequest<'_>,
     receipt_request: &AcquisitionReceiptRequest,
     release: &AcquisitionReceiptRelease,
+    negative_cache: &NegativeCacheIdentity<'_>,
 ) -> Result<(), DownloadError> {
     let proof = {
         let _scope =
@@ -351,7 +594,14 @@ fn verify_and_install_bundle(
         crate::release_bundle::install_release_bundle_with_proof(bundle_root, catalog, release)
             .map_err(|error| DownloadError::new(format!("install semantic-pack bundle: {error}")))?
     };
-    finish_acquisition(catalog, request, receipt_request, release, proof)
+    finish_acquisition(
+        catalog,
+        request,
+        receipt_request,
+        release,
+        proof,
+        negative_cache,
+    )
 }
 
 fn finish_acquisition(
@@ -360,6 +610,7 @@ fn finish_acquisition(
     receipt_request: &AcquisitionReceiptRequest,
     release: &AcquisitionReceiptRelease,
     proof: crate::release_bundle::BundleInstallationProof,
+    negative_cache: &NegativeCacheIdentity<'_>,
 ) -> Result<(), DownloadError> {
     let satisfied = match request {
         AcquisitionRequest::GeneratedProduction(key) => catalog
@@ -383,7 +634,17 @@ fn finish_acquisition(
         .map_err(|error| DownloadError::new(format!("record acquisition absence: {error}")))?
     {
         AcquisitionReceiptLookup::Satisfied => Ok(()),
-        AcquisitionReceiptLookup::KnownVerifiedAbsence => Err(unsatisfied_error(request)),
+        AcquisitionReceiptLookup::KnownVerifiedAbsence => {
+            if let Some(path) = negative_cache.path() {
+                record_negative_cache(
+                    path,
+                    negative_cache.request_digest,
+                    negative_cache.release_digest,
+                    release,
+                )?;
+            }
+            Err(unsatisfied_error(request))
+        }
         AcquisitionReceiptLookup::ReceiptMiss => unreachable!("receipt write returns final state"),
     }
 }
@@ -418,6 +679,18 @@ fn unsatisfied_error(request: &AcquisitionRequest<'_>) -> DownloadError {
         AcquisitionRequest::DeclaredPack(query) => DownloadError::new(format!(
             "verified semantic-pack bundle installed no {} pack for {:?}",
             query.ecosystem, query
+        )),
+    }
+}
+
+fn negative_cache_error(request: &AcquisitionRequest<'_>) -> DownloadError {
+    match request {
+        AcquisitionRequest::GeneratedProduction(_) => DownloadError::new(
+            "known negative cache: verified release did not install the requested generated production",
+        ),
+        AcquisitionRequest::DeclaredPack(query) => DownloadError::new(format!(
+            "known negative cache: verified release installed no {} pack for {query:?}",
+            query.ecosystem
         )),
     }
 }
@@ -669,7 +942,7 @@ mod tests {
     use super::*;
     use crate::release_bundle::{
         PACK_SPEC_SCHEMA_VERSION, PinnedArtifact, PinnedJdkSourceLayout, PinnedLookupQuery,
-        PinnedPackKind, PinnedPackSpec, generate_release_bundle,
+        PinnedPackKind, PinnedPackSpec, ReleaseBundleIndex, generate_release_bundle,
     };
     use brokk_bifrost_analysis::analyzer::semantic_model::{
         ActivationSelector, CatalogCoordinate, CatalogOpenMode, Compatibility,
@@ -976,7 +1249,7 @@ mod tests {
         let checksum_url = release_asset_url(CHECKSUM_NAME);
         let checksum = format!("{archive_digest}  {ARCHIVE_NAME}\n").into_bytes();
         let transport = FakeTransport::new(HashMap::from([
-            (checksum_url.clone(), checksum),
+            (checksum_url.clone(), checksum.clone()),
             (archive_url.clone(), fixture.archive.clone()),
         ]));
 
@@ -1221,6 +1494,138 @@ mod tests {
                 .unwrap(),
             AcquisitionReceiptLookup::Satisfied,
             "a newly satisfying verified pack must win before receipt lookup"
+        );
+    }
+
+    /// A bundle that installs a curated pack but skips its stale generated
+    /// production leaves a durable per-catalog absence receipt. A machine-local
+    /// negative cache must carry that identity to the next fresh catalog, where
+    /// the receipt does not exist.
+    #[test]
+    fn negative_cache_prevents_a_second_fresh_catalog_from_fetching_the_archive() {
+        let fixture = generated_bundle_fixture();
+        let extraction = tempdir().unwrap();
+        let bundle_root = safe_extract_archive(&fixture.archive, extraction.path()).unwrap();
+        let index_path = bundle_root.join("index.json");
+        let mut index: ReleaseBundleIndex =
+            serde_json::from_slice(&fs::read(&index_path).unwrap()).unwrap();
+        let generated = index
+            .generated_productions
+            .first_mut()
+            .expect("fixture has a generated production");
+        generated.cache_version = GENERATED_PRODUCTION_CACHE_VERSION - 1;
+        generated.production_digest =
+            brokk_bifrost_analysis::analyzer::semantic_model::recorded_generated_production_digest(
+                &generated.input_digest,
+                &generated.producer_name,
+                &generated.producer_version,
+                generated.schema_version,
+                generated.cache_version,
+            )
+            .unwrap();
+        fs::write(&index_path, serde_json::to_vec(&index).unwrap()).unwrap();
+        let index_checksum = hex_digest(&fs::read(&index_path).unwrap());
+        let sums_path = bundle_root.join("SHA256SUMS");
+        let sums = fs::read_to_string(&sums_path).unwrap();
+        let mut sums_lines: Vec<_> = sums.lines().map(ToOwned::to_owned).collect();
+        let (_, index_path_in_sums) = sums_lines
+            .first()
+            .expect("bundle checksums are non-empty")
+            .split_once("  ")
+            .expect("bundle checksum uses SHA256SUMS spacing");
+        assert_eq!(index_path_in_sums, "index.json");
+        sums_lines[0] = format!("{index_checksum}  index.json");
+        fs::write(&sums_path, sums_lines.join("\n") + "\n").unwrap();
+        let incompatible_archive = archive_bundle(&bundle_root);
+        let archive_digest = hex_digest(&incompatible_archive);
+        let archive_url = release_asset_url(ARCHIVE_NAME);
+        let checksum_url = release_asset_url(CHECKSUM_NAME);
+        let checksum = format!("{archive_digest}  {ARCHIVE_NAME}\n").into_bytes();
+
+        let negative_cache = tempdir().unwrap();
+        let first_catalog = SemanticPackCatalog::open_ephemeral(Default::default()).unwrap();
+        let transport = FakeTransport::new(HashMap::from([
+            (checksum_url.clone(), checksum.clone()),
+            (archive_url.clone(), incompatible_archive.clone()),
+        ]));
+        let error = acquire_with_negative_cache(
+            &first_catalog,
+            &AcquisitionRequest::GeneratedProduction(&fixture.key),
+            &transport,
+            Some(negative_cache.path()),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("did not install the requested generated production"),
+            "{error}"
+        );
+        assert_eq!(
+            transport.requests.lock().unwrap().as_slice(),
+            &[checksum_url.clone(), archive_url.clone()]
+        );
+
+        let second_catalog = SemanticPackCatalog::open_ephemeral(Default::default()).unwrap();
+        let second_transport = FakeTransport::new(HashMap::from([
+            (checksum_url.clone(), checksum.clone()),
+            (archive_url.clone(), incompatible_archive.clone()),
+        ]));
+        let second_error = acquire_with_negative_cache(
+            &second_catalog,
+            &AcquisitionRequest::GeneratedProduction(&fixture.key),
+            &second_transport,
+            Some(negative_cache.path()),
+        )
+        .unwrap_err();
+        assert!(
+            second_error.to_string().contains("known negative cache"),
+            "{second_error}"
+        );
+        assert_eq!(
+            second_transport.requests.lock().unwrap().as_slice(),
+            std::slice::from_ref(&checksum_url)
+        );
+        assert!(
+            second_catalog
+                .generated_production(&fixture.key)
+                .unwrap()
+                .is_none()
+        );
+
+        // The negative answer is advisory. Once it expires, acquisition retries
+        // the immutable archive and can refresh the entry.
+        let marker_directory = negative_cache.path().join(NEGATIVE_CACHE_DIR);
+        let marker_path = fs::read_dir(&marker_directory)
+            .unwrap()
+            .next()
+            .expect("first acquisition recorded one negative-cache entry")
+            .unwrap()
+            .path();
+        let mut marker: NegativeCacheEntry =
+            serde_json::from_slice(&fs::read(&marker_path).unwrap()).unwrap();
+        marker.created_at = negative_cache_now() - NEGATIVE_CACHE_TTL.as_secs() as i64 - 1;
+        fs::write(&marker_path, serde_json::to_vec(&marker).unwrap()).unwrap();
+        let third_transport = FakeTransport::new(HashMap::from([
+            (checksum_url.clone(), checksum),
+            (archive_url.clone(), incompatible_archive),
+        ]));
+        let third_error = acquire_with_negative_cache(
+            &second_catalog,
+            &AcquisitionRequest::GeneratedProduction(&fixture.key),
+            &third_transport,
+            Some(negative_cache.path()),
+        )
+        .unwrap_err();
+        assert!(
+            third_error
+                .to_string()
+                .contains("did not install the requested generated production"),
+            "{third_error}"
+        );
+        assert_eq!(
+            third_transport.requests.lock().unwrap().as_slice(),
+            &[checksum_url, archive_url]
         );
     }
 

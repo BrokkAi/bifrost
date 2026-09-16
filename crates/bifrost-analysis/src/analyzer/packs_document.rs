@@ -19,10 +19,11 @@ use serde::Deserialize;
 
 use crate::analyzer::semantic_model::{
     CatalogError, CatalogOpenMode, CatalogOptions, DependencyPackLimits,
-    RegisteredWorkspaceSemanticModel, SEMANTIC_PACK_CACHE_ROOT_ENV, SemanticModelActivationControl,
-    SemanticModelActivationEvidence, SemanticModelActivationRequest, SemanticModelControlAction,
-    SemanticModelControlScope, SemanticModelPackSelector, SemanticModelRuntimeLimits,
-    SemanticPackCatalog, WORKSPACE_SEMANTIC_MODEL_DIRECTORY, WorkspaceSemanticModelOptions,
+    PendingDependencyPackAcquisition, RegisteredWorkspaceSemanticModel,
+    SEMANTIC_PACK_CACHE_ROOT_ENV, SemanticModelActivationControl, SemanticModelActivationEvidence,
+    SemanticModelActivationRequest, SemanticModelControlAction, SemanticModelControlScope,
+    SemanticModelPackSelector, SemanticModelRuntimeLimits, SemanticPackCatalog,
+    WORKSPACE_SEMANTIC_MODEL_DIRECTORY, WorkspaceSemanticModelOptions,
     WorkspaceSemanticModelRegistration, WorkspaceSemanticModelRegistrationError,
     open_default_semantic_pack_catalog, register_workspace_semantic_models,
 };
@@ -461,6 +462,114 @@ pub fn activate_workspace_semantic_sources_in_catalog(
     additional_evidence: &[SemanticModelActivationEvidence],
     cancellation: &crate::CancellationToken,
 ) -> Result<Option<WorkspacePacksActivation>, WorkspaceActivationError> {
+    let Some(prelude) =
+        workspace_activation_prelude(workspace, catalog, &sources, additional_evidence)?
+    else {
+        return Ok(None);
+    };
+    let activation = SemanticModelActivationRequest {
+        bifrost_version: Version::parse(env!("CARGO_PKG_VERSION"))
+            .expect("package version must be semver"),
+        evidence: prelude.evidence,
+        controls: prelude.controls,
+        limits: SemanticModelRuntimeLimits::default(),
+    };
+    // An empty ecosystem list still resolves: the dependency loop simply has
+    // nothing to discover, and the request's workspace evidence is what
+    // selects. That keeps one code path for all routes.
+    let outcome = workspace.activate_dependency_packs(
+        analyzer_config,
+        &prelude.ecosystems,
+        DependencyPackWorkspaceContext {
+            catalog,
+            persistence: None,
+            activation: &activation,
+            limits: DependencyPackLimits::default(),
+            cancellation,
+        },
+    );
+    Ok(Some(WorkspacePacksActivation {
+        ecosystems: prelude.ecosystems,
+        workspace_models: prelude.workspace_models,
+        outcome,
+    }))
+}
+
+/// The outcome of the installed-pack stage of one workspace activation
+/// transaction: the published interim activation plus every dependency whose
+/// exact acquisition remains for the full stage.
+#[derive(Debug)]
+pub struct InstalledWorkspacePacksActivation {
+    pub activation: WorkspacePacksActivation,
+    pub pending: Vec<PendingDependencyPackAcquisition>,
+}
+
+/// The installed-pack stage of [`activate_workspace_semantic_sources_in_catalog`]
+/// (issue #3401, the #3372 family): the same catalog bootstrap, workspace-local
+/// registration, and dependency discovery, but dependency preparation resolves
+/// only against packs already installed in the catalog -- nothing is fetched,
+/// verified, extracted, read as a dependency artifact, or generated from a
+/// local toolchain. Dependencies that stage cannot settle come back in
+/// `pending`; running the full transaction afterwards reproduces exactly the
+/// activation the un-staged path would have published.
+pub fn activate_installed_workspace_semantic_sources_in_catalog(
+    workspace: &WorkspaceAnalyzer,
+    analyzer_config: &AnalyzerConfig,
+    catalog: &SemanticPackCatalog,
+    sources: WorkspaceActivationSources<'_>,
+    additional_evidence: &[SemanticModelActivationEvidence],
+    cancellation: &crate::CancellationToken,
+) -> Result<Option<InstalledWorkspacePacksActivation>, WorkspaceActivationError> {
+    let Some(prelude) =
+        workspace_activation_prelude(workspace, catalog, &sources, additional_evidence)?
+    else {
+        return Ok(None);
+    };
+    let activation = SemanticModelActivationRequest {
+        bifrost_version: Version::parse(env!("CARGO_PKG_VERSION"))
+            .expect("package version must be semver"),
+        evidence: prelude.evidence,
+        controls: prelude.controls,
+        limits: SemanticModelRuntimeLimits::default(),
+    };
+    let installed = workspace.activate_installed_dependency_packs(
+        analyzer_config,
+        &prelude.ecosystems,
+        DependencyPackWorkspaceContext {
+            catalog,
+            persistence: None,
+            activation: &activation,
+            limits: DependencyPackLimits::default(),
+            cancellation,
+        },
+    );
+    Ok(Some(InstalledWorkspacePacksActivation {
+        activation: WorkspacePacksActivation {
+            ecosystems: prelude.ecosystems,
+            workspace_models: prelude.workspace_models,
+            outcome: installed.outcome,
+        },
+        pending: installed.pending,
+    }))
+}
+
+/// The sources every workspace activation transaction assembles the same way:
+/// the selected ecosystems, the registered workspace-local models, and the
+/// activation request's evidence and controls. `None` is the shared early
+/// return of both transaction kinds: no selected route contributes anything.
+struct WorkspaceActivationPrelude {
+    ecosystems: Vec<DependencyPackEcosystem>,
+    workspace_models: Vec<RegisteredWorkspaceSemanticModel>,
+    evidence: Vec<SemanticModelActivationEvidence>,
+    controls: Vec<SemanticModelActivationControl>,
+}
+
+fn workspace_activation_prelude(
+    workspace: &WorkspaceAnalyzer,
+    catalog: &SemanticPackCatalog,
+    sources: &WorkspaceActivationSources<'_>,
+    additional_evidence: &[SemanticModelActivationEvidence],
+) -> Result<Option<WorkspaceActivationPrelude>, WorkspaceActivationError> {
     let ecosystems = workspace_pack_ecosystems(workspace, sources.config);
     // Does this workspace opt into the reviewed route at all? Presence of the
     // directory is the whole opt-in, and asking costs one stat. Discovery
@@ -538,31 +647,11 @@ pub fn activate_workspace_semantic_sources_in_catalog(
     }
     evidence.sort();
     evidence.dedup();
-    let activation = SemanticModelActivationRequest {
-        bifrost_version: Version::parse(env!("CARGO_PKG_VERSION"))
-            .expect("package version must be semver"),
-        evidence,
-        controls,
-        limits: SemanticModelRuntimeLimits::default(),
-    };
-    // An empty ecosystem list still resolves: the dependency loop simply has
-    // nothing to discover, and the request's workspace evidence is what
-    // selects. That keeps one code path for all routes.
-    let outcome = workspace.activate_dependency_packs(
-        analyzer_config,
-        &ecosystems,
-        DependencyPackWorkspaceContext {
-            catalog,
-            persistence: None,
-            activation: &activation,
-            limits: DependencyPackLimits::default(),
-            cancellation,
-        },
-    );
-    Ok(Some(WorkspacePacksActivation {
+    Ok(Some(WorkspaceActivationPrelude {
         ecosystems,
         workspace_models: registration.models,
-        outcome,
+        evidence,
+        controls,
     }))
 }
 

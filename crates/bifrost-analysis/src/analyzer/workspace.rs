@@ -6,10 +6,11 @@ use crate::analyzer::multi_analyzer::{WorkspaceBuildContext, build_language_dele
 use crate::analyzer::semantic_model::{
     DependencyDiscoveryEvidence, DependencyDiscoveryOutcome, DependencyPackAdapter,
     DependencyPackLimits, DependencyPackPreparationOutcome, DependencyResolver,
-    DependencyResolverBounds, SemanticModelActivationPersistence, SemanticModelActivationRequest,
-    SemanticModelRuntimeOutcome, SemanticPackCatalog, SubprocessPolicy,
-    acquire_active_semantic_models_with_evidence, prepare_compatible_installed_semantic_packs,
-    prepare_dependency_semantic_packs,
+    DependencyResolverBounds, PendingDependencyPackAcquisition, SemanticModelActivationPersistence,
+    SemanticModelActivationRequest, SemanticModelRuntimeOutcome, SemanticPackCatalog,
+    SubprocessPolicy, acquire_active_semantic_models_with_evidence,
+    prepare_compatible_installed_semantic_packs, prepare_dependency_semantic_packs,
+    prepare_installed_dependency_packs,
 };
 use crate::analyzer::store::StoreError;
 use crate::analyzer::tree_sitter_analyzer::WorkspaceBuildSnapshot;
@@ -865,6 +866,14 @@ pub struct DependencyPackActivationOutcome {
     pub diagnostic_refresh_required: bool,
 }
 
+/// The installed-pack stage's activation: the published interim outcome plus
+/// every dependency whose exact acquisition remains for the full stage.
+#[derive(Debug)]
+pub struct InstalledDependencyPackActivationOutcome {
+    pub outcome: DependencyPackActivationOutcome,
+    pub pending: Vec<PendingDependencyPackAcquisition>,
+}
+
 impl DependencyPackActivationOutcome {
     pub fn complete(&self) -> bool {
         self.ecosystems.iter().all(|outcome| {
@@ -1009,8 +1018,138 @@ impl WorkspaceAnalyzer {
             });
         }
 
+        self.publish_dependency_pack_activation(
+            activation,
+            publication_evidence,
+            outcomes,
+            cancelled,
+            ecosystems.is_empty(),
+            &context,
+        )
+    }
+
+    /// The installed-pack stage of [`Self::activate_dependency_packs`]: run
+    /// the same per-ecosystem discovery, resolve every discovered dependency
+    /// against the packs already installed in the catalog, and publish that
+    /// overlay, all without reading dependency artifacts or fetching,
+    /// verifying, extracting, or generating anything (issue #3401, the #3372
+    /// family).
+    ///
+    /// The outcome is the session's interim activation: its overlay is real,
+    /// but every dependency the installed selection could not settle is
+    /// returned in `pending` with its ecosystem, so the host can keep the
+    /// expensive acquisition on a background stage and mark answers produced
+    /// in the meantime. The full stage re-runs discovery and preparation from
+    /// the same inputs, so what it publishes supersedes this stage exactly.
+    pub fn activate_installed_dependency_packs(
+        &self,
+        config: &AnalyzerConfig,
+        ecosystems: &[DependencyPackEcosystem],
+        context: DependencyPackWorkspaceContext<'_>,
+    ) -> InstalledDependencyPackActivationOutcome {
+        let mut outcomes = Vec::with_capacity(ecosystems.len());
+        let mut activation = context.activation.clone();
+        let mut publication_evidence = Vec::with_capacity(ecosystems.len());
+        let mut pending = Vec::new();
+        let mut cancelled = false;
+
+        for ecosystem in ecosystems.iter().copied() {
+            let resolver = ecosystem.resolver();
+            let mut limits = context.limits;
+            resolver.adjust_limits(config, &mut limits);
+            let discovery = {
+                let _scope = crate::profiling::scope_with(|| {
+                    format!("semantic_pack.discover[{}]", ecosystem.label())
+                });
+                resolver.resolve(
+                    config,
+                    self.analyzer().project(),
+                    &limits,
+                    Some(context.cancellation),
+                )
+            };
+            if discovery.cancelled {
+                cancelled = true;
+                outcomes.push(DependencyPackEcosystemOutcome {
+                    ecosystem,
+                    discovery,
+                    preparation: None,
+                });
+                break;
+            }
+            let preparation = {
+                let _scope = crate::profiling::scope_with(|| {
+                    format!(
+                        "semantic_pack.prepare_installed[{},{} deps]",
+                        ecosystem.label(),
+                        discovery.dependencies.len()
+                    )
+                });
+                prepare_installed_dependency_packs(
+                    context.catalog,
+                    resolver.adapter(),
+                    &discovery.dependencies,
+                    &limits,
+                    Some(context.cancellation),
+                )
+            };
+            if preparation.outcome.cancelled {
+                cancelled = true;
+                outcomes.push(DependencyPackEcosystemOutcome {
+                    ecosystem,
+                    discovery,
+                    preparation: Some(preparation.outcome),
+                });
+                break;
+            }
+            pending.extend(preparation.pending.into_iter().map(|dependency_id| {
+                PendingDependencyPackAcquisition {
+                    ecosystem,
+                    dependency_id,
+                }
+            }));
+            if preparation.outcome.complete || !preparation.outcome.evidence.is_empty() {
+                activation
+                    .evidence
+                    .extend(preparation.outcome.evidence.iter().cloned());
+                publication_evidence.push((
+                    ecosystem.languages().to_vec().into_boxed_slice(),
+                    DependencyDiscoveryEvidence::from_outcome(&discovery),
+                ));
+            }
+            outcomes.push(DependencyPackEcosystemOutcome {
+                ecosystem,
+                discovery,
+                preparation: Some(preparation.outcome),
+            });
+        }
+
+        let outcome = self.publish_dependency_pack_activation(
+            activation,
+            publication_evidence,
+            outcomes,
+            cancelled,
+            ecosystems.is_empty(),
+            &context,
+        );
+        InstalledDependencyPackActivationOutcome { outcome, pending }
+    }
+
+    /// Publish one assembled dependency activation into this analyzer's
+    /// overlay: the shared tail of [`Self::activate_dependency_packs`] and
+    /// [`Self::activate_installed_dependency_packs`]. An activation with
+    /// nothing to publish leaves any previous publication untouched.
+    fn publish_dependency_pack_activation(
+        &self,
+        mut activation: SemanticModelActivationRequest,
+        publication_evidence: Vec<(Box<[Language]>, DependencyDiscoveryEvidence)>,
+        outcomes: Vec<DependencyPackEcosystemOutcome>,
+        cancelled: bool,
+        ecosystems_empty: bool,
+        context: &DependencyPackWorkspaceContext<'_>,
+    ) -> DependencyPackActivationOutcome {
         if cancelled
-            || (!ecosystems.is_empty()
+            || (!ecosystems_empty
                 && publication_evidence.is_empty()
                 && activation.evidence.is_empty())
         {

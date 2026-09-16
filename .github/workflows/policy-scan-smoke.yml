@@ -118,7 +118,9 @@ jobs:
           working-directory: smoke-fixture/clean
           sarif-file: clean.sarif
           upload: 'false'
-          cache: 'false'
+          cache: 'true'
+          policy-timings: 'true'
+          artifact-name: policy-smoke-clean-${{ matrix.os }}
 
       - name: Assert the clean result
         shell: bash
@@ -137,6 +139,41 @@ jobs:
           py=python3; command -v python3 >/dev/null 2>&1 || py=python
           "${py}" -c "import json,sys; d=json.load(open(sys.argv[1])); assert isinstance(d['runs'], list), 'runs is not an array'" "${SARIF_FILE}"
           test "${CODE}" = 0 || { echo "::error::clean fixture exit code is ${CODE}, expected 0"; exit 1; }
+          "${py}" - "${SARIF_FILE}" <<'PYCODE'
+          import json
+          from pathlib import Path
+          import sys
+          report_path = Path(sys.argv[1])
+          report = json.loads(report_path.read_text())
+          prefix = "bifrost: policy stage timings "
+          records = [json.loads(line[len(prefix):]) for line in Path(str(report_path) + ".stderr.log").read_text().splitlines() if line.startswith(prefix)]
+          assert len(records) == 1, records
+          assert records[0]["kind"] == "bifrost.policy-stage-timings", records
+          assert records[0]["scope"] == "workspace", records
+          assert records[0]["stages"], records
+          runs = report["runs"][0]["properties"]["bifrost.policyRuns"]
+          assert any(metric["name"] == "evaluation.elapsed_ms" for run in runs for metric in run["work"]["metrics"]), runs
+          PYCODE
+
+      - name: Restore the same analyzer cache
+        id: cached-clean
+        uses: ./.github/actions/policy-scan
+        with:
+          version: local
+          working-directory: smoke-fixture/clean
+          sarif-file: cached-clean.sarif
+          upload: 'false'
+          cache: 'true'
+
+      - name: Assert exact cache restoration
+        shell: bash
+        env:
+          CACHE_HIT: ${{ steps.cached-clean.outputs.analyzer-cache-hit }}
+          CODE: ${{ steps.cached-clean.outputs.exit-code }}
+        run: |
+          set -euo pipefail
+          test "${CACHE_HIT}" = true
+          test "${CODE}" = 0
 
       # Leg B: a planted finding must make the action's gate step fail with
       # exit code 1.
@@ -150,6 +187,8 @@ jobs:
           sarif-file: finding.sarif
           upload: 'false'
           cache: 'false'
+          policy-timings: 'true'
+          artifact-name: policy-smoke-finding-${{ matrix.os }}
 
       - name: Assert the gate failed
         shell: bash

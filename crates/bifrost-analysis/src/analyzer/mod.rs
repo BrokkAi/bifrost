@@ -277,10 +277,11 @@ pub use typescript::TypescriptAnalyzer;
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub use usages::java_usage_evidence_cache::JavaUsageEvidenceCacheStats;
+pub use usages::workspace_graph::UsageEcosystem;
 pub use workspace::{
     DependencyPackActivationOutcome, DependencyPackEcosystem, DependencyPackEcosystemOutcome,
-    DependencyPackWorkspaceContext, EmptyAnalyzer, PythonSemanticModelActivationOutcome,
-    PythonSemanticModelWorkspaceContext, WorkspaceAnalyzer,
+    DependencyPackWorkspaceContext, EmptyAnalyzer, InstalledDependencyPackActivationOutcome,
+    PythonSemanticModelActivationOutcome, PythonSemanticModelWorkspaceContext, WorkspaceAnalyzer,
 };
 pub(crate) use workspace::{SharedAnalyzerCache, WorkspaceProjectionLease};
 

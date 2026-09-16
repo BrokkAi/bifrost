@@ -372,6 +372,16 @@ pub(crate) struct SlicedQuery {
     pub(crate) keys: Vec<PolicyUnitKey>,
 }
 
+pub(crate) fn query_slicing_widen_reason(query: &CodeQuery) -> Option<WidenReason> {
+    if query.plan.requires_workspace_field_index() {
+        Some(WidenReason::WorkspacePreparationRequired)
+    } else if !PlanPartitioning::classify(&query.plan).is_by_seed() {
+        Some(WidenReason::PlanCrossesSeeds)
+    } else {
+        None
+    }
+}
+
 /// Execute one query as the merge of one execution per seed file.
 ///
 /// `Err` is the demand to evaluate the whole policy instead, with the reason
@@ -392,8 +402,8 @@ pub(crate) fn sliced_query_units(
     attempt: &mut UnitAttempt,
 ) -> Result<SlicedQuery, WidenReason> {
     let incremental = reuse.incremental();
-    if !PlanPartitioning::classify(&query.plan).is_by_seed() {
-        return Err(WidenReason::PlanCrossesSeeds);
+    if let Some(reason) = query_slicing_widen_reason(query) {
+        return Err(reason);
     }
     // A changed-fact set that could not be completed is smaller than the truth,
     // and a smaller set would let a changed input pass verification.
@@ -443,6 +453,9 @@ pub(crate) fn sliced_query_units(
             None => {
                 attempt.recomputed();
                 let (rows, reads) = recompute_unit(execution.analyzer, || {
+                    let _timing = brokk_bifrost_analysis::profiling::scope_with(|| {
+                        format!("policy.query_unit[{}]", rel_path_string(file))
+                    });
                     execute_code_query_unit(
                         execution.analyzer,
                         execution.workspace,

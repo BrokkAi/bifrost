@@ -1222,6 +1222,12 @@ fn reused_or_derived<T: Clone>(
         }
         return Ok(derived.value.clone());
     }
+    let _derivation = profiling::scope_with(|| {
+        format!(
+            "type_flow.refinement_derive[{}]",
+            std::any::type_name::<T>()
+        )
+    });
     if budget.has_charged_artifact(identity) {
         // This accounting scope already paid for this exact derivation under
         // an earlier root whose cache did not outlive it. Deriving it again

@@ -629,7 +629,26 @@ pub fn verify_recorded_generated_production_digest(
     schema_version: u32,
     cache_version: u32,
 ) -> Result<bool, CatalogError> {
-    if !is_lower_sha256(production_digest) || !is_lower_sha256(input_digest) {
+    let expected = recorded_generated_production_digest(
+        input_digest,
+        producer_name,
+        producer_version,
+        schema_version,
+        cache_version,
+    )?;
+    Ok(production_digest == expected)
+}
+
+/// Compute the release identity recorded for a generated production at the
+/// cache epoch named by the release, including historical bundle entries.
+pub fn recorded_generated_production_digest(
+    input_digest: &str,
+    producer_name: &str,
+    producer_version: &str,
+    schema_version: u32,
+    cache_version: u32,
+) -> Result<String, CatalogError> {
+    if !is_lower_sha256(input_digest) {
         return Err(CatalogError::Integrity(
             "generated-production digests must be lowercase SHA-256".to_owned(),
         ));
@@ -644,14 +663,13 @@ pub fn verify_recorded_generated_production_digest(
                 .to_owned(),
         ));
     }
-    Ok(production_digest
-        == generated_production_digest_for_cache_version(
-            input_digest,
-            producer_name,
-            producer_version,
-            schema_version,
-            cache_version,
-        ))
+    Ok(generated_production_digest_for_cache_version(
+        input_digest,
+        producer_name,
+        producer_version,
+        schema_version,
+        cache_version,
+    ))
 }
 
 /// An acquired operating-system lock for one exact generated production.

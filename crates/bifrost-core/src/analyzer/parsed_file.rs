@@ -10,9 +10,16 @@ use tree_sitter::Node;
 
 use crate::analyzer::model::{
     CodeUnit, CppTemplateMetadata, ImportInfo, ProjectFile, Range, RubyMethodDispatchMode,
-    ScalaExportInfo, SignatureMetadata,
+    ScalaExportInfo, SignatureMetadata, StructuredImportPath, StructuredImportPathKind,
+    StructuredImportScope,
 };
+use crate::analyzer::resolution_facts::{FileResolutionFacts, ResolutionSiteId};
 use crate::analyzer::rust_facts::RustUsageFacts;
+use crate::analyzer::source_facts::{
+    SourceDeclarationId, SourceDeclarationVisibilityFact, SourceFactRows, SourceImportId,
+    SourceOccurrenceId,
+};
+use crate::analyzer::structural::facts::StructuralFactRows;
 use crate::analyzer::structural::materialization::MaterializationRecord;
 use crate::analyzer::tree_walk::node_range;
 use crate::hash::{HashMap, HashSet};
@@ -20,6 +27,9 @@ use crate::text_utils::compute_line_starts;
 
 #[derive(Debug, Clone)]
 pub struct ParsedFile {
+    /// Completed native/source inventory. Unsupported and unproduced adapters
+    /// leave this absent; semantic gaps remain inside an available packet.
+    pub native_source: Option<ParsedNativeSource>,
     pub package_name: String,
     pub content_qualifier: String,
     pub top_level_declarations: Vec<CodeUnit>,
@@ -185,6 +195,7 @@ fn record_removal_scan(_scanned: usize) {}
 impl ParsedFile {
     pub fn new(package_name: String) -> Self {
         Self {
+            native_source: None,
             content_qualifier: package_name.clone(),
             package_name,
             top_level_declarations: Vec::new(),
@@ -566,10 +577,23 @@ impl ParsedFile {
         code_unit: CodeUnit,
         metadata: SignatureMetadata,
     ) {
+        self.add_signature_with_metadata_ordinal(code_unit, metadata);
+    }
+
+    /// Insert or reuse metadata, returning its exact per-unit projection ordinal.
+    pub fn add_signature_with_metadata_ordinal(
+        &mut self,
+        code_unit: CodeUnit,
+        metadata: SignatureMetadata,
+    ) -> usize {
         self.add_signature(code_unit.clone(), metadata.label().to_string());
         let entries = self.signature_metadata.entry(code_unit).or_default();
-        if !entries.contains(&metadata) {
+        if let Some(ordinal) = entries.iter().position(|entry| entry == &metadata) {
+            ordinal
+        } else {
+            let ordinal = entries.len();
             entries.push(metadata);
+            ordinal
         }
     }
 
@@ -749,6 +773,328 @@ fn compact_replacement_occurrences(
     }
     compacted.reverse();
     *units = compacted;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceDeclarationMetadataLink {
+    pub declaration: SourceDeclarationId,
+    pub unit: CodeUnit,
+    pub metadata_ordinal: usize,
+}
+
+/// One canonical source-backed import leaf. The enclosing `ParsedSourceFacts`
+/// vector assigns its dense [`SourceImportId`] by index; projections carry that
+/// id explicitly rather than matching consumer ordinals, names, or ranges.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceImportFact {
+    pub declaration: SourceOccurrenceId,
+    pub target: Option<SourceOccurrenceId>,
+    pub alias_occurrence: Option<SourceOccurrenceId>,
+    pub statement: String,
+    pub is_wildcard: bool,
+    pub is_global: bool,
+    pub identifier: Option<String>,
+    pub alias: Option<String>,
+    /// A malformed directive still owns source identity and display metadata,
+    /// even when its path cannot be interpreted. This differs from a known
+    /// structured path with empty lists.
+    pub path: Option<SourceImportPathFact>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceImportPathFact {
+    pub kind: Option<StructuredImportPathKind>,
+    pub segments: Vec<String>,
+    pub lexical_prefixes: Vec<String>,
+    pub lexical_scopes: Vec<SourceOccurrenceId>,
+}
+
+impl SourceImportPathFact {
+    fn estimated_retained_bytes(&self) -> usize {
+        self.segments
+            .capacity()
+            .saturating_mul(std::mem::size_of::<String>())
+            .saturating_add(
+                self.segments
+                    .iter()
+                    .map(String::capacity)
+                    .fold(0usize, usize::saturating_add),
+            )
+            .saturating_add(
+                self.lexical_prefixes
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<String>()),
+            )
+            .saturating_add(
+                self.lexical_prefixes
+                    .iter()
+                    .map(String::capacity)
+                    .fold(0usize, usize::saturating_add),
+            )
+            .saturating_add(
+                self.lexical_scopes
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<SourceOccurrenceId>()),
+            )
+    }
+}
+
+impl SourceImportFact {
+    /// Heap storage owned by this leaf, excluding its inline struct storage.
+    pub fn estimated_retained_bytes(&self) -> usize {
+        self.statement
+            .capacity()
+            .saturating_add(self.identifier.as_ref().map_or(0, String::capacity))
+            .saturating_add(self.alias.as_ref().map_or(0, String::capacity))
+            .saturating_add(
+                self.path
+                    .as_ref()
+                    .map_or(0, SourceImportPathFact::estimated_retained_bytes),
+            )
+    }
+
+    /// Capture the structured import interpretation while the producer owns
+    /// the source occurrences. Display byte spans in `ImportInfo` are not
+    /// copied; `import_info` materializes them from the canonical arena.
+    pub fn from_import(
+        import: ImportInfo,
+        declaration: SourceOccurrenceId,
+        target: Option<SourceOccurrenceId>,
+        alias_occurrence: Option<SourceOccurrenceId>,
+        lexical_scopes: Vec<SourceOccurrenceId>,
+    ) -> Self {
+        assert!(
+            import.path.is_some() || lexical_scopes.is_empty(),
+            "an unavailable import path cannot own path scope projections"
+        );
+        let path = import.path.map(|path| SourceImportPathFact {
+            kind: path.kind,
+            segments: path.segments,
+            lexical_prefixes: path.lexical_prefixes,
+            lexical_scopes,
+        });
+        Self {
+            declaration,
+            target,
+            alias_occurrence,
+            statement: import.raw_snippet,
+            is_wildcard: import.is_wildcard,
+            is_global: import.is_global,
+            identifier: import.identifier,
+            alias: import.alias,
+            path,
+        }
+    }
+
+    /// Materialize the existing generic DTO without making its byte ranges a
+    /// second source authority.
+    pub fn import_info(&self, source: &SourceFactRows) -> ImportInfo {
+        let declaration_start_byte = source.occurrence(self.declaration).range.start_byte;
+        let binder_span = self
+            .alias_occurrence
+            .or(self.target)
+            .map(|occurrence| source.occurrence(occurrence).range)
+            .map(|range| crate::analyzer::structural::facts::Span {
+                start_byte: range.start_byte,
+                end_byte: range.end_byte,
+            });
+        ImportInfo {
+            raw_snippet: self.statement.clone(),
+            is_wildcard: self.is_wildcard,
+            is_global: self.is_global,
+            identifier: self.identifier.clone(),
+            alias: self.alias.clone(),
+            path: self.path.as_ref().map(|path| StructuredImportPath {
+                segments: path.segments.clone(),
+                kind: path.kind,
+                lexical_prefixes: path.lexical_prefixes.clone(),
+                lexical_scopes: path
+                    .lexical_scopes
+                    .iter()
+                    .map(|occurrence| {
+                        let range = source.occurrence(*occurrence).range;
+                        StructuredImportScope {
+                            start_byte: range.start_byte,
+                            end_byte: range.end_byte,
+                        }
+                    })
+                    .collect(),
+                declaration_start_byte,
+            }),
+            binder_span,
+        }
+    }
+}
+
+/// Canonical common and Java source rows from one completed producer walk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedSourceFacts {
+    pub source_bytes: usize,
+    pub occurrences: SourceFactRows,
+    pub structural: StructuralFactRows,
+    pub native_site_occurrences: Vec<SourceOccurrenceId>,
+    pub native_declaration_sources: Vec<(ResolutionSiteId, SourceDeclarationId)>,
+    /// None is unavailable; Some(empty) is an explicitly produced family.
+    pub declaration_visibilities: Option<Vec<SourceDeclarationVisibilityFact>>,
+    pub java: Option<crate::analyzer::java_facts::JavaSourceFacts>,
+    pub imports: Vec<SourceImportFact>,
+    pub generic_imports: Vec<SourceImportId>,
+    pub source_declaration_units: Vec<(SourceDeclarationId, CodeUnit)>,
+    pub source_declaration_metadata: Vec<SourceDeclarationMetadataLink>,
+}
+
+/// One validated native inventory and its source authority. The constructor
+/// checks crosswalks once; read-only access keeps the coupled rows coherent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedNativeSource {
+    resolution: FileResolutionFacts,
+    source: ParsedSourceFacts,
+}
+
+impl ParsedNativeSource {
+    pub fn new(
+        resolution: FileResolutionFacts,
+        source: ParsedSourceFacts,
+        parsed: &ParsedFile,
+    ) -> Self {
+        let rows = &source.occurrences;
+        for occurrence in rows.occurrences() {
+            assert!(
+                occurrence.range.end_byte <= source.source_bytes,
+                "source occurrence exceeds input extent"
+            );
+        }
+        assert_eq!(
+            resolution.sites.len(),
+            source.native_site_occurrences.len(),
+            "native sites require an exact source crosswalk"
+        );
+        for (ordinal, site) in resolution.sites.iter().enumerate() {
+            assert_eq!(site.id.index(), ordinal, "native site ids must be dense");
+            let range = rows
+                .occurrence(source.native_site_occurrences[ordinal])
+                .range;
+            assert_eq!(
+                (site.start_byte, site.end_byte),
+                (range.start_byte, range.end_byte),
+                "native site differs from canonical source occurrence"
+            );
+        }
+        for &(site, declaration) in &source.native_declaration_sources {
+            assert!(site.index() < resolution.sites.len());
+            assert_eq!(
+                rows.declaration(declaration)
+                    .name
+                    .expect("native declaration must have a source name"),
+                source.native_site_occurrences[site.index()],
+                "native declaration site must be its exact source name occurrence"
+            );
+        }
+        for (declaration, unit) in &source.source_declaration_units {
+            rows.declaration(*declaration);
+            assert!(
+                parsed.declarations.contains(unit),
+                "source link references an absent CodeUnit"
+            );
+        }
+        let unit_links = source
+            .source_declaration_units
+            .iter()
+            .map(|(declaration, unit)| (*declaration, unit))
+            .collect::<HashSet<_>>();
+        for link in &source.source_declaration_metadata {
+            rows.declaration(link.declaration);
+            assert!(
+                unit_links.contains(&(link.declaration, &link.unit)),
+                "metadata requires the exact source-to-unit link"
+            );
+            assert!(
+                parsed
+                    .signature_metadata
+                    .get(&link.unit)
+                    .and_then(|metadata| metadata.get(link.metadata_ordinal))
+                    .is_some(),
+                "metadata ordinal references an absent row"
+            );
+        }
+        if let Some(visibilities) = &source.declaration_visibilities {
+            let mut seen = HashSet::default();
+            for fact in visibilities {
+                rows.declaration(fact.declaration);
+                assert!(
+                    seen.insert(fact.declaration),
+                    "source declaration visibility is unique"
+                );
+            }
+        }
+        if let Some(java) = &source.java {
+            assert!(java.valid_links(rows), "invalid Java source link");
+        }
+        for (id, node) in source.structural.nodes().iter().enumerate() {
+            rows.occurrence(node.occurrence);
+            if let Some(name) = node.name {
+                rows.occurrence(name);
+            }
+            assert!(node.parent.is_none_or(|parent| (parent as usize) < id));
+            assert!(
+                (node.subtree_end as usize) > id
+                    && (node.subtree_end as usize) <= source.structural.nodes().len()
+            );
+            for role in source
+                .structural
+                .roles(u32::try_from(id).expect("structural id"))
+            {
+                rows.occurrence(role.occurrence);
+                if let Some(name) = role.name {
+                    rows.occurrence(name);
+                }
+                if let Some(keyword) = role.keyword {
+                    rows.occurrence(keyword);
+                }
+                assert!(
+                    role.node
+                        .is_none_or(|target| (target as usize) < source.structural.nodes().len())
+                );
+            }
+        }
+        for import in &source.imports {
+            rows.occurrence(import.declaration);
+            if let Some(target) = import.target {
+                rows.occurrence(target);
+            }
+            if let Some(alias) = import.alias_occurrence {
+                rows.occurrence(alias);
+            }
+            if let Some(path) = &import.path {
+                for &scope in &path.lexical_scopes {
+                    rows.occurrence(scope);
+                }
+            }
+        }
+        for import in &source.generic_imports {
+            assert!(import.index() < source.imports.len());
+        }
+        assert_eq!(
+            parsed.imports,
+            source
+                .generic_imports
+                .iter()
+                .map(|id| source.imports[id.index()].import_info(rows))
+                .collect::<Vec<_>>(),
+            "generic imports must match their canonical source projections"
+        );
+        Self { resolution, source }
+    }
+
+    pub fn resolution_facts(&self) -> &FileResolutionFacts {
+        &self.resolution
+    }
+    pub fn source_facts(&self) -> &ParsedSourceFacts {
+        &self.source
+    }
+    pub fn into_parts(self) -> (FileResolutionFacts, ParsedSourceFacts) {
+        (self.resolution, self.source)
+    }
 }
 
 #[cfg(test)]

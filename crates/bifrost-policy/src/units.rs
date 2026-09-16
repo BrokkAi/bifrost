@@ -1339,6 +1339,9 @@ pub enum WidenReason {
     WholePolicyFamily,
     /// The plan's rows are not the concatenation of its per-seed rows.
     PlanCrossesSeeds,
+    /// The plan needs workspace-wide preparation that is not safely shared
+    /// across independent seed units. Evaluate it once before attempting units.
+    WorkspacePreparationRequired,
     /// A unit performed reads the ledger could not name.
     UnitUnbounded,
     /// A unit's own execution was truncated or ran under a bounded budget.
@@ -1371,6 +1374,7 @@ impl WidenReason {
         match self {
             Self::WholePolicyFamily => "whole_policy_family",
             Self::PlanCrossesSeeds => "plan_crosses_seeds",
+            Self::WorkspacePreparationRequired => "workspace_preparation_required",
             Self::UnitUnbounded => "unit_unbounded",
             Self::UnitNotExhaustive => "unit_not_exhaustive",
             Self::UnitDiagnostics => "unit_diagnostics",

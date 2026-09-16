@@ -17,12 +17,13 @@ use crate::{
     FindingSeverity, OrganizationalRiskAssessment, POLICY_EXIT_CLEAN, POLICY_EXIT_FINDING,
     POLICY_EXIT_UNRELIABLE, PolicyAnalysisType, PolicyBaselineReview, PolicyBatchOutcome,
     PolicyDiagnostic, PolicyDiagnosticSeverity, PolicyDiffReview, PolicyDisplayRegion,
-    PolicyEvaluationDate, PolicyFinding, PolicyFindingBaseline, PolicyFindingEvidence,
-    PolicyFindingSuppression, PolicyLevel, PolicyObligationKind, PolicyPackActivationReview,
-    PolicyReportDiagnostic, PolicyReportDiagnosticCode, PolicyReportDocument,
-    PolicyReportEvaluationContext, PolicyRuleDescriptor, PolicyRun, PolicyRunCompletion,
-    PolicySemanticHash, PolicySeveritySpec, PolicySourceLocation, PolicySuppressionPolicyHashState,
-    PolicySuppressionReview, PolicyWorkReport, ProofMetadata, RelatedPolicyLocation,
+    PolicyEvaluationDate, PolicyExecutionMetadata, PolicyFinding, PolicyFindingBaseline,
+    PolicyFindingEvidence, PolicyFindingSuppression, PolicyIncrementalReview, PolicyLevel,
+    PolicyObligationKind, PolicyPackActivationReview, PolicyReportDiagnostic,
+    PolicyReportDiagnosticCode, PolicyReportDocument, PolicyReportEvaluationContext,
+    PolicyRuleDescriptor, PolicyRun, PolicyRunCompletion, PolicySemanticHash, PolicySeveritySpec,
+    PolicySourceLocation, PolicySuppressionPolicyHashState, PolicySuppressionReview,
+    PolicyWorkReport, ProofMetadata, RelatedPolicyLocation,
 };
 
 const SARIF_SCHEMA_URI: &str =
@@ -1113,6 +1114,13 @@ impl SarifObligationSummary {
 
 #[derive(Serialize)]
 struct SarifRunProperties<'a> {
+    #[serde(rename = "bifrost.execution")]
+    execution: &'a PolicyExecutionMetadata,
+    #[serde(
+        rename = "bifrost.incremental",
+        skip_serializing_if = "Option::is_none"
+    )]
+    incremental: Option<&'a PolicyIncrementalReview>,
     #[serde(rename = "bifrost.policyReportSchemaVersion")]
     schema_version: u32,
     #[serde(rename = "bifrost.policyEvaluation")]
@@ -1149,6 +1157,8 @@ struct SarifRunProperties<'a> {
 impl<'a> SarifRunProperties<'a> {
     fn from_report(report: &'a PolicyReportDocument) -> Self {
         Self {
+            execution: report.execution(),
+            incremental: report.incremental(),
             schema_version: report.schema_version(),
             evaluation: report.evaluation(),
             policy_runs: SarifPolicyRuns(report.runs()),

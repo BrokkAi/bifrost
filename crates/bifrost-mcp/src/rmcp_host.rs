@@ -17,10 +17,10 @@ use crate::mcp_common::{
     AGENTS_GUIDANCE_MIME_TYPE, AGENTS_GUIDANCE_TEXT, AGENTS_GUIDANCE_URI,
     BENCHMARK_PROFILE_BOUNDARY_MARKER, BENCHMARK_PROFILE_BOUNDARY_METHOD, CODEX_MCP_CLIENT_NAME,
     CODEX_SANDBOX_STATE_META_CAPABILITY, MCP_DISCOVERY_TEXT_MAX_CHARS, MCP_FILE_WATCHER_ENV,
-    McpRenderOptions, McpServerSpec, UNBOUND_WORKSPACE_MESSAGE, analyzer_stop_deadline,
-    attach_run_policy_correlation, attach_run_policy_correlation_result, client_root_to_path,
-    file_uri_to_path, file_watching_enabled, fit_get_summaries_output_to_budget,
-    mcp_analyzer_request_budget, mcp_request_deadline, request_correlation_id, serial_tool_request,
+    McpRenderOptions, McpServerSpec, RequestBudget, UNBOUND_WORKSPACE_MESSAGE,
+    analyzer_stop_deadline, attach_run_policy_correlation, attach_run_policy_correlation_result,
+    client_root_to_path, file_uri_to_path, file_watching_enabled,
+    fit_get_summaries_output_to_budget, request_correlation_id, serial_tool_request,
 };
 use crate::ordered_transport::{
     OutboundResponseTimings, ResponseTimingTransport, RootsOrderedTransport, RootsRevocations,
@@ -1334,7 +1334,7 @@ impl BifrostMcpHandler {
         arguments: Value,
         suppression_preflight: Option<PreparedRunPolicyPreflight>,
         workspace_scope: Option<WorkspaceRequestScope>,
-        deadline: Option<Instant>,
+        request_budget: Option<RequestBudget>,
         request_correlation_id: Option<String>,
         mcp_cancellation: McpCancellationToken,
         permit: AnalyzerPermit,
@@ -1352,9 +1352,10 @@ impl BifrostMcpHandler {
         // answers with the typed budget error when the work cannot stop. The
         // reserve is measured from now, so readiness and admission wait already
         // spent are never handed back as grace.
-        let bifrost_cancellation = match deadline {
-            Some(deadline) => crate::CancellationToken::default()
-                .with_deadline(analyzer_stop_deadline(&name, Instant::now(), deadline)),
+        let bifrost_cancellation = match request_budget {
+            Some(request_budget) => crate::CancellationToken::default().with_deadline(
+                analyzer_stop_deadline(&name, Instant::now(), request_budget.deadline()),
+            ),
             None => crate::CancellationToken::default(),
         };
         // How the analyzer's phases reach the client while the call is still
@@ -1471,10 +1472,11 @@ impl BifrostMcpHandler {
                     ErrorData::internal_error(format!("MCP tool execution panicked: {error}"), None)
                 })?,
                 () = async {
-                    match deadline {
-                        Some(deadline) => {
-                            tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await
-                        }
+                    match request_budget {
+                        Some(request_budget) => tokio::time::sleep_until(
+                            tokio::time::Instant::from_std(request_budget.deadline()),
+                        )
+                        .await,
                         None => std::future::pending().await,
                     }
                 } => {
@@ -1486,11 +1488,12 @@ impl BifrostMcpHandler {
                     if let Some(progress) = progress {
                         progress.phase(format!("cancelling {name}")).await;
                     }
-                    let budget = mcp_analyzer_request_budget()
-                        .or_else(|| {
-                            crate::mcp_common::fallback_request_budget(&name, cold_workspace)
-                        })
-                        .expect("the deadline fired, so a configured or fallback budget applied");
+                    // The budget this request was accepted under, not a second
+                    // reading of the configured knob: since #3279 an execution
+                    // timer can fire on a fallback rung alone (#3396).
+                    let budget = request_budget
+                        .expect("the deadline fired, so the request had a budget")
+                        .budget();
                     let phase = bifrost_cancellation.phase().expect(
                         "the request entered its execution phase before the budget could fire",
                     );
@@ -1644,6 +1647,67 @@ enum PreparedToolCall {
         workspace_scope: Option<WorkspaceRequestScope>,
     },
     Reply(CallToolResult),
+}
+
+/// Take one analyzer slot, bounded by the request's own budget.
+///
+/// `request_budget` is the exact value that produced the request's deadline,
+/// so the timeout arm names the budget that expired rather than reading the
+/// configured knob a second time. Since #3279 that budget can be a fallback
+/// rung with nothing configured, and #3396 is the panic that followed from
+/// asking the configured knob alone.
+async fn await_analyzer_admission(
+    pool: &AnalyzerExecutionPool,
+    request_budget: Option<RequestBudget>,
+    name: &str,
+    cancelled: &McpCancellationToken,
+) -> Result<AnalyzerPermit, ErrorData> {
+    let admission = match request_budget {
+        Some(request_budget) => {
+            tokio::time::timeout(
+                request_budget
+                    .deadline()
+                    .saturating_duration_since(Instant::now()),
+                pool.acquire(cancelled),
+            )
+            .await
+        }
+        None => Ok(pool.acquire(cancelled).await),
+    };
+    match admission {
+        Ok(Admission::Granted(permit)) => Ok(permit),
+        Ok(Admission::Cancelled) => Err(ErrorData::internal_error(
+            "the tool call was cancelled while waiting for analyzer capacity",
+            None,
+        )),
+        Ok(Admission::Saturated) => {
+            eprintln!(
+                "bifrost: refusing {name}; more than {} analyzer requests are already queued",
+                MAX_QUEUED_ANALYZER_REQUESTS
+            );
+            Err(ErrorData::internal_error(
+                format!(
+                    "too many analyzer requests are queued; retry {name} once earlier calls complete"
+                ),
+                None,
+            ))
+        }
+        Err(_elapsed) => {
+            // Only the budgeted arm above can produce an elapsed timeout, and
+            // this is that same value, so the diagnostic always names the
+            // budget that bounded the wait.
+            let request_budget = request_budget
+                .expect("an admission wait is timed out only when the request had a budget");
+            eprintln!(
+                "bifrost: {name} exhausted its {:?} budget waiting for analyzer capacity",
+                request_budget.budget()
+            );
+            Err(ErrorData::internal_error(
+                format!("{name} timed out waiting for analyzer capacity"),
+                None,
+            ))
+        }
+    }
 }
 
 /// The operation behind one durable task: the synchronous execution path's
@@ -2320,7 +2384,13 @@ impl ServerHandler for BifrostMcpHandler {
         let accepted_at = Instant::now();
         let cold_workspace = service.workspace_build_pending();
         let mut workspace_readiness_wait = Duration::ZERO;
-        let deadline = mcp_request_deadline(accepted_at, &name, cold_workspace);
+        // Resolved once for the whole request: the readiness wait, the
+        // admission wait, and the execution timer all run under the same
+        // budget, and each timeout names the budget that actually expired
+        // (#3396). Since #3279 that budget can be a fallback rung with no
+        // `BIFROST_MCP_REQUEST_BUDGET_SECS` set.
+        let request_budget = RequestBudget::resolve(&name, cold_workspace, accepted_at);
+        let deadline = request_budget.map(|request_budget| request_budget.deadline());
         if !serial {
             if let Some(progress) = &progress {
                 progress.phase("waiting for workspace readiness").await;
@@ -2350,56 +2420,16 @@ impl ServerHandler for BifrostMcpHandler {
         // `mcp_fairness` p95 gate in benchmark/interactive-latency.toml is
         // written against what the client experiences.
         let admission_started_at = Instant::now();
-        let admission = if serial {
-            Ok(Admission::Granted(AnalyzerPermit::exempt()))
+        let permit = if serial {
+            AnalyzerPermit::exempt()
         } else {
             if let Some(progress) = &progress {
                 progress.phase("waiting for analyzer admission").await;
             }
-            match deadline {
-                Some(deadline) => {
-                    tokio::time::timeout(
-                        deadline.saturating_duration_since(Instant::now()),
-                        self.analyzer_pool.acquire(&context.ct),
-                    )
-                    .await
-                }
-                None => Ok(self.analyzer_pool.acquire(&context.ct).await),
-            }
+            await_analyzer_admission(&self.analyzer_pool, request_budget, &name, &context.ct)
+                .await?
         };
         let analyzer_admission_wait = admission_started_at.elapsed();
-        let permit = match admission {
-            Ok(Admission::Granted(permit)) => permit,
-            Ok(Admission::Cancelled) => {
-                return Err(ErrorData::internal_error(
-                    "the tool call was cancelled while waiting for analyzer capacity",
-                    None,
-                ));
-            }
-            Ok(Admission::Saturated) => {
-                eprintln!(
-                    "bifrost: refusing {name}; more than {} analyzer requests are already queued",
-                    crate::analyzer_pool::MAX_QUEUED_ANALYZER_REQUESTS
-                );
-                return Err(ErrorData::internal_error(
-                    format!(
-                        "too many analyzer requests are queued; retry {name} once earlier calls complete"
-                    ),
-                    None,
-                ));
-            }
-            Err(_elapsed) => {
-                let budget = mcp_analyzer_request_budget()
-                    .expect("admission can only time out when a budget is configured");
-                eprintln!(
-                    "bifrost: {name} exhausted its {budget:?} budget waiting for analyzer capacity"
-                );
-                return Err(ErrorData::internal_error(
-                    format!("{name} timed out waiting for analyzer capacity"),
-                    None,
-                ));
-            }
-        };
         let queue_wait = accepted_at.elapsed();
         profiling::duration(
             transport_phase_label("workspace_readiness_wait", &name, correlation_id.as_deref()),
@@ -2446,7 +2476,7 @@ impl ServerHandler for BifrostMcpHandler {
                 arguments,
                 run_policy_preflight,
                 workspace_scope,
-                deadline,
+                request_budget,
                 correlation_id.clone(),
                 context.ct.clone(),
                 permit,
@@ -2864,21 +2894,114 @@ mod cold_workspace_deadline_tests {
         // before the build finishes), but the wait is bounded by the default
         // interactive budget instead of running forever (#3279).
         let accepted_at = Instant::now();
-        let deadline = mcp_request_deadline(accepted_at, "search_symbols", true)
+        let discovery = RequestBudget::with_configured(None, "search_symbols", true, accepted_at)
             .expect("cold discovery must still be bounded");
         assert_eq!(
-            deadline.duration_since(accepted_at),
-            crate::mcp_common::DEFAULT_INTERACTIVE_REQUEST_BUDGET
+            discovery.deadline(),
+            accepted_at + crate::mcp_common::DEFAULT_INTERACTIVE_REQUEST_BUDGET
         );
         assert_eq!(
-            mcp_request_deadline(accepted_at, "scan_usages_by_location", true)
-                .expect("cold non-discovery reads stay bounded"),
+            RequestBudget::with_configured(None, "scan_usages_by_location", true, accepted_at)
+                .expect("cold non-discovery reads stay bounded")
+                .deadline(),
             accepted_at + crate::mcp_common::COLD_WORKSPACE_REQUEST_BUDGET
         );
         assert_eq!(
-            mcp_request_deadline(accepted_at, "search_symbols", false)
-                .expect("warm discovery is bounded by the default budget"),
+            RequestBudget::with_configured(None, "search_symbols", false, accepted_at)
+                .expect("warm discovery is bounded by the default budget")
+                .deadline(),
             accepted_at + crate::mcp_common::DEFAULT_INTERACTIVE_REQUEST_BUDGET
+        );
+    }
+}
+
+/// Issue #3396: an analyzer-admission timeout answers with the typed error
+/// whatever budget bounded the wait.
+///
+/// Since #3279 a request can be bounded by the fallback ladder with no
+/// `BIFROST_MCP_REQUEST_BUDGET_SECS` set -- 60 s interactive, 4.5 s cold
+/// non-discovery, 240 s for a synchronous `run_policy`. The timeout arm used
+/// to re-read the configured knob and `expect` it, so exactly those waits
+/// panicked the server instead of answering "timed out waiting for analyzer
+/// capacity".
+#[cfg(test)]
+mod analyzer_admission_budget_tests {
+    use super::*;
+    use crate::mcp_common::{
+        COLD_WORKSPACE_REQUEST_BUDGET, DEFAULT_INTERACTIVE_REQUEST_BUDGET,
+        DEFAULT_POLICY_REQUEST_BUDGET,
+    };
+
+    /// A request that has already spent its budget by the time admission
+    /// starts -- the readiness wait is bounded by the same deadline -- against
+    /// a pool whose only slot is taken. The timeout then fires immediately, so
+    /// this costs no wall-clock wait.
+    #[tokio::test]
+    async fn a_fallback_budget_admission_timeout_returns_the_typed_error() {
+        let pool = AnalyzerExecutionPool::new(1, 1);
+        let cancelled = McpCancellationToken::new();
+        let _held = match pool.acquire(&cancelled).await {
+            Admission::Granted(permit) => permit,
+            Admission::Cancelled => panic!("an uncancelled pool must not cancel admission"),
+            Admission::Saturated => panic!("the first acquire must take the free slot"),
+        };
+
+        for (tool_name, cold_workspace, fallback) in [
+            ("get_summaries", true, COLD_WORKSPACE_REQUEST_BUDGET),
+            ("search_symbols", false, DEFAULT_INTERACTIVE_REQUEST_BUDGET),
+            ("run_policy", false, DEFAULT_POLICY_REQUEST_BUDGET),
+        ] {
+            // No configured budget: only the fallback rung can bound this
+            // request, which is the shape the issue's panic came from.
+            let accepted_at = Instant::now() - fallback;
+            let request_budget =
+                RequestBudget::with_configured(None, tool_name, cold_workspace, accepted_at)
+                    .unwrap_or_else(|| {
+                        panic!("{tool_name} (cold={cold_workspace}) has a fallback budget")
+                    });
+            assert_eq!(request_budget.budget(), fallback);
+
+            let Err(error) =
+                await_analyzer_admission(&pool, Some(request_budget), tool_name, &cancelled).await
+            else {
+                panic!("a saturated pool must not grant admission");
+            };
+            let wire = serde_json::to_value(error).expect("errors serialize");
+            assert_eq!(wire["code"], -32603, "{tool_name}");
+            assert_eq!(
+                wire["message"],
+                format!("{tool_name} timed out waiting for analyzer capacity")
+            );
+        }
+    }
+
+    /// The unbounded arm carries no timer, so it still ends only in a permit,
+    /// a cancellation, or saturation. The ladder leaves the serial
+    /// workspace-mutating tools unbounded -- named mode still sends them
+    /// through admission -- and a timer here would cut such a mutation short
+    /// on a budget nobody set.
+    #[tokio::test]
+    async fn an_unbounded_admission_wait_keeps_waiting() {
+        assert_eq!(
+            RequestBudget::with_configured(None, "refresh", false, Instant::now()),
+            None,
+            "a serial workspace-mutating tool has no fallback rung to bound it"
+        );
+        let pool = AnalyzerExecutionPool::new(1, 1);
+        let cancelled = McpCancellationToken::new();
+        let _held = match pool.acquire(&cancelled).await {
+            Admission::Granted(permit) => permit,
+            Admission::Cancelled => panic!("an uncancelled pool must not cancel admission"),
+            Admission::Saturated => panic!("the first acquire must take the free slot"),
+        };
+        cancelled.cancel();
+
+        let Err(error) = await_analyzer_admission(&pool, None, "refresh", &cancelled).await else {
+            panic!("a cancelled unbounded wait must refuse, not time out");
+        };
+        assert_eq!(
+            serde_json::to_value(error).expect("errors serialize")["message"],
+            "the tool call was cancelled while waiting for analyzer capacity"
         );
     }
 }

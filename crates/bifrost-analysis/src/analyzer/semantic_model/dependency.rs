@@ -3,6 +3,7 @@ use std::sync::{OnceLock, RwLock};
 use std::time::Duration;
 
 use crate::CancellationToken;
+use crate::analyzer::DependencyPackEcosystem;
 use crate::analyzer::canonical_hash::{CanonicalHasher, lower_hex_string};
 use crate::analyzer::topology::DependencyScope;
 use crate::hash::{HashSet, set_with_capacity};
@@ -1630,6 +1631,148 @@ pub fn prepare_compatible_installed_semantic_packs(
         complete,
         cancelled,
         profile,
+    }
+}
+
+/// One dependency whose exact pack the installed-pack stage could not settle
+/// from the catalog: acquisition (fetch, verification, extraction, or
+/// generation from a local toolchain) remains for the full activation stage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingDependencyPackAcquisition {
+    pub ecosystem: DependencyPackEcosystem,
+    pub dependency_id: String,
+}
+
+/// The installed-pack stage's per-ecosystem result: the preparation outcome
+/// over the packs already installed in the catalog, plus the identities of the
+/// dependencies that still need the full activation stage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstalledDependencyPackPreparation {
+    pub outcome: DependencyPackPreparationOutcome,
+    pub pending: Vec<String>,
+}
+
+/// The installed-pack stage of dependency preparation: resolve every
+/// dependency against the packs already installed in this catalog without
+/// reading dependency artifacts and without fetching, verifying, extracting,
+/// or generating anything (issue #3401, the #3372 family).
+///
+/// A dependency the adapter cannot produce -- one that carries no artifact, or
+/// one the adapter refuses -- resolves through the same local installed-pack
+/// check the full stage's declared route runs, so an installed hit there is
+/// final: the full stage would reach the same answer. A producible dependency
+/// is always pending, because the full stage prefers exact production from the
+/// local artifacts; an installed hit still serves the interim answer, but only
+/// under the curated trust rule, so an untrusted local partial cannot decide
+/// an answer the final activation would refuse.
+///
+/// A dependency no installed pack settles is reported in `pending` rather than
+/// diagnosed: nothing about it has failed, its acquisition simply has not run.
+/// Catalog lookup failures are diagnosed and also leave the dependency
+/// pending, so the full stage re-attempts and reports through its own outcome.
+pub fn prepare_installed_dependency_packs(
+    catalog: &SemanticPackCatalog,
+    adapter: &dyn DependencyPackAdapter,
+    dependencies: &[ResolvedDependency],
+    limits: &DependencyPackLimits,
+    cancellation: Option<&CancellationToken>,
+) -> InstalledDependencyPackPreparation {
+    let mut diagnostics = BoundedDependencyDiagnostics::new(limits);
+    let mut installed_packs = Vec::new();
+    let mut evidence = Vec::new();
+    let mut profile = DependencyPackPreparationProfile::default();
+    let mut pending = Vec::new();
+    let mut cancelled = false;
+    let mut failed = false;
+
+    let dependency_limit = dependencies.len().min(limits.max_dependencies);
+    if dependencies.len() > dependency_limit {
+        failed = true;
+        diagnostics.error(
+            "limit.dependencies",
+            None,
+            None,
+            format!(
+                "dependency count exceeds configured limit {}",
+                limits.max_dependencies
+            ),
+        );
+    }
+
+    for dependency in &dependencies[..dependency_limit] {
+        if is_cancelled(cancellation) {
+            cancelled = true;
+            break;
+        }
+        profile.dependencies_considered += 1;
+        if dependency.id.is_empty() {
+            failed = true;
+            diagnostics.error(
+                "dependency.identity",
+                None,
+                None,
+                "resolved dependency identity must not be empty",
+            );
+            continue;
+        }
+        let producible = !dependency.artifacts.is_empty() && adapter.can_produce(dependency);
+        let mut settled = false;
+        if producible {
+            match compatible_curated_installed_pack(catalog, dependency) {
+                Ok(Some(installed)) => {
+                    evidence.push(installed.evidence.clone());
+                    installed_packs.push(installed);
+                    profile.installed_packs += 1;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    failed = true;
+                    diagnostics.catalog(Some(&dependency.id), "catalog.lookup", error);
+                }
+            }
+        } else {
+            match compatible_installed_pack(catalog, dependency, &mut diagnostics) {
+                Ok(Some(installed)) => {
+                    settled = true;
+                    evidence.push(installed.evidence.clone());
+                    installed_packs.push(installed);
+                    profile.installed_packs += 1;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    failed = true;
+                    diagnostics.catalog(Some(&dependency.id), "catalog.lookup", error);
+                }
+            }
+        }
+        if producible || !settled {
+            pending.push(dependency.id.clone());
+        }
+    }
+
+    if cancelled {
+        failed = true;
+        diagnostics.error(
+            "preparation.cancelled",
+            None,
+            None,
+            "dependency semantic-pack preparation was cancelled",
+        );
+    }
+    let complete = !failed && !cancelled && pending.is_empty();
+    let (diagnostics, suppressed_diagnostics) = diagnostics.finish();
+    InstalledDependencyPackPreparation {
+        outcome: DependencyPackPreparationOutcome {
+            packs: Vec::new(),
+            installed_packs,
+            evidence,
+            diagnostics,
+            suppressed_diagnostics,
+            complete,
+            cancelled,
+            profile,
+        },
+        pending,
     }
 }
 

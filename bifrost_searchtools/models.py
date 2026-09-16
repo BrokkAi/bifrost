@@ -5646,6 +5646,7 @@ class CodeQueryDiagnosticCode(StrEnum):
     CALL_BINDING_SELECTOR_REJECTED = "call_binding_selector_rejected"
     SEMANTIC_BUDGET_EXHAUSTED = "semantic_budget_exhausted"
     SEMANTIC_PROVIDER_FAILED = "semantic_provider_failed"
+    SEMANTIC_PACK_ACQUISITION_PENDING = "semantic_pack_acquisition_pending"
     UNRESOLVED_PROTOCOL_REFERENCE = "unresolved_protocol_reference"
     TYPESTATE_REGISTRATION_STALE = "typestate_registration_stale"
     TYPESTATE_HANDLE_STALE = "typestate_handle_stale"

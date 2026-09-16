@@ -92,28 +92,63 @@ pub(crate) fn mcp_analyzer_request_budget() -> Option<Duration> {
         .map(Duration::from_secs)
 }
 
-pub(crate) fn mcp_request_deadline(
-    accepted_at: Instant,
-    tool_name: &str,
-    cold_workspace: bool,
-) -> Option<Instant> {
-    mcp_request_deadline_with_budget(
-        accepted_at,
-        tool_name,
-        cold_workspace,
-        mcp_analyzer_request_budget(),
-    )
+/// The budget that bounds one accepted request, and the instant it expires.
+///
+/// The two travel together because every diagnostic about an expired request
+/// has to name the budget that actually applied. Resolving them separately is
+/// what produced #3396: the deadline honored the fallback ladder (#3279) while
+/// the admission timeout re-read only the configured knob, so a timeout the
+/// ladder itself created panicked the server as if no budget had applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RequestBudget {
+    budget: Duration,
+    deadline: Instant,
 }
 
-fn mcp_request_deadline_with_budget(
-    accepted_at: Instant,
-    tool_name: &str,
-    cold_workspace: bool,
-    configured_budget: Option<Duration>,
-) -> Option<Instant> {
-    configured_budget
-        .or_else(|| fallback_request_budget(tool_name, cold_workspace))
-        .map(|budget| accepted_at + budget)
+impl RequestBudget {
+    /// The bound on a request accepted at `accepted_at`: the operator's
+    /// configured `BIFROST_MCP_REQUEST_BUDGET_SECS`, or the fallback rung for
+    /// the tool and workspace state. `None` means the request is unbounded.
+    pub(crate) fn resolve(
+        tool_name: &str,
+        cold_workspace: bool,
+        accepted_at: Instant,
+    ) -> Option<Self> {
+        Self::with_configured(
+            mcp_analyzer_request_budget(),
+            tool_name,
+            cold_workspace,
+            accepted_at,
+        )
+    }
+
+    /// [`Self::resolve`] with the configured knob supplied by the caller, so
+    /// the ladder itself is testable without touching the process environment.
+    pub(crate) fn with_configured(
+        configured_budget: Option<Duration>,
+        tool_name: &str,
+        cold_workspace: bool,
+        accepted_at: Instant,
+    ) -> Option<Self> {
+        configured_budget
+            .or_else(|| fallback_request_budget(tool_name, cold_workspace))
+            .map(|budget| Self {
+                budget,
+                deadline: accepted_at + budget,
+            })
+    }
+
+    /// The budget for diagnostics: the value a timeout names, never a second
+    /// reading of the configured knob.
+    pub(crate) fn budget(&self) -> Duration {
+        self.budget
+    }
+
+    /// The instant the request expires, shared by the readiness wait, the
+    /// admission wait, and the execution timer.
+    pub(crate) fn deadline(&self) -> Instant {
+        self.deadline
+    }
 }
 
 /// The budget a request falls back to when no operator configured one.
@@ -1212,14 +1247,15 @@ mod shared_tests {
             ("run_policy", false),
             ("refresh", true),
         ] {
-            let configured = mcp_request_deadline_with_budget(
-                accepted_at,
+            let configured = RequestBudget::with_configured(
+                Some(configured_budget),
                 tool_name,
                 cold_workspace,
-                Some(configured_budget),
+                accepted_at,
             )
             .unwrap_or_else(|| panic!("{tool_name} should honor a configured budget"));
-            assert_eq!(configured.duration_since(accepted_at), configured_budget);
+            assert_eq!(configured.budget(), configured_budget);
+            assert_eq!(configured.deadline(), accepted_at + configured_budget);
         }
     }
 
@@ -1233,13 +1269,17 @@ mod shared_tests {
             ("scan_usages_by_reference", false),
             ("get_symbol_sources", false),
         ] {
-            let deadline =
-                mcp_request_deadline_with_budget(accepted_at, tool_name, cold_workspace, None)
+            let budget =
+                RequestBudget::with_configured(None, tool_name, cold_workspace, accepted_at)
                     .unwrap_or_else(|| panic!("{tool_name} must be bounded by the default budget"));
             assert_eq!(
-                deadline.duration_since(accepted_at),
+                budget.budget(),
                 DEFAULT_INTERACTIVE_REQUEST_BUDGET,
                 "{tool_name} (cold={cold_workspace})"
+            );
+            assert_eq!(
+                budget.deadline(),
+                accepted_at + DEFAULT_INTERACTIVE_REQUEST_BUDGET
             );
         }
     }
@@ -1248,11 +1288,12 @@ mod shared_tests {
     fn cold_non_discovery_reads_keep_the_fail_fast_budget() {
         let accepted_at = Instant::now();
         for tool_name in ["get_summaries", "scan_usages_by_reference", "usage_graph"] {
-            let deadline = mcp_request_deadline_with_budget(accepted_at, tool_name, true, None)
+            let budget = RequestBudget::with_configured(None, tool_name, true, accepted_at)
                 .unwrap_or_else(|| panic!("{tool_name} must keep its cold fail-fast budget"));
+            assert_eq!(budget.budget(), COLD_WORKSPACE_REQUEST_BUDGET);
             assert_eq!(
-                deadline.duration_since(accepted_at),
-                COLD_WORKSPACE_REQUEST_BUDGET
+                budget.deadline(),
+                accepted_at + COLD_WORKSPACE_REQUEST_BUDGET
             );
         }
     }
@@ -1267,7 +1308,7 @@ mod shared_tests {
             ("get_active_workspace", false),
         ] {
             assert_eq!(
-                mcp_request_deadline_with_budget(accepted_at, tool_name, cold_workspace, None),
+                RequestBudget::with_configured(None, tool_name, cold_workspace, accepted_at),
                 None,
                 "{tool_name} (cold={cold_workspace}) must stay unbounded without a configured budget"
             );
@@ -1281,14 +1322,15 @@ mod shared_tests {
     fn synchronous_policy_runs_get_the_policy_budget() {
         let accepted_at = Instant::now();
         for cold_workspace in [false, true] {
-            let deadline =
-                mcp_request_deadline_with_budget(accepted_at, "run_policy", cold_workspace, None)
+            let budget =
+                RequestBudget::with_configured(None, "run_policy", cold_workspace, accepted_at)
                     .unwrap_or_else(|| {
                         panic!("run_policy (cold={cold_workspace}) must be bounded by default")
                     });
+            assert_eq!(budget.budget(), DEFAULT_POLICY_REQUEST_BUDGET);
             assert_eq!(
-                deadline.duration_since(accepted_at),
-                DEFAULT_POLICY_REQUEST_BUDGET
+                budget.deadline(),
+                accepted_at + DEFAULT_POLICY_REQUEST_BUDGET
             );
         }
         assert!(
@@ -1296,17 +1338,15 @@ mod shared_tests {
             "the fallback must leave room under the client deadline the issue reported"
         );
         // A configured budget still wins, including one below the fallback.
-        let configured = mcp_request_deadline_with_budget(
-            accepted_at,
+        let configured = RequestBudget::with_configured(
+            Some(Duration::from_secs(30)),
             "run_policy",
             false,
-            Some(Duration::from_secs(30)),
+            accepted_at,
         )
         .expect("a configured budget applies to run_policy");
-        assert_eq!(
-            configured.duration_since(accepted_at),
-            Duration::from_secs(30)
-        );
+        assert_eq!(configured.budget(), Duration::from_secs(30));
+        assert_eq!(configured.deadline(), accepted_at + Duration::from_secs(30));
     }
 
     #[test]

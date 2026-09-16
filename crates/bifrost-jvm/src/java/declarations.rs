@@ -1,17 +1,34 @@
 use brokk_bifrost_core::analyzer::fq_name::{
-    FqName, SegmentId, SegmentKind, joined_segments, normalize_joined, segment_interner,
+    FqName, SegmentId, SegmentKind, joined_segments, segment_interner,
 };
+use brokk_bifrost_core::analyzer::java_facts::JavaTypeConstructorShape;
 use brokk_bifrost_core::analyzer::model::{CallableArity, SignatureMetadata};
 use brokk_bifrost_core::analyzer::model::{DeclarationInfo, DeclarationKind};
-use brokk_bifrost_core::analyzer::parsed_file::ParsedFile;
+use brokk_bifrost_core::analyzer::parsed_file::{
+    ParsedFile, ParsedNativeSource, ParsedSourceFacts, SourceDeclarationMetadataLink,
+    SourceImportFact,
+};
+use brokk_bifrost_core::analyzer::source_facts::{
+    PrimarySourceFactCollector, SourceDeclarationId, SourceDeclarationVisibilityFact,
+    SourceImportId,
+};
+use brokk_bifrost_core::analyzer::structural::collector::StructuralFactCollector;
 use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
-use brokk_bifrost_core::analyzer::tree_walk::{WalkControl, walk_named_tree_preorder};
+use brokk_bifrost_core::analyzer::structural::spec::{CompiledKinds, StructuralSpec};
+use brokk_bifrost_core::analyzer::tree_walk::{
+    ParentIndex, TreeWalkAction, WalkControl, walk_named_tree_preorder,
+};
 use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
-use brokk_bifrost_core::hash::HashSet;
+use brokk_bifrost_core::hash::{HashMap, HashSet};
 use tree_sitter::{Node, Parser, Tree};
 
 use crate::java::graph_support::{java_declared_type_parameters, java_type_parameter_name};
-use crate::java::imports::parse_import_info;
+use crate::java::imports::{
+    JavaImportSyntax, JavaPackageSyntax, parse_import_syntax, parse_package_syntax,
+};
+use crate::java::resolution::{JavaResolutionBuilder, JavaResolutionExtraction};
+use crate::java::source_types::is_java_synthetic_class_body;
+use crate::java::structural::{JAVA_KIND_TABLE, JAVA_STRUCTURAL_SPEC};
 
 /// Intern one qualified-name segment in the process-global interner.
 fn java_segment(text: &str, kind: SegmentKind) -> SegmentId {
@@ -23,19 +40,12 @@ const JAVA_PACKAGE_SEPARATOR: &str = ".";
 
 /// Build the structured package-path prefix for a Java declaration.
 ///
-/// `package_name` (from `determine_package_name`) is already the `.`-joined
-/// dotted package (`com.example.pkg`, empty for the unnamed package). Each
-/// component becomes one [`SegmentKind::Package`] segment — mirroring python's
-/// `python_module_fq` (`Package`-`Package` renders `.` by default, which is
-/// exactly this convention; unlike go's `/`-joined import path, java's package
-/// has no `Path` component).
-///
-/// [`joined_segments`] is the split half of the shared empty-component
-/// decision; `determine_package_name` applies [`normalize_joined`], its join
-/// half, to the string it returns. A Java identifier cannot contain a literal
-/// `.`, but a declaration can still be written with a doubled or dangling one
-/// -- intellij-community's inspection fixtures carry `package com..foo;` -- and
-/// the two spellings must not disagree about it (#2375).
+/// `package_name` is the `.`-joined dotted package (`com.example.pkg`, empty
+/// for the unnamed package). Each component becomes one
+/// [`SegmentKind::Package`] segment - mirroring python's `python_module_fq`
+/// (`Package`-`Package` renders `.` by default, which is exactly this
+/// convention; unlike go's `/`-joined import path, java's package has no
+/// `Path` component).
 pub(crate) fn java_package_fq(package_name: &str) -> FqName {
     let mut fq = FqName::new();
     for component in joined_segments(package_name, JAVA_PACKAGE_SEPARATOR) {
@@ -44,32 +54,64 @@ pub(crate) fn java_package_fq(package_name: &str) -> FqName {
     fq
 }
 
-pub fn determine_package_name(root: Node<'_>, source: &str) -> String {
+struct JavaTopLevelPackageSyntaxes<'tree, 'source> {
+    syntaxes: Vec<JavaPackageSyntax<'tree, 'source>>,
+    display_index: Option<usize>,
+}
+
+impl<'tree, 'source> JavaTopLevelPackageSyntaxes<'tree, 'source> {
+    fn display(&self) -> Option<&JavaPackageSyntax<'tree, 'source>> {
+        self.display_index.map(|index| &self.syntaxes[index])
+    }
+}
+
+/// Interpret every top-level package node once for the primary walk. The
+/// display candidate deliberately keeps the historical first-package-before-
+/// class boundary, while the full record list lets native lowering reuse the
+/// same syntax for late package nodes and retain its independent admission
+/// gaps.
+fn collect_top_level_package_syntaxes<'tree, 'source>(
+    root: Node<'tree>,
+    source: &'source str,
+) -> JavaTopLevelPackageSyntaxes<'tree, 'source> {
+    let mut syntaxes = Vec::new();
+    let mut display_index = None;
+    let mut display_prefix = true;
     for index in 0..root.named_child_count() {
         let Some(child) = root.named_child(index) else {
             continue;
         };
-
         if child.kind() == "package_declaration" {
-            let declared = node_text(child, source)
-                .trim()
-                .strip_prefix("package ")
-                .unwrap_or("")
-                .strip_suffix(';')
-                .unwrap_or("")
-                .trim()
-                .to_string();
-            // Share the empty-component decision with `java_package_fq`, which
-            // splits this string back apart (#2375).
-            return normalize_joined(&declared, JAVA_PACKAGE_SEPARATOR).into_owned();
+            let syntax = parse_package_syntax(child, source);
+            if display_prefix && display_index.is_none() {
+                display_index = Some(syntaxes.len());
+            }
+            syntaxes.push(syntax);
         }
-
         if is_class_like_declaration_kind(child.kind()) {
-            break;
+            display_prefix = false;
         }
     }
+    JavaTopLevelPackageSyntaxes {
+        syntaxes,
+        display_index,
+    }
+}
 
-    String::new()
+fn package_name_from_syntax(syntax: Option<&JavaPackageSyntax<'_, '_>>) -> String {
+    let Some(segments) = syntax.and_then(|syntax| syntax.segments.as_ref()) else {
+        return String::new();
+    };
+    segments
+        .iter()
+        .map(|(_, spelling)| *spelling)
+        .collect::<Vec<_>>()
+        .join(JAVA_PACKAGE_SEPARATOR)
+}
+
+pub fn determine_package_name(root: Node<'_>, source: &str) -> String {
+    let packages = collect_top_level_package_syntaxes(root, source);
+    package_name_from_syntax(packages.display())
 }
 
 fn strip_generic_type_arguments(input: &str) -> String {
@@ -232,7 +274,7 @@ fn looks_like_java_method_name(name: &str) -> bool {
     first.is_ascii_lowercase() && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
 }
 
-fn looks_like_pascal_identifier(name: &str) -> bool {
+pub(super) fn looks_like_pascal_identifier(name: &str) -> bool {
     let mut chars = name.chars();
     let Some(first) = chars.next() else {
         return false;
@@ -265,254 +307,59 @@ pub fn collect_type_identifiers(node: Node<'_>, source: &str, identifiers: &mut 
     });
 }
 
-/// The `type_identifiers` fact family persisted for one Java blob: every name
-/// the file spells that could bind a type declared in another workspace file.
-///
-/// Two readings share this one set, so it must be a superset of both. The
-/// reverse-reference prefilter needs written type names and qualified type
-/// paths (`java.util.List`). The file dependency graph's same-package tier
-/// needs the terminal names Java binds implicitly, and a class used as a
-/// static or value qualifier (`Owner.INSTANCE`) spells `Owner` as a plain
-/// `identifier`, not a `type_identifier` -- so capitalized identifiers are
-/// retained as structured type-like evidence too.
-///
-/// Both readings are conservative: an extra name costs a candidate that a
-/// later exact check discards, while a missing name silently loses an edge.
-///
-/// A declaration's own name is excluded. It is a definition, not a reference,
-/// and the same-package reading has no later check that would discard it: a
-/// file that recorded the classes it declares would report itself as one of
-/// its own referencing files.
-fn collect_persisted_type_identifiers(
-    node: Node<'_>,
-    source: &str,
-    identifiers: &mut HashSet<String>,
-) {
-    walk_named_tree_preorder(node, true, |node| {
-        let text = node_text(node, source).trim();
-        if !text.is_empty()
-            && (matches!(node.kind(), "type_identifier" | "scoped_type_identifier")
-                || (node.kind() == "identifier"
-                    && looks_like_pascal_identifier(text)
-                    && !is_declared_name(node)))
-        {
-            identifiers.insert(text.to_string());
-        }
-        WalkControl::Continue
-    });
-}
-
 /// Whether `node` is the `name` field of the declaration that encloses it.
-fn is_declared_name(node: Node<'_>) -> bool {
+pub(super) fn is_declared_name(node: Node<'_>) -> bool {
     node.parent()
         .and_then(|parent| parent.child_by_field_name("name"))
         == Some(node)
 }
 
-/// One class-like scope waiting on the extraction stack.
-///
-/// A written declaration and an anonymous `new Base(...) { ... }` body differ
-/// only in where their name, header, and supertype come from. Everything after
-/// that -- members, nested types, signature metadata -- is the same walk, so
-/// both ride the one explicit stack rather than a second traversal (#2045).
-enum JavaClassScope<'tree> {
-    Declared(Node<'tree>),
-    Anonymous {
-        creation: Node<'tree>,
-        body: Node<'tree>,
-    },
-    EnumConstantBody {
-        constant: Node<'tree>,
-        body: Node<'tree>,
-    },
+/// Facts needed to publish one class-like scope, whichever form introduced it.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct JavaTypeShape {
+    pub(super) is_static: bool,
+    pub(super) constructor_shape: Option<JavaTypeConstructorShape>,
 }
 
-/// A pending scope together with the owner it hangs off and the file's
-/// top-level owner: `(scope, parent, top level)`.
-type PendingClassScope<'tree> = (JavaClassScope<'tree>, Option<CodeUnit>, Option<CodeUnit>);
+#[derive(Debug, Clone, Copy)]
+pub(super) struct JavaFieldShape {
+    pub(super) is_static: bool,
+    pub(super) is_final: bool,
+}
 
-/// What the extraction loop needs from one class-like scope, whichever form
-/// introduced it.
+#[derive(Debug, Clone)]
+pub(super) struct JavaCallableShape {
+    properties: JavaCallableProperties,
+    parameter_repetition: HashMap<usize, bool>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct JavaCallableProperties {
+    pub(super) is_static: bool,
+    pub(super) is_constructor: bool,
+    pub(super) arity: CallableArity,
+}
+
+impl JavaCallableShape {
+    pub(super) fn properties(&self) -> JavaCallableProperties {
+        self.properties
+    }
+
+    pub(super) fn repeated_for(&self, node_id: usize) -> Option<bool> {
+        self.parameter_repetition.get(&node_id).copied()
+    }
+}
+
 struct JavaClassScopeFacts<'tree> {
     unit: CodeUnit,
     /// The node whose range anchors the declaration. The loop also reads its
     /// kind: only a `record_declaration` has components and a compact
     /// constructor.
     anchor: Node<'tree>,
-    body: Option<Node<'tree>>,
     raw_supertypes: Vec<String>,
     signature: String,
     is_interface: bool,
     is_static: bool,
-}
-
-pub fn visit_class_like<'tree>(
-    file: &ProjectFile,
-    source: &str,
-    node: Node<'tree>,
-    package_name: &str,
-    parent: Option<&CodeUnit>,
-    top_level_owner: Option<&CodeUnit>,
-    parsed: &mut brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
-) -> Option<CodeUnit> {
-    let mut first = None;
-    let mut stack: Vec<PendingClassScope<'tree>> = vec![(
-        JavaClassScope::Declared(node),
-        parent.cloned(),
-        top_level_owner.cloned(),
-    )];
-    while let Some((scope, parent, top_level_owner)) = stack.pop() {
-        let facts = match scope {
-            JavaClassScope::Declared(node) => {
-                let Some(facts) =
-                    declared_class_scope(file, source, node, package_name, parent.as_ref())
-                else {
-                    continue;
-                };
-                facts
-            }
-            JavaClassScope::Anonymous { creation, body } => {
-                let owner = parent.as_ref().expect(
-                    "an anonymous class body is always written inside an enclosing declaration",
-                );
-                anonymous_class_scope(file, source, creation, body, package_name, owner)
-            }
-            JavaClassScope::EnumConstantBody { constant, body } => {
-                let owner = parent
-                    .as_ref()
-                    .expect("an enum-constant-specific body is always owned by its declaring enum");
-                enum_constant_class_scope(file, source, constant, body, package_name, owner)
-            }
-        };
-
-        let code_unit = facts.unit;
-        if first.is_none() {
-            first = Some(code_unit.clone());
-        }
-
-        let top_level = top_level_owner.unwrap_or_else(|| code_unit.clone());
-        parsed.add_code_unit(
-            code_unit.clone(),
-            facts.anchor,
-            source,
-            parent.clone(),
-            Some(top_level.clone()),
-        );
-        parsed.set_raw_supertypes(code_unit.clone(), facts.raw_supertypes);
-        // The declaration node's own kind is what separates an interface from a
-        // class; recording it here is what lets a family edge state `implements`
-        // rather than `overrides` without re-reading the owner's source. A Java
-        // annotation type is an interface -- `@interface Marker` declares
-        // `interface Marker extends java.lang.annotation.Annotation` -- so a
-        // class that names one in its `implements` clause implements it.
-        parsed.add_signature_with_metadata(
-            code_unit.clone(),
-            SignatureMetadata::new(facts.signature, Vec::new())
-                .with_class_like_interface(facts.is_interface)
-                .with_class_like_static(facts.is_static)
-                // The arity of the written parameter list, so a class that
-                // writes none is a recorded zero rather than an unread list.
-                // An anonymous body and an enum-constant body write no list at
-                // all, which is the same recorded zero.
-                .with_recorded_type_parameters(
-                    java_declared_type_parameters(facts.anchor)
-                        .into_iter()
-                        .filter_map(|parameter| java_type_parameter_name(parameter, source))
-                        .map(str::to_string)
-                        .collect(),
-                ),
-        );
-
-        if facts.anchor.kind() == "record_declaration" {
-            visit_record_components(
-                file,
-                source,
-                facts.anchor,
-                package_name,
-                &code_unit,
-                &top_level,
-                parsed,
-            );
-        }
-
-        let Some(body) = facts.body else {
-            continue;
-        };
-        for child in class_like_body_children_rev(body) {
-            match child.kind() {
-                kind if is_class_like_declaration_kind(kind) => {
-                    stack.push((
-                        JavaClassScope::Declared(child),
-                        Some(code_unit.clone()),
-                        Some(top_level.clone()),
-                    ));
-                }
-                "method_declaration" | "constructor_declaration" => {
-                    visit_callable(
-                        file,
-                        source,
-                        child,
-                        package_name,
-                        &code_unit,
-                        &top_level,
-                        parsed,
-                        &mut stack,
-                    );
-                }
-                "compact_constructor_declaration"
-                    if facts.anchor.kind() == "record_declaration" =>
-                {
-                    visit_compact_constructor(
-                        file,
-                        source,
-                        child,
-                        facts.anchor,
-                        package_name,
-                        &code_unit,
-                        &top_level,
-                        parsed,
-                        &mut stack,
-                    );
-                }
-                "field_declaration" | "constant_declaration" => {
-                    visit_field_declaration(
-                        file,
-                        source,
-                        child,
-                        package_name,
-                        &code_unit,
-                        &top_level,
-                        parsed,
-                        &mut stack,
-                    );
-                }
-                "enum_constant" => {
-                    visit_enum_constant(
-                        file,
-                        source,
-                        child,
-                        package_name,
-                        &code_unit,
-                        &top_level,
-                        parsed,
-                    );
-                    if let Some(body) = enum_constant_class_body(child) {
-                        stack.push((
-                            JavaClassScope::EnumConstantBody {
-                                constant: child,
-                                body,
-                            },
-                            Some(code_unit.clone()),
-                            Some(top_level.clone()),
-                        ));
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    first
 }
 
 /// Build the stable identity for a written class-like declaration without
@@ -573,20 +420,20 @@ fn declared_class_scope<'tree>(
     node: Node<'tree>,
     package_name: &str,
     parent: Option<&CodeUnit>,
+    type_shape: JavaTypeShape,
 ) -> Option<JavaClassScopeFacts<'tree>> {
     let unit = class_like_code_unit(file, source, node, package_name, parent)?;
 
     Some(JavaClassScopeFacts {
         unit,
         anchor: node,
-        body: node.child_by_field_name("body"),
         raw_supertypes: extract_raw_supertypes(node, source),
         signature: class_signature(node, source),
         is_interface: matches!(
             node.kind(),
             "interface_declaration" | "annotation_type_declaration"
         ),
-        is_static: java_class_like_is_static(node, parent),
+        is_static: type_shape.is_static,
     })
 }
 
@@ -627,7 +474,6 @@ fn anonymous_class_scope<'tree>(
             fq,
         ),
         anchor: body,
-        body: Some(body),
         raw_supertypes,
         signature: format!("{} {{", normalize_whitespace(header)),
         is_interface: false,
@@ -670,7 +516,6 @@ fn enum_constant_class_scope<'tree>(
             fq,
         ),
         anchor: body,
-        body: Some(body),
         raw_supertypes: vec![declaring_enum.identifier().to_string()],
         signature: format!("{} {{", normalize_whitespace(header)),
         is_interface: false,
@@ -678,199 +523,154 @@ fn enum_constant_class_scope<'tree>(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn visit_callable<'tree>(
-    file: &ProjectFile,
-    source: &str,
-    node: Node<'tree>,
-    package_name: &str,
-    parent: &CodeUnit,
-    top_level: &CodeUnit,
-    parsed: &mut brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
-    pending: &mut Vec<PendingClassScope<'tree>>,
-) {
-    let Some(name_node) = node.child_by_field_name("name") else {
-        return;
-    };
-
-    let name = node_text(name_node, source).trim();
-    if name.is_empty() {
-        return;
-    }
-
-    let signature = node
-        .child_by_field_name("parameters")
-        .map(|parameters| canonical_parameters_signature(parameters, source));
-    let short_name = format!("{}.{}", parent.short_name(), name);
-    let callable_sig = callable_signature(node, source);
-    let parameter_labels = node
-        .child_by_field_name("parameters")
-        .map(|parameters| parameter_labels(parameters, source))
-        .unwrap_or_default();
-    let fq = parent
-        .fq()
-        .clone()
-        .with_pushed(java_segment(name, SegmentKind::Member));
-    let code_unit = CodeUnit::with_signature_and_fq(
-        file.clone(),
-        brokk_bifrost_core::analyzer::model::CodeUnitType::Function,
-        package_name.to_string(),
-        short_name,
-        signature.clone(),
-        false,
-        fq,
-    );
-
-    parsed.add_code_unit(
-        code_unit.clone(),
-        node,
-        source,
-        Some(parent.clone()),
-        Some(top_level.clone()),
-    );
-    let modifiers = java_callable_modifiers(node);
-    parsed.add_signature_with_metadata(
-        code_unit.clone(),
-        SignatureMetadata::with_parameter_labels(callable_sig, parameter_labels)
-            .with_callable_arity(
-                node.child_by_field_name("parameters")
-                    .map(callable_arity_for_parameters)
-                    .unwrap_or_else(|| CallableArity::exact(0)),
-            )
-            .with_callable_modifiers(
-                modifiers.is_static,
-                node.kind() == "constructor_declaration",
-                modifiers.visibility,
-            )
-            .with_callable_parameter_types(
-                node.child_by_field_name("parameters")
-                    .map(|parameters| canonical_parameter_type_texts(parameters, source))
-                    .unwrap_or_default(),
-            )
-            .with_callable_native(modifiers.is_native),
-    );
-
-    if let Some(body) = node.child_by_field_name("body") {
-        collect_body_scopes(
-            file,
-            source,
-            body,
-            package_name,
-            &code_unit,
-            top_level,
-            parsed,
-            pending,
-        );
-    }
+fn record_source_declaration(
+    collector: &mut PrimarySourceFactCollector<'_>,
+    links: &mut Vec<(SourceDeclarationId, CodeUnit)>,
+    node: Node<'_>,
+    unit: &CodeUnit,
+) -> SourceDeclarationId {
+    let occurrence = collector.intern_node(node);
+    let name = node
+        .child_by_field_name("name")
+        .map(|name| collector.intern_node(name));
+    let declaration = collector.declare(occurrence, name);
+    links.push((declaration, unit.clone()));
+    declaration
 }
 
-#[allow(clippy::too_many_arguments)]
-fn visit_compact_constructor<'tree>(
-    file: &ProjectFile,
-    source: &str,
-    node: Node<'tree>,
-    record: Node<'tree>,
-    package_name: &str,
-    parent: &CodeUnit,
-    top_level: &CodeUnit,
-    parsed: &mut brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
-    pending: &mut Vec<PendingClassScope<'tree>>,
+fn add_source_metadata(
+    parsed: &mut ParsedFile,
+    links: &mut Vec<SourceDeclarationMetadataLink>,
+    declaration: SourceDeclarationId,
+    unit: &CodeUnit,
+    metadata: SignatureMetadata,
 ) {
-    let Some(name_node) = node.child_by_field_name("name") else {
-        return;
-    };
-    let Some(parameters) = record.child_by_field_name("parameters") else {
-        return;
-    };
-    let name = node_text(name_node, source).trim();
-    if name.is_empty() {
-        return;
-    }
-
-    let signature = canonical_parameters_signature(parameters, source);
-    let short_name = format!("{}.{}", parent.short_name(), name);
-    let declaration_header = callable_signature(node, source);
-    let callable_sig = format!("{declaration_header}{signature}");
-    let fq = parent
-        .fq()
-        .clone()
-        .with_pushed(java_segment(name, SegmentKind::Member));
-    let code_unit = CodeUnit::with_signature_and_fq(
-        file.clone(),
-        brokk_bifrost_core::analyzer::model::CodeUnitType::Function,
-        package_name.to_string(),
-        short_name,
-        Some(signature),
-        false,
-        fq,
-    );
-    parsed.add_code_unit(
-        code_unit.clone(),
-        node,
-        source,
-        Some(parent.clone()),
-        Some(top_level.clone()),
-    );
-    parsed.add_signature_with_metadata(
-        code_unit.clone(),
-        SignatureMetadata::with_parameter_labels(
-            callable_sig,
-            parameter_labels(parameters, source),
-        )
-        .with_callable_arity(callable_arity_for_parameters(parameters))
-        .with_callable_modifiers(false, true, java_callable_modifiers(node).visibility)
-        .with_callable_parameter_types(canonical_parameter_type_texts(parameters, source)),
-    );
-
-    if let Some(body) = node.child_by_field_name("body") {
-        collect_body_scopes(
-            file,
-            source,
-            body,
-            package_name,
-            &code_unit,
-            top_level,
-            parsed,
-            pending,
-        );
-    }
+    let metadata_ordinal = parsed.add_signature_with_metadata_ordinal(unit.clone(), metadata);
+    links.push(SourceDeclarationMetadataLink {
+        declaration,
+        unit: unit.clone(),
+        metadata_ordinal,
+    });
 }
 
-#[allow(clippy::too_many_arguments)]
-fn visit_field_declaration<'tree>(
-    file: &ProjectFile,
-    source: &str,
-    node: Node<'tree>,
-    package_name: &str,
-    parent: &CodeUnit,
-    top_level: &CodeUnit,
-    parsed: &mut brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
-    pending: &mut Vec<PendingClassScope<'tree>>,
-) {
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if child.kind() != "variable_declarator" {
-            continue;
-        }
+impl<'tree, 'source, 'parsed> JavaPrimaryParseState<'tree, 'source, 'parsed> {
+    fn visit_callable(
+        &mut self,
+        node: Node,
+        parent: &CodeUnit,
+        top_level: &CodeUnit,
+        visibility: DeclaredVisibility,
+        modifiers: JavaDeclarationModifiers,
+        properties: JavaCallableProperties,
+    ) -> Option<CodeUnit> {
+        let file = &self.file;
+        let source = self.source;
+        let package_name = &self.package_name;
+        let parsed = &mut *self.parsed;
+        let collector = self.resolution.source_collector_mut();
+        let links = &mut self.source_declaration_units;
+        let metadata_links = &mut self.source_declaration_metadata;
 
-        let Some(name_node) = child.child_by_field_name("name") else {
-            continue;
-        };
+        let name_node = node.child_by_field_name("name")?;
 
         let name = node_text(name_node, source).trim();
         if name.is_empty() {
-            continue;
+            return None;
         }
 
+        let signature = node
+            .child_by_field_name("parameters")
+            .map(|parameters| canonical_parameters_signature(parameters, source));
+        let short_name = format!("{}.{}", parent.short_name(), name);
+        let callable_sig = callable_signature(node, source);
+        let parameter_labels = node
+            .child_by_field_name("parameters")
+            .map(|parameters| parameter_labels(parameters, source))
+            .unwrap_or_default();
         let fq = parent
             .fq()
             .clone()
             .with_pushed(java_segment(name, SegmentKind::Member));
-        let code_unit = CodeUnit::new_fq(
+        let code_unit = CodeUnit::with_signature_and_fq(
             file.clone(),
-            brokk_bifrost_core::analyzer::model::CodeUnitType::Field,
+            brokk_bifrost_core::analyzer::model::CodeUnitType::Function,
             package_name.to_string(),
-            format!("{}.{}", parent.short_name(), name),
+            short_name,
+            signature.clone(),
+            false,
+            fq,
+        );
+
+        parsed.add_code_unit(
+            code_unit.clone(),
+            node,
+            source,
+            Some(parent.clone()),
+            Some(top_level.clone()),
+        );
+        let declaration = record_source_declaration(collector, links, node, &code_unit);
+        add_source_metadata(
+            parsed,
+            metadata_links,
+            declaration,
+            &code_unit,
+            SignatureMetadata::with_parameter_labels(callable_sig, parameter_labels)
+                .with_callable_arity(properties.arity)
+                .with_callable_modifiers(
+                    properties.is_static,
+                    properties.is_constructor,
+                    visibility,
+                )
+                .with_callable_parameter_types(
+                    node.child_by_field_name("parameters")
+                        .map(|parameters| canonical_parameter_type_texts(parameters, source))
+                        .unwrap_or_default(),
+                )
+                .with_callable_native(modifiers.is_native),
+        );
+
+        Some(code_unit)
+    }
+
+    fn visit_compact_constructor(
+        &mut self,
+        node: Node,
+        record: Node,
+        parent: &CodeUnit,
+        top_level: &CodeUnit,
+        visibility: DeclaredVisibility,
+        properties: JavaCallableProperties,
+    ) -> Option<CodeUnit> {
+        let file = &self.file;
+        let source = self.source;
+        let package_name = &self.package_name;
+        let parsed = &mut *self.parsed;
+        let collector = self.resolution.source_collector_mut();
+        let links = &mut self.source_declaration_units;
+        let metadata_links = &mut self.source_declaration_metadata;
+
+        let name_node = node.child_by_field_name("name")?;
+        let parameters = record.child_by_field_name("parameters")?;
+        let name = node_text(name_node, source).trim();
+        if name.is_empty() {
+            return None;
+        }
+
+        let signature = canonical_parameters_signature(parameters, source);
+        let short_name = format!("{}.{}", parent.short_name(), name);
+        let declaration_header = callable_signature(node, source);
+        let callable_sig = format!("{declaration_header}{signature}");
+        let fq = parent
+            .fq()
+            .clone()
+            .with_pushed(java_segment(name, SegmentKind::Member));
+        let code_unit = CodeUnit::with_signature_and_fq(
+            file.clone(),
+            brokk_bifrost_core::analyzer::model::CodeUnitType::Function,
+            package_name.to_string(),
+            short_name,
+            Some(signature),
+            false,
             fq,
         );
         parsed.add_code_unit(
@@ -880,97 +680,156 @@ fn visit_field_declaration<'tree>(
             Some(parent.clone()),
             Some(top_level.clone()),
         );
-        let signature = field_signature(node, child, source);
-        let field_type = node
-            .child_by_field_name("type")
-            .map(|type_node| normalize_whitespace(node_text(type_node, source)));
-        let (is_static, is_final) = java_field_modifiers(node);
-        let has_initializer = child.child_by_field_name("value").is_some();
-        parsed.add_signature_with_metadata(
-            code_unit,
-            SignatureMetadata::new(signature, Vec::new())
-                .with_return_type_text(field_type)
-                .with_field_modifiers(is_static, is_final)
-                .with_field_initializer(has_initializer),
+        let declaration = record_source_declaration(collector, links, node, &code_unit);
+        add_source_metadata(
+            parsed,
+            metadata_links,
+            declaration,
+            &code_unit,
+            SignatureMetadata::with_parameter_labels(
+                callable_sig,
+                parameter_labels(parameters, source),
+            )
+            .with_callable_arity(properties.arity)
+            .with_callable_modifiers(properties.is_static, properties.is_constructor, visibility)
+            .with_callable_parameter_types(canonical_parameter_type_texts(parameters, source)),
         );
 
-        if let Some(value) = child.child_by_field_name("value") {
-            collect_body_scopes(
-                file,
-                source,
-                value,
-                package_name,
-                parent,
-                top_level,
-                parsed,
-                pending,
-            );
-        }
+        Some(code_unit)
     }
-}
 
-fn java_field_modifiers(field: Node<'_>) -> (bool, bool) {
-    let modifiers = (0..field.named_child_count())
-        .filter_map(|index| field.named_child(index))
-        .find(|child| child.kind() == "modifiers");
-    let mut is_static = false;
-    let mut is_final = false;
-    if let Some(modifiers) = modifiers {
-        for index in 0..modifiers.child_count() {
-            let Some(modifier) = modifiers.child(index) else {
+    fn visit_field_declaration(
+        &mut self,
+        node: Node,
+        parent: &CodeUnit,
+        top_level: &CodeUnit,
+        shape: JavaFieldShape,
+    ) {
+        let file = &self.file;
+        let source = self.source;
+        let package_name = &self.package_name;
+        let parsed = &mut *self.parsed;
+        let collector = self.resolution.source_collector_mut();
+        let links = &mut self.source_declaration_units;
+        let metadata_links = &mut self.source_declaration_metadata;
+
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if child.kind() != "variable_declarator" {
+                continue;
+            }
+
+            let Some(name_node) = child.child_by_field_name("name") else {
                 continue;
             };
-            match modifier.kind() {
-                "static" => is_static = true,
-                "final" => is_final = true,
-                _ => {}
-            }
-        }
-    }
 
-    let mut ancestor = field.parent();
-    let mut implicit_static_final = false;
-    while let Some(current) = ancestor {
-        if is_class_like_declaration_kind(current.kind()) {
-            implicit_static_final = matches!(
-                current.kind(),
-                "interface_declaration" | "annotation_type_declaration"
+            let name = node_text(name_node, source).trim();
+            if name.is_empty() {
+                continue;
+            }
+
+            let fq = parent
+                .fq()
+                .clone()
+                .with_pushed(java_segment(name, SegmentKind::Member));
+            let code_unit = CodeUnit::new_fq(
+                file.clone(),
+                brokk_bifrost_core::analyzer::model::CodeUnitType::Field,
+                package_name.to_string(),
+                format!("{}.{}", parent.short_name(), name),
+                fq,
             );
-            break;
+            parsed.add_code_unit(
+                code_unit.clone(),
+                node,
+                source,
+                Some(parent.clone()),
+                Some(top_level.clone()),
+            );
+            let declaration = record_source_declaration(collector, links, child, &code_unit);
+            let signature = field_signature(node, child, source);
+            let field_type = node
+                .child_by_field_name("type")
+                .map(|type_node| normalize_whitespace(node_text(type_node, source)));
+            let has_initializer = child.child_by_field_name("value").is_some();
+            add_source_metadata(
+                parsed,
+                metadata_links,
+                declaration,
+                &code_unit,
+                SignatureMetadata::new(signature, Vec::new())
+                    .with_return_type_text(field_type)
+                    .with_field_modifiers(shape.is_static, shape.is_final)
+                    .with_field_initializer(has_initializer),
+            );
         }
-        ancestor = current.parent();
     }
-    is_static |= implicit_static_final;
-    is_final |= implicit_static_final;
-    (is_static, is_final)
 }
 
-fn visit_record_components(
-    file: &ProjectFile,
-    source: &str,
-    node: Node<'_>,
-    package_name: &str,
-    parent: &CodeUnit,
-    top_level: &CodeUnit,
-    parsed: &mut brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
-) {
-    let Some(parameters) = node.child_by_field_name("parameters") else {
-        return;
-    };
+impl<'tree, 'source, 'parsed> JavaPrimaryParseState<'tree, 'source, 'parsed> {
+    fn visit_record_components(&mut self, node: Node<'_>, parent: &CodeUnit, top_level: &CodeUnit) {
+        let file = &self.file;
+        let source = self.source;
+        let package_name = &self.package_name;
+        let Some(parameters) = node.child_by_field_name("parameters") else {
+            return;
+        };
 
-    let mut cursor = parameters.walk();
-    for child in parameters.named_children(&mut cursor) {
-        if child.kind() != "formal_parameter" {
-            continue;
+        let mut cursor = parameters.walk();
+        for child in parameters.named_children(&mut cursor) {
+            if child.kind() != "formal_parameter" {
+                continue;
+            }
+
+            let Some(name_node) = child.child_by_field_name("name") else {
+                continue;
+            };
+
+            let name = node_text(name_node, source).trim();
+            if name.is_empty() {
+                continue;
+            }
+
+            let fq = parent
+                .fq()
+                .clone()
+                .with_pushed(java_segment(name, SegmentKind::Member));
+            let code_unit = CodeUnit::new_fq(
+                file.clone(),
+                brokk_bifrost_core::analyzer::model::CodeUnitType::Field,
+                package_name.to_string(),
+                format!("{}.{}", parent.short_name(), name),
+                fq,
+            );
+            self.parsed.add_code_unit(
+                code_unit.clone(),
+                child,
+                source,
+                Some(parent.clone()),
+                Some(top_level.clone()),
+            );
+            record_source_declaration(
+                self.resolution.source_collector_mut(),
+                &mut self.source_declaration_units,
+                child,
+                &code_unit,
+            );
+            self.parsed
+                .add_signature(code_unit, normalize_whitespace(node_text(child, source)));
         }
+    }
 
-        let Some(name_node) = child.child_by_field_name("name") else {
-            continue;
+    fn visit_enum_constant(&mut self, node: Node<'_>, parent: &CodeUnit, top_level: &CodeUnit) {
+        let file = &self.file;
+        let source = self.source;
+        let package_name = &self.package_name;
+        let Some(name_node) = node.child_by_field_name("name") else {
+            return;
         };
 
         let name = node_text(name_node, source).trim();
         if name.is_empty() {
-            continue;
+            return;
         }
 
         let fq = parent
@@ -984,151 +843,28 @@ fn visit_record_components(
             format!("{}.{}", parent.short_name(), name),
             fq,
         );
-        parsed.add_code_unit(
+        self.parsed.add_code_unit(
             code_unit.clone(),
-            child,
+            node,
             source,
             Some(parent.clone()),
             Some(top_level.clone()),
         );
-        parsed.add_signature(code_unit, normalize_whitespace(node_text(child, source)));
-    }
-}
-
-fn visit_enum_constant(
-    file: &ProjectFile,
-    source: &str,
-    node: Node<'_>,
-    package_name: &str,
-    parent: &CodeUnit,
-    top_level: &CodeUnit,
-    parsed: &mut brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
-) {
-    let Some(name_node) = node.child_by_field_name("name") else {
-        return;
-    };
-
-    let name = node_text(name_node, source).trim();
-    if name.is_empty() {
-        return;
-    }
-
-    let fq = parent
-        .fq()
-        .clone()
-        .with_pushed(java_segment(name, SegmentKind::Member));
-    let code_unit = CodeUnit::new_fq(
-        file.clone(),
-        brokk_bifrost_core::analyzer::model::CodeUnitType::Field,
-        package_name.to_string(),
-        format!("{}.{}", parent.short_name(), name),
-        fq,
-    );
-    parsed.add_code_unit(
-        code_unit.clone(),
-        node,
-        source,
-        Some(parent.clone()),
-        Some(top_level.clone()),
-    );
-    parsed.add_signature_with_metadata(
-        code_unit,
-        SignatureMetadata::new(enum_constant_signature(node, source), Vec::new())
-            .with_field_modifiers(true, true),
-    );
-}
-
-/// Walk one executable body and record the scopes written inside it.
-///
-/// Three scope forms can appear in a method, constructor, or initializer: a
-/// lambda, a class declared local to the body, and an anonymous class body.
-/// The lambda gets its unit here. The two class-like forms are handed to the
-/// caller's own extraction stack, which already knows how to index a class
-/// body and everything under it, and this walk does not descend into them
-/// (#2045). Nothing recurses: the walk keeps its own explicit stack and the
-/// class-like forms leave it entirely.
-#[allow(clippy::too_many_arguments)]
-fn collect_body_scopes<'tree>(
-    file: &ProjectFile,
-    source: &str,
-    node: Node<'tree>,
-    package_name: &str,
-    parent: &CodeUnit,
-    top_level: &CodeUnit,
-    parsed: &mut brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
-    pending: &mut Vec<PendingClassScope<'tree>>,
-) {
-    let mut stack = vec![(node, parent.clone())];
-    while let Some((node, parent)) = stack.pop() {
-        if is_class_like_declaration_kind(node.kind()) {
-            pending.push((
-                JavaClassScope::Declared(node),
-                Some(parent),
-                Some(top_level.clone()),
-            ));
-            continue;
-        }
-
-        // `new Base(arg) { ... }` splits in two: the class body is its own
-        // scope, while the type arguments and the constructor arguments are
-        // written in this scope and keep being walked here.
-        let anonymous_body = java_anonymous_class_body(node);
-        if let Some(body) = anonymous_body {
-            pending.push((
-                JavaClassScope::Anonymous {
-                    creation: node,
-                    body,
-                },
-                Some(parent.clone()),
-                Some(top_level.clone()),
-            ));
-        }
-
-        let next_parent = if node.kind() == "lambda_expression" {
-            let lambda = lambda_code_unit(file, package_name, &parent, node);
-            parsed.add_code_unit(
-                lambda.clone(),
-                node,
-                source,
-                Some(parent),
-                Some(top_level.clone()),
-            );
-            lambda
-        } else {
-            parent
-        };
-        let mut cursor = node.walk();
-        let children = node
-            .named_children(&mut cursor)
-            .filter(|child| Some(*child) != anonymous_body)
-            .collect::<Vec<_>>();
-        stack.extend(
-            children
-                .into_iter()
-                .rev()
-                .map(|child| (child, next_parent.clone())),
+        let declaration = record_source_declaration(
+            self.resolution.source_collector_mut(),
+            &mut self.source_declaration_units,
+            node,
+            &code_unit,
+        );
+        add_source_metadata(
+            self.parsed,
+            &mut self.source_declaration_metadata,
+            declaration,
+            &code_unit,
+            SignatureMetadata::new(enum_constant_signature(node, source), Vec::new())
+                .with_field_modifiers(true, true),
         );
     }
-}
-
-/// The `class_body` an `object_creation_expression` carries when it declares
-/// an anonymous class rather than only calling a constructor.
-fn java_anonymous_class_body<'tree>(node: Node<'tree>) -> Option<Node<'tree>> {
-    if node.kind() != "object_creation_expression" {
-        return None;
-    }
-    (0..node.named_child_count())
-        .filter_map(|index| node.named_child(index))
-        .find(|child| child.kind() == "class_body")
-}
-
-fn enum_constant_class_body<'tree>(node: Node<'tree>) -> Option<Node<'tree>> {
-    if node.kind() != "enum_constant" {
-        return None;
-    }
-    (0..node.named_child_count())
-        .filter_map(|index| node.named_child(index))
-        .find(|child| child.kind() == "class_body")
 }
 
 fn lambda_code_unit(
@@ -1483,34 +1219,6 @@ fn class_signature(node: Node<'_>, source: &str) -> String {
     format!("{} {{", normalize_whitespace(header))
 }
 
-fn java_class_like_is_static(node: Node<'_>, parent: Option<&CodeUnit>) -> bool {
-    if parent.is_none() {
-        return false;
-    }
-    if matches!(
-        node.kind(),
-        "interface_declaration"
-            | "enum_declaration"
-            | "record_declaration"
-            | "annotation_type_declaration"
-    ) || java_callable_modifiers(node).is_static
-    {
-        return true;
-    }
-
-    let mut ancestor = node.parent();
-    while let Some(current) = ancestor {
-        if is_class_like_declaration_kind(current.kind()) {
-            return matches!(
-                current.kind(),
-                "interface_declaration" | "annotation_type_declaration"
-            );
-        }
-        ancestor = current.parent();
-    }
-    false
-}
-
 fn callable_signature(node: Node<'_>, source: &str) -> String {
     let end = node
         .child_by_field_name("body")
@@ -1575,28 +1283,26 @@ fn canonical_parameter_type_texts(parameters: Node<'_>, source: &str) -> Vec<Str
     parts
 }
 
-/// The modifier facts a Java callable declares, read from its `modifiers`
-/// node rather than from its rendered header text.
-struct JavaCallableModifiers {
-    is_static: bool,
+/// The modifier facts one Java declaration states, read from its structured
+/// `modifiers` child rather than from its rendered header text.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct JavaDeclarationModifiers {
+    pub(super) is_abstract: bool,
+    pub(super) is_static: bool,
+    pub(super) is_final: bool,
     /// The declaration is implemented outside every source the workspace can
     /// read. A consumer that must not guess past a body-less callee needs this
     /// to tell `native` from `abstract`.
-    is_native: bool,
-    visibility: DeclaredVisibility,
+    pub(super) is_native: bool,
+    /// `None` means that Java's owner-aware default applies. Keeping the
+    /// written modifier distinct from its effective visibility lets the
+    /// resolution producer apply interface and annotation implicit-public
+    /// semantics without changing ordinary class-member metadata.
+    pub(super) explicit_visibility: Option<DeclaredVisibility>,
 }
 
-fn java_callable_modifiers(node: Node<'_>) -> JavaCallableModifiers {
-    // Java's default when no access modifier is written is package-private.
-    // Interface members are implicitly public, but that is an inheritance rule
-    // the consumer applies from the owner's kind; the declaration itself still
-    // states nothing here, and inventing `Public` would be a claim the source
-    // never made.
-    let mut modifiers = JavaCallableModifiers {
-        is_static: false,
-        is_native: false,
-        visibility: DeclaredVisibility::PackagePrivate,
-    };
+pub(super) fn java_declaration_modifiers(node: Node<'_>) -> JavaDeclarationModifiers {
+    let mut modifiers = JavaDeclarationModifiers::default();
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         if child.kind() != "modifiers" {
@@ -1605,11 +1311,19 @@ fn java_callable_modifiers(node: Node<'_>) -> JavaCallableModifiers {
         let mut inner = child.walk();
         for modifier in child.children(&mut inner) {
             match modifier.kind() {
+                "abstract" => modifiers.is_abstract = true,
                 "static" => modifiers.is_static = true,
+                "final" => modifiers.is_final = true,
                 "native" => modifiers.is_native = true,
-                "public" => modifiers.visibility = DeclaredVisibility::Public,
-                "protected" => modifiers.visibility = DeclaredVisibility::Protected,
-                "private" => modifiers.visibility = DeclaredVisibility::Private,
+                "public" => {
+                    modifiers.explicit_visibility = Some(DeclaredVisibility::Public);
+                }
+                "protected" => {
+                    modifiers.explicit_visibility = Some(DeclaredVisibility::Protected);
+                }
+                "private" => {
+                    modifiers.explicit_visibility = Some(DeclaredVisibility::Private);
+                }
                 _ => {}
             }
         }
@@ -1657,6 +1371,85 @@ fn callable_arity_for_parameters(parameters: Node<'_>) -> CallableArity {
     }
     let required = total.saturating_sub(usize::from(repeated));
     CallableArity::new(required, total, repeated)
+}
+
+fn java_callable_shape(
+    parameters: Option<Node<'_>>,
+    modifiers: JavaDeclarationModifiers,
+    is_constructor: bool,
+) -> JavaCallableShape {
+    let (arity, parameter_repetition) = parameters
+        .map(|parameters| {
+            let mut total = 0usize;
+            let mut repeated_any = false;
+            let mut parameter_repetition = HashMap::default();
+            let mut cursor = parameters.walk();
+            for child in parameters.named_children(&mut cursor) {
+                let repeated = match child.kind() {
+                    "formal_parameter" => {
+                        total += 1;
+                        false
+                    }
+                    "spread_parameter" => {
+                        total += 1;
+                        repeated_any = true;
+                        true
+                    }
+                    "ERROR" if malformed_spread_parameter_name(child).is_some() => {
+                        total += 1;
+                        repeated_any = true;
+                        true
+                    }
+                    _ => continue,
+                };
+                assert!(
+                    parameter_repetition.insert(child.id(), repeated).is_none(),
+                    "one Java callable parameter shape per source node"
+                );
+            }
+            (
+                CallableArity::new(
+                    total.saturating_sub(usize::from(repeated_any)),
+                    total,
+                    repeated_any,
+                ),
+                parameter_repetition,
+            )
+        })
+        .unwrap_or_else(|| (CallableArity::exact(0), HashMap::default()));
+    JavaCallableShape {
+        properties: JavaCallableProperties {
+            is_static: modifiers.is_static,
+            is_constructor,
+            arity,
+        },
+        parameter_repetition,
+    }
+}
+
+fn java_type_constructor_shape(node: Node<'_>) -> Option<JavaTypeConstructorShape> {
+    match node.kind() {
+        "class_declaration" => {
+            let body = node.child_by_field_name("body")?;
+            let has_explicit_constructor = {
+                let mut cursor = body.walk();
+                body.named_children(&mut cursor)
+                    .any(|child| child.kind() == "constructor_declaration")
+            };
+            Some(if has_explicit_constructor {
+                JavaTypeConstructorShape::NoImplicit
+            } else {
+                JavaTypeConstructorShape::Default
+            })
+        }
+        "record_declaration" => Some(JavaTypeConstructorShape::RecordCanonical(
+            callable_arity_for_parameters(node.child_by_field_name("parameters")?),
+        )),
+        "interface_declaration" | "enum_declaration" | "annotation_type_declaration" => {
+            Some(JavaTypeConstructorShape::NoImplicit)
+        }
+        kind => panic!("unsupported Java type constructor shape node kind {kind}"),
+    }
 }
 
 fn spread_parameter_type_node(parameter: Node<'_>) -> Option<Node<'_>> {
@@ -1771,6 +1564,944 @@ fn enum_constant_signature(node: Node<'_>, source: &str) -> String {
     text
 }
 
+#[derive(Clone)]
+struct JavaDeclarationContext {
+    unit: CodeUnit,
+    top_level: CodeUnit,
+    is_record: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JavaSourceOwnerKind {
+    Class,
+    Interface,
+    Enum,
+    Record,
+    Annotation,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct JavaSourceOwner {
+    kind: JavaSourceOwnerKind,
+    body_id: usize,
+}
+
+impl JavaSourceOwner {
+    fn from_declaration(node: Node<'_>) -> Option<Self> {
+        let kind = match node.kind() {
+            "class_declaration" => JavaSourceOwnerKind::Class,
+            "interface_declaration" => JavaSourceOwnerKind::Interface,
+            "enum_declaration" => JavaSourceOwnerKind::Enum,
+            "record_declaration" => JavaSourceOwnerKind::Record,
+            "annotation_type_declaration" => JavaSourceOwnerKind::Annotation,
+            _ => return None,
+        };
+        Some(Self {
+            kind,
+            body_id: node
+                .child_by_field_name("body")
+                .map(|body| body.id())
+                .unwrap_or(node.id()),
+        })
+    }
+
+    fn synthetic_class(body: Node<'_>) -> Self {
+        assert_eq!(body.kind(), "class_body");
+        Self {
+            kind: JavaSourceOwnerKind::Class,
+            body_id: body.id(),
+        }
+    }
+}
+
+struct JavaPrimaryParseState<'tree, 'source, 'parsed> {
+    file: ProjectFile,
+    source: &'source str,
+    package_name: String,
+    package_module: Option<CodeUnit>,
+    package_syntaxes: HashMap<usize, JavaPackageSyntax<'tree, 'source>>,
+    root_id: usize,
+    parsed: &'parsed mut ParsedFile,
+    resolution: JavaResolutionBuilder<'source>,
+    structural: StructuralFactCollector<'source>,
+    structural_kinds: &'source CompiledKinds,
+    call_site_context: &'source brokk_bifrost_core::analyzer::structural::callable::CallSiteContext,
+    structural_parents: Vec<Option<u32>>,
+    declaration_contexts: Vec<JavaDeclarationContext>,
+    declaration_exits: Vec<bool>,
+    source_visibility_owners: Vec<JavaSourceOwner>,
+    source_visibility_exits: Vec<bool>,
+    source_declaration_visibilities: Vec<SourceDeclarationVisibilityFact>,
+    source_declaration_units: Vec<(SourceDeclarationId, CodeUnit)>,
+    source_declaration_by_node: HashMap<usize, SourceDeclarationId>,
+    source_declaration_metadata: Vec<SourceDeclarationMetadataLink>,
+    source_imports: Vec<SourceImportFact>,
+    generic_imports: Vec<SourceImportId>,
+}
+
+impl<'tree, 'source, 'parsed> JavaPrimaryParseState<'tree, 'source, 'parsed> {
+    fn new(
+        file: &ProjectFile,
+        source: &'source str,
+        package_syntaxes: JavaTopLevelPackageSyntaxes<'tree, 'source>,
+        parsed: &'parsed mut ParsedFile,
+        root: Node<'tree>,
+        structural_kinds: &'source CompiledKinds,
+        call_site_context: &'source brokk_bifrost_core::analyzer::structural::callable::CallSiteContext,
+    ) -> Self {
+        let package_name = package_name_from_syntax(package_syntaxes.display());
+        let package_module =
+            (!package_name.is_empty()).then(|| module_code_unit(file, &package_name));
+        let package_syntaxes = package_syntaxes
+            .syntaxes
+            .into_iter()
+            .map(|syntax| (syntax.node.id(), syntax))
+            .collect::<HashMap<_, _>>();
+        let resolution = JavaResolutionBuilder::new(root, source);
+        let structural = StructuralFactCollector::new(
+            &JAVA_STRUCTURAL_SPEC,
+            source,
+            call_site_context,
+            usize::MAX,
+            None,
+        );
+        Self {
+            file: file.clone(),
+            source,
+            package_name,
+            package_module,
+            package_syntaxes,
+            root_id: root.id(),
+            parsed,
+            resolution,
+            structural,
+            structural_kinds,
+            call_site_context,
+            structural_parents: vec![None],
+            declaration_contexts: Vec::new(),
+            declaration_exits: Vec::new(),
+            source_visibility_owners: Vec::new(),
+            source_visibility_exits: Vec::new(),
+            source_declaration_visibilities: Vec::new(),
+            source_declaration_units: Vec::new(),
+            source_declaration_by_node: HashMap::default(),
+            source_declaration_metadata: Vec::new(),
+            source_imports: Vec::new(),
+            generic_imports: Vec::new(),
+        }
+    }
+
+    fn current_owner(&self) -> Option<&CodeUnit> {
+        self.declaration_contexts
+            .last()
+            .map(|context| &context.unit)
+    }
+
+    fn current_top_level(&self) -> Option<CodeUnit> {
+        self.declaration_contexts
+            .last()
+            .map(|context| context.top_level.clone())
+    }
+
+    fn intern_source_declaration(&mut self, node: Node<'_>) -> SourceDeclarationId {
+        let collector = self.resolution.source_collector_mut();
+        let occurrence = collector.intern_node(node);
+        let name = node
+            .child_by_field_name("name")
+            .map(|name| collector.intern_node(name));
+        collector.declare(occurrence, name)
+    }
+
+    fn direct_member_of_current_type(&self, node: Node<'_>) -> bool {
+        let Some(owner) = self.source_visibility_owners.last() else {
+            return false;
+        };
+        let Some(parent) = node.parent() else {
+            return false;
+        };
+        if parent.id() == owner.body_id {
+            return true;
+        }
+        owner.kind == JavaSourceOwnerKind::Enum
+            && parent.kind() == "enum_body_declarations"
+            && parent
+                .parent()
+                .is_some_and(|body| body.id() == owner.body_id)
+    }
+
+    fn source_type_shape(
+        &self,
+        node: Node<'_>,
+        modifiers: JavaDeclarationModifiers,
+    ) -> JavaTypeShape {
+        let has_parent = self.current_owner().is_some();
+        let implicit_static = matches!(
+            node.kind(),
+            "interface_declaration"
+                | "enum_declaration"
+                | "record_declaration"
+                | "annotation_type_declaration"
+        ) || (self.direct_member_of_current_type(node)
+            && matches!(
+                self.source_visibility_owners.last().map(|owner| owner.kind),
+                Some(JavaSourceOwnerKind::Interface | JavaSourceOwnerKind::Annotation)
+            ));
+        JavaTypeShape {
+            is_static: has_parent && (modifiers.is_static || implicit_static),
+            constructor_shape: java_type_constructor_shape(node),
+        }
+    }
+
+    fn source_field_shape(
+        &self,
+        node: Node<'_>,
+        modifiers: JavaDeclarationModifiers,
+    ) -> JavaFieldShape {
+        let implicit_static_final = self.direct_member_of_current_type(node)
+            && matches!(
+                self.source_visibility_owners.last().map(|owner| owner.kind),
+                Some(JavaSourceOwnerKind::Interface | JavaSourceOwnerKind::Annotation)
+            );
+        JavaFieldShape {
+            is_static: modifiers.is_static || implicit_static_final,
+            is_final: modifiers.is_final || implicit_static_final,
+        }
+    }
+
+    fn source_callable_parameters(node: Node<'tree>) -> Option<Node<'tree>> {
+        if node.kind() == "compact_constructor_declaration" {
+            node.parent()
+                .and_then(|body| body.parent())
+                .filter(|record| record.kind() == "record_declaration")
+                .and_then(|record| record.child_by_field_name("parameters"))
+        } else {
+            node.child_by_field_name("parameters")
+        }
+    }
+
+    fn source_visibility_for(&self, node: Node<'_>) -> DeclaredVisibility {
+        let explicit = self
+            .resolution
+            .source_modifiers_for(node)
+            .explicit_visibility;
+        if let Some(explicit) = explicit {
+            return explicit;
+        }
+
+        match node.kind() {
+            kind if is_class_like_declaration_kind(kind) => {
+                if node
+                    .parent()
+                    .is_some_and(|parent| parent.id() == self.root_id)
+                {
+                    DeclaredVisibility::PackagePrivate
+                } else if self.direct_member_of_current_type(node) {
+                    match self.source_visibility_owners.last().map(|owner| owner.kind) {
+                        Some(JavaSourceOwnerKind::Interface | JavaSourceOwnerKind::Annotation) => {
+                            DeclaredVisibility::Public
+                        }
+                        _ => DeclaredVisibility::PackagePrivate,
+                    }
+                } else {
+                    DeclaredVisibility::Unknown
+                }
+            }
+            "method_declaration"
+            | "constructor_declaration"
+            | "compact_constructor_declaration"
+            | "annotation_type_element_declaration" => {
+                let constructor = matches!(
+                    node.kind(),
+                    "constructor_declaration" | "compact_constructor_declaration"
+                );
+                if constructor
+                    && self.source_visibility_owners.last().map(|owner| owner.kind)
+                        == Some(JavaSourceOwnerKind::Enum)
+                {
+                    DeclaredVisibility::Private
+                } else if self.direct_member_of_current_type(node)
+                    && matches!(
+                        self.source_visibility_owners.last().map(|owner| owner.kind),
+                        Some(JavaSourceOwnerKind::Interface | JavaSourceOwnerKind::Annotation)
+                    )
+                {
+                    DeclaredVisibility::Public
+                } else {
+                    DeclaredVisibility::PackagePrivate
+                }
+            }
+            "field_declaration" | "constant_declaration" => {
+                if self.direct_member_of_current_type(node)
+                    && matches!(
+                        self.source_visibility_owners.last().map(|owner| owner.kind),
+                        Some(JavaSourceOwnerKind::Interface | JavaSourceOwnerKind::Annotation)
+                    )
+                {
+                    DeclaredVisibility::Public
+                } else {
+                    DeclaredVisibility::PackagePrivate
+                }
+            }
+            "enum_constant" => DeclaredVisibility::Public,
+            kind => panic!("unsupported Java source visibility node kind {kind}"),
+        }
+    }
+
+    fn capture_source_visibility(
+        &mut self,
+        node: Node<'tree>,
+        declaration: SourceDeclarationId,
+        visibility: DeclaredVisibility,
+    ) {
+        self.source_declaration_visibilities
+            .push(SourceDeclarationVisibilityFact {
+                declaration,
+                visibility,
+            });
+        self.resolution
+            .set_source_declaration_visibility(node, declaration, visibility);
+    }
+
+    fn capture_source_properties(&mut self, node: Node<'tree>) {
+        let mut pushed_owner = false;
+        let is_modifier_owner = is_class_like_declaration_kind(node.kind())
+            || matches!(
+                node.kind(),
+                "method_declaration"
+                    | "constructor_declaration"
+                    | "compact_constructor_declaration"
+                    | "field_declaration"
+                    | "constant_declaration"
+                    | "enum_constant"
+                    | "annotation_type_element_declaration"
+            );
+        if is_modifier_owner {
+            let modifiers = java_declaration_modifiers(node);
+            self.resolution
+                .set_source_declaration_modifiers(node, modifiers);
+            if is_class_like_declaration_kind(node.kind()) {
+                let shape = self.source_type_shape(node, modifiers);
+                self.resolution.set_source_type_shape(node, shape);
+            } else if matches!(
+                node.kind(),
+                "method_declaration"
+                    | "constructor_declaration"
+                    | "compact_constructor_declaration"
+                    | "annotation_type_element_declaration"
+            ) {
+                let parameters = Self::source_callable_parameters(node);
+                let shape = java_callable_shape(
+                    parameters,
+                    modifiers,
+                    matches!(
+                        node.kind(),
+                        "constructor_declaration" | "compact_constructor_declaration"
+                    ),
+                );
+                self.resolution.set_source_callable_shape(node, shape);
+            } else if matches!(node.kind(), "field_declaration" | "constant_declaration") {
+                let shape = self.source_field_shape(node, modifiers);
+                self.resolution.set_source_field_shape(node, shape);
+            }
+        }
+
+        match node.kind() {
+            kind if is_class_like_declaration_kind(kind) => {
+                let declaration = self.intern_source_declaration(node);
+                let visibility = self.source_visibility_for(node);
+                self.capture_source_visibility(node, declaration, visibility);
+                if node.kind() == "record_declaration"
+                    && let Some(parameters) = node.child_by_field_name("parameters")
+                {
+                    let mut cursor = parameters.walk();
+                    for component in parameters.named_children(&mut cursor) {
+                        if component.kind() != "formal_parameter"
+                            || component.child_by_field_name("name").is_none()
+                        {
+                            continue;
+                        }
+                        let declaration = self.intern_source_declaration(component);
+                        self.capture_source_visibility(
+                            component,
+                            declaration,
+                            DeclaredVisibility::Private,
+                        );
+                    }
+                }
+                if let Some(owner) = JavaSourceOwner::from_declaration(node) {
+                    self.source_visibility_owners.push(owner);
+                    pushed_owner = true;
+                }
+            }
+            "method_declaration"
+            | "constructor_declaration"
+            | "compact_constructor_declaration"
+            | "annotation_type_element_declaration" => {
+                if node.child_by_field_name("name").is_some() {
+                    let declaration = self.intern_source_declaration(node);
+                    let visibility = self.source_visibility_for(node);
+                    self.capture_source_visibility(node, declaration, visibility);
+                }
+            }
+            "field_declaration" | "constant_declaration" => {
+                let visibility = self.source_visibility_for(node);
+                let mut cursor = node.walk();
+                for declarator in node.named_children(&mut cursor) {
+                    if declarator.kind() != "variable_declarator"
+                        || declarator.child_by_field_name("name").is_none()
+                    {
+                        continue;
+                    }
+                    let declaration = self.intern_source_declaration(declarator);
+                    self.capture_source_visibility(declarator, declaration, visibility);
+                }
+            }
+            "enum_constant" if node.child_by_field_name("name").is_some() => {
+                let declaration = self.intern_source_declaration(node);
+                let visibility = self.source_visibility_for(node);
+                self.capture_source_visibility(node, declaration, visibility);
+            }
+            "class_body" if is_java_synthetic_class_body(node) => {
+                self.source_visibility_owners
+                    .push(JavaSourceOwner::synthetic_class(node));
+                pushed_owner = true;
+            }
+            _ => {}
+        }
+        self.source_visibility_exits.push(pushed_owner);
+    }
+
+    fn source_visibility(&self, node: Node<'_>) -> DeclaredVisibility {
+        self.resolution.source_visibility_for(node)
+    }
+
+    fn field_visibility(&self, node: Node<'_>) -> Option<DeclaredVisibility> {
+        let mut cursor = node.walk();
+        node.named_children(&mut cursor)
+            .find(|child| {
+                child.kind() == "variable_declarator" && child.child_by_field_name("name").is_some()
+            })
+            .map(|declarator| self.source_visibility(declarator))
+    }
+
+    fn record_unit_source(&mut self, node: Node<'_>, unit: &CodeUnit) -> SourceDeclarationId {
+        record_source_declaration(
+            self.resolution.source_collector_mut(),
+            &mut self.source_declaration_units,
+            node,
+            unit,
+        )
+    }
+
+    /// Capture the source-owned type family before native or display admission.
+    fn capture_source_type_facts(&mut self, node: Node<'tree>) {
+        let is_callable = matches!(
+            node.kind(),
+            "method_declaration" | "constructor_declaration" | "compact_constructor_declaration"
+        );
+        let is_class = is_class_like_declaration_kind(node.kind());
+        if !is_callable && !is_class {
+            return;
+        }
+        if !is_class && node.child_by_field_name("name").is_none() {
+            return;
+        }
+        let declaration = self.intern_source_declaration(node);
+        self.source_declaration_by_node
+            .insert(node.id(), declaration);
+        if let Some(owner) = self.source_declaration_owner(node) {
+            self.resolution
+                .record_source_declaration_owner(declaration, owner);
+        }
+        if is_class {
+            self.resolution
+                .record_source_type_parameters(node, declaration);
+            self.resolution.record_source_local_type(node, declaration);
+        } else {
+            self.resolution.record_source_callable(node, declaration);
+        }
+    }
+
+    fn source_declaration_owner(&self, node: Node<'tree>) -> Option<SourceDeclarationId> {
+        let mut current = node.parent();
+        while let Some(ancestor) = current {
+            if is_java_synthetic_class_body(ancestor) {
+                return None;
+            }
+            if is_class_like_declaration_kind(ancestor.kind())
+                || matches!(
+                    ancestor.kind(),
+                    "method_declaration"
+                        | "constructor_declaration"
+                        | "compact_constructor_declaration"
+                )
+            {
+                return self.source_declaration_by_node.get(&ancestor.id()).copied();
+            }
+            current = ancestor.parent();
+        }
+        None
+    }
+
+    fn add_class_scope(&mut self, node: Node<'_>) -> bool {
+        let parent = self.current_owner().cloned();
+        let is_root = parent.is_none();
+        let type_shape = self.resolution.source_type_shape_for(node);
+        let Some(facts) = declared_class_scope(
+            &self.file,
+            self.source,
+            node,
+            &self.package_name,
+            parent.as_ref(),
+            type_shape,
+        ) else {
+            return false;
+        };
+        let unit = facts.unit.clone();
+        let top_level = self.current_top_level().unwrap_or_else(|| unit.clone());
+        self.parsed.add_code_unit(
+            unit.clone(),
+            facts.anchor,
+            self.source,
+            parent,
+            Some(top_level.clone()),
+        );
+        self.parsed
+            .set_raw_supertypes(unit.clone(), facts.raw_supertypes);
+        let declaration = self.record_unit_source(node, &unit);
+        let metadata = SignatureMetadata::new(facts.signature, Vec::new())
+            .with_class_like_interface(facts.is_interface)
+            .with_class_like_static(facts.is_static)
+            .with_recorded_type_parameters(
+                java_declared_type_parameters(node)
+                    .into_iter()
+                    .filter_map(|parameter| java_type_parameter_name(parameter, self.source))
+                    .map(str::to_string)
+                    .collect(),
+            );
+        add_source_metadata(
+            self.parsed,
+            &mut self.source_declaration_metadata,
+            declaration,
+            &unit,
+            metadata,
+        );
+        if facts.anchor.kind() == "record_declaration" {
+            self.visit_record_components(facts.anchor, &unit, &top_level);
+        }
+        if is_root && let Some(module) = self.package_module.clone() {
+            self.parsed.add_child(module, unit.clone());
+        }
+        self.declaration_contexts.push(JavaDeclarationContext {
+            unit,
+            top_level,
+            is_record: facts.anchor.kind() == "record_declaration",
+        });
+        true
+    }
+
+    fn add_synthetic_class_scope(&mut self, node: Node<'_>) -> bool {
+        let Some(parent) = self.current_owner().cloned() else {
+            return false;
+        };
+        let Some(parent_node) = node.parent() else {
+            return false;
+        };
+        let facts = match parent_node.kind() {
+            "object_creation_expression" => anonymous_class_scope(
+                &self.file,
+                self.source,
+                parent_node,
+                node,
+                &self.package_name,
+                &parent,
+            ),
+            "enum_constant" => enum_constant_class_scope(
+                &self.file,
+                self.source,
+                parent_node,
+                node,
+                &self.package_name,
+                &parent,
+            ),
+            _ => return false,
+        };
+        let unit = facts.unit;
+        let top_level = self.current_top_level().unwrap_or_else(|| unit.clone());
+        self.parsed.add_code_unit(
+            unit.clone(),
+            facts.anchor,
+            self.source,
+            Some(parent),
+            Some(top_level.clone()),
+        );
+        self.parsed
+            .set_raw_supertypes(unit.clone(), facts.raw_supertypes);
+        self.parsed.add_signature_with_metadata(
+            unit.clone(),
+            SignatureMetadata::new(facts.signature, Vec::new())
+                .with_class_like_interface(facts.is_interface)
+                .with_class_like_static(facts.is_static),
+        );
+        self.declaration_contexts.push(JavaDeclarationContext {
+            unit,
+            top_level,
+            is_record: false,
+        });
+        true
+    }
+
+    fn enter_declaration(&mut self, node: Node<'_>, active: bool) {
+        let mut pushed = false;
+        if active {
+            match node.kind() {
+                "package_declaration" => {
+                    if let Some(module) = self.package_module.clone() {
+                        self.parsed.add_code_unit(
+                            module.clone(),
+                            node,
+                            self.source,
+                            None,
+                            Some(module.clone()),
+                        );
+                        self.parsed.add_signature(
+                            module.clone(),
+                            format!("package {};", self.package_name),
+                        );
+                        self.record_unit_source(node, &module);
+                    }
+                }
+                kind if is_class_like_declaration_kind(kind) => {
+                    pushed = self.add_class_scope(node);
+                }
+                "method_declaration" | "constructor_declaration"
+                    if self.current_owner().is_some() =>
+                {
+                    let parent = self.current_owner().cloned().expect("callable owner");
+                    let top_level = self.current_top_level().expect("callable top level");
+                    let visibility = self.source_visibility(node);
+                    let modifiers = self.resolution.source_modifiers_for(node);
+                    let properties = self.resolution.source_callable_shape_for(node).properties();
+                    if let Some(unit) = self.visit_callable(
+                        node, &parent, &top_level, visibility, modifiers, properties,
+                    ) {
+                        self.declaration_contexts.push(JavaDeclarationContext {
+                            unit,
+                            top_level,
+                            is_record: false,
+                        });
+                        pushed = true;
+                    }
+                }
+                "compact_constructor_declaration"
+                    if self.current_owner().is_some()
+                        && self
+                            .declaration_contexts
+                            .last()
+                            .is_some_and(|context| context.is_record) =>
+                {
+                    let parent = self.current_owner().cloned().expect("record owner");
+                    let top_level = self.current_top_level().expect("record top level");
+                    let record = node
+                        .parent()
+                        .and_then(|body| body.parent())
+                        .filter(|record| record.kind() == "record_declaration");
+                    let visibility = self.source_visibility(node);
+                    let properties = self.resolution.source_callable_shape_for(node).properties();
+                    if let Some(record) = record
+                        && let Some(unit) = self.visit_compact_constructor(
+                            node, record, &parent, &top_level, visibility, properties,
+                        )
+                    {
+                        self.declaration_contexts.push(JavaDeclarationContext {
+                            unit,
+                            top_level,
+                            is_record: false,
+                        });
+                        pushed = true;
+                    }
+                }
+                "field_declaration" | "constant_declaration" if self.current_owner().is_some() => {
+                    let parent = self.current_owner().cloned().expect("field owner");
+                    let top_level = self.current_top_level().expect("field top level");
+                    if self.field_visibility(node).is_some() {
+                        let shape = self.resolution.source_field_shape_for(node);
+                        self.visit_field_declaration(node, &parent, &top_level, shape);
+                    }
+                }
+                "enum_constant" if self.current_owner().is_some() => {
+                    let parent = self.current_owner().cloned().expect("enum owner");
+                    let top_level = self.current_top_level().expect("enum top level");
+                    self.visit_enum_constant(node, &parent, &top_level);
+                }
+                "class_body" => {
+                    pushed = self.add_synthetic_class_scope(node);
+                }
+                "lambda_expression" if self.current_owner().is_some() => {
+                    let parent = self.current_owner().cloned().expect("lambda owner");
+                    let top_level = self.current_top_level().expect("lambda top level");
+                    let unit = lambda_code_unit(&self.file, &self.package_name, &parent, node);
+                    self.parsed.add_code_unit(
+                        unit.clone(),
+                        node,
+                        self.source,
+                        Some(parent),
+                        Some(top_level.clone()),
+                    );
+                    self.declaration_contexts.push(JavaDeclarationContext {
+                        unit,
+                        top_level,
+                        is_record: false,
+                    });
+                    pushed = true;
+                }
+                _ => {}
+            }
+        }
+        self.declaration_exits.push(pushed);
+    }
+
+    fn enter_import(&mut self, node: Node<'tree>, syntax: &JavaImportSyntax<'tree, 'source>) {
+        assert_eq!(node.kind(), "import_declaration");
+        let raw = node_text(node, self.source).trim().to_string();
+        let import = syntax.to_import_info(node, raw);
+        let declaration = self.resolution.source_collector_mut().intern_node(node);
+        let target = if syntax.is_wildcard {
+            None
+        } else {
+            syntax
+                .segments
+                .as_ref()
+                .and_then(|segments| segments.last().map(|(segment, _)| *segment))
+                .map(|target| self.resolution.source_collector_mut().intern_node(target))
+        };
+        let source_import_id = SourceImportId::try_from_index(self.source_imports.len())
+            .expect("Java source import count exceeds u32");
+        self.source_imports.push(SourceImportFact::from_import(
+            import,
+            declaration,
+            target,
+            None,
+            Vec::new(),
+        ));
+        self.generic_imports.push(source_import_id);
+    }
+
+    fn take_package_syntax(&mut self, node: Node<'tree>) -> JavaPackageSyntax<'tree, 'source> {
+        assert_eq!(node.kind(), "package_declaration");
+        if let Some(syntax) = self.package_syntaxes.remove(&node.id()) {
+            return syntax;
+        }
+        assert_ne!(
+            node.parent().map(|parent| parent.id()),
+            Some(self.root_id),
+            "every top-level Java package syntax must be precollected"
+        );
+        parse_package_syntax(node, self.source)
+    }
+
+    fn enter(
+        &mut self,
+        node: Node<'tree>,
+        declaration_active: bool,
+        native_active: bool,
+        parents: &ParentIndex<'tree>,
+    ) -> (bool, TreeWalkAction) {
+        // Capture source-owned declaration properties before either projection
+        // applies its own admission or suppression rules.
+        self.capture_source_type_facts(node);
+        self.capture_source_properties(node);
+        let enclosing = *self
+            .structural_parents
+            .last()
+            .expect("Java structural traversal has a root frame");
+        let mut structural_parent = enclosing;
+        if node.is_named()
+            && let Some(kind) = self.structural_kinds.kind_of(&node)
+            && JAVA_STRUCTURAL_SPEC.should_extract(node, kind)
+        {
+            let kind = JAVA_STRUCTURAL_SPEC.refine_kind(
+                node,
+                kind,
+                enclosing.map(|id| self.structural.normalized_kind(id)),
+                self.source,
+                self.call_site_context,
+            );
+            let fact_id = self
+                .structural
+                .enter(
+                    node,
+                    kind,
+                    enclosing,
+                    self.resolution.source_collector_mut(),
+                )
+                .expect("complete Java preparation has no structural admission limit");
+            let mut sink = self
+                .structural
+                .role_sink(self.resolution.source_collector_mut(), parents);
+            JAVA_STRUCTURAL_SPEC.extract(node, kind, &mut sink);
+            self.structural
+                .accept_roles(fact_id, sink)
+                .expect("complete Java preparation has no structural admission limit");
+            structural_parent = Some(fact_id);
+        }
+        self.structural_parents.push(structural_parent);
+        let package_syntax = (native_active && node.kind() == "package_declaration")
+            .then(|| self.take_package_syntax(node));
+        let import_syntax =
+            (node.kind() == "import_declaration").then(|| parse_import_syntax(node, self.source));
+        if let Some(syntax) = import_syntax.as_ref() {
+            self.enter_import(node, syntax);
+        }
+        let native_action = if !node.is_named() {
+            // The Java resolution lowerer historically receives named nodes;
+            // keep punctuation transparent while the coordinated driver lets
+            // structural collection observe the complete parser tree.
+            TreeWalkAction::Descend
+        } else if native_active {
+            if let Some(syntax) = package_syntax.as_ref() {
+                self.resolution.enter_package(node, syntax)
+            } else if let Some(syntax) = import_syntax.as_ref() {
+                self.resolution.enter_import(node, syntax)
+            } else {
+                self.resolution.enter(node)
+            }
+        } else {
+            self.resolution.record_type_identifier(node);
+            TreeWalkAction::Skip
+        };
+        self.enter_declaration(node, declaration_active);
+        (true, native_action)
+    }
+
+    fn exit(&mut self, native_exit: bool) {
+        assert!(self.structural_parents.pop().is_some());
+        if self
+            .source_visibility_exits
+            .pop()
+            .expect("every Java primary node has a source-property exit")
+        {
+            self.source_visibility_owners
+                .pop()
+                .expect("Java source-property owner exit must balance");
+        }
+        if self
+            .declaration_exits
+            .pop()
+            .expect("every Java primary node has a declaration exit")
+        {
+            self.declaration_contexts
+                .pop()
+                .expect("Java declaration context exit must balance");
+        }
+        if native_exit {
+            self.resolution.exit_scope();
+        }
+    }
+
+    fn finish(mut self) {
+        assert_eq!(self.structural_parents, [None]);
+        assert!(self.declaration_contexts.is_empty());
+        assert!(self.declaration_exits.is_empty());
+        assert!(self.source_visibility_owners.is_empty());
+        assert!(self.source_visibility_exits.is_empty());
+        let structural = self
+            .structural
+            .finish()
+            .expect("complete Java preparation has no structural admission limit");
+        let native: JavaResolutionExtraction = self.resolution.finish();
+        let source_imports = std::mem::take(&mut self.source_imports);
+        let generic_imports = std::mem::take(&mut self.generic_imports);
+        self.parsed.imports = generic_imports
+            .iter()
+            .map(|id| {
+                source_imports
+                    .get(id.index())
+                    .expect("Java generic import projection references a source import")
+                    .import_info(&native.source_facts)
+            })
+            .collect();
+        self.parsed.type_identifiers = native.type_identifiers;
+        let java_source_facts = native.java_source_facts;
+        let source_facts = ParsedSourceFacts {
+            java: Some(java_source_facts),
+            source_bytes: self.source.len(),
+            occurrences: native.source_facts,
+            structural,
+            native_site_occurrences: native.site_occurrences,
+            native_declaration_sources: native.declaration_sources,
+            declaration_visibilities: Some(std::mem::take(
+                &mut self.source_declaration_visibilities,
+            )),
+            imports: source_imports,
+            generic_imports,
+            source_declaration_units: std::mem::take(&mut self.source_declaration_units),
+            source_declaration_metadata: std::mem::take(&mut self.source_declaration_metadata),
+        };
+        assert_eq!(
+            self.parsed.imports.len(),
+            source_facts.generic_imports.len()
+        );
+        self.parsed.native_source = Some(ParsedNativeSource::new(
+            native.facts,
+            source_facts,
+            self.parsed,
+        ));
+    }
+}
+
+enum JavaPrimaryFrame<'tree> {
+    Enter {
+        node: Node<'tree>,
+        declaration_active: bool,
+        native_active: bool,
+    },
+    Exit {
+        native_exit: bool,
+    },
+}
+
+fn walk_java_primary_tree<'tree>(
+    root: Node<'tree>,
+    state: &mut JavaPrimaryParseState<'tree, '_, '_>,
+    parents: &ParentIndex<'tree>,
+) {
+    let mut stack = vec![JavaPrimaryFrame::Enter {
+        node: root,
+        declaration_active: true,
+        native_active: true,
+    }];
+    while let Some(frame) = stack.pop() {
+        match frame {
+            JavaPrimaryFrame::Enter {
+                node,
+                declaration_active,
+                native_active,
+            } => {
+                let (declaration_descend, native_action) =
+                    state.enter(node, declaration_active, native_active, parents);
+                let native_descend = native_active
+                    && matches!(
+                        &native_action,
+                        TreeWalkAction::Descend | TreeWalkAction::DescendWithExit
+                    );
+                let native_exit =
+                    native_active && matches!(&native_action, TreeWalkAction::DescendWithExit);
+                stack.push(JavaPrimaryFrame::Exit { native_exit });
+                let mut cursor = node.walk();
+                let mut children = node.children(&mut cursor).collect::<Vec<_>>();
+                children.reverse();
+                stack.extend(children.into_iter().map(|child| JavaPrimaryFrame::Enter {
+                    node: child,
+                    declaration_active: declaration_active && declaration_descend,
+                    native_active: native_descend,
+                }));
+            }
+            JavaPrimaryFrame::Exit { native_exit } => state.exit(native_exit),
+        }
+    }
+}
+
 pub fn module_code_unit(file: &ProjectFile, package_name: &str) -> CodeUnit {
     let fq = java_package_fq(package_name);
     match package_name.rsplit_once('.') {
@@ -1837,45 +2568,24 @@ fn collect_supertype_nodes(node: Node<'_>, source: &str, raw: &mut Vec<String>) 
 /// declaration with its members.
 pub fn parse_java_file(file: &ProjectFile, source: &str, tree: &Tree) -> ParsedFile {
     let root = tree.root_node();
-    let package_name = determine_package_name(root, source);
+    let package_syntaxes = collect_top_level_package_syntaxes(root, source);
+    let package_name = package_name_from_syntax(package_syntaxes.display());
     let mut parsed = ParsedFile::new(package_name.clone());
-    collect_persisted_type_identifiers(root, source, &mut parsed.type_identifiers);
-    let package_module_code_unit =
-        (!package_name.is_empty()).then(|| module_code_unit(file, &package_name));
-
-    for index in 0..root.named_child_count() {
-        let Some(child) = root.named_child(index) else {
-            continue;
-        };
-
-        match child.kind() {
-            "package_declaration" => {
-                if let Some(module) = &package_module_code_unit {
-                    parsed.add_code_unit(module.clone(), child, source, None, Some(module.clone()));
-                    parsed.add_signature(module.clone(), format!("package {};", package_name));
-                }
-            }
-            "import_declaration" => {
-                let raw = node_text(child, source).trim().to_string();
-                parsed.imports.push(parse_import_info(child, source, raw));
-            }
-            "class_declaration"
-            | "interface_declaration"
-            | "enum_declaration"
-            | "record_declaration"
-            | "annotation_type_declaration" => {
-                let class_code_unit =
-                    visit_class_like(file, source, child, &package_name, None, None, &mut parsed);
-                if let (Some(module), Some(class_code_unit)) =
-                    (&package_module_code_unit, class_code_unit)
-                {
-                    parsed.add_child(module.clone(), class_code_unit);
-                }
-            }
-            _ => {}
-        }
-    }
-
+    let grammar = tree_sitter_java::LANGUAGE.into();
+    let structural_kinds = CompiledKinds::compile(&grammar, JAVA_KIND_TABLE);
+    let call_site_context = JAVA_STRUCTURAL_SPEC.call_site_context(root, source);
+    let parents = ParentIndex::new(root);
+    let mut state = JavaPrimaryParseState::new(
+        file,
+        source,
+        package_syntaxes,
+        &mut parsed,
+        root,
+        &structural_kinds,
+        &call_site_context,
+    );
+    walk_java_primary_tree(root, &mut state, &parents);
+    state.finish();
     parsed
 }
 
@@ -1945,6 +2655,56 @@ class Outer {
             "a declaration's own name is a definition, not a reference: {:?}",
             parsed.type_identifiers
         );
+    }
+}
+
+#[cfg(test)]
+mod source_shape_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    fn parse(source: &str) -> ParsedFile {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_java::LANGUAGE.into())
+            .expect("java grammar");
+        let tree = parser.parse(source, None).expect("java tree");
+        let file = ProjectFile::new(
+            std::env::temp_dir().join("java-source-shape"),
+            "src/Fixture.java",
+        );
+        parse_java_file(&file, source, &tree)
+    }
+
+    fn metadata<'a>(parsed: &'a ParsedFile, prefix: &str) -> &'a SignatureMetadata {
+        parsed
+            .signature_metadata
+            .values()
+            .flat_map(|rows| rows.iter())
+            .find(|metadata| metadata.label().starts_with(prefix))
+            .unwrap_or_else(|| panic!("missing Java metadata beginning with {prefix:?}"))
+    }
+
+    #[test]
+    fn source_shapes_feed_metadata_and_native_staticness_without_ancestor_reinterpretation() {
+        let parsed = parse(
+            "class Outer { class Inner {} class Explicit { Explicit() {} } void local() { class OuterLocal {} } static void shape(String first, String... rest) {} Runnable anonymous = new Runnable() { int anonymousField; }; } \
+             interface I { int field; Runnable interfaceAnonymous = new Runnable() { int bodyField; }; class Nested {} void method() { class InterfaceLocal {} } } \
+             enum E { ONE { int enumField; } } record R(int value) {}",
+        );
+
+        assert!(metadata(&parsed, "static void shape").callable_is_static());
+        assert_eq!(
+            metadata(&parsed, "static void shape").callable_arity(),
+            Some(CallableArity::new(1, 2, true))
+        );
+        assert!(metadata(&parsed, "int field").field_is_static());
+        assert!(metadata(&parsed, "class Nested {").class_like_is_static());
+        assert!(!metadata(&parsed, "class InterfaceLocal {").class_like_is_static());
+        for field in ["int anonymousField", "int bodyField", "int enumField"] {
+            assert!(!metadata(&parsed, field).field_is_static());
+            assert!(!metadata(&parsed, field).field_is_final());
+        }
     }
 }
 

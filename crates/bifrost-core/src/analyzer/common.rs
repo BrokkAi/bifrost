@@ -10,6 +10,7 @@ use tree_sitter::Node;
 use crate::analyzer::structural::facts::Span;
 use crate::analyzer::{CodeUnit, Language, ProjectFile};
 use crate::cancellation::CancellationToken;
+use std::path::Path;
 
 /// The byte span a tree-sitter node covers, in the shared structural span
 /// shape. Adapters use this to record token anchors (e.g. an import's binder
@@ -60,6 +61,32 @@ pub fn declaration_language_for_file(file: &ProjectFile) -> Language {
     file.declaration_language()
 }
 
+/// The language whose spelling rules name a declaration found in a file at
+/// `rel_path`, decided from the path alone.
+///
+/// [`declaration_language_for_file`] is the same answer for a caller holding
+/// the file. This is for the callers that hold only a workspace-relative path
+/// -- a stored row keyed by path, a checker reading a tool payload -- and both
+/// reach it through the same `declaration_language_of` rule, so the owner is
+/// one function rather than one per entry point.
+pub fn declaration_language_for_rel_path(rel_path: &Path) -> Language {
+    let extension = rel_path.extension().and_then(|ext| ext.to_str());
+    let language = extension.map_or(Language::None, Language::from_extension);
+    declaration_language_of(language, unclaimed_extension(extension))
+}
+
+/// The declaration-naming rule over the two facts a path decides:
+/// [`ProjectFile::language`] and [`ProjectFile::has_unclaimed_extension`].
+///
+/// [`ProjectFile::language`]: crate::analyzer::ProjectFile::language
+/// [`ProjectFile::has_unclaimed_extension`]: crate::analyzer::ProjectFile::has_unclaimed_extension
+pub(crate) fn declaration_language_of(language: Language, unclaimed_extension: bool) -> Language {
+    match language {
+        Language::None if unclaimed_extension => INCLUDE_CLAIMING_LANGUAGE,
+        language => language,
+    }
+}
+
 /// Whether no analyzable language claims this file's extension.
 ///
 /// This is the eligibility rule for include-driven language inference (#1837):
@@ -74,6 +101,12 @@ pub fn declaration_language_for_file(file: &ProjectFile) -> Language {
 /// even though no analyzer parses it directly.
 pub fn has_unclaimed_extension(file: &ProjectFile) -> bool {
     file.has_unclaimed_extension()
+}
+
+/// The extension-list half of [`has_unclaimed_extension`], for a caller that
+/// has the extension rather than a file.
+pub(crate) fn unclaimed_extension(extension: Option<&str>) -> bool {
+    extension.is_none_or(|extension| !Language::is_source_extension(extension))
 }
 
 /// Whether an analyzer covering `languages` could have indexed `file`, judged
