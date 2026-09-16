@@ -1742,25 +1742,35 @@ fn bifrost_mcp_lists_and_runs_built_in_policies() {
     // records both.
     assert_eq!(catalog["schema_version"], 2);
     let packs = catalog["packs"].as_array().expect("policy packs");
-    assert_eq!(packs.len(), 2);
+    assert_eq!(packs.len(), 3);
     assert_eq!(packs[0]["id"], "bifrost.code-smells");
-    let correctness_policies = packs[0]["policies"]
+    let code_smells_policies = packs[0]["policies"]
         .as_array()
-        .expect("correctness policies");
-    assert_eq!(correctness_policies.len(), 17);
-    assert!(correctness_policies.iter().all(|policy| {
+        .expect("code-smells policies");
+    assert_eq!(code_smells_policies.len(), 17);
+    assert!(code_smells_policies.iter().all(|policy| {
         policy["authored_hash"].as_str().is_some()
             && policy["resolved_semantic_hash"]
                 .as_str()
                 .is_some_and(|hash| Some(hash) == policy["authored_hash"].as_str())
     }));
     assert!(
-        correctness_policies
+        code_smells_policies
             .iter()
             .any(|policy| policy["id"] == "bifrost.correctness.go-data-race")
     );
-    assert_eq!(packs[1]["id"], "bifrost.security");
-    let security_policies = packs[1]["policies"].as_array().expect("security policies");
+    assert_eq!(packs[1]["id"], "bifrost.correctness");
+    let resource_lifecycle_policies = packs[1]["policies"]
+        .as_array()
+        .expect("correctness policies");
+    assert_eq!(resource_lifecycle_policies.len(), 1);
+    assert!(
+        resource_lifecycle_policies
+            .iter()
+            .any(|policy| policy["id"] == "bifrost.correctness.resource-lifecycle")
+    );
+    assert_eq!(packs[2]["id"], "bifrost.security");
+    let security_policies = packs[2]["policies"].as_array().expect("security policies");
     assert_eq!(security_policies.len(), 2);
     assert!(
         security_policies.iter().any(|policy| {
@@ -1831,6 +1841,7 @@ fn bifrost_mcp_lists_and_runs_built_in_policies() {
             "bifrost.correctness.go-wrong-error-on-failure-path",
             "bifrost.correctness.python-absent-member",
             "bifrost.correctness.rayon-in-blocking-lazy-init",
+            "bifrost.correctness.resource-lifecycle",
             "bifrost.correctness.unsafe-deserialization"
         ],
         "{category}"

@@ -5,7 +5,7 @@ analysis behavior, integrations, and release artifacts. It is curated from the
 complete private release range because the public open-core repository is a
 projection and its commit history does not contain every source commit.
 
-## Unreleased
+## [0.11.4] - 2026-09-15
 
 ### Added
 
@@ -68,6 +68,14 @@ projection and its commit history does not contain every source commit.
   (reconciling the timer and subtest models), the `bifrost.go.stdlib.testing`
   declarations are 1.1.0, and the built-in `bifrost.code-smells` pack is
   2.13.0 so the public Go data-race policy also seeds roots that call `Run`.
+- Go data-race analysis now models `sync.Cond` through its associated locker.
+  `Wait` unlocks, suspends, and reacquires that locker; `Signal` and `Broadcast`
+  remain notifications rather than unconditional joins, so a missed signal or
+  a different waiter does not invent ordering.
+- Go data-race analysis now applies `Mutex.TryLock`, `RWMutex.TryLock`, and
+  `RWMutex.TryRLock` protection only on paths where the returned boolean is
+  proven true, retaining the correct reader or writer mode. The false branch
+  holds no lock, and unresolved result flow remains an open boundary.
 - Python conditional type refinements now survive semantic-pack and CSMI
   wire round trips, with exact binding and preserved provenance.
 - Configuration facts are now exposed through canonical CodeQuery and RQL.
@@ -112,6 +120,9 @@ projection and its commit history does not contain every source commit.
   selector row and every loaded shard. Fresh policy processes that activate a
   released dependency pack spend materially less time before evaluation, with
   unchanged activation decisions and provenance.
+- Cold-retention benchmark comparisons now judge the first request against a
+  monotonic absolute ceiling as well as its warm median, and expose the reason
+  structurally instead of inferring it from rendered detail text.
 - Python type-flow queries reuse semantic artifacts prepared by field-slot
   surveys. Binding and correlation refinement share their copy, open-binding,
   and relevant-event inventories, allowing more fixed-budget analyses to
@@ -145,6 +156,9 @@ projection and its commit history does not contain every source commit.
 - Diff-tool requests now report their execution phases to the client while
   running, and analyzer cache build-lock waits are cancellable and
   self-naming.
+- MCP clients can negotiate the stable 2026-07-28 protocol revision. Discovery
+  advertises only the revisions covered by Bifrost's wire and conformance
+  gates, and unadvertised prompt and resource-template methods fail explicitly.
 - Analyzer cache collection stays out of the way of interactive work and
   paces itself per new store.
 - Kotlin overload selection now resolves through the shared call_binding
@@ -161,6 +175,10 @@ projection and its commit history does not contain every source commit.
   `diff_base` stage and a budget that expires there no longer degrades gating to
   a full run. MCP Tasks keep their ten-minute window.
 
+- Semantic-pack acquisition now rejects incompatible generated productions
+  from bundle index metadata before reading their assets, skips decoding stale
+  productions that will not be installed, and avoids re-verifying the same
+  cache-miss bytes after a publish race.
 - A Python guard whose arm calls the builtin `exit` or `quit` now ends that
   arm. The generated stdlib pack projects the `__call__` contract of the
   `_sitebuiltins.Quitter` values those names bind, so the class the guard
@@ -174,6 +192,11 @@ projection and its commit history does not contain every source commit.
 - `query_code` advertises schema versions as strings, avoiding Gemini tool-list
   rejection of numeric enums. Canonical CodeQuery JSON emits `"1"`; existing
   numeric version inputs remain readable.
+
+- The DeepSeek Harness npm plugin is now promoted from the same immutable
+  qualification bundle as the release binaries. Its launcher metadata is
+  checked after publication against the macOS archive sidecar, preventing a
+  stale `archiveSha256` pin from making every managed binary preparation fail.
 
 - Java receiver lookup now infers `var` locals from uniquely resolved factory
   return declarations, preserving separate runtime-dispatch proof and incomplete

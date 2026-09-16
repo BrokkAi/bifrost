@@ -2543,6 +2543,93 @@ impl TypedSelection {
 }
 
 #[cfg(test)]
+impl PreloadedFactSource {
+    pub(super) fn install_transfer_for_test(
+        &mut self,
+        fragment: BindingFragmentId,
+        transfer: LoweredTypeTransfer,
+    ) {
+        let semantic = transfer.rule().semantic();
+        retain_source_row_fragment(&mut self.typed.source_row_fragments, semantic, fragment);
+        let source = transfer.source_slot();
+        let target = transfer.rule().target_slot();
+        self.typed
+            .transfers_by_source
+            .entry(source)
+            .or_default()
+            .push(transfer.clone());
+        self.typed
+            .transfers_by_target
+            .entry(target)
+            .or_default()
+            .push(transfer);
+        let owners = &self.typed.source_row_fragments;
+        for rows in [
+            self.typed.transfers_by_source.get_mut(&source).unwrap(),
+            self.typed.transfers_by_target.get_mut(&target).unwrap(),
+        ] {
+            rows.sort_by_key(|row| (owners[&row.rule().semantic()], row.rule().semantic()));
+            rows.dedup();
+        }
+    }
+    pub(super) fn replace_transfer_for_test(
+        &mut self,
+        semantic: SemanticId,
+        delta: i64,
+        transform: super::model::TypeTransferValueTransform,
+        completion: ResolutionCompletion,
+    ) {
+        let mut replaced = 0;
+        for transfers in self
+            .typed
+            .transfers_by_source
+            .values_mut()
+            .chain(self.typed.transfers_by_target.values_mut())
+        {
+            for transfer in transfers {
+                if transfer.rule().semantic() != semantic {
+                    continue;
+                }
+                *transfer = LoweredTypeTransfer::new(
+                    transfer.source_slot(),
+                    transfer.kind(),
+                    TypeTransferRule::new(
+                        semantic,
+                        transfer.rule().target_slot(),
+                        delta,
+                        transform,
+                        completion.clone(),
+                    ),
+                );
+                replaced += 1;
+            }
+        }
+        assert_eq!(
+            replaced, 2,
+            "one selected transfer appears once in each access direction"
+        );
+    }
+    pub(super) fn set_frontier_completion_for_test(
+        &mut self,
+        fragment: BindingFragmentId,
+        frontier: SemanticId,
+        completion: ResolutionCompletion,
+    ) -> Option<SelectedTypeFrontierCompletion> {
+        retain_source_row_fragment(&mut self.typed.source_row_fragments, frontier, fragment);
+        self.typed.frontier_completion_by_frontier.insert(
+            frontier,
+            SelectedTypeFrontierCompletion::new(fragment, frontier, completion),
+        )
+    }
+    pub(super) fn frontier_completion_for_test(
+        &self,
+        frontier: SemanticId,
+    ) -> &ResolutionCompletion {
+        self.typed.frontier_completion_by_frontier[&frontier].completion()
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::super::batch::BatchResolutionEngine;
     use super::super::batch::{ReverseCandidateGapExclusionPlan, ReverseCandidateGapIdentity};

@@ -31,11 +31,14 @@ use super::{
 };
 
 pub const CODE_SMELLS_PACK_ID: &str = "bifrost.code-smells";
+pub const CORRECTNESS_PACK_ID: &str = "bifrost.correctness";
 pub const SECURITY_PACK_ID: &str = "bifrost.security";
 const BUILT_IN_MANIFEST_SCHEMA_VERSION: u32 = 2;
 
 const CODE_SMELLS_MANIFEST_SOURCE: &str =
     include_str!("../policy-packs/bifrost.code-smells/manifest.json");
+const CORRECTNESS_MANIFEST_SOURCE: &str =
+    include_str!("../policy-packs/bifrost.correctness/manifest.json");
 const SECURITY_MANIFEST_SOURCE: &str =
     include_str!("../policy-packs/bifrost.security/manifest.json");
 
@@ -116,6 +119,11 @@ const CODE_SMELLS_POLICY_SOURCES: &[(&str, &str)] = &[
     ),
 ];
 
+const CORRECTNESS_POLICY_SOURCES: &[(&str, &str)] = &[(
+    "policies/resource-lifecycle.rqlp",
+    include_str!("../policy-packs/bifrost.correctness/policies/resource-lifecycle.rqlp"),
+)];
+
 const SECURITY_POLICY_SOURCES: &[(&str, &str)] = &[
     (
         "policies/jvm/servlet-parameter-to-jdbc.rqlp",
@@ -133,11 +141,13 @@ const SECURITY_POLICY_SOURCES: &[(&str, &str)] = &[
 
 const EMBEDDED_POLICY_PACK_SOURCES: &[(&str, &str)] = &[
     ("bifrost.code-smells", CODE_SMELLS_MANIFEST_SOURCE),
+    ("bifrost.correctness", CORRECTNESS_MANIFEST_SOURCE),
     ("bifrost.security", SECURITY_MANIFEST_SOURCE),
 ];
 
 const EMBEDDED_POLICY_SOURCES: &[(&str, &[(&str, &str)])] = &[
     ("bifrost.code-smells", CODE_SMELLS_POLICY_SOURCES),
+    ("bifrost.correctness", CORRECTNESS_POLICY_SOURCES),
     ("bifrost.security", SECURITY_POLICY_SOURCES),
 ];
 
@@ -865,7 +875,7 @@ mod tests {
     #[test]
     fn checked_in_catalog_is_internally_consistent() {
         let catalog = built_in_policy_catalog().expect("valid built-in catalog");
-        assert_eq!(catalog.document().packs.len(), 2);
+        assert_eq!(catalog.document().packs.len(), 3);
         assert_eq!(
             catalog
                 .pack_manifest(CODE_SMELLS_PACK_ID)
@@ -876,11 +886,29 @@ mod tests {
         );
         assert_eq!(
             catalog
+                .pack_manifest(CORRECTNESS_PACK_ID)
+                .expect("correctness pack")
+                .policies
+                .len(),
+            1
+        );
+        assert_eq!(
+            catalog
                 .pack_manifest(SECURITY_PACK_ID)
                 .expect("security pack")
                 .policies
                 .len(),
             2
+        );
+        assert_eq!(
+            catalog
+                .select(&BuiltInPolicySelection {
+                    packs: vec![CORRECTNESS_PACK_ID.to_owned()],
+                    ..BuiltInPolicySelection::default()
+                })
+                .expect("select correctness pack")
+                .len(),
+            1
         );
         assert_eq!(
             catalog

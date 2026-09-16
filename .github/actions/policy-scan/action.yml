@@ -19,7 +19,7 @@ inputs:
       install and uses a release or debug `bifrost` binary from the checkout,
       otherwise the `bifrost` already on PATH.
     required: false
-    default: v0.11.3
+    default: v0.11.4
   policy-packs:
     description: Space-separated built-in pack IDs to run.
     required: false
@@ -332,9 +332,15 @@ runs:
             echo "::group::Bifrost policy report diagnostics"
             if diagnostics=$(jq -r '
               .runs[].invocations[]?.toolExecutionNotifications[]?
-              | select(.descriptor.id == "BIFROST_REPORT_DIAGNOSTIC")
-              | .properties["bifrost.reportDiagnostic"] as $diagnostic
-              | "\($diagnostic.code // "unknown"): \(.message.text // "<no-message>")"
+              | if .properties["bifrost.reportDiagnostic"] != null then
+                  .properties["bifrost.reportDiagnostic"] as $diagnostic
+                  | "\($diagnostic.code // .descriptor.id // "unknown"): \(.message.text // "<no-message>")"
+                elif .properties["bifrost.completion"] != null then
+                  .properties["bifrost.completion"] as $completion
+                  | "\(.descriptor.id // "unknown"): \(.message.text // "<no-message>")"
+                    + " [policy: \(.properties["bifrost.policyId"] // "unknown"); completion: \($completion | tojson)]"
+                else empty
+                end
             ' "${SARIF_PATH}"); then
               if [ -n "${diagnostics}" ]; then
                 printf '%s\n' "${diagnostics}"

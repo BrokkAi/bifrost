@@ -991,6 +991,11 @@ jobs:
         run: node --test plugins/bifrost-agent/test/launcher.test.mjs
       - name: Validate agent plugin manifests
         run: node scripts/public/check-codex-plugin-manifest.mjs
+      - name: Test and package the DSH plugin
+        run: |
+          npm test
+          npm pack --pack-destination ../../dist
+        working-directory: plugins/bifrost-dsh
       - name: Package exact agent plugin archive
         shell: bash
         env:
@@ -1010,6 +1015,7 @@ jobs:
           path: |
             dist/bifrost-agent-*.tar.gz
             dist/bifrost-agent-*.sha256
+            dist/brokkai-dsh-plugin-bifrost-*.tgz
           if-no-files-found: error
           retention-days: 14
 

@@ -3110,6 +3110,7 @@ mod tests {
     };
 
     use super::super::fact_lowering::lookup_semantic;
+    use super::super::model::TypeTransferApplication;
     use super::*;
 
     fn call_semantic(fragment: BindingFragmentId, call: ResolutionSiteId) -> SemanticId {
@@ -4815,6 +4816,18 @@ mod tests {
             &ResolutionCompletion::Complete
         );
 
+        let base = base_type.frontier().possible_values()[0];
+        assert!(matches!(
+            declared.rule().apply(base),
+            TypeTransferApplication::Value(ResolutionSlotValue::Runtime { .. })
+        ));
+        assert_eq!(
+            observed
+                .rule()
+                .apply(sub_value.frontier().possible_values()[0]),
+            TypeTransferApplication::Value(sub_value.frontier().possible_values()[0])
+        );
+
         let declared_slots = lowered
             .declaration_types()
             .iter()
@@ -5098,6 +5111,16 @@ mod tests {
             incremented.transfers()[0].rule().completion(),
             &ResolutionCompletion::Complete
         );
+        let TypeTransferApplication::Value(decremented) = rule.apply(input) else {
+            panic!("2 - 1 is representable")
+        };
+        assert_eq!(decremented.ty().indirection(), 1);
+        let TypeTransferApplication::Value(incremented_value) =
+            incremented.transfers()[0].rule().apply(input)
+        else {
+            panic!("2 + 1 is representable")
+        };
+        assert_eq!(incremented_value.ty().indirection(), 3);
     }
 
     #[test]
@@ -5141,6 +5164,8 @@ mod tests {
             seed.frontier().possible_values(),
             [ResolutionSlotValue::TypeObject(_)]
         ));
+        let input = seed.frontier().possible_values()[0];
+        assert_eq!(rule.apply(input), TypeTransferApplication::NoValue);
     }
 
     #[test]

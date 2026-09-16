@@ -46,7 +46,7 @@ require_count '*.crate' exactly "${#RELEASE_CRATES[@]}"
 require_count '*.crate.metadata.json' exactly "${#RELEASE_CRATES[@]}"
 require_count '*.whl' exactly 10
 require_count '*.vsix' exactly 1
-require_count '*.tgz' more-than 0
+require_count '*.tgz' at-least 2
 require_count '*.sha256' at-least 7
 [[ -f "$bundle/THIRD_PARTY_LICENSES.html" ]] ||
   die "qualification bundle has no THIRD_PARTY_LICENSES.html"

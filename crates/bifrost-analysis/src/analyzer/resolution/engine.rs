@@ -23,8 +23,8 @@ use super::coverage::{LoweredCandidateDirection, LoweredCoverageGap, LoweringCov
 use super::model::{
     AlphaRenamingId, BindingFragmentId, BindingNodeId, BindingNodeKind, EndpointSignature,
     PartialPath, PartialPathId, ResolutionAnswer, ResolutionCompletion, ResolutionIncompleteReason,
-    ResolutionWitness, SemanticId, StackPattern, TypeTransferRule, WitnessStep,
-    clone_completion_with_poll,
+    ResolutionWitness, SemanticId, StackPattern, TypeTransferApplication, TypeTransferRule,
+    TypedFrontierState, WitnessStep, clone_completion_with_poll,
 };
 use super::saturation::{CycleCompletenessCertifier, SaturationBranch, SaturationDecision};
 
@@ -3301,6 +3301,85 @@ where
             Some(left.len().cmp(&right.len()))
         }
     }
+}
+
+pub(super) fn apply_type_transfer_rules(
+    state: &TypedFrontierState,
+    mut rules: Vec<TypeTransferRule>,
+    source_completion: ResolutionCompletion,
+    cancellation: &CancellationToken,
+) -> StoreResult<(Vec<TypedFrontierState>, ResolutionCompletion)> {
+    rules.sort_unstable();
+    for duplicate in rules
+        .windows(2)
+        .filter(|pair| pair[0].semantic() == pair[1].semantic())
+    {
+        if duplicate[0] != duplicate[1] {
+            return Err(StoreError::new(format!(
+                "type-transfer semantic {} names conflicting rules: {:?}",
+                duplicate[0].semantic(),
+                duplicate
+            )));
+        }
+    }
+    rules.dedup();
+
+    let base_completion = state.completion().combine(&source_completion);
+    let mut completion = rules
+        .iter()
+        .fold(base_completion.clone(), |completion, rule| {
+            completion.combine(rule.completion())
+        });
+    if cancellation.is_cancelled() {
+        return Ok((Vec::new(), completion.combine(&cancelled_completion())));
+    }
+
+    let mut alternatives = Vec::with_capacity(rules.len());
+    let mut work = 0_usize;
+    for rule in rules {
+        work += 1;
+        if work.is_multiple_of(CANCELLATION_QUANTUM) && cancellation.is_cancelled() {
+            return Ok((Vec::new(), completion.combine(&cancelled_completion())));
+        }
+
+        let mut values = Vec::with_capacity(state.possible_values().len());
+        let mut adjustment_failed = false;
+        for value in state.possible_values().iter().copied() {
+            work += 1;
+            if work.is_multiple_of(CANCELLATION_QUANTUM) && cancellation.is_cancelled() {
+                return Ok((Vec::new(), completion.combine(&cancelled_completion())));
+            }
+            match rule.apply(value) {
+                TypeTransferApplication::Value(value) => values.push(value),
+                TypeTransferApplication::NoValue => {}
+                TypeTransferApplication::IndirectionOutOfRange => adjustment_failed = true,
+            }
+        }
+
+        let mut rule_completion = base_completion.combine(rule.completion());
+        if adjustment_failed {
+            rule_completion = rule_completion.combine(&ResolutionCompletion::incomplete([
+                ResolutionIncompleteReason::UnsupportedSemantic(rule.semantic()),
+            ]));
+        }
+        completion = completion.combine(&rule_completion);
+        alternatives.push(TypedFrontierState::new(
+            rule.target_slot(),
+            values,
+            rule_completion,
+        ));
+    }
+    if cancellation.is_cancelled() {
+        return Ok((Vec::new(), completion.combine(&cancelled_completion())));
+    }
+    alternatives.sort_unstable_by(|left, right| {
+        left.slot()
+            .cmp(&right.slot())
+            .then_with(|| left.possible_values().cmp(right.possible_values()))
+            .then_with(|| left.completion().cmp(right.completion()))
+    });
+    alternatives.dedup();
+    Ok((alternatives, completion))
 }
 
 #[cfg(test)]

@@ -539,6 +539,8 @@ test("publishers preserve their platform, environment, and OIDC protections", ()
   assert.match(publishNpm, /--manifest-sha256/u);
   assert.match(publishNpm, /actions\/download-artifact@[0-9a-f]{40}/u);
   assert.match(publishNpm, /--dist "\$RUNNER_TEMP\/npm-qualified"/u);
+  assert.match(publishNpm, /brokkai-dsh-plugin-bifrost-/u);
+  assert.match(publishNpm, /test "\$\{#files\[@\]\}" -eq 8/u);
   assert.doesNotMatch(publishNpm, /^\s*npm\s+pack\b/mu);
 });
 

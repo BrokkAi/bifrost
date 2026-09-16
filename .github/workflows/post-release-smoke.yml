@@ -250,6 +250,7 @@ jobs:
     permissions:
       contents: read
     env:
+      RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
       RELEASE_VERSION: ${{ needs.resolve.outputs.version }}
       NPM_PACKAGES: |
         @brokkai/bifrost
@@ -259,6 +260,7 @@ jobs:
         @brokkai/bifrost-android-arm64
         @brokkai/bifrost-win32-x64
         @brokkai/bifrost-win32-arm64
+        @brokkai/dsh-plugin-bifrost
     steps:
       - name: Check every npm package with bounded propagation retry
         shell: bash
@@ -293,6 +295,31 @@ jobs:
             done
             test "$found" = 1
           done
+      - name: Check the DSH launcher pin against the published macOS archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_dir="$RUNNER_TEMP/dsh-plugin"
+          mkdir -p "$package_dir"
+          npm pack --pack-destination "$package_dir" \
+            --registry https://registry.npmjs.org \
+            "@brokkai/dsh-plugin-bifrost@${RELEASE_VERSION}"
+          package_archive="$(find "$package_dir" -maxdepth 1 -type f -name '*.tgz' -print -quit)"
+          test -n "$package_archive"
+          metadata="$RUNNER_TEMP/dsh-bifrost-release.json"
+          tar -xOf "$package_archive" package/bifrost-release.json > "$metadata"
+          jq -e --arg version "$RELEASE_VERSION" \
+            '.binaryVersion == $version and (.archiveSha256["universal-apple-darwin"] | test("^[0-9a-f]{64}$"))' \
+            "$metadata" >/dev/null
+          expected="$(jq -r '.archiveSha256["universal-apple-darwin"]' "$metadata")"
+          sidecar="$RUNNER_TEMP/bifrost-macos.sha256"
+          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+            "https://github.com/BrokkAi/bifrost/releases/download/${RELEASE_TAG}/bifrost-${RELEASE_TAG}-universal-apple-darwin.tar.gz.sha256" \
+            --output "$sidecar"
+          actual="$(awk 'NR == 1 { print $1 }' "$sidecar")"
+          [[ "$actual" =~ ^[0-9a-f]{64}$ ]]
+          test "$expected" = "$actual"
+          echo "DSH launcher metadata matches the published macOS archive"
 
   install-smoke:
     name: install and select published npm binary (${{ matrix.os }})

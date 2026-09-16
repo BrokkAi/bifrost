@@ -11,6 +11,7 @@ mod completion_reasons;
 mod coverage;
 mod engine;
 mod fact_lowering;
+mod fact_resolution;
 mod fact_source;
 mod local_identity;
 mod model;
@@ -503,3 +504,9 @@ pub(crate) fn normalized_java_bundle_facts_for_test()
         ..FileResolutionFacts::default()
     }
 }
+
+pub use fact_resolution::{
+    FactCallableReceiverChannels, FactCallableReceiverDisposition,
+    FactCallableReceiverTargetDisposition, FactProjectedFrontier, FactReadSession,
+    FactReferenceReceiverGap, FactResolutionAnswer,
+};

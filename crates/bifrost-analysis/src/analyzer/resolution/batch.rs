@@ -587,6 +587,10 @@ pub struct ReferenceSeedBatch {
 }
 
 impl ReferenceSeedBatch {
+    pub(super) fn into_seeds(self) -> Box<[ReferenceSeed]> {
+        self.seeds
+    }
+
     pub fn new(seeds: impl IntoIterator<Item = ReferenceSeed>) -> Self {
         Self::new_observing(seeds, || {})
     }
@@ -2141,6 +2145,10 @@ pub struct BatchedReferenceAnswer {
 }
 
 impl BatchedReferenceAnswer {
+    pub(super) fn into_parts(self) -> (SemanticId, ResolutionAnswer) {
+        (self.reference, self.answer)
+    }
+
     pub const fn reference(&self) -> SemanticId {
         self.reference
     }
@@ -2159,6 +2167,16 @@ pub struct ReferenceBatchAnswer {
 }
 
 impl ReferenceBatchAnswer {
+    pub(super) fn into_parts(
+        self,
+    ) -> (
+        Box<[BatchedReferenceAnswer]>,
+        ResolutionCompletion,
+        ResolutionBatchMetrics,
+    ) {
+        (self.answers, self.completion, self.metrics)
+    }
+
     pub fn answers(&self) -> &[BatchedReferenceAnswer] {
         &self.answers
     }
@@ -3268,7 +3286,7 @@ impl<'a, S: BatchResolutionFragmentSource + ?Sized> BatchResolutionEngine<'a, S>
             .map(|(answer, _)| answer)
     }
 
-    fn resolve_reference_with_metrics(
+    pub(super) fn resolve_reference_with_metrics(
         &self,
         query: ResolutionQuery,
         cancellation: &CancellationToken,
@@ -3330,7 +3348,7 @@ impl<'a, S: BatchResolutionFragmentSource + ?Sized> BatchResolutionEngine<'a, S>
             .map(|(answer, _)| answer)
     }
 
-    fn resolve_seeded_reference_with_metrics(
+    pub(super) fn resolve_seeded_reference_with_metrics(
         &self,
         request: &SeededReferenceRequest,
         cancellation: &CancellationToken,
@@ -3405,6 +3423,56 @@ impl<'a, S: BatchResolutionFragmentSource + ?Sized> BatchResolutionEngine<'a, S>
                 prepared,
                 ResolutionBatchMetrics {
                     reference_seeds: batch.len(),
+                    batches: 1,
+                    ..ResolutionBatchMetrics::default()
+                },
+                cancellation,
+                &mut work,
+            ));
+        }
+        self.resolve_seeded_reference_requests(&requests, cancellation)
+    }
+
+    pub(super) fn resolve_owned_reference_batch(
+        &self,
+        batch: ReferenceSeedBatch,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<ReferenceBatchAnswer> {
+        let seeds = batch.into_seeds().into_vec();
+        let seed_count = seeds.len();
+        let mut work = 0_usize;
+        let (prepared, mut cancelled) =
+            prepare_reference_seed_completions(&seeds, cancellation, &mut work);
+        if !self.charge_scope_steps(seed_count) {
+            return Ok(cancelled_prepared_seed_answers(
+                prepared,
+                ResolutionBatchMetrics {
+                    reference_seeds: seed_count,
+                    batches: 1,
+                    ..ResolutionBatchMetrics::default()
+                },
+                cancellation,
+                &mut work,
+            ));
+        }
+        let mut requests = Vec::with_capacity(seeds.len());
+        if !cancelled {
+            for seed in seeds {
+                let request = SeededReferenceRequest::identity_with_poll(seed, &mut || {
+                    poll_reverse_completion(cancellation, &mut work)
+                });
+                let Some(request) = request else {
+                    cancelled = true;
+                    break;
+                };
+                requests.push(request);
+            }
+        }
+        if cancelled || cancellation.is_cancelled() {
+            return Ok(cancelled_prepared_seed_answers(
+                prepared,
+                ResolutionBatchMetrics {
+                    reference_seeds: seed_count,
                     batches: 1,
                     ..ResolutionBatchMetrics::default()
                 },

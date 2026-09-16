@@ -1,0 +1,297 @@
+; Resource lifecycle: a tracked resource must be closed on every supported exit
+; of the procedure that acquired it.
+;
+; This is a selectable policy specialization. Each language contributes one
+; reviewed acquisition family (the `subject` entries) and the close/use
+; operations that its supported ownership contract knows. A call that merely
+; has a matching name never creates a subject: the acquisition selector names
+; one reviewed factory per language, and every later event is bound to the
+; tracked subject identity rather than to the spelled receiver or argument.
+; The helper's own return is not the acquiring root's terminal exit; the
+; analysis root is the procedure that acquired the resource.
+;
+; Close is observed at both continuations. The normal-return close event
+; observes a close that completed, and the exceptional-return close event
+; observes a close whose own continuation was exceptional, so a close that may
+; fail discharges only the exit class it can actually reach. A `try/finally`
+; close satisfies both obligations; a bare trailing close leaves the
+; exceptional obligation, because the close operation's own failure contract is
+; not a proof that the resource was released.
+(policy
+  :schema-version 1
+  :id "bifrost.correctness.resource-lifecycle"
+  :name "Resource lifecycle"
+  :message "Resource can leave its analysis root without being closed"
+  :severity error
+  :description "Reports a resource acquired by a supported acquisition family that reaches a normal or exceptional analysis-root exit without a supported close. Unsupported escape, ownership-transfer, and alias shapes stay inconclusive instead of clean."
+  :help-uri "https://bifrost.brokk.ai/static-analysis-policies/#built-in-correctness-pack"
+  :tags ["correctness" "resource-leak" "lifecycle"]
+  :analysis
+    (analysis
+      :type typestate
+      :mode may
+      :call-modeling (call-modeling :unmodeled paranoid)
+      :subjects
+        (subject-set
+          :entries [
+            (subject
+              :id java-handle
+              :selector
+                (rql
+                  :schema-version 1
+                  (language java
+                    (call :callee (name "openResource"))))
+              :subject return-value)
+            (subject
+              :id go-resource
+              :selector
+                (rql
+                  :schema-version 1
+                  (language go
+                    (call :callee (name "open_resource"))))
+              :subject return-value)
+            (subject
+              :id javascript-resource
+              :selector
+                (rql
+                  :schema-version 1
+                  (language javascript
+                    (call :callee (name "openResource"))))
+              :subject return-value)
+            (subject
+              :id typescript-resource
+              :selector
+                (rql
+                  :schema-version 1
+                  (language typescript
+                    (call :callee (name "openResource"))))
+              :subject return-value)
+            (subject
+              :id python-resource
+              :selector
+                (rql
+                  :schema-version 1
+                  (language python
+                    (call :callee (name "open_resource"))))
+              :subject return-value)
+            (subject
+              :id rust-resource
+              :selector
+                (rql
+                  :schema-version 1
+                  (language rust
+                    (call :callee (name "open_resource"))))
+              :subject return-value)
+            (subject
+              :id kotlin-resource
+              :selector
+                (rql
+                  :schema-version 1
+                  (language kotlin
+                    (call :callee (name "openResource"))))
+              :subject return-value)
+            (subject
+              :id scala-resource
+              :selector
+                (rql
+                  :schema-version 1
+                  (language scala
+                    (call :callee (name "openResource"))))
+              :subject return-value)
+            (subject
+              :id php-resource
+              :selector
+                (rql
+                  :schema-version 1
+                  (language php
+                    (call :callee (name "open_resource"))))
+              :subject return-value)
+            (subject
+              :id ruby-resource
+              :selector
+                (rql
+                  :schema-version 1
+                  (language ruby
+                    (call :callee (name "open_resource"))))
+              :subject return-value)
+            (subject
+              :id csharp-resource
+              :selector
+                (rql
+                  :schema-version 1
+                  (language csharp
+                    (call :callee (name "OpenResource"))))
+              :subject return-value)
+            (subject
+              :id c-resource
+              :selector
+                (rql
+                  :schema-version 1
+                  (language c
+                    (call :callee (name "open_resource"))))
+              :subject return-value)
+            (subject
+              :id cpp-resource
+              :selector
+                (rql
+                  :schema-version 1
+                  (language cpp
+                    (call :callee (name "open_resource"))))
+              :subject return-value)])
+      :uncertainty
+        (uncertainty
+          :escape inconclusive)
+      :automaton
+        (automaton
+          :states [open closed violated]
+          :initial open
+          :accepting-states [closed]
+          :error-states [violated]
+          :events [
+            (event
+              :id close-argument
+              :calls
+                (calls
+                  :selector
+                    (rql
+                      :schema-version 1
+                      (union
+                        (language java (call :callee (name "closeResource")))
+                        (language go (call :callee (name "close_resource")))
+                        (language javascript (call :callee (name "closeResource")))
+                        (language typescript (call :callee (name "closeResource")))
+                        (language python (call :callee (name "close_resource")))
+                        (language rust (call :callee (name "close_resource")))
+                        (language kotlin (call :callee (name "closeResource")))
+                        (language scala (call :callee (name "closeResource")))
+                        (language php (call :callee (name "close_resource")))
+                        (language ruby (call :callee (name "close_resource")))
+                        (language csharp (call :callee (name "CloseResource")))
+                        (language c (call :callee (name "close_resource")))
+                        (language cpp (call :callee (name "close_resource")))))
+                  :subject (argument :index 0)
+                  :phase after-normal-return))
+            (event
+              :id close-argument-exceptional
+              :calls
+                (calls
+                  :selector
+                    (rql
+                      :schema-version 1
+                      (union
+                        (language java (call :callee (name "closeResource")))
+                        (language go (call :callee (name "close_resource")))
+                        (language javascript (call :callee (name "closeResource")))
+                        (language typescript (call :callee (name "closeResource")))
+                        (language python (call :callee (name "close_resource")))
+                        (language rust (call :callee (name "close_resource")))
+                        (language kotlin (call :callee (name "closeResource")))
+                        (language scala (call :callee (name "closeResource")))
+                        (language php (call :callee (name "close_resource")))
+                        (language ruby (call :callee (name "close_resource")))
+                        (language csharp (call :callee (name "CloseResource")))
+                        (language c (call :callee (name "close_resource")))
+                        (language cpp (call :callee (name "close_resource")))))
+                  :subject (argument :index 0)
+                  :phase after-exceptional-return))
+            (event
+              :id close-receiver
+              :calls
+                (calls
+                  :selector
+                    (rql
+                      :schema-version 1
+                      (union
+                        (language java (call :callee (name "close")))
+                        (language javascript (call :callee (name "close")))
+                        (language typescript (call :callee (name "close")))
+                        (language python (call :callee (name "close")))
+                        (language rust (call :callee (name "close")))
+                        (language kotlin (call :callee (name "close")))
+                        (language scala (call :callee (name "close")))
+                        (language php (call :callee (name "close")))
+                        (language ruby (call :callee (name "close")))
+                        (language csharp (call :callee (name "Close")))))
+                  :subject receiver
+                  :phase after-normal-return))
+            (event
+              :id close-receiver-exceptional
+              :calls
+                (calls
+                  :selector
+                    (rql
+                      :schema-version 1
+                      (union
+                        (language java (call :callee (name "close")))
+                        (language javascript (call :callee (name "close")))
+                        (language typescript (call :callee (name "close")))
+                        (language python (call :callee (name "close")))
+                        (language rust (call :callee (name "close")))
+                        (language kotlin (call :callee (name "close")))
+                        (language scala (call :callee (name "close")))
+                        (language php (call :callee (name "close")))
+                        (language ruby (call :callee (name "close")))
+                        (language csharp (call :callee (name "Close")))))
+                  :subject receiver
+                  :phase after-exceptional-return))
+            (event
+              :id use-argument
+              :calls
+                (calls
+                  :selector
+                    (rql
+                      :schema-version 1
+                      (union
+                        (language java (call :callee (name "useResource")))
+                        (language go (call :callee (name "use_resource")))
+                        (language javascript (call :callee (name "useResource")))
+                        (language typescript (call :callee (name "useResource")))
+                        (language python (call :callee (name "use_resource")))
+                        (language rust (call :callee (name "use_resource")))
+                        (language kotlin (call :callee (name "useResource")))
+                        (language scala (call :callee (name "useResource")))
+                        (language php (call :callee (name "use_resource")))
+                        (language ruby (call :callee (name "use_resource")))
+                        (language csharp (call :callee (name "UseResource")))
+                        (language c (call :callee (name "use_resource")))
+                        (language cpp (call :callee (name "use_resource")))))
+                  :subject (argument :index 0)
+                  :phase after-normal-return))
+            (event
+              :id use-receiver
+              :calls
+                (calls
+                  :selector
+                    (rql
+                      :schema-version 1
+                      (union
+                        (language java (call :callee (name "write")))
+                        (language javascript (call :callee (name "write")))
+                        (language typescript (call :callee (name "write")))
+                        (language python (call :callee (name "use")))
+                        (language rust (call :callee (name "use")))
+                        (language kotlin (call :callee (name "use")))
+                        (language scala (call :callee (name "use")))
+                        (language php (call :callee (name "use")))
+                        (language ruby (call :callee (name "use")))
+                        (language csharp (call :callee (name "Use")))))
+                  :subject receiver
+                  :phase after-normal-return))]
+          :transitions [
+            (transition :from open :on close-argument :to closed)
+            (transition :from open :on close-argument-exceptional :to closed)
+            (transition :from open :on close-receiver :to closed)
+            (transition :from open :on close-receiver-exceptional :to closed)
+            (transition :from closed :on use-argument :to violated)
+            (transition :from closed :on use-receiver :to violated)
+            (transition :from open :on use-argument :to open)
+            (transition :from open :on use-receiver :to open)]
+          :terminal-expectations [
+            (terminal-expectation
+              :id "normal-exit-closed"
+              :on (normal-procedure-exit :scope analysis-root)
+              :expected-states [closed])
+            (terminal-expectation
+              :id "exceptional-exit-closed"
+              :on (exceptional-procedure-exit :scope analysis-root)
+              :expected-states [closed])])))

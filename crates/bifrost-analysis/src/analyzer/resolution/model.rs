@@ -1042,6 +1042,13 @@ pub enum TypeTransferValueTransform {
     ToNoValue,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TypeTransferApplication {
+    Value(ResolutionSlotValue),
+    NoValue,
+    IndirectionOutOfRange,
+}
+
 /// One immutable file-local rule that copies values between typed slots.
 ///
 /// A rule deliberately stores no output values. Its output is a pure function
@@ -1106,6 +1113,33 @@ impl TypeTransferRule {
     pub fn completion(&self) -> &ResolutionCompletion {
         &self.completion
     }
+    pub(super) fn apply(&self, value: ResolutionSlotValue) -> TypeTransferApplication {
+        if self.value_transform == TypeTransferValueTransform::ToNoValue {
+            return TypeTransferApplication::NoValue;
+        }
+        let ty = value.ty();
+        let Some(adjusted) = i64::from(ty.indirection()).checked_add(self.indirection_delta) else {
+            return TypeTransferApplication::IndirectionOutOfRange;
+        };
+        let Ok(adjusted) = u32::try_from(adjusted) else {
+            return TypeTransferApplication::IndirectionOutOfRange;
+        };
+        let adjusted = ResolutionTypeRef::new(ty.identity(), adjusted);
+        TypeTransferApplication::Value(match self.value_transform {
+            TypeTransferValueTransform::Preserve => match value {
+                ResolutionSlotValue::TypeObject(_) => ResolutionSlotValue::type_object(adjusted),
+                ResolutionSlotValue::Runtime { addressable, .. } => {
+                    ResolutionSlotValue::runtime(adjusted, addressable)
+                }
+            },
+            TypeTransferValueTransform::ToRuntime { addressable } => {
+                ResolutionSlotValue::runtime(adjusted, addressable)
+            }
+            TypeTransferValueTransform::ToNoValue => {
+                unreachable!("no-value transfers return before type adjustment")
+            }
+        })
+    }
 }
 
 /// The value alternatives at one point where binding hands work to type flow.
@@ -1117,6 +1151,17 @@ pub struct TypedFrontierState {
 }
 
 impl TypedFrontierState {
+    pub(super) fn into_parts(
+        self,
+    ) -> (SemanticId, Box<[ResolutionSlotValue]>, ResolutionCompletion) {
+        (self.slot, self.possible_values, self.completion)
+    }
+
+    pub(super) fn with_completion(mut self, completion: ResolutionCompletion) -> Self {
+        self.completion = completion;
+        self
+    }
+
     pub fn new(
         slot: SemanticId,
         possible_values: impl Into<Box<[ResolutionSlotValue]>>,
@@ -1178,6 +1223,17 @@ pub struct ResolutionWitness {
 }
 
 impl ResolutionWitness {
+    pub(super) fn into_parts(
+        self,
+    ) -> (
+        SemanticId,
+        SemanticId,
+        Box<[WitnessStep]>,
+        ResolutionCompletion,
+    ) {
+        (self.reference, self.target, self.steps, self.completion)
+    }
+
     pub fn new(
         reference: SemanticId,
         target: SemanticId,

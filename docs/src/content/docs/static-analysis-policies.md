@@ -65,6 +65,39 @@ run means no Proven absence was found, not that every runtime receiver was
 classified. Inspect `(witness (absent-member ...))` for the retained origin-to-
 access evidence; missing or truncated evidence is explicitly labeled.
 
+### Built-in correctness pack
+
+The installed binary also embeds `bifrost.correctness`. Version 0.1 contains
+`bifrost.correctness.resource-lifecycle`, a typestate rule that reports a
+resource reaching a normal or exceptional exit of the procedure that acquired
+it while it is still open. Analysis roots are acquiring procedures, so a
+helper's return is never treated as a terminal exit. The rule observes the
+close operation at both its normal and its exceptional continuation: a
+`try/finally` close discharges both obligations, while a bare trailing close
+leaves the exceptional obligation because the close operation's own failure
+contract is not a release proof. Every event is bound to the tracked subject
+identity, so a close written on an unrelated object cannot discharge an
+obligation.
+
+The shipped release claims Java, Go, JavaScript, TypeScript, Python, Rust,
+Kotlin, Scala, and PHP. Each language row carries one reviewed acquisition
+family (a concrete factory, its close operations, and its use operations) plus
+a multi-file positive, a corrected close, and an unrelated same-named close in
+`tests/suite_bench_policy/resource_lifecycle_pack.rs`. The pack manifest
+records the claimed languages, so a language cannot be claimed without a
+fixture and a fixture cannot exist without a claim. C, C++, C#, and Ruby rows
+stay open until their adapters bind the reviewed close; the exact gap and the
+interface-typed resource gap are recorded in
+`.agents/docs/resource-lifecycle-language-status.md`.
+
+Activate the rule with `--policy-id bifrost.correctness.resource-lifecycle` or
+`--policy-pack bifrost.correctness`. A project with a custom `Handle` API
+follows the reviewed configuration path: copy the rule and replace the
+policy-local acquisition family selectors with the project's exact factory and
+close identities, as the Java landing fixture under
+`tests/fixtures/resource-lifecycle/` does. A call that merely spells `open` or
+`close` creates no subject.
+
 ### Built-in security pack
 
 The installed binary also embeds `bifrost.security`. Version 1.0 contains one
