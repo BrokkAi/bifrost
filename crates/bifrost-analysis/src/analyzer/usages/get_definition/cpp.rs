@@ -38,6 +38,7 @@ use brokk_bifrost_cpp::graph::resolver::{
     cpp_alias_declaration_target_text, cpp_class_declaration_strength,
     cpp_field_declaration_names_function_type, cpp_field_expression_receiver,
     cpp_member_using_declaration_scopes, cpp_qualified_name_has_scope_suffix,
+    field_declared_binding, field_initializer_holds_subobject,
     guard_requirements_hold_at_reference, is_c_offsetof_member_node,
     is_c_sizeof_expression_type_candidate, is_c_source_file, is_type_shaped_template_argument_name,
     preprocessor_guard_environment, recovered_c_new_expression_argument_at,
@@ -1032,22 +1033,69 @@ pub(super) fn resolve_cpp<'a>(
                     ctx.root,
                     identifier.start_byte(),
                 )
-                && let Some(base_owner) = ctx.visibility.inherited_injected_class_owner(
+            {
+                if let Some(base_owner) = ctx.visibility.inherited_injected_class_owner(
                     &graph,
                     ctx.file,
                     &enclosing_owner,
                     text,
-                )
-            {
+                ) {
+                    let arity = ctx
+                        .visibility
+                        .call_arity_evidence(ctx.file, initializer, ctx.source)
+                        .exact();
+                    let constructors =
+                        cpp_member_candidates(ctx, token, vec![base_owner], text, arity, None)
+                            .into_iter()
+                            .filter(|unit| unit.is_function() && unit.identifier() == text)
+                            .collect::<Vec<_>>();
+                    if !constructors.is_empty() {
+                        return candidates_outcome(constructors);
+                    }
+                }
+                // A member initializer `member(args)` on a field that holds a
+                // class by value runs that class's constructor: the usage scan
+                // proves the site as a constructor usage, so navigation must
+                // name the selected constructors too, not only the field
+                // (#3390). A pointer/reference member holds no subobject and
+                // stays a plain field reference (#3286).
                 let arity = ctx
                     .visibility
                     .call_arity_evidence(ctx.file, initializer, ctx.source)
                     .exact();
-                let constructors =
-                    cpp_member_candidates(ctx, token, vec![base_owner], text, arity, None)
+                let fields =
+                    cpp_member_candidates(ctx, token, vec![enclosing_owner], text, None, None)
                         .into_iter()
-                        .filter(|unit| unit.is_function() && unit.identifier() == text)
+                        .filter(|unit| unit.is_field() && unit.identifier() == text)
                         .collect::<Vec<_>>();
+                let mut constructors = Vec::new();
+                for field in &fields {
+                    if !field_initializer_holds_subobject(&graph, ctx.visibility, field) {
+                        continue;
+                    }
+                    let Some(type_owner) =
+                        field_declared_binding(&graph, ctx.visibility, ctx.file, field)
+                            .and_then(|binding| binding.unit)
+                            .filter(|unit| unit.is_class())
+                    else {
+                        continue;
+                    };
+                    let constructor_name = type_owner.identifier().to_string();
+                    constructors.extend(
+                        cpp_member_candidates(
+                            ctx,
+                            token,
+                            vec![type_owner],
+                            &constructor_name,
+                            arity,
+                            None,
+                        )
+                        .into_iter()
+                        .filter(|unit| unit.is_function() && unit.identifier() == constructor_name),
+                    );
+                }
+                sort_units(&mut constructors);
+                constructors.dedup();
                 if !constructors.is_empty() {
                     return candidates_outcome(constructors);
                 }

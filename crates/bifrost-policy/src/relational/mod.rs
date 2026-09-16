@@ -34,7 +34,7 @@ pub use coverage::{
 pub use eval::{
     MAX_VIOLATION_REPRESENTATIVE_TUPLES, RelationalAssertionEvaluation,
     RelationalAssertionEvaluationError, RelationalAssertionViolation, RelationalEvaluationWork,
-    RelationalViolationRow, evaluate_plan_ir,
+    RelationalViolationRow, VacuousAssertion, evaluate_plan_ir,
 };
 pub use introspect::{
     RELATION_SCHEMA_FORMAT, RelationDomainSchema, RelationExpansionSchema, RelationFieldSchema,

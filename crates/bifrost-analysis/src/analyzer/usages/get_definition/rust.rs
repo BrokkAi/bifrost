@@ -22,7 +22,9 @@ use crate::analyzer::{RustReferenceContext, SignatureMetadata, StructuredTypeIde
 use crate::hash::{HashMap, HashSet};
 use brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict;
 use brokk_bifrost_core::analyzer::symbol_path::strip_raw_identifier_prefix;
-use brokk_bifrost_rust::declarations::rust_macro_invocation_arguments;
+use brokk_bifrost_rust::declarations::{
+    rust_macro_invocation_arguments, rust_unqualified_macro_invocation_name,
+};
 use brokk_bifrost_rust::field_roles::{
     RustFieldNameRole, RustStructFieldContainer, classify_rust_field_name,
 };
@@ -1054,6 +1056,35 @@ fn resolve_rust_unscoped(
         };
         if !candidates.is_empty() {
             return candidates_outcome(candidates);
+        }
+    }
+    // A bare `self`/`super` path root names the enclosing module (or its
+    // parent): a macro metavariable such as `self::$module` leaves the keyword
+    // a single-token reference, and the usage scan proves that segment as a
+    // usage of the module, so navigation must name it too (#3390). The `::`
+    // sibling check keeps the lowercase `self` receiver value out of this rule.
+    if let Some(tree) = tree
+        && matches!(reference, "self" | "super")
+        && let Some(focused) = smallest_named_node_covering(
+            tree.root_node(),
+            site.focus_start_byte,
+            site.focus_end_byte,
+        )
+        && focused
+            .next_sibling()
+            .is_some_and(|sibling| sibling.kind() == "::")
+    {
+        let mut current = analyzer.enclosing_code_unit(file, &site.range);
+        while current.as_ref().is_some_and(|unit| !unit.is_module()) {
+            current = current.and_then(|unit| analyzer.parent_of(&unit));
+        }
+        let lexical_module = if reference == "self" {
+            current
+        } else {
+            current.and_then(|unit| analyzer.parent_of(&unit))
+        };
+        if let Some(module) = lexical_module.filter(CodeUnit::is_module) {
+            return candidates_outcome(vec![module]);
         }
     }
     if let Some(tree) = tree
@@ -7030,6 +7061,11 @@ fn rust_expression_type_fqn_mode(
                                 }),
                         );
                     }
+                    "macro_invocation" if mode == RustTypeMode::Direct => {
+                        values.push(rust_builtin_macro_value_type_fqn(
+                            analyzer, token, support, file, source, root, expression,
+                        ));
+                    }
                     _ => values.push(None),
                 }
             }
@@ -7091,6 +7127,71 @@ fn rust_expression_type_fqn_mode(
     }
 
     values.pop().flatten()
+}
+
+fn rust_builtin_macro_value_type_fqn(
+    _analyzer: &dyn IAnalyzer,
+    _token: QueryToken<'_>,
+    support: &dyn RustDefinitionProvider,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    invocation: Node<'_>,
+) -> Option<String> {
+    if rust_unqualified_macro_invocation_name(invocation, source) != Some("vec") {
+        return None;
+    }
+    if rust_visible_local_macro_rules_named(
+        support,
+        file,
+        source,
+        root,
+        invocation.start_byte(),
+        "vec",
+    ) {
+        return None;
+    }
+    Some("alloc.vec.Vec".to_string())
+}
+
+fn rust_visible_local_macro_rules_named(
+    support: &dyn RustDefinitionProvider,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    before_byte: usize,
+    expected: &str,
+) -> bool {
+    if support
+        .file_identifier(file, expected)
+        .into_iter()
+        .any(|unit| unit.is_macro())
+    {
+        return true;
+    }
+    let mut pending = vec![root];
+    while let Some(node) = pending.pop() {
+        if !support.scope_step() {
+            return true;
+        }
+        if node.start_byte() >= before_byte {
+            continue;
+        }
+        if is_macro_rules_definition(node, source)
+            && node
+                .child_by_field_name("name")
+                .map(|name| rust_node_text(name, source).trim())
+                == Some(expected)
+        {
+            return true;
+        }
+        let mut cursor = node.walk();
+        pending.extend(
+            node.named_children(&mut cursor)
+                .filter(|child| child.start_byte() < before_byte),
+        );
+    }
+    false
 }
 
 #[allow(clippy::too_many_arguments)]

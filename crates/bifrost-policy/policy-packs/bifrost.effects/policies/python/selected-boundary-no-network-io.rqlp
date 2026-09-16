@@ -1,0 +1,64 @@
+; Network-effect boundary for one explicitly selected Python declaration.
+;
+; This is the shipped specialization. Its ship-time declaration selection is
+; the empty set, so a repository that enables this policy without editing the
+; selection block below carries no purity obligation at all. Purity is never
+; inferred from a function name, a file name, a comment, or an unqualified
+; annotation.
+;
+; Activation
+; ----------
+; 1. Ship or install a reviewed semantic model for this language that declares
+;    the concrete network API identity with the effect `bifrost.network_io`.
+;    `semantic-packs/web-network/python/bifrost.web-network-python.json` is the
+;    reviewed model for `urllib.request.urlopen`; place it under
+;    `.bifrost/semantic-models/`.
+; 2. Replace both declaration selections in the analysis block below with the
+;    exact declaration(s) this repository protects, for example:
+;      (language python (enclosing-decl (function :name "total")))
+; 3. Enable the policy: `bifrost --policy-id
+;    bifrost.effects.python.selected-boundary-no-network-io --fail-on error`.
+;
+; The rule body is shared across languages; only the language label, the
+; activated model, and this selection block differ.
+(policy
+  :schema-version 1
+  :id "bifrost.effects.python.selected-boundary-no-network-io"
+  :name "Selected Python boundary reaches no network effect"
+  :message "the selected Python boundary reaches the declared network effect"
+  :severity error
+  :description "One explicitly selected Python declaration must not reach a declared network effect, directly or through workspace helpers. The effect is declared by a reviewed semantic model on the exact external API identity, never inferred from a function name, a file name, a comment, or an unqualified annotation. The ship-time selection is empty; configure the declaration-selection block before enabling this policy."
+  :help-uri "https://bifrost.brokk.ai/static-analysis-policies/#network-effect-boundary"
+  :tags ["effects" "network" "boundary" "python"]
+  :analysis
+    (analysis
+      :type assertion
+      ; ---------------------------------------------------------------------
+      ; Declaration-selection block. Ship-time selection: the empty set.
+      ; Replace both `(except ...)` expressions below with the exact
+      ; declaration this repository protects. The `effect` binding repeats the
+      ; same selection on purpose: `procedure-effects` derives a closure for
+      ; every declaration its input query returns, so repeating the selection
+      ; is what keeps the policy from deriving effects for declarations it did
+      ; not select. With the ship-time empty selection it derives none, the
+      ; assertion has no group to judge, and the run is vacuously clean.
+      ; ---------------------------------------------------------------------
+      (bind :name selected
+        :query (rql :schema-version 1
+          (language python
+            (except
+              (enclosing-decl (function))
+              (enclosing-decl (function))))))
+      (bind :name effect
+        :query (rql :schema-version 1
+          (language python
+            (procedure-effects
+              (except
+                (enclosing-decl (function))
+                (enclosing-decl (function)))))))
+      (join :left selected :right effect :on ((id procedure_id)))
+      (group :name selected-boundary :by (selected.id)
+        (aggregate :name network-effects :op count
+          :where ((effect.effect_id eq "bifrost.network_io")
+                  (effect.derivation eq declared))))
+      (assert :group selected-boundary :value network-effects :cardinality (exactly 0))))

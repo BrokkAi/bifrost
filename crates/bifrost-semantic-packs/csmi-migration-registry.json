@@ -447,6 +447,62 @@
       "classification": "blocked_missing_adapter_or_identity_evidence",
       "generation_strategy": "retain_until_profile_support",
       "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/go-stdlib-net-http-declarations/manifest.json",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence.",
+      "source_model": "crates/bifrost-semantic-packs/models/go-stdlib-net-http-declarations.json"
+    },
+    {
+      "asset_role": "compiled_shard",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/go-stdlib-net-http-declarations/shards/go.stdlib.net-http.declarations.deflate",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence.",
+      "source_model": "crates/bifrost-semantic-packs/models/go-stdlib-net-http-declarations.json"
+    },
+    {
+      "asset_role": "compiled_manifest",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/go-stdlib-net-http/manifest.json",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence.",
+      "source_model": "crates/bifrost-semantic-packs/models/go-stdlib-net-http.json"
+    },
+    {
+      "asset_role": "compiled_shard",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/go-stdlib-net-http/shards/go.stdlib.net-http.handler-registration.deflate",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence.",
+      "source_model": "crates/bifrost-semantic-packs/models/go-stdlib-net-http.json"
+    },
+    {
+      "asset_role": "compiled_manifest",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
       "path": "crates/bifrost-semantic-packs/embedded/go-stdlib-net-url-declarations/manifest.json",
       "profiles": [],
       "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence.",
@@ -1373,6 +1429,40 @@
       "generation_strategy": "retain_until_profile_support",
       "native_source_kind": "generated_semantic_model",
       "path": "crates/bifrost-semantic-packs/models/go-stdlib-net-declarations.json",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence."
+    },
+    {
+      "asset_role": "generated_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "embedded_paths": [
+        "crates/bifrost-semantic-packs/embedded/go-stdlib-net-http-declarations/manifest.json",
+        "crates/bifrost-semantic-packs/embedded/go-stdlib-net-http-declarations/shards/go.stdlib.net-http.declarations.deflate"
+      ],
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "generated_semantic_model",
+      "path": "crates/bifrost-semantic-packs/models/go-stdlib-net-http-declarations.json",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence."
+    },
+    {
+      "asset_role": "generated_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "embedded_paths": [
+        "crates/bifrost-semantic-packs/embedded/go-stdlib-net-http/manifest.json",
+        "crates/bifrost-semantic-packs/embedded/go-stdlib-net-http/shards/go.stdlib.net-http.handler-registration.deflate"
+      ],
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "generated_semantic_model",
+      "path": "crates/bifrost-semantic-packs/models/go-stdlib-net-http.json",
       "profiles": [],
       "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence."
     },
@@ -2523,6 +2613,51 @@
       "path": "semantic-packs/typescript/typescript-7.0.2.json",
       "profiles": [],
       "reason": "Artifact acquisition and extraction instructions are inputs to model generation, not semantic model facts."
+    },
+    {
+      "asset_role": "authored_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "authored_semantic_model",
+      "path": "semantic-packs/web-network/javascript/bifrost.web-network-javascript.json",
+      "profiles": [
+        "javascript-typescript"
+      ],
+      "reason": "Reviewed network-effect model for the #3387 boundary family; exportability remains pending lossless field and applicability audit."
+    },
+    {
+      "asset_role": "authored_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "authored_semantic_model",
+      "path": "semantic-packs/web-network/python/bifrost.web-network-python.json",
+      "profiles": [
+        "python"
+      ],
+      "reason": "Reviewed network-effect model for the #3387 boundary family; exportability remains pending lossless field and applicability audit."
+    },
+    {
+      "asset_role": "authored_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "authored_semantic_model",
+      "path": "semantic-packs/web-network/typescript/bifrost.web-network-typescript.json",
+      "profiles": [
+        "javascript-typescript"
+      ],
+      "reason": "Reviewed network-effect model for the #3387 boundary family; exportability remains pending lossless field and applicability audit."
     }
   ],
   "format": "bifrost_csmi_migration_registry/v1",

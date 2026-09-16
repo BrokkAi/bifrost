@@ -124,6 +124,59 @@ pub(crate) fn semantic_model_lookup_type(
     }
 }
 
+pub(super) fn exact_semantic_model_type_outcome(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    language: Language,
+    fqn: &str,
+    target_kind: TypeLookupTargetKind,
+) -> Option<TypeLookupOutcome> {
+    let overlay = analyzer.semantic_model_overlay()?;
+    let matched = overlay.symbols_named(fqn);
+    let records = matched
+        .records
+        .into_iter()
+        .filter(|symbol| {
+            symbol.owner_id.is_none()
+                && symbol.language == language.config_label()
+                && (symbol.qualified_name == fqn || symbol.aliases.iter().any(|alias| alias == fqn))
+        })
+        .collect::<Vec<_>>();
+    if records.is_empty() {
+        return None;
+    }
+    let complete = matched.disposition
+        == crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique
+        && records.len() == 1
+        && !records[0].provenance.ambiguous
+        && records[0].provenance.completeness
+            == crate::analyzer::semantic_model::SemanticModelCompleteness::Complete;
+    let types = records
+        .into_iter()
+        .map(|symbol| semantic_model_lookup_type(file, symbol))
+        .collect();
+    Some(TypeLookupOutcome {
+        status: if complete {
+            TypeLookupStatus::Resolved
+        } else {
+            TypeLookupStatus::Ambiguous
+        },
+        reference: None,
+        types,
+        diagnostics: if complete {
+            Vec::new()
+        } else {
+            vec![TypeLookupDiagnostic {
+                kind: "semantic_model_type_incomplete".to_string(),
+                message: format!(
+                    "semantic-model declarations for `{fqn}` are partial or ambiguous"
+                ),
+            }]
+        },
+        target_kind,
+    })
+}
+
 pub fn resolve_type_batch(
     analyzer: &dyn IAnalyzer,
     requests: Vec<TypeLookupRequest>,

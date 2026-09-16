@@ -10119,28 +10119,6 @@ fn go_heap_identity_asserted_pointer_fields_never_disappear() {
 }
 
 #[test]
-fn go_heap_identity_preserves_comma_ok_asserted_pointer_payloads() {
-    let (_project, workspace) = heap_identity_workspace();
-    for root in [
-        "sharedCommaOkPointerAssertion",
-        "sharedLocalCommaOkPointerAssertion",
-    ] {
-        let result = heap_identity_conflicts(&workspace, root);
-        assert_proven_unordered_unprotected_conflict(
-            &result,
-            "a comma-ok assertion result keeps the stored pointer's identity",
-        );
-    }
-}
-
-#[test]
-fn go_heap_identity_keeps_a_failed_comma_ok_arm_unproven() {
-    let (_project, workspace) = heap_identity_workspace();
-    let result = heap_identity_conflicts(&workspace, "commaOkFailedArmAssertion");
-    assert_no_proven_conflicts_with_explicit_evidence(&result);
-}
-
-#[test]
 fn go_heap_identity_preserves_asserted_pointer_payloads() {
     let (_project, workspace) = heap_identity_workspace();
     for root in [
@@ -11347,36 +11325,6 @@ func sharedVarPointerAssertion() {
     var recovered = boxed.(*cell)
     go func() { recovered.n = 1 }()
     go func() { original.n = 2 }()
-}
-
-func sharedCommaOkPointerAssertion() {
-    original := &cell{}
-    var boxed any = original
-    go func() {
-        if recovered, ok := boxed.(*cell); ok {
-            recovered.n = 1
-        }
-    }()
-    go func() { original.n = 2 }()
-}
-
-func sharedLocalCommaOkPointerAssertion() {
-    original := &cell{}
-    go func() {
-        var boxed any = original
-        if recovered, ok := boxed.(*cell); ok {
-            recovered.n = 1
-        }
-    }()
-    go func() { original.n = 2 }()
-}
-
-func commaOkFailedArmAssertion(boxed any, pointer *cell) {
-    var ok bool
-    if pointer, ok = boxed.(*cell); !ok {
-        go func() { pointer.n = 1 }()
-        go func() { pointer.n = 2 }()
-    }
 }
 
 func sharedDirectPointerAssertion() {
@@ -22475,5 +22423,675 @@ func forwardedRoot(t *testing.T) {
                     == brokk_bifrost_flow::concurrency::ConcurrentOrdering::HappensBefore
         }),
         "a forwarded callable grants no ordering the wrapper cannot establish: {forwarded:#?}"
+    );
+}
+
+/// The reviewed `net/http` handler-registration protocol pack shared by the
+/// handler tests: `http.HandleFunc` and `(*http.ServeMux).HandleFunc` spawn
+/// an unbounded handler task with no join, `http.NewServeMux` constructs the
+/// receiver, and the `http.Handler` interface forms name the typed
+/// `net/http.Handler` boundary (issue #3408).
+const HTTP_HANDLER_PACK: &[u8] = br#"{
+  "schema_version": 2,
+  "pack_id": "test.go.http-handler",
+  "version": "1.0.0",
+  "producer": { "name": "test", "version": "1.0.0" },
+  "language": "go",
+  "ecosystem": "go",
+  "compatibility": { "bifrost": ">=0.11.3, <1.0.0", "toolchains": [] },
+  "provenance": { "source": "test", "revision": "1" },
+  "license": "MIT",
+  "completeness": "complete",
+  "safety": { "generated_code_only": false, "review_required": false },
+  "shards": [{
+    "id": "declarations",
+    "activation": [{}],
+    "payload": {
+      "kind": "declaration_facts",
+      "types": [
+        {
+          "id": "type.b6eedc642c6132236bae5425a063fd44b150a8ea8555340b10ef1d3082dffe9a",
+          "name": "net/http", "type_kind": "module", "visibility": "package",
+          "is_abstract": false, "is_sealed": false, "has_explicit_type_terms": false,
+          "type_parameters": [], "type_parameter_constraints": [], "embedded_types": [],
+          "hierarchy": [], "aliases": ["http"], "extension_surfaces": [],
+          "locator": { "kind": "artifact", "path": "src/net/http/server.go", "symbol": "net/http" }
+        },
+        {
+          "id": "type.93777606d63fbb9dc04087a876b5408f323d632fb8ff469033fa91b384dfd9cc",
+          "name": "net/http.Handler", "type_kind": "interface", "visibility": "public",
+          "is_abstract": true, "is_sealed": false, "has_explicit_type_terms": false,
+          "type_parameters": [], "type_parameter_constraints": [], "embedded_types": [],
+          "hierarchy": [], "aliases": [], "extension_surfaces": [],
+          "locator": { "kind": "artifact", "path": "src/net/http/server.go", "symbol": "net/http.Handler" }
+        },
+        {
+          "id": "type.4c393b735855228a04f3c05bd17a970f4301acda0f7c16507fe4453daa72660b",
+          "name": "net/http.ServeMux", "type_kind": "struct", "visibility": "public",
+          "is_abstract": false, "is_sealed": false, "has_explicit_type_terms": false,
+          "type_parameters": [], "type_parameter_constraints": [], "embedded_types": [],
+          "hierarchy": [], "aliases": [], "extension_surfaces": [],
+          "locator": { "kind": "artifact", "path": "src/net/http/server.go", "symbol": "net/http.ServeMux" }
+        }
+      ],
+      "members": [
+        {
+          "id": "member.9af6dc214e864d397e406b8857431d9aefac5766686e6d4d95adb3a67c494f10",
+          "owner": "type.b6eedc642c6132236bae5425a063fd44b150a8ea8555340b10ef1d3082dffe9a",
+          "name": "NewServeMux", "member_kind": "function", "visibility": "public", "is_static": true,
+          "is_abstract": false, "is_virtual": false,
+          "signature": { "type_parameters": [], "parameters": [], "returns": { "kind": "pointer", "element": { "kind": "declared", "id": "type.4c393b735855228a04f3c05bd17a970f4301acda0f7c16507fe4453daa72660b", "arguments": [], "nullable": false } } },
+          "aliases": [],
+          "locator": { "kind": "artifact", "path": "src/net/http/server.go", "symbol": "net/http.NewServeMux" }
+        },
+        {
+          "id": "member.f7c17b594b5859f3dbea72f9e2190c4603ea8d4baadebf6f898bbdc08ef3a7a3",
+          "owner": "type.b6eedc642c6132236bae5425a063fd44b150a8ea8555340b10ef1d3082dffe9a",
+          "name": "HandleFunc", "member_kind": "function", "visibility": "public", "is_static": true,
+          "is_abstract": false, "is_virtual": false,
+          "signature": { "type_parameters": [], "parameters": [{ "name": "pattern", "type": { "kind": "named", "name": "string", "arguments": [], "nullable": false }, "optional": false, "variadic": false }, { "name": "handler", "type": { "kind": "named", "name": "func(net/http.ResponseWriter,*net/http.Request)", "arguments": [], "nullable": false }, "optional": false, "variadic": false }] },
+          "aliases": [],
+          "locator": { "kind": "artifact", "path": "src/net/http/server.go", "symbol": "net/http.HandleFunc" }
+        },
+        {
+          "id": "member.a8b0914462fd948fbe3642097fe5e048c3614c50ec5556ad0dab49ea13ff3dfa",
+          "owner": "type.b6eedc642c6132236bae5425a063fd44b150a8ea8555340b10ef1d3082dffe9a",
+          "name": "Handle", "member_kind": "function", "visibility": "public", "is_static": true,
+          "is_abstract": false, "is_virtual": false,
+          "signature": { "type_parameters": [], "parameters": [{ "name": "pattern", "type": { "kind": "named", "name": "string", "arguments": [], "nullable": false }, "optional": false, "variadic": false }, { "name": "handler", "type": { "kind": "named", "name": "net/http.Handler", "arguments": [], "nullable": false }, "optional": false, "variadic": false }] },
+          "aliases": [],
+          "locator": { "kind": "artifact", "path": "src/net/http/server.go", "symbol": "net/http.Handle" }
+        },
+        {
+          "id": "member.394649d2d0cefee027325c02c6cab04ae0035f4c17fabbbe8b193a0b5beed09a",
+          "owner": "type.b6eedc642c6132236bae5425a063fd44b150a8ea8555340b10ef1d3082dffe9a",
+          "name": "Serve", "member_kind": "function", "visibility": "public", "is_static": true,
+          "is_abstract": false, "is_virtual": false,
+          "signature": { "type_parameters": [], "parameters": [{ "name": "l", "type": { "kind": "named", "name": "net.Listener", "arguments": [], "nullable": false }, "optional": false, "variadic": false }, { "name": "handler", "type": { "kind": "named", "name": "net/http.Handler", "arguments": [], "nullable": false }, "optional": false, "variadic": false }], "returns": { "kind": "named", "name": "error", "arguments": [], "nullable": false } },
+          "aliases": [],
+          "locator": { "kind": "artifact", "path": "src/net/http/server.go", "symbol": "net/http.Serve" }
+        },
+        {
+          "id": "member.55c4eccff19fc50b68ff06dabf0c12527a27850d0e6a43f7793bab40e04f2124",
+          "owner": "type.b6eedc642c6132236bae5425a063fd44b150a8ea8555340b10ef1d3082dffe9a",
+          "name": "ListenAndServe", "member_kind": "function", "visibility": "public", "is_static": true,
+          "is_abstract": false, "is_virtual": false,
+          "signature": { "type_parameters": [], "parameters": [{ "name": "addr", "type": { "kind": "named", "name": "string", "arguments": [], "nullable": false }, "optional": false, "variadic": false }, { "name": "handler", "type": { "kind": "named", "name": "net/http.Handler", "arguments": [], "nullable": false }, "optional": false, "variadic": false }], "returns": { "kind": "named", "name": "error", "arguments": [], "nullable": false } },
+          "aliases": [],
+          "locator": { "kind": "artifact", "path": "src/net/http/server.go", "symbol": "net/http.ListenAndServe" }
+        },
+        {
+          "id": "member.54c86563d13dead12ac400f2e7ddf30b55152059bfd39bebf7b8cdc659b95768",
+          "owner": "type.4c393b735855228a04f3c05bd17a970f4301acda0f7c16507fe4453daa72660b",
+          "name": "HandleFunc", "member_kind": "method", "visibility": "public", "is_static": false,
+          "is_abstract": false, "is_virtual": false,
+          "signature": { "type_parameters": [], "parameters": [{ "name": "pattern", "type": { "kind": "named", "name": "string", "arguments": [], "nullable": false }, "optional": false, "variadic": false }, { "name": "handler", "type": { "kind": "named", "name": "func(net/http.ResponseWriter,*net/http.Request)", "arguments": [], "nullable": false }, "optional": false, "variadic": false }] },
+          "receiver": { "pointer": true }, "aliases": [],
+          "locator": { "kind": "artifact", "path": "src/net/http/server.go", "symbol": "net/http.ServeMux.HandleFunc" }
+        },
+        {
+          "id": "member.b9bc67c1cc6e6c9efce3e637210d2e5357fa90a6c70ebe2ec348b658f5b11ffc",
+          "owner": "type.4c393b735855228a04f3c05bd17a970f4301acda0f7c16507fe4453daa72660b",
+          "name": "Handle", "member_kind": "method", "visibility": "public", "is_static": false,
+          "is_abstract": false, "is_virtual": false,
+          "signature": { "type_parameters": [], "parameters": [{ "name": "pattern", "type": { "kind": "named", "name": "string", "arguments": [], "nullable": false }, "optional": false, "variadic": false }, { "name": "handler", "type": { "kind": "named", "name": "net/http.Handler", "arguments": [], "nullable": false }, "optional": false, "variadic": false }] },
+          "receiver": { "pointer": true }, "aliases": [],
+          "locator": { "kind": "artifact", "path": "src/net/http/server.go", "symbol": "net/http.ServeMux.Handle" }
+        }
+      ],
+      "relations": []
+    }
+  }, {
+    "id": "behavior",
+    "activation": [{}],
+    "payload": {
+      "kind": "procedure_summaries",
+      "summaries": [
+        {
+          "id": "net-http.handle-func",
+          "target": { "path": "src/net/http/server.go", "symbol": "net/http.HandleFunc(pattern string, handler func(net/http.ResponseWriter, *net/http.Request))", "has_receiver": false, "parameter_count": 2 },
+          "completeness": "complete",
+          "transfers": [],
+          "concurrency_effects": [{ "kind": "task_spawn", "callable": { "kind": "parameter", "ordinal": 1 } }]
+        },
+        {
+          "id": "net-http.serve-mux.handle-func",
+          "target": { "path": "src/net/http/server.go", "symbol": "net/http.ServeMux.HandleFunc(pattern string, handler func(net/http.ResponseWriter, *net/http.Request))", "has_receiver": true, "parameter_count": 2 },
+          "completeness": "complete",
+          "transfers": [],
+          "concurrency_effects": [{ "kind": "task_spawn", "callable": { "kind": "parameter", "ordinal": 1 } }]
+        },
+        {
+          "id": "net-http.new-serve-mux",
+          "target": { "path": "src/net/http/server.go", "symbol": "net/http.NewServeMux()", "has_receiver": false, "parameter_count": 0 },
+          "completeness": "complete",
+          "normal_result_count": 1,
+          "locations": [{ "id": "net-http.new-serve-mux.mux", "location_kind": "heap" }],
+          "transfers": [],
+          "effects": [{ "kind": "allocation", "event": "net-http.new-serve-mux.allocation", "output": { "kind": "indexed_normal_return", "ordinal": 0 } }]
+        },
+        {
+          "id": "net-http.handle",
+          "target": { "path": "src/net/http/server.go", "symbol": "net/http.Handle(pattern string, handler net/http.Handler)", "has_receiver": false, "parameter_count": 2 },
+          "completeness": "complete",
+          "transfers": [],
+          "concurrency_effects": [{ "kind": "unsupported", "protocol": "net/http.Handler" }]
+        },
+        {
+          "id": "net-http.serve-mux.handle",
+          "target": { "path": "src/net/http/server.go", "symbol": "net/http.ServeMux.Handle(pattern string, handler net/http.Handler)", "has_receiver": true, "parameter_count": 2 },
+          "completeness": "complete",
+          "transfers": [],
+          "concurrency_effects": [{ "kind": "unsupported", "protocol": "net/http.Handler" }]
+        },
+        {
+          "id": "net-http.serve",
+          "target": { "path": "src/net/http/server.go", "symbol": "net/http.Serve(l net.Listener, handler net/http.Handler)", "has_receiver": false, "parameter_count": 2 },
+          "completeness": "complete",
+          "transfers": [],
+          "concurrency_effects": [{ "kind": "unsupported", "protocol": "net/http.Handler" }]
+        },
+        {
+          "id": "net-http.listen-and-serve",
+          "target": { "path": "src/net/http/server.go", "symbol": "net/http.ListenAndServe(addr string, handler net/http.Handler)", "has_receiver": false, "parameter_count": 2 },
+          "completeness": "complete",
+          "transfers": [],
+          "concurrency_effects": [{ "kind": "unsupported", "protocol": "net/http.Handler" }]
+        }
+      ]
+    }
+  }]
+}"#;
+
+fn http_handler_snapshot(
+    workspace: &WorkspaceAnalyzer,
+) -> std::sync::Arc<ActiveSemanticModelSnapshot> {
+    let pack = compile_source(
+        SourceFormat::Json,
+        HTTP_HANDLER_PACK,
+        &CompilerOptions::default(),
+    )
+    .unwrap_or_else(|diagnostics| panic!("http handler pack compiles: {diagnostics:#?}"));
+    let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default())
+        .expect("ephemeral semantic-pack catalog");
+    catalog
+        .register_session_pack(
+            &pack,
+            &SessionPackSource {
+                kind: SessionPackSourceKind::Embedded,
+                source_id: "test:go-http-handler".to_owned(),
+            },
+        )
+        .expect("register http handler model pack");
+    let activation = acquire_active_semantic_models(
+        workspace.analyzer(),
+        &catalog,
+        None,
+        &SemanticModelActivationRequest {
+            bifrost_version: Version::parse(env!("CARGO_PKG_VERSION")).expect("crate version"),
+            evidence: vec![SemanticModelActivationEvidence {
+                language: "go".to_owned(),
+                ecosystem: "go".to_owned(),
+                package: None,
+                module: None,
+                toolchain: None,
+                target: None,
+                configuration: None,
+                artifact_sha256: None,
+            }],
+            controls: Vec::new(),
+            limits: SemanticModelRuntimeLimits::default(),
+        },
+        &CancellationToken::default(),
+    );
+    match activation {
+        SemanticModelRuntimeOutcome::Ready { snapshot, .. } => snapshot,
+        other => panic!("http handler models activate: {other:#?}"),
+    }
+}
+
+/// The handler fixtures shared by the protocol test: one root per modeled
+/// clause.
+const HTTP_HANDLER_SOURCE: &str = r#"package main
+
+import "net/http"
+
+var sharedValue = 0
+
+func handlerA(w http.ResponseWriter, r *http.Request) { sharedValue = 1 }
+
+func handlerB(w http.ResponseWriter, r *http.Request) { sharedValue = 2 }
+
+func twoHandlersRoot() {
+	http.HandleFunc("/a", handlerA)
+	http.HandleFunc("/b", handlerB)
+}
+
+func muxHandlersRoot() {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/a", handlerA)
+	mux.HandleFunc("/b", handlerB)
+}
+
+func postRegistrationRoot() int {
+	http.HandleFunc("/a", handlerA)
+	sharedValue = 3
+	return sharedValue
+}
+
+var orderedValue = 0
+
+func orderedReader(w http.ResponseWriter, r *http.Request) { _ = orderedValue }
+
+func orderedRoot() int {
+	orderedValue = 1
+	http.HandleFunc("/r", orderedReader)
+	return 0
+}
+
+type localMux struct{}
+
+func (m *localMux) HandleFunc(pattern string, h func(http.ResponseWriter, *http.Request)) {
+}
+
+func sameNameRoot() int {
+	mux := &localMux{}
+	mux.HandleFunc("/a", handlerA)
+	sharedValue = 3
+	return sharedValue
+}
+
+func unresolvedRoot() int {
+	var h func(http.ResponseWriter, *http.Request)
+	http.HandleFunc("/u", h)
+	sharedValue = 3
+	return sharedValue
+}
+
+type sharedHandler struct{}
+
+func (sharedHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { sharedValue = 1 }
+
+func interfaceRoot() int {
+	mux := http.NewServeMux()
+	var h http.Handler = sharedHandler{}
+	mux.Handle("/a", h)
+	mux.Handle("/b", h)
+	sharedValue = 3
+	return sharedValue
+}
+
+func serveRoot() int {
+	var h http.Handler
+	http.ListenAndServe(":8080", h)
+	sharedValue = 3
+	return sharedValue
+}
+"#;
+
+#[test]
+fn go_concurrent_access_conflicts_bind_http_handler_registrations() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file("main.go", HTTP_HANDLER_SOURCE)
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let snapshot = http_handler_snapshot(&workspace);
+
+    let cancellation = CancellationToken::default();
+    let mut budget = SemanticBudget::default();
+    let artifact = workspace
+        .materialize_program_semantics(
+            &project.file("main.go"),
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("http handler semantics materialize")
+        .available_value()
+        .cloned()
+        .expect("http handler semantics are available");
+    let procedure = |name: &str| {
+        artifact
+            .procedures()
+            .iter()
+            .find(|candidate| {
+                candidate
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|segment| segment.name())
+                    == Some(name)
+            })
+            .and_then(|row| artifact.procedure_handle(row.id()))
+            .unwrap_or_else(|| panic!("missing {name}"))
+    };
+    let provider = super::super::concurrency::WorkspaceConcurrencyProvider::new(
+        &workspace,
+        Some(snapshot),
+        None,
+    );
+    let report = |name: &str| {
+        let mut budget = SemanticBudget::default();
+        brokk_bifrost_flow::concurrency::concurrent_access_conflicts(
+            &provider,
+            &procedure(name),
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .unwrap_or_else(|error| panic!("{name} report computes: {error}"))
+    };
+    let proven_unordered = |name: &str| {
+        report(name).conflicts.iter().any(|conflict| {
+            conflict.proven
+                && conflict.exhaustive
+                && conflict.ordering
+                    == brokk_bifrost_flow::concurrency::ConcurrentOrdering::Unordered
+                && conflict.protection
+                    == brokk_bifrost_flow::concurrency::ConcurrentProtection::Unprotected
+        })
+    };
+
+    // Positive: two handlers registered on the default mux write one shared
+    // variable from concurrent request goroutines.
+    assert!(
+        proven_unordered("twoHandlersRoot"),
+        "two registered handlers must race on the shared variable: {:#?}",
+        report("twoHandlersRoot")
+    );
+
+    // Positive: the ServeMux method form binds through the NewServeMux
+    // receiver the declarations describe.
+    assert!(
+        proven_unordered("muxHandlersRoot"),
+        "two mux-registered handlers must race on the shared variable: {:#?}",
+        report("muxHandlersRoot")
+    );
+
+    // Positive: no net/http API joins the handler, so the registering
+    // function's later write races the handler.
+    assert!(
+        proven_unordered("postRegistrationRoot"),
+        "the handler must race the post-registration write: {:#?}",
+        report("postRegistrationRoot")
+    );
+
+    // Ordering: the registration is the spawn edge, so a write before it is
+    // ordered before the handler's reads.
+    let ordered = report("orderedRoot");
+    assert!(
+        ordered.conflicts.iter().any(|conflict| {
+            conflict.proven
+                && conflict.ordering
+                    == brokk_bifrost_flow::concurrency::ConcurrentOrdering::HappensBefore
+        }),
+        "the registration must order the earlier write before the handler reads: {ordered:#?}"
+    );
+    assert!(
+        !ordered.conflicts.iter().any(|conflict| {
+            conflict.proven
+                && conflict.ordering
+                    == brokk_bifrost_flow::concurrency::ConcurrentOrdering::Unordered
+        }),
+        "an ordered write cannot race the handler: {ordered:#?}"
+    );
+
+    // Same name, wrong type: an unrelated HandleFunc method binds no reviewed
+    // summary, so its argument never becomes a modeled task.
+    let same_name = report("sameNameRoot");
+    assert!(
+        !same_name.conflicts.iter().any(|conflict| {
+            conflict.proven
+                && conflict.ordering
+                    == brokk_bifrost_flow::concurrency::ConcurrentOrdering::Unordered
+        }),
+        "a same-name method on another type spawns no modeled handler: {same_name:#?}"
+    );
+
+    // Incomplete: a handler value the registration cannot name keeps its
+    // typed boundary instead of inventing a task.
+    let incomplete = report("unresolvedRoot");
+    assert!(
+        incomplete
+            .reasons
+            .contains(&brokk_bifrost_flow::concurrency::ConcurrencyOpenReason::UnresolvedTarget),
+        "the unresolved handler value must keep its typed boundary: {incomplete:#?}"
+    );
+    assert!(
+        !incomplete.conflicts.iter().any(|conflict| {
+            conflict.proven
+                && conflict.ordering
+                    == brokk_bifrost_flow::concurrency::ConcurrentOrdering::Unordered
+        }),
+        "no comparison may claim a handler the registration cannot name: {incomplete:#?}"
+    );
+
+    // Boundary: one handler value shared by two routes through the
+    // http.Handler interface form names the typed boundary; the model does
+    // not resolve the ServeHTTP dispatch, so no handler task is proven.
+    let interface = report("interfaceRoot");
+    assert!(
+        interface.reasons.iter().any(|reason| matches!(
+            reason,
+            brokk_bifrost_flow::concurrency::ConcurrencyOpenReason::UnsupportedSynchronization(protocol)
+                if protocol.as_ref() == "net/http.Handler"
+        )),
+        "the interface registration must name the net/http.Handler boundary: {interface:#?}"
+    );
+    assert!(
+        !interface.conflicts.iter().any(|conflict| {
+            conflict.proven
+                && conflict.ordering
+                    == brokk_bifrost_flow::concurrency::ConcurrentOrdering::Unordered
+        }),
+        "the unresolved interface dispatch proves no handler task: {interface:#?}"
+    );
+
+    // Boundary: ListenAndServe passes its handler through the same interface
+    // form and names the same boundary.
+    let serve = report("serveRoot");
+    assert!(
+        serve.reasons.iter().any(|reason| matches!(
+            reason,
+            brokk_bifrost_flow::concurrency::ConcurrencyOpenReason::UnsupportedSynchronization(protocol)
+                if protocol.as_ref() == "net/http.Handler"
+        )),
+        "ListenAndServe must name the net/http.Handler boundary: {serve:#?}"
+    );
+    assert!(
+        !serve.conflicts.iter().any(|conflict| {
+            conflict.proven
+                && conflict.ordering
+                    == brokk_bifrost_flow::concurrency::ConcurrentOrdering::Unordered
+        }),
+        "ListenAndServe proves no handler task through the interface: {serve:#?}"
+    );
+}
+
+#[test]
+fn go_projected_summaries_retain_http_handler_spawns() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file(
+            "main.go",
+            r#"package main
+
+import "net/http"
+
+var sharedValue = 0
+
+func handlerA(w http.ResponseWriter, r *http.Request) { sharedValue = 1 }
+
+func registerRoutes() {
+	http.HandleFunc("/a", handlerA)
+}
+
+func summarizedRoot() int {
+	registerRoutes()
+	sharedValue = 2
+	return sharedValue
+}
+
+func forwardHandler(h func(http.ResponseWriter, *http.Request)) {
+	http.HandleFunc("/f", h)
+}
+
+func forwardedRoot() int {
+	forwardHandler(handlerA)
+	sharedValue = 3
+	return sharedValue
+}
+"#,
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let snapshot = http_handler_snapshot(&workspace);
+
+    let cancellation = CancellationToken::default();
+    let mut budget = SemanticBudget::default();
+    let artifact = workspace
+        .materialize_program_semantics(
+            &project.file("main.go"),
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("http wrapper semantics materialize")
+        .available_value()
+        .cloned()
+        .expect("http wrapper semantics are available");
+    let procedure = |name: &str| {
+        artifact
+            .procedures()
+            .iter()
+            .find(|candidate| {
+                candidate
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|segment| segment.name())
+                    == Some(name)
+            })
+            .and_then(|row| artifact.procedure_handle(row.id()))
+            .unwrap_or_else(|| panic!("missing {name}"))
+    };
+    let register_routes = procedure("registerRoutes");
+    let summarized_root = procedure("summarizedRoot");
+    let forward_handler = procedure("forwardHandler");
+    let forwarded_root = procedure("forwardedRoot");
+
+    // Project production summaries for the wrapper closure and prove that a
+    // routes helper keeps its unbounded handler spawn through exact
+    // actual/formal substitution, while a wrapper that forwards its callable
+    // formal keeps the typed callable boundary.
+    let icfg =
+        crate::analyzer::semantic::WorkspaceIcfgProvider::with_active_semantic_model_snapshot(
+            &workspace,
+            Some(snapshot.clone()),
+        );
+    let projection_provider = super::super::concurrency::WorkspaceConcurrencyProvider::new(
+        &workspace,
+        Some(snapshot.clone()),
+        None,
+    );
+    let roots = [
+        summarized_root.clone(),
+        register_routes.clone(),
+        forward_handler.clone(),
+        forwarded_root.clone(),
+    ];
+    let mut projection_budget = SemanticBudget::default();
+    let summaries =
+        brokk_bifrost_flow::typestate::project_production_semantic_summaries_with_concurrency(
+            &roots,
+            &icfg,
+            &projection_provider,
+            &mut SemanticRequest::new(&mut projection_budget, &cancellation),
+        )
+        .expect("http wrapper summaries project");
+    let routes_summary = summaries
+        .summary_for(&register_routes)
+        .expect("the routes helper has a production summary");
+    assert!(
+        routes_summary.effects().iter().any(|effect| matches!(
+            effect.key(),
+            brokk_bifrost_flow::dataflow::SummaryEffectKey::Concurrency(effect)
+                if matches!(
+                    effect.kind(),
+                    brokk_bifrost_flow::dataflow::SummaryConcurrencyEffectKind::TaskSpawn {
+                        condition: brokk_bifrost_flow::dataflow::SummaryTaskSpawnCondition::Unconditional,
+                        group: None,
+                        timer: None,
+                        ..
+                    }
+                )
+        )),
+        "the routes helper must retain its unbounded handler spawn with no join: {routes_summary:#?}"
+    );
+
+    // The helper holds the registration in one activation, so the exact
+    // summary and the direct expansion agree that the handler races the
+    // caller's later write.
+    let direct_provider = super::super::concurrency::WorkspaceConcurrencyProvider::new(
+        &workspace,
+        Some(snapshot.clone()),
+        None,
+    );
+    let mut direct_budget = SemanticBudget::default();
+    let direct = brokk_bifrost_flow::concurrency::concurrent_access_conflicts(
+        &direct_provider,
+        &summarized_root,
+        &mut SemanticRequest::new(&mut direct_budget, &cancellation),
+    )
+    .expect("direct http wrapper report computes");
+    assert!(
+        direct.conflicts.iter().any(|conflict| {
+            conflict.proven
+                && conflict.exhaustive
+                && conflict.ordering
+                    == brokk_bifrost_flow::concurrency::ConcurrentOrdering::Unordered
+                && conflict.protection
+                    == brokk_bifrost_flow::concurrency::ConcurrentProtection::Unprotected
+        }),
+        "the helper-registered handler must race the caller's later write: {direct:#?}"
+    );
+    let projected_provider = super::super::concurrency::WorkspaceConcurrencyProvider::new(
+        &workspace,
+        Some(snapshot.clone()),
+        Some(summaries),
+    );
+    let mut projected_budget = SemanticBudget::default();
+    let projected = brokk_bifrost_flow::concurrency::concurrent_access_conflicts(
+        &projected_provider,
+        &summarized_root,
+        &mut SemanticRequest::new(&mut projected_budget, &cancellation),
+    )
+    .expect("projected http wrapper report computes");
+    assert_eq!(
+        projected, direct,
+        "fresh task summaries preserve the direct http wrapper report"
+    );
+
+    // A wrapper that forwards its callable formal cannot name the handler on
+    // its summary boundary, so both expansion modes keep the typed callable
+    // boundary instead of inventing a task.
+    let mut forwarded_direct_budget = SemanticBudget::default();
+    let forwarded_direct = brokk_bifrost_flow::concurrency::concurrent_access_conflicts(
+        &direct_provider,
+        &forwarded_root,
+        &mut SemanticRequest::new(&mut forwarded_direct_budget, &cancellation),
+    )
+    .expect("direct forwarded report computes");
+    assert!(
+        forwarded_direct
+            .reasons
+            .contains(&brokk_bifrost_flow::concurrency::ConcurrencyOpenReason::UnresolvedTarget),
+        "a wrapper that forwards its callable keeps the typed callable boundary: {forwarded_direct:#?}"
+    );
+    let mut forwarded_projected_budget = SemanticBudget::default();
+    let forwarded_projected = brokk_bifrost_flow::concurrency::concurrent_access_conflicts(
+        &projected_provider,
+        &forwarded_root,
+        &mut SemanticRequest::new(&mut forwarded_projected_budget, &cancellation),
+    )
+    .expect("projected forwarded report computes");
+    assert_eq!(
+        forwarded_projected, forwarded_direct,
+        "fresh task summaries preserve the direct forwarded report"
     );
 }

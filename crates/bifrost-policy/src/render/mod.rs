@@ -463,12 +463,16 @@ mod tests {
             "the per-run line must name the tier:\n{human}"
         );
         assert!(
-            human.contains("proven-by-summary (authored models) policy run"),
-            "the run summary must count the tier distinctly:\n{human}"
+            human.starts_with("0 findings | Analysis incomplete\n\nFindings\n"),
+            "the report header must preserve non-exhaustive analysis:\n{human}"
         );
         assert!(
-            !human.contains("complete policy run"),
-            "a summary-backed run must not be counted as complete:\n{human}"
+            human.contains("\nAnalysis warnings\n  test.render: proven by summary"),
+            "the analysis warning must identify the summary-backed run:\n{human}"
+        );
+        assert!(
+            !human.contains("Analysis complete"),
+            "a summary-backed run must not be presented as exhaustive:\n{human}"
         );
 
         let mut sarif = Vec::new();
@@ -735,17 +739,16 @@ mod tests {
         .unwrap();
         assert_eq!(first, second);
         let finding = String::from_utf8(first).unwrap();
+        assert!(finding.starts_with("1 finding | Analysis complete\n\nFindings\n"));
+        assert!(finding.contains("[warning] test.render: Avoid target\n"));
+        assert!(finding.contains("    Location: app.ts:1:8\n"));
         assert!(
-            finding.starts_with("[warning]  app.ts:1:8\n    Avoid target\n\n"),
-            "unexpected human report:\n{finding}"
+            finding.contains("    Certainty: definite; proof: proven; completeness: complete\n")
         );
         assert!(!finding.contains("  evidence: structural_match function\n"));
         assert!(!finding.contains("policy rule: test.render (Render)\n"));
-        assert!(
-            finding.contains(
-                "summary: 1 active finding; 0 suppressed findings; 1 complete policy run\n"
-            )
-        );
+        assert!(finding.contains("\nAnalysis warnings\n  None.\n"));
+        assert!(finding.contains("\nDependency models\n  Not reported.\n"));
         assert!(!finding.contains('\u{001B}'));
 
         let clean = evaluated_report(
@@ -763,9 +766,9 @@ mod tests {
         .unwrap();
         let output = String::from_utf8(output).unwrap();
         assert!(!output.contains("policy rule: test.render (Render)\n"));
-        assert!(output.ends_with(
-            "summary: 0 active findings; 0 suppressed findings; 1 complete policy run; clean\n"
-        ));
+        assert!(output.starts_with("0 findings | Analysis complete\n\nFindings\n"));
+        assert!(output.contains("  No findings reported.\n"));
+        assert!(!output.contains("does not establish"));
 
         let cancellation = CancellationToken::new();
         cancellation.cancel();
@@ -787,12 +790,12 @@ mod tests {
         )
         .unwrap();
         let output = String::from_utf8(output).unwrap();
-        assert!(
-            output.contains("policy test.render (Render): inconclusive (cancelled); non-clean")
-        );
-        assert!(output.ends_with(
-            "summary: 0 active findings; 0 suppressed findings; 1 inconclusive policy run; non-clean\n"
+        assert!(output.starts_with("0 findings | Analysis incomplete\n\nFindings\n"));
+        assert!(output.contains(
+            "Incomplete coverage: zero findings does not establish that the code is safe."
         ));
+        assert!(output.contains("\nAnalysis warnings\n"));
+        assert!(output.contains("  test.render: inconclusive (cancelled)\n"));
     }
 
     #[test]
@@ -816,12 +819,10 @@ mod tests {
         let note = format!(
             "note: policy test.render inferred policy schema 1 and RQL schema {compatible_rql_version}\n"
         );
-        assert!(output.starts_with(note.as_str()));
+        assert!(output.starts_with("0 findings | Analysis complete\n"));
+        assert!(output.contains(&format!("\nAnalysis warnings\n{note}")));
         assert_eq!(output.matches(note.as_str()).count(), 1);
         assert!(!output.contains("policy rule: test.render (Render)\n"));
-        assert!(output.ends_with(
-            "summary: 0 active findings; 0 suppressed findings; 1 complete policy run; clean\n"
-        ));
 
         let mut verbose = Vec::new();
         write_policy_human(
@@ -832,7 +833,8 @@ mod tests {
         )
         .unwrap();
         let verbose = String::from_utf8(verbose).unwrap();
-        assert!(verbose.starts_with(note.as_str()));
+        assert!(verbose.starts_with("0 findings | Analysis complete\n"));
+        assert!(verbose.contains(&format!("\nAnalysis warnings\n{note}")));
         assert_eq!(verbose.matches(note.as_str()).count(), 1);
         assert!(verbose.contains("policy rule: test.render (Render)\n"));
     }

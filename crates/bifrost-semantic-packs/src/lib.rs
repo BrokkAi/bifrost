@@ -197,6 +197,12 @@ const GO_STDLIB_NET_URL_SHARDS: &[&[u8]] = &[include_bytes!(
 const GO_STDLIB_NET_URL_DECLARATION_SHARDS: &[&[u8]] = &[include_bytes!(
     "../embedded/go-stdlib-net-url-declarations/shards/go.stdlib.net-url.declarations.deflate"
 )];
+const GO_STDLIB_NET_HTTP_SHARDS: &[&[u8]] = &[include_bytes!(
+    "../embedded/go-stdlib-net-http/shards/go.stdlib.net-http.handler-registration.deflate"
+)];
+const GO_STDLIB_NET_HTTP_DECLARATION_SHARDS: &[&[u8]] = &[include_bytes!(
+    "../embedded/go-stdlib-net-http-declarations/shards/go.stdlib.net-http.declarations.deflate"
+)];
 const GO_STDLIB_BYTES_DECLARATION_SHARDS: &[&[u8]] = &[include_bytes!(
     "../embedded/go-stdlib-bytes-declarations/shards/go.stdlib.bytes.declarations.json"
 )];
@@ -364,6 +370,16 @@ const BIFROST_EMBEDDED_PACK_ENTRIES: &[EmbeddedSemanticPack<'static>] = &[
         "bifrost.go.stdlib.net-url-declarations@1.0.0",
         include_bytes!("../embedded/go-stdlib-net-url-declarations/manifest.json"),
         GO_STDLIB_NET_URL_DECLARATION_SHARDS,
+    ),
+    EmbeddedSemanticPack::new(
+        "bifrost.go.stdlib.net-http@1.0.0",
+        include_bytes!("../embedded/go-stdlib-net-http/manifest.json"),
+        GO_STDLIB_NET_HTTP_SHARDS,
+    ),
+    EmbeddedSemanticPack::new(
+        "bifrost.go.stdlib.net-http-declarations@1.0.0",
+        include_bytes!("../embedded/go-stdlib-net-http-declarations/manifest.json"),
+        GO_STDLIB_NET_HTTP_DECLARATION_SHARDS,
     ),
     EmbeddedSemanticPack::new(
         "bifrost.go.stdlib.bytes-declarations@1.0.0",
@@ -1248,6 +1264,7 @@ mod tests {
             "bifrost.go.stdlib.log-declarations",
             "bifrost.go.stdlib.net-declarations",
             "bifrost.go.stdlib.net-url-declarations",
+            "bifrost.go.stdlib.net-http-declarations",
             "bifrost.go.stdlib.bytes-declarations",
             "bifrost.go.stdlib.encoding-pem-declarations",
             "bifrost.go.stdlib.crypto-x509-declarations",
@@ -1744,6 +1761,104 @@ mod tests {
                 return false;
             };
             contract.result_success_predicate == Some(CompiledResultPredicate::NonNull)
+        }));
+
+        let net_http = decoded
+            .iter()
+            .find(|pack| pack.manifest.pack_id == "bifrost.go.stdlib.net-http")
+            .expect("the Go net/http pack ships");
+        let shard = decode_shard_for_manifest(
+            &net_http.manifest,
+            &net_http.shards[0].descriptor,
+            &net_http.shards[0].bytes,
+            &DecodeLimits::default(),
+        )
+        .expect("the Go net/http shard decodes");
+        let summaries = shard
+            .payload()
+            .procedure_summaries()
+            .expect("the Go net/http shard carries procedure summaries");
+        assert_eq!(summaries.len(), 7);
+        for (id, has_receiver) in [
+            ("net-http.handle-func", false),
+            ("net-http.serve-mux.handle-func", true),
+        ] {
+            assert!(summaries.iter().any(|summary| {
+                summary.id == id
+                    && summary.target.has_receiver == has_receiver
+                    && summary.target.parameter_count == 2
+                    && matches!(
+                        summary.concurrency_effects.as_slice(),
+                        [CompiledConcurrencyEffect::TaskSpawn {
+                            callable,
+                            group: None,
+                            condition: None,
+                            timer: None,
+                        }] if callable == &CompiledSummaryInput::Parameter { ordinal: 1 }
+                    )
+            }));
+        }
+        assert!(summaries.iter().any(|summary| {
+            summary.id == "net-http.new-serve-mux"
+                && summary.normal_result_count == Some(1)
+                && summary.effects.iter().any(|effect| {
+                    matches!(
+                        effect,
+                        CompiledSummaryEffect::Allocation {
+                            output: CompiledSummaryOutput::IndexedNormalReturn { ordinal: 0 },
+                            ..
+                        }
+                    )
+                })
+        }));
+        // The http.Handler interface forms keep a reviewed unsupported
+        // boundary: their callback is the dynamic type's ServeHTTP method,
+        // which the model does not resolve.
+        for id in [
+            "net-http.handle",
+            "net-http.serve-mux.handle",
+            "net-http.serve",
+            "net-http.listen-and-serve",
+        ] {
+            assert!(summaries.iter().any(|summary| {
+                summary.id == id
+                    && matches!(
+                        summary.concurrency_effects.as_slice(),
+                        [CompiledConcurrencyEffect::Unsupported { protocol }]
+                            if protocol == "net/http.Handler"
+                    )
+            }));
+        }
+
+        let net_http_declarations = decoded
+            .iter()
+            .find(|pack| pack.manifest.pack_id == "bifrost.go.stdlib.net-http-declarations")
+            .expect("the Go net/http declaration pack ships");
+        let shard = decode_shard_for_manifest(
+            &net_http_declarations.manifest,
+            &net_http_declarations.shards[0].descriptor,
+            &net_http_declarations.shards[0].bytes,
+            &DecodeLimits::default(),
+        )
+        .expect("the Go net/http declaration shard decodes");
+        let (types, members, relations) = shard
+            .payload()
+            .declaration_facts()
+            .expect("the Go net/http declaration shard carries declaration facts");
+        assert_eq!(types.len(), 3);
+        assert_eq!(members.len(), 7);
+        assert!(relations.is_empty());
+        assert!(types.iter().any(|fact| {
+            fact.name == "net/http"
+                && fact.aliases == ["http"]
+                && fact.type_kind == TypeKind::Module
+        }));
+        assert!(members.iter().any(|fact| {
+            fact.name == "HandleFunc"
+                && fact
+                    .signature
+                    .as_ref()
+                    .is_some_and(|signature| signature.parameters.len() == 2)
         }));
 
         let testify = decoded

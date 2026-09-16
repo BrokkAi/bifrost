@@ -541,6 +541,8 @@ fn discover_jdk_semantic_pack_dependencies(
         candidates.push((resolve_path(project_root, Path::new(&java_home)), false));
     }
 
+    let discovery_requested =
+        !candidates.is_empty() || config.standard_library_discovery.discover_java_home;
     let mut discovery = JdkDiscovery {
         inputs_considered: candidates.len(),
         ..JdkDiscovery::default()
@@ -650,6 +652,17 @@ fn discover_jdk_semantic_pack_dependencies(
                 }
             }
         }
+    }
+    if discovery.dependencies.is_empty() && discovery.diagnostics.is_empty() && discovery_requested
+    {
+        discovery.diagnostics.push(DependencyPackDiagnostic {
+            severity: DependencyPackDiagnosticSeverity::Warning,
+            code: "jdk.home.unavailable".to_owned(),
+            dependency_id: None,
+            location: None,
+            message: "no usable JDK was discovered; JVM standard-library semantic packs are inactive. Set JAVA_HOME to a JDK installation in the language-server process environment and restart Bifrost"
+                .to_owned(),
+        });
     }
     discovery
 }
@@ -3906,6 +3919,21 @@ mod tests {
     const GROUP_PATH: &str = "com/example/external-lib/1.2.3";
     const BINARY_JAR: &str = "external-lib-1.2.3.jar";
     const SOURCE_JAR: &str = "external-lib-1.2.3-sources.jar";
+
+    #[test]
+    fn missing_jdk_discovery_explains_how_to_activate_stdlib_packs() {
+        let config = JvmAnalyzerConfig::default();
+        let root = tempfile::tempdir().expect("temp root");
+        let discovery = discover_jdk_semantic_pack_dependencies(&config, root.path(), None);
+
+        let diagnostic = discovery
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "jdk.home.unavailable")
+            .expect("missing JDK must produce actionable discovery guidance");
+        assert!(diagnostic.message.contains("JAVA_HOME"));
+        assert!(diagnostic.message.contains("restart Bifrost"));
+    }
 
     // -----------------------------------------------------------------------
     // The artifact half of the JVM external member surface (#1900).

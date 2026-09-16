@@ -39,13 +39,73 @@ jobs:
           shared-key: policy-sarif
           cache-on-failure: true
 
+      # rust-cache deliberately excludes workspace crates, so an exact cache
+      # hit still recompiles both Bifrost binaries. Cache the final executables
+      # separately under the repository's canonical compiled-input identity.
+      - name: Resolve compiled-input identity
+        id: compiled-inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          identity=$(git log -1 --format=%H -- \
+            src crates resources Cargo.toml Cargo.lock build.rs \
+            rust-toolchain.toml .cargo/config.toml)
+          if [[ ! "${identity}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Unable to resolve the Bifrost compiled-input identity"
+            exit 1
+          fi
+          echo "identity=${identity}" >> "${GITHUB_OUTPUT}"
+
+      - name: Restore exact policy binaries
+        id: policy-binaries
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            target/release/bifrost
+            target/release/bifrost-semantic-pack
+          key: bifrost-policy-binaries-v1-${{ runner.os }}-${{ runner.arch }}-rust-1.97.1-${{ steps.compiled-inputs.outputs.identity }}
+
+      - name: Verify restored policy binaries
+        if: steps.policy-binaries.outputs.cache-hit == 'true'
+        shell: bash
+        env:
+          EXPECTED_IDENTITY: ${{ steps.compiled-inputs.outputs.identity }}
+        run: |
+          set -euo pipefail
+          test -x target/release/bifrost
+          test -x target/release/bifrost-semantic-pack
+          actual=$(target/release/bifrost --build-identity)
+          if [ "${actual}" != "${EXPECTED_IDENTITY}" ]; then
+            echo "::error::Restored Bifrost reports build identity ${actual}, expected ${EXPECTED_IDENTITY}"
+            exit 1
+          fi
+          set +e
+          semantic_pack_usage=$(target/release/bifrost-semantic-pack 2>&1)
+          semantic_pack_status=$?
+          set -e
+          if [ "${semantic_pack_status}" -ne 2 ] || [[ "${semantic_pack_usage}" != "error: usage:"* ]]; then
+            echo "::error::Restored semantic-pack tool did not report its expected usage contract"
+            printf '%s\n' "${semantic_pack_usage}"
+            exit 1
+          fi
+
       # Build both binaries with one feature graph. Running Cargo again for the
       # pack generator rebuilt shared dependencies with release-tooling enabled.
       - name: Build the release policy runner and semantic-pack tool
+        if: steps.policy-binaries.outputs.cache-hit != 'true'
         run: >-
           cargo build --locked --release --bin bifrost --bin bifrost-semantic-pack
           -p brokk-bifrost -p brokk-bifrost-semantic-packs
           --features brokk-bifrost-semantic-packs/release-tooling
+
+      - name: Save exact policy binaries
+        if: steps.policy-binaries.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            target/release/bifrost
+            target/release/bifrost-semantic-pack
+          key: bifrost-policy-binaries-v1-${{ runner.os }}-${{ runner.arch }}-rust-1.97.1-${{ steps.compiled-inputs.outputs.identity }}
 
       - name: Generate and install pinned Python semantic pack
         env:

@@ -367,7 +367,7 @@ fn expand_reference_expression_bounded(
             }
             continue;
         }
-        if left > lower_bound && bytes[left - 1] == b'.' {
+        if left > lower_bound && bytes[left - 1] == b'.' && (left < 2 || bytes[left - 2] != b'.') {
             left -= 1;
             while left > lower_bound && is_ident_byte(bytes[left - 1], language) {
                 left -= 1;
@@ -388,7 +388,10 @@ fn expand_reference_expression_bounded(
             }
             continue;
         }
-        if right < upper_bound && bytes[right] == b'.' {
+        // A single `.` continues a member chain; a `..` run is a range or
+        // variadic operator owned by the surrounding syntax, so `Self::X..`
+        // ends the reference at `Self::X` (#3390).
+        if right < upper_bound && bytes[right] == b'.' && bytes.get(right + 1) != Some(&b'.') {
             right += 1;
             while right < upper_bound && is_ident_byte(bytes[right], language) {
                 right += 1;

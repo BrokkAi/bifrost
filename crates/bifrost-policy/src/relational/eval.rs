@@ -71,6 +71,25 @@ pub struct RelationalAssertionViolation {
     pub representatives: Vec<Vec<RelationalViolationRow>>,
 }
 
+/// One assertion whose group relation held no group at all, over a relation
+/// whose coverage was exhaustive.
+///
+/// An assertion over no group cannot be violated, so the verdict is satisfied,
+/// but it is satisfied vacuously: the policy's own selection matched nothing in
+/// the scanned workspace. That is the same statement #2659 settled for a taint
+/// endpoint set that bound nothing, and it gets the same answer -- the run
+/// stays complete and clean, and the report carries an advisory note so a
+/// reader can tell a vacuous verdict from a proven one.
+///
+/// The exhaustive coverage is what separates this from an unmet obligation. An
+/// empty group relation whose coverage is short means no group was *observed*,
+/// which is a claim about rows nobody read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VacuousAssertion {
+    pub assertion: PolicyAssertId,
+    pub group: RowGroupName,
+}
+
 /// What one relational plan concluded.
 ///
 /// `violations` holds only verdicts the rows prove; anything the coverage rules
@@ -81,6 +100,9 @@ pub struct RelationalAssertionEvaluation {
     pub violations: Vec<RelationalAssertionViolation>,
     /// Verdicts the plan could not publish, in deterministic order.
     pub unmet_obligations: Vec<RelationalObligation>,
+    /// Assertions that had no group to judge over an exhaustive relation, in
+    /// plan order. Their verdicts are clean and vacuous.
+    pub vacuous_assertions: Vec<VacuousAssertion>,
     pub obligations_truncated: bool,
     pub omitted_obligations_lower_bound: u64,
     /// Whether every bound relation was exhaustively covered and no plan bound
@@ -276,6 +298,7 @@ pub fn evaluate_plan_ir(
             Ok(RelationalAssertionEvaluation {
                 violations: Vec::new(),
                 unmet_obligations: obligations.retained,
+                vacuous_assertions: Vec::new(),
                 obligations_truncated: obligations.truncated,
                 omitted_obligations_lower_bound: obligations.omitted,
                 exhaustive: false,
@@ -327,6 +350,7 @@ fn evaluate_plan(
 
     let mut violations = Vec::new();
     let mut obligations = Obligations::default();
+    let mut vacuous_assertions = Vec::new();
     for assertion in &plan.assertions {
         state.check_cancelled()?;
         let Some(Some(relation)) = relations.get(assertion.relation.index()) else {
@@ -353,21 +377,31 @@ fn evaluate_plan(
             });
         };
 
-        if relation.tuples.is_empty() && !relation.coverage.is_exhaustive() {
-            // No group was observed at all, so the assertion's clean verdict is
-            // a claim about rows nobody read.
-            obligations.push(RelationalObligation::new(
-                assertion.id.clone(),
-                RelationalObligationKind::AbsenceRequiresExhaustiveCoverage,
-                assertion.group.clone(),
-                Vec::new(),
-                relation
-                    .coverage
-                    .partition()
-                    .clone()
-                    .union(relation.witness_partition.clone()),
-                relation.coverage.incomplete_reasons(),
-            ));
+        if relation.tuples.is_empty() {
+            if relation.coverage.is_exhaustive() {
+                // Every row that exists was read and there was no group among
+                // them, so the assertion is satisfied vacuously rather than
+                // proven. The verdict stands; the run says so.
+                vacuous_assertions.push(VacuousAssertion {
+                    assertion: assertion.id.clone(),
+                    group: assertion.group.clone(),
+                });
+            } else {
+                // No group was observed at all, so the assertion's clean
+                // verdict is a claim about rows nobody read.
+                obligations.push(RelationalObligation::new(
+                    assertion.id.clone(),
+                    RelationalObligationKind::AbsenceRequiresExhaustiveCoverage,
+                    assertion.group.clone(),
+                    Vec::new(),
+                    relation
+                        .coverage
+                        .partition()
+                        .clone()
+                        .union(relation.witness_partition.clone()),
+                    relation.coverage.incomplete_reasons(),
+                ));
+            }
         }
 
         for tuple in &relation.tuples {
@@ -467,6 +501,7 @@ fn evaluate_plan(
         incomplete_reasons,
         violations,
         unmet_obligations: obligations.retained,
+        vacuous_assertions,
         obligations_truncated: obligations.truncated,
         omitted_obligations_lower_bound: obligations.omitted,
         exhaustive,

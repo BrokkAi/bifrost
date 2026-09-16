@@ -292,6 +292,111 @@ shape, not proof of runtime dispatch, loop invariance, or measured cost.
 -- it reports only what its assert established -- and it states its own two
 limits in its message and description.
 
+### Built-in network-effect boundary pack
+
+The installed binary also embeds `bifrost.effects`, which is opt-in: a run that
+names no selector evaluates no built-in pack, and this pack is the one that
+carries a configured obligation rather than a repository-independent prompt.
+Each policy in it asserts that **one explicitly selected declaration** reaches
+no declared network effect, directly or through workspace helpers.
+
+The obligation never comes from a name, a file name, a comment, or an
+unqualified annotation. It comes from two reviewed artifacts:
+
+- a semantic model that declares the effect `bifrost.network_io` on the exact
+  API identity, checked in under `.bifrost/semantic-models/` or installed in
+  the catalog; and
+- the repository's declaration-selection block inside the policy, which names
+  the exact declaration(s) the repository reviewed.
+
+The ship-time selection is the empty set, so a repository that enables the pack
+without configuring a selection carries no purity obligation at all and gets a
+clean, complete run. Configure the block, then select the policy:
+
+```sh
+bifrost --root . \
+  --policy-id bifrost.effects.javascript.selected-boundary-no-network-io \
+  --fail-on error
+```
+
+The JavaScript and TypeScript specializations are separate policies with
+separate stable IDs and separate model packs, so a shared rule body never hides
+a missing language. The reviewed models
+(`semantic-packs/web-network/javascript/bifrost.web-network-javascript.json`
+and its TypeScript sibling) declare the WHATWG `fetch` operation at the global
+object identity `globalThis.fetch`. A bare `fetch(...)` binds that identity
+only when the identifier carries no lexical binding at the call site: a
+module-local `fetch`, an imported `fetch`, a parameter, or a reassignment mints
+no identity and therefore no effect. Nothing about the call's spelling is
+trusted, and a call the analyzer cannot expand leaves the absence claim unmet
+rather than clean.
+
+Findings retain the selected root, the helper chain, the exact API, and the
+declared effect's pack/model/summary provenance; the relational row publishes
+`depth`, `classification` (direct or transitive), `certainty`, `timing`,
+`coverage`, and a bounded witness chain.
+
+<!-- policy-doc-test:rqlp:tests/fixtures/network-effect-boundary/policies/javascript.rqlp -->
+```lisp
+; Network-effect boundary for one explicitly selected JavaScript declaration.
+;
+; The rule family is shared; only the declaration-selection block below and the
+; activated language model differ per language. `total` is not pure because it
+; is named `total`: the reviewed configuration on this repository selects that
+; exact declaration, and a repository that configures nothing carries no
+; obligation at all.
+;
+; The join
+; --------
+; `procedure-effects` projects one row per (procedure, effect id) with the
+; classification (direct or transitive), certainty, timing, coverage and a
+; bounded witness chain. Rows are keyed on the declaration domain's own
+; `procedure_id`, so the join to the selected relation is declaration-identity
+; equality.
+;
+; The absence claim
+; -----------------
+; `(exactly 0)` is an absence claim, so it is conclusive only when the effect
+; relation's coverage is exhaustive. A selected declaration that reaches an
+; unresolved helper leaves the effect set open; the run then publishes an unmet
+; obligation and exits 2 rather than reporting a clean verdict.
+(policy
+  :schema-version 1
+  :id "bifrost.effects.javascript.selected-boundary-no-network-io"
+  :name "Selected JavaScript boundary reaches no network effect"
+  :message "the selected JavaScript boundary reaches the declared network effect"
+  :severity error
+  :description "One explicitly selected JavaScript declaration must not reach a declared network effect, directly or through workspace helpers. The effect is declared by a reviewed semantic model on the exact external API identity, never inferred from a function name, a file name, a comment, or an unqualified annotation."
+  :help-uri "https://bifrost.brokk.ai/static-analysis-policies/#network-effect-boundary"
+  :tags ["effects" "network" "boundary" "javascript"]
+  :analysis
+    (analysis
+      :type assertion
+      ; ---------------------------------------------------------------------
+      ; Declaration-selection block (the repository's reviewed configuration).
+      ; Replace the pattern below with the exact declaration this repository
+      ; protects, for example:
+      ;   (language javascript
+      ;     (inside-decl (class :name "PriceCalculator")
+      ;       (method :name "total")))
+      ; ---------------------------------------------------------------------
+      (bind :name selected
+        :query (rql :schema-version 1
+          (language javascript
+            (enclosing-decl (function :name "total")))))
+      (bind :name effect
+        :query (rql :schema-version 1
+          (language javascript
+            (procedure-effects
+              (enclosing-decl (function :name "total"))))))
+      (join :left selected :right effect :on ((id procedure_id)))
+      (group :name selected-boundary :by (selected.id)
+        (aggregate :name network-effects :op count
+          :where ((effect.effect_id eq "bifrost.network_io")
+                  (effect.derivation eq declared))))
+      (assert :group selected-boundary :value network-effects :cardinality (exactly 0))))
+```
+
 ### A runnable match policy
 
 This complete checked fixture selects direct Python call syntax whose callee is
@@ -341,11 +446,20 @@ With `--fail-on never`, the complete human report is:
 
 <!-- policy-doc-test:human:dynamic-eval -->
 ```text
-note: policy bifrost.security.dynamic-eval inferred policy schema 1 and RQL schema 1
-[warning]  app.py:2:12
-    Dynamic evaluation is forbidden
+1 finding | Analysis complete
 
-summary: 1 active finding; 0 suppressed findings; dependency packs: mode default; complete; ecosystems python; 1 complete policy run
+Findings
+  [warning] bifrost.security.dynamic-eval: Dynamic evaluation is forbidden
+    Location: app.py:2:12
+    Certainty: definite; proof: proven; completeness: complete
+
+
+Analysis warnings
+note: policy bifrost.security.dynamic-eval inferred policy schema 1 and RQL schema 1
+
+Dependency models
+  Coverage: complete
+  Mode: default; ecosystems: python
 ```
 
 </details>

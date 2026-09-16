@@ -140,11 +140,8 @@ fn completion_provider(client_capabilities: &ClientCapabilities) -> Option<Compl
         return None;
     }
     Some(CompletionOptions {
-        // v1: client must invoke completion explicitly. We don't expose
-        // trigger characters because identifier-prefix-only completion
-        // isn't meaningful on `.` or `::` (we don't resolve qualified
-        // names yet).
         resolve_provider: Some(false),
+        trigger_characters: Some(vec![".".to_string()]),
         ..CompletionOptions::default()
     })
 }

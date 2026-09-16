@@ -33,6 +33,7 @@ use super::{
 pub const CODE_SMELLS_PACK_ID: &str = "bifrost.code-smells";
 pub const CORRECTNESS_PACK_ID: &str = "bifrost.correctness";
 pub const SECURITY_PACK_ID: &str = "bifrost.security";
+pub const EFFECTS_PACK_ID: &str = "bifrost.effects";
 const BUILT_IN_MANIFEST_SCHEMA_VERSION: u32 = 2;
 
 const CODE_SMELLS_MANIFEST_SOURCE: &str =
@@ -41,6 +42,7 @@ const CORRECTNESS_MANIFEST_SOURCE: &str =
     include_str!("../policy-packs/bifrost.correctness/manifest.json");
 const SECURITY_MANIFEST_SOURCE: &str =
     include_str!("../policy-packs/bifrost.security/manifest.json");
+const EFFECTS_MANIFEST_SOURCE: &str = include_str!("../policy-packs/bifrost.effects/manifest.json");
 
 const CODE_SMELLS_POLICY_SOURCES: &[(&str, &str)] = &[
     (
@@ -139,16 +141,39 @@ const SECURITY_POLICY_SOURCES: &[(&str, &str)] = &[
     ),
 ];
 
+const EFFECTS_POLICY_SOURCES: &[(&str, &str)] = &[
+    (
+        "policies/javascript/selected-boundary-no-network-io.rqlp",
+        include_str!(
+            "../policy-packs/bifrost.effects/policies/javascript/selected-boundary-no-network-io.rqlp"
+        ),
+    ),
+    (
+        "policies/python/selected-boundary-no-network-io.rqlp",
+        include_str!(
+            "../policy-packs/bifrost.effects/policies/python/selected-boundary-no-network-io.rqlp"
+        ),
+    ),
+    (
+        "policies/typescript/selected-boundary-no-network-io.rqlp",
+        include_str!(
+            "../policy-packs/bifrost.effects/policies/typescript/selected-boundary-no-network-io.rqlp"
+        ),
+    ),
+];
+
 const EMBEDDED_POLICY_PACK_SOURCES: &[(&str, &str)] = &[
     ("bifrost.code-smells", CODE_SMELLS_MANIFEST_SOURCE),
     ("bifrost.correctness", CORRECTNESS_MANIFEST_SOURCE),
     ("bifrost.security", SECURITY_MANIFEST_SOURCE),
+    ("bifrost.effects", EFFECTS_MANIFEST_SOURCE),
 ];
 
 const EMBEDDED_POLICY_SOURCES: &[(&str, &[(&str, &str)])] = &[
     ("bifrost.code-smells", CODE_SMELLS_POLICY_SOURCES),
     ("bifrost.correctness", CORRECTNESS_POLICY_SOURCES),
     ("bifrost.security", SECURITY_POLICY_SOURCES),
+    ("bifrost.effects", EFFECTS_POLICY_SOURCES),
 ];
 
 static BUILT_IN_CATALOG: OnceLock<BuiltInPolicyCatalog> = OnceLock::new();
@@ -875,7 +900,7 @@ mod tests {
     #[test]
     fn checked_in_catalog_is_internally_consistent() {
         let catalog = built_in_policy_catalog().expect("valid built-in catalog");
-        assert_eq!(catalog.document().packs.len(), 3);
+        assert_eq!(catalog.document().packs.len(), 4);
         assert_eq!(
             catalog
                 .pack_manifest(CODE_SMELLS_PACK_ID)
@@ -900,6 +925,36 @@ mod tests {
                 .len(),
             2
         );
+        let effects = catalog
+            .pack_manifest(EFFECTS_PACK_ID)
+            .expect("effects pack");
+        assert_eq!(effects.policies.len(), 3);
+        assert_eq!(
+            effects
+                .policies
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "bifrost.effects.javascript.selected-boundary-no-network-io",
+                "bifrost.effects.python.selected-boundary-no-network-io",
+                "bifrost.effects.typescript.selected-boundary-no-network-io",
+            ]
+        );
+        for entry in &effects.policies {
+            assert_eq!(
+                entry.required_capabilities,
+                vec![
+                    "semantic-model-declared-effects",
+                    "transitive-procedure-effects",
+                    "exhaustive-effect-coverage",
+                    "module-identity-declaration-selection",
+                    "external-api-identity",
+                ],
+                "{}",
+                entry.id
+            );
+        }
         assert_eq!(
             catalog
                 .select(&BuiltInPolicySelection {

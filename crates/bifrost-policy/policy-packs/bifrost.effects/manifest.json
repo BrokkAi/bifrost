@@ -1,0 +1,66 @@
+{
+  "schema_version": 2,
+  "id": "bifrost.effects",
+  "version": "1.0.0",
+  "name": "Bifrost network-effect boundaries",
+  "description": "Configurable forbidden-network-effect specializations. Each policy asserts that one explicitly selected declaration reaches no declared network effect, directly or through workspace helpers. The effect is declared by a reviewed semantic model on the exact API identity; purity is never inferred from a name, a file name, a comment, or an unqualified annotation, and a repository that configures no selection carries no obligation.",
+  "policies": [
+    {
+      "path": "policies/javascript/selected-boundary-no-network-io.rqlp",
+      "id": "bifrost.effects.javascript.selected-boundary-no-network-io",
+      "authored_hash": "1dd58941aa1e7eb9019e33c7d6e515a5c00b5695c62cd0a07e60771de0080090",
+      "resolved_semantic_hash": "1dd58941aa1e7eb9019e33c7d6e515a5c00b5695c62cd0a07e60771de0080090",
+      "category": "effects",
+      "supported_languages": [
+        "javascript"
+      ],
+      "required_capabilities": [
+        "semantic-model-declared-effects",
+        "transitive-procedure-effects",
+        "exhaustive-effect-coverage",
+        "module-identity-declaration-selection",
+        "external-api-identity"
+      ],
+      "severity_rationale": "A declaration the repository reviewed as a pure calculation reaching network I/O breaks the boundary the review relied on and can turn a local computation into an externally visible side effect.",
+      "remediation": "Move the effect to the caller, or make the selected declaration's helper chain reach no declared network effect. Configure the declaration-selection block with the exact declaration this repository protects before enabling the policy."
+    },
+    {
+      "path": "policies/python/selected-boundary-no-network-io.rqlp",
+      "id": "bifrost.effects.python.selected-boundary-no-network-io",
+      "authored_hash": "a97dc7d6d32604e0146f986f071ae42200003aed516dbb7b8fece2dbfe015943",
+      "resolved_semantic_hash": "a97dc7d6d32604e0146f986f071ae42200003aed516dbb7b8fece2dbfe015943",
+      "category": "effects",
+      "supported_languages": [
+        "python"
+      ],
+      "required_capabilities": [
+        "semantic-model-declared-effects",
+        "transitive-procedure-effects",
+        "exhaustive-effect-coverage",
+        "module-identity-declaration-selection",
+        "external-api-identity"
+      ],
+      "severity_rationale": "A declaration the repository reviewed as a pure calculation reaching network I/O breaks the boundary the review relied on and can turn a local computation into an externally visible side effect.",
+      "remediation": "Move the effect to the caller, or make the selected declaration's helper chain reach no declared network effect. Configure the declaration-selection block with the exact declaration this repository protects before enabling the policy."
+    },
+    {
+      "path": "policies/typescript/selected-boundary-no-network-io.rqlp",
+      "id": "bifrost.effects.typescript.selected-boundary-no-network-io",
+      "authored_hash": "7a8e974e05b52a9ec11319c20c0c3dc4f4b7d40917cf9c27d62b74edcfdb89ee",
+      "resolved_semantic_hash": "7a8e974e05b52a9ec11319c20c0c3dc4f4b7d40917cf9c27d62b74edcfdb89ee",
+      "category": "effects",
+      "supported_languages": [
+        "typescript"
+      ],
+      "required_capabilities": [
+        "semantic-model-declared-effects",
+        "transitive-procedure-effects",
+        "exhaustive-effect-coverage",
+        "module-identity-declaration-selection",
+        "external-api-identity"
+      ],
+      "severity_rationale": "A declaration the repository reviewed as a pure calculation reaching network I/O breaks the boundary the review relied on and can turn a local computation into an externally visible side effect.",
+      "remediation": "Move the effect to the caller, or make the selected declaration's helper chain reach no declared network effect. Configure the declaration-selection block with the exact declaration this repository protects before enabling the policy."
+    }
+  ]
+}

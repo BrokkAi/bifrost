@@ -2465,6 +2465,18 @@ fn relational_run(
         );
     }
 
+    // An assertion that had no group to judge is satisfied vacuously, not
+    // proven. The run stays complete and clean -- zero findings over an empty
+    // selection is the correct answer -- and the advisory says so, exactly as
+    // a taint policy whose endpoint selectors bound nothing does (#2659).
+    retain_vacuous_assertion_diagnostics(
+        &mut diagnostics,
+        &mut diagnostics_truncated,
+        budget.max_diagnostics(),
+        &policy.definition().metadata.id,
+        &evaluation,
+    );
+
     run_incomplete.extend(evaluation.incomplete_reasons.iter().copied());
     // An assertion whose verdict the coverage rules blocked makes the run
     // non-reliable, which is what keeps status 0 impossible. It does not
@@ -3030,6 +3042,40 @@ fn retain_incomplete_run_diagnostic(
 /// Truncation is recorded, never silent: the run's typed incomplete reasons
 /// are folded in before this runs, so a dropped diagnostic costs detail and
 /// never soundness.
+/// One advisory note per assertion whose group relation held no group at all.
+///
+/// The verdict is clean and the run is complete: an assertion over no group
+/// cannot be violated, and reading that as an incompleteness would make an
+/// honest negative unusable. What the report must not do is let a reader
+/// mistake the vacuous verdict for a proven one, so the note names the
+/// assertion and its group. `PolicyDiagnostic::empty_selection` carries the
+/// code, severity and impact so this and the taint evaluator cannot drift.
+fn retain_vacuous_assertion_diagnostics(
+    diagnostics: &mut Vec<PolicyDiagnostic>,
+    diagnostics_truncated: &mut bool,
+    max_diagnostics: usize,
+    policy_id: &PolicyId,
+    evaluation: &super::super::assertion_policy::RelationalAssertionEvaluation,
+) {
+    for vacuous in &evaluation.vacuous_assertions {
+        if diagnostics.len() >= max_diagnostics {
+            *diagnostics_truncated = true;
+            return;
+        }
+        match PolicyDiagnostic::empty_selection(format!(
+            "assertion policy `{}` observed no group for relational assertion `{}` group `{}`: \
+             its selection matched no row in the scanned workspace, so this run reports zero \
+             findings vacuously rather than proving the asserted condition holds",
+            policy_id.as_str(),
+            vacuous.assertion,
+            vacuous.group,
+        )) {
+            Ok(diagnostic) => diagnostics.push(diagnostic),
+            Err(_) => *diagnostics_truncated = true,
+        }
+    }
+}
+
 fn retain_relational_obligation_diagnostics(
     diagnostics: &mut Vec<PolicyDiagnostic>,
     diagnostics_truncated: &mut bool,

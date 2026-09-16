@@ -14,7 +14,7 @@ use crate::analyzer::semantic_model::{
     read_exact_artifact_while,
 };
 use crate::analyzer::topology::DependencyScope;
-use crate::analyzer::{Project, RustAnalyzerConfig, RustDependencyApiEvidence};
+use crate::analyzer::{Language, Project, RustAnalyzerConfig, RustDependencyApiEvidence};
 use crate::hash::{HashMap, HashSet};
 
 const CARGO_METADATA_FORMAT_VERSION: u32 = 1;
@@ -182,7 +182,7 @@ pub fn resolve_rust_semantic_pack_dependencies(
         }
     }
 
-    if !cancelled {
+    if !cancelled && project.analyzer_languages().contains(&Language::Rust) {
         match resolve_rust_stdlib_dependency(
             project,
             limits,
@@ -231,7 +231,15 @@ fn resolve_rust_stdlib_dependency(
             ));
         }
         Ok(_) => {}
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            return Err(diagnostic(
+                "rust.toolchain.missing",
+                Some(&path),
+                format!(
+                    "Rust standard-library semantics require rust-toolchain.toml pinned to exact channel {RUST_STDLIB_TOOLCHAIN_CHANNEL}"
+                ),
+            ));
+        }
         Err(error) => {
             return Err(diagnostic(
                 "rust.toolchain.metadata",
@@ -1184,6 +1192,7 @@ mod tests {
     #[test]
     fn public_discovery_reports_complete_exact_dependency() {
         let fixture = EvidenceFixture::new();
+        fixture.write_exact_toolchain();
         let project = TestProject::new(fixture._root.path().to_path_buf(), Language::Rust);
         let config = RustAnalyzerConfig {
             dependency_api_evidence: vec![fixture.evidence.clone()],
@@ -1199,8 +1208,16 @@ mod tests {
         assert!(outcome.complete, "diagnostics: {:?}", outcome.diagnostics);
         assert!(!outcome.cancelled);
         assert_eq!(outcome.profile.metadata_inputs_considered, 2);
-        assert_eq!(outcome.profile.dependencies_resolved, 1);
-        assert_eq!(outcome.dependencies.len(), 1);
+        assert_eq!(outcome.profile.dependencies_resolved, 2);
+        assert_eq!(outcome.dependencies.len(), 2);
+        assert!(outcome.dependencies.iter().any(|dependency| dependency.id
+            == "rust:widget@1.2.3:widget:x86_64-unknown-linux-gnu:derive"));
+        assert!(
+            outcome
+                .dependencies
+                .iter()
+                .any(|dependency| dependency.id == "rust:stdlib:nightly-2026-08-24")
+        );
     }
 
     #[test]
@@ -1250,6 +1267,27 @@ mod tests {
         assert!(dependency.provenance.iter().any(|entry| {
             entry.key == "rustc.commit" && entry.value == RUST_STDLIB_RUSTC_COMMIT
         }));
+    }
+
+    #[test]
+    fn missing_rust_toolchain_reports_stdlib_remediation_requirement() {
+        let fixture = EvidenceFixture::new();
+        let project = TestProject::new(fixture._root.path().to_path_buf(), Language::Rust);
+        let outcome = resolve_rust_semantic_pack_dependencies(
+            &RustAnalyzerConfig::default(),
+            &project,
+            &DependencyPackLimits::default(),
+            None,
+        );
+
+        assert!(!outcome.complete);
+        assert!(outcome.dependencies.is_empty());
+        assert_eq!(outcome.diagnostics[0].code, "rust.toolchain.missing");
+        assert!(
+            outcome.diagnostics[0]
+                .message
+                .contains(RUST_STDLIB_TOOLCHAIN_CHANNEL)
+        );
     }
 
     #[test]
@@ -1316,6 +1354,7 @@ mod tests {
     #[test]
     fn invalid_bundles_still_consume_discovery_budgets() {
         let fixture = EvidenceFixture::new();
+        fixture.write_exact_toolchain();
         fs::write(&fixture.evidence.metadata_path, b"not json").unwrap();
         let project = TestProject::new(fixture._root.path().to_path_buf(), Language::Rust);
         let config = RustAnalyzerConfig {
@@ -1447,6 +1486,14 @@ mod tests {
             fixture.write_metadata(true);
             fixture.write_rustdoc(TARGET);
             fixture
+        }
+
+        fn write_exact_toolchain(&self) {
+            fs::write(
+                self._root.path().join("rust-toolchain.toml"),
+                format!("[toolchain]\nchannel = \"{RUST_STDLIB_TOOLCHAIN_CHANNEL}\"\n"),
+            )
+            .unwrap();
         }
 
         fn write_metadata(&self, reachable: bool) {

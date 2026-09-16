@@ -395,20 +395,53 @@ pub(super) fn exact_direct_named_import_call(
     ))
 }
 
+/// The global object identity a receiverless runtime-global call resolves
+/// through.
+///
+/// JavaScript and TypeScript write a global function as a bare identifier
+/// (`fetch(url)`), which carries no receiver for the dotted modeled-call route
+/// to name. The language defines exactly one object that supplies such a name
+/// at program scope, and `globalThis` is that object's own spelling. A bare
+/// call binds it only when the active declaration model names the member, so
+/// the identity comes from the reviewed model rather than from the callee's
+/// spelling.
+const JSTS_GLOBAL_OBJECT_NAME: &str = "globalThis";
+
+/// How the modeled callee receives the object it is a member of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModeledExternalReceiver {
+    /// The call writes `owner.member(...)`, so the written value binds the
+    /// member.
+    BoundMember,
+    /// The call writes `member(...)`, so the program scope supplies the global
+    /// object and no written value participates.
+    GlobalObject,
+}
+
 #[derive(Debug)]
 struct ModeledExternalCall<'a> {
     owner: &'a SemanticModelSymbol,
     callable: &'a SemanticModelSymbol,
     parameter_count: u32,
+    receiver: ModeledExternalReceiver,
 }
 
 impl ModeledExternalCall<'_> {
     fn proof(&self) -> ExactExternalCallProof {
-        ExactExternalCallProof::js_ts_bound_external_member(
-            &self.owner.qualified_name,
-            &self.callable.name,
-            self.parameter_count,
-        )
+        match self.receiver {
+            ModeledExternalReceiver::BoundMember => {
+                ExactExternalCallProof::js_ts_bound_external_member(
+                    &self.owner.qualified_name,
+                    &self.callable.name,
+                    self.parameter_count,
+                )
+            }
+            ModeledExternalReceiver::GlobalObject => ExactExternalCallProof::js_ts_global_function(
+                &self.owner.qualified_name,
+                &self.callable.name,
+                self.parameter_count,
+            ),
+        }
     }
 }
 
@@ -476,6 +509,9 @@ fn modeled_external_call_expression<'a>(
 ) -> Option<ModeledExternalCall<'a>> {
     let remaining = remaining.checked_sub(1)?;
     let function = call.child_by_field_name("function")?;
+    if function.kind() == "identifier" {
+        return modeled_global_call_expression(overlay, language, source, call, function, lexical);
+    }
     let (receiver, member_node) = jsts_dotted_access_parts(function)?;
     let member = simple_reference_name(member_node, source, language)?;
     let arguments = call.child_by_field_name("arguments")?;
@@ -515,6 +551,53 @@ fn modeled_external_call_expression<'a>(
         owner,
         callable,
         parameter_count,
+        receiver: ModeledExternalReceiver::BoundMember,
+    })
+}
+
+/// Resolve one receiverless callee against the modeled global object.
+///
+/// Both halves of the proof are structural. The callee identifier must carry no
+/// lexical binding at the call site, so the reference resolves through the
+/// program scope; and the active model must declare the global object with
+/// exactly one matching member at the written arity. A parameter, a local
+/// declaration, a function declaration, or an import all bind the name and
+/// therefore mint no identity, which is what keeps a shadowed `fetch` from
+/// borrowing the global model's effect by spelling.
+fn modeled_global_call_expression<'a>(
+    overlay: &'a SemanticModelOverlay,
+    language: Language,
+    source: &str,
+    call: Node<'_>,
+    callee: Node<'_>,
+    lexical: &JsTsLexicalBindingIndex,
+) -> Option<ModeledExternalCall<'a>> {
+    let member = simple_reference_name(callee, source, language)?;
+    if !lexical
+        .binding_identifier_ranges_at(member, callee.start_byte())
+        .is_empty()
+    {
+        return None;
+    }
+    let owner = exact_modeled_type_named(overlay, language, JSTS_GLOBAL_OBJECT_NAME)?;
+    let arguments = call.child_by_field_name("arguments")?;
+    let parameter_count = {
+        let mut cursor = arguments.walk();
+        u32::try_from(arguments.named_children(&mut cursor).count()).ok()?
+    };
+    let matched = overlay.callable_for_target(SemanticModelCallableKey::new(
+        language.config_label(),
+        &owner.qualified_name,
+        member,
+        false,
+        parameter_count,
+    ));
+    let callable = matched.unique()?;
+    Some(ModeledExternalCall {
+        owner,
+        callable,
+        parameter_count,
+        receiver: ModeledExternalReceiver::GlobalObject,
     })
 }
 

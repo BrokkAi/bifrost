@@ -106,6 +106,19 @@ projection and its commit history does not contain every source commit.
   `RWMutex.TryRLock` protection only on paths where the returned boolean is
   proven true, retaining the correct reader or writer mode. The false branch
   holds no lock, and unresolved result flow remains an open boundary.
+- Go data-race analysis now models `net/http` handler registration as an
+  unbounded task source: a handler registered with `http.HandleFunc` or
+  `(*http.ServeMux).HandleFunc` runs concurrently with every other handler
+  and with the code after the registration, and no `net/http` API joins it,
+  so two handlers writing a shared variable and a handler racing the
+  registering function's later write are proven races. The new reviewed
+  `bifrost.go.stdlib.net-http` pack binds the spawn through exact
+  declarations in the new `bifrost.go.stdlib.net-http-declarations` pack;
+  the `http.Handler` interface forms (`Handle`, `Serve`, `ListenAndServe`)
+  keep a reviewed `unsupported_synchronization:net/http.Handler` boundary,
+  and gRPC service-method registration is the named follow-up. The built-in
+  `bifrost.code-smells` pack is 2.14.0 so the public Go data-race policy
+  also seeds roots that call `HandleFunc`.
 - Python conditional type refinements now survive semantic-pack and CSMI
   wire round trips, with exact binding and preserved provenance.
 - Configuration facts are now exposed through canonical CodeQuery and RQL.

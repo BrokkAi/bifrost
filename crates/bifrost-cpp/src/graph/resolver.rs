@@ -12831,6 +12831,22 @@ pub fn field_declared_binding(
     ))
 }
 
+/// Whether a member-initializer `field(args)` runs the declared type's
+/// constructor: only a member that holds the type by value does. `Owner* p`
+/// initialized as `p(nullptr)` binds a pointer and `Owner& r` as `r(other)`
+/// binds a reference; neither runs an `Owner` constructor (#3286). A member
+/// whose declaration the index cannot decode keeps the by-value reading, the
+/// same assumption the usage scan's declared-type match makes.
+pub fn field_initializer_holds_subobject(
+    analyzer: &CppGraphSource<'_>,
+    visibility: &VisibilityIndex<'_>,
+    field: &CodeUnit,
+) -> bool {
+    visibility
+        .field_declared_type_fact(analyzer, field)
+        .is_none_or(|fact| !fact.binds_indirectly)
+}
+
 /// Resolve the receiver type minted for a named declarator on an anonymous C
 /// aggregate, such as `struct { int r; } c`. The declaration index preserves
 /// the aggregate as the nested class `Owner$c`, but the field's type fact has

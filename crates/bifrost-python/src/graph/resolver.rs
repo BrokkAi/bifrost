@@ -138,10 +138,16 @@ fn is_module_level_target_identifier(
             .is_some_and(|parent| parent.is_module() && parent.source() == file)
 }
 
+/// The name under which `target` is bound in the innermost scope a file scan
+/// can reference. Only class owners are climbed: a target nested in a function
+/// is bound by its own identifier in that function's body, never by the outer
+/// class's or function's name, so treating the outer name as the target's
+/// binding attributes the outer declaration's usages to the nested target
+/// (#3390).
 pub fn top_level_identifier(index: &dyn CodeUnitIndex, target: &CodeUnit) -> String {
     let mut current = target.clone();
     while let Some(parent) = index.parent_of(&current) {
-        if parent.is_module() {
+        if !parent.is_class() {
             break;
         }
         current = parent;

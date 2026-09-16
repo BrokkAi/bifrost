@@ -23,7 +23,8 @@ use crate::finding::{
     FindingCompleteness, FindingIncompleteReason, PolicyDiagnostic, PolicyDiagnosticCode,
     PolicyDiagnosticImpact, PolicyDiagnosticSeverity, PolicyFailureReason, PolicyIncompleteReason,
     PolicyLocationRelationship, PolicyRunCompletion, ProofMetadata, ProofReason, ProofState,
-    RelatedPolicyLocation, WitnessStepKind,
+    RelatedPolicyLocation, ReportValueError, StoreDimensionEvidence, WitnessStep, WitnessStepKind,
+    WitnessStepProvenance,
 };
 use crate::finding::{PolicyWorkMetric, PolicyWorkReport, PolicyWorkUnit};
 use crate::finding_identity::{
@@ -204,11 +205,21 @@ pub(crate) struct CompiledTaintEndpoint {
     pub(crate) event: ValueFlowEventKey,
 }
 
+#[derive(Debug, Clone)]
+struct CompiledStoreEnd {
+    endpoint: ResolvedEndpointIdentity,
+    event: ValueFlowEventKey,
+    call: CallSiteHandle,
+    channel: TaintStoreChannel,
+}
+
 pub(crate) struct CompiledTaintPolicyPlan {
     pub(crate) internal_policy_id: String,
     pub(crate) plan: TaintPolicyPlan,
     pub(crate) sources: Box<[CompiledTaintEndpoint]>,
     pub(crate) sinks: Box<[CompiledTaintEndpoint]>,
+    store_writes: Box<[CompiledStoreEnd]>,
+    store_reads: Box<[CompiledStoreEnd]>,
 }
 
 enum TaintPolicyCompilation {
@@ -235,6 +246,8 @@ struct PreparedTaintPlan {
     policy_id: PolicyId,
     sources: Box<[CompiledTaintEndpoint]>,
     sinks: Box<[CompiledTaintEndpoint]>,
+    store_writes: Box<[CompiledStoreEnd]>,
+    store_reads: Box<[CompiledStoreEnd]>,
     compilation_elapsed: Duration,
 }
 
@@ -322,19 +335,12 @@ fn empty_selection_diagnostics(
         .named()
         .into_iter()
         .filter_map(|set| {
-            PolicyDiagnostic::try_new(
-                PolicyDiagnosticCode::EmptySelection,
-                PolicyDiagnosticSeverity::Note,
-                PolicyDiagnosticImpact::Advisory,
-                format!(
-                    "taint policy `{}` bound no {set} endpoint: its {set} selectors matched no \
-                     location in the scanned workspace, so this run reports zero findings \
-                     vacuously rather than proving that no flow exists",
-                    policy_id.as_str()
-                ),
-                None,
-                Vec::new(),
-            )
+            PolicyDiagnostic::empty_selection(format!(
+                "taint policy `{}` bound no {set} endpoint: its {set} selectors matched no \
+                 location in the scanned workspace, so this run reports zero findings \
+                 vacuously rather than proving that no flow exists",
+                policy_id.as_str()
+            ))
             .ok()
         })
         .collect()
@@ -606,6 +612,8 @@ impl ProductionTaintPolicyEvaluator {
                                 policy_id: policy_id.clone(),
                                 sources: compiled.sources,
                                 sinks: compiled.sinks,
+                                store_writes: compiled.store_writes,
+                                store_reads: compiled.store_reads,
                                 compilation_elapsed,
                             },
                         );
@@ -738,6 +746,7 @@ impl ProductionTaintPolicyEvaluator {
                         seeding.uncertain && !batch.analysis().store_reads().is_empty();
                     let Err(failure) = solve_and_project_batch(
                         &batch,
+                        &seeding.seeds[batch_index],
                         &metadata,
                         &policies,
                         &mut payloads,
@@ -2371,11 +2380,33 @@ impl<'a> TaintPolicyCompiler<'a> {
                 }
             }
             let sink_metadata = endpoint_metadata(&sinks, &sink_specs[..sinks.len()]);
+            let store_write_metadata = store_writes
+                .iter()
+                .zip(&write_specs)
+                .map(|(end, (event, _))| CompiledStoreEnd {
+                    endpoint: end.endpoint.endpoint.clone(),
+                    event: event.clone(),
+                    call: end.call.clone(),
+                    channel: end.channel.clone(),
+                })
+                .collect::<Vec<_>>();
+            let store_read_metadata = store_reads
+                .iter()
+                .zip(&read_specs)
+                .map(|(end, (event, _))| CompiledStoreEnd {
+                    endpoint: end.endpoint.endpoint.clone(),
+                    event: event.clone(),
+                    call: end.call.clone(),
+                    channel: end.channel.clone(),
+                })
+                .collect::<Vec<_>>();
             compiled.push(CompiledTaintPolicyPlan {
                 internal_policy_id,
                 plan,
                 sources: source_metadata.into_boxed_slice(),
                 sinks: sink_metadata.into_boxed_slice(),
+                store_writes: store_write_metadata.into_boxed_slice(),
+                store_reads: store_read_metadata.into_boxed_slice(),
             });
         }
         if compiled.is_empty() {
@@ -4500,8 +4531,32 @@ struct StoreSeeding {
 #[derive(Clone, PartialEq)]
 struct StoreReadSeed {
     source: ValueFlowSourceId,
+    event: ValueFlowEventKey,
     classes: TaintClassSet,
     contributors: BTreeSet<ResolvedEndpointIdentity>,
+    crossings: Vec<StoreCrossingProvenance>,
+}
+
+#[derive(Clone, PartialEq)]
+struct StoreCrossingProvenance {
+    source_endpoint: ResolvedEndpointIdentity,
+    source_to_write: Option<SummaryWitness>,
+    write_endpoint: ResolvedEndpointIdentity,
+    write_call: CallSiteHandle,
+    read_endpoint: ResolvedEndpointIdentity,
+    read_call: CallSiteHandle,
+    write_channel: TaintStoreChannel,
+    read_channel: TaintStoreChannel,
+}
+
+#[derive(Clone)]
+struct ObservedStoreWrite {
+    policy_id: PolicyId,
+    source_endpoint: ResolvedEndpointIdentity,
+    source_to_write: Option<SummaryWitness>,
+    endpoint: ResolvedEndpointIdentity,
+    call: CallSiteHandle,
+    channel: TaintStoreChannel,
 }
 
 impl StoreSeeding {
@@ -4558,22 +4613,21 @@ fn seed_store_channels(
             vec![batch.analysis().universe().empty_set(); batch.analysis().store_writes().len()]
         })
         .collect::<Vec<_>>();
-    let mut write_contributors = batches
+    let mut observed_writes = batches
         .iter()
-        .map(|batch| {
-            vec![BTreeSet::<ResolvedEndpointIdentity>::new(); batch.analysis().store_writes().len()]
-        })
+        .map(|batch| vec![Vec::<ObservedStoreWrite>::new(); batch.analysis().store_writes().len()])
         .collect::<Vec<_>>();
     // Per batch, the compiled metadata's origin-event-to-endpoint rows, for
     // attributing an observed write back to the policy sources that fed it.
     let batch_origin_endpoints = batches
         .iter()
         .map(|batch| {
-            let mut rows: Vec<(&ValueFlowEventKey, &ResolvedEndpointIdentity)> = Vec::new();
+            let mut rows: Vec<(&PolicyId, &ValueFlowEventKey, &ResolvedEndpointIdentity)> =
+                Vec::new();
             for internal in batch.policy_ids() {
                 if let Some(plan) = metadata.get(internal) {
                     for row in plan.sources.iter() {
-                        rows.push((&row.event, &row.endpoint));
+                        rows.push((&plan.policy_id, &row.event, &row.endpoint));
                     }
                 }
             }
@@ -4666,6 +4720,12 @@ fn seed_store_channels(
                 }) else {
                     continue;
                 };
+                let write_event = batch
+                    .analysis()
+                    .value_flow()
+                    .sink(batch.analysis().store_writes()[write_index].sink())
+                    .expect("a bound store write retains its value-flow sink")
+                    .key();
                 let merged = write_classes[index][write_index].union(finding.classes());
                 if merged != write_classes[index][write_index] {
                     write_classes[index][write_index] = merged;
@@ -4673,11 +4733,45 @@ fn seed_store_channels(
                 }
                 for origin in finding.origins().evidence() {
                     let key = origin.origin().value_flow_key();
-                    for (event, endpoint) in &batch_origin_endpoints[index] {
-                        if *event == key
-                            && write_contributors[index][write_index].insert((*endpoint).clone())
-                        {
-                            changed = true;
+                    for (policy_id, event, endpoint) in &batch_origin_endpoints[index] {
+                        if *event != key {
+                            continue;
+                        }
+                        for internal in batch.policy_ids() {
+                            let Some(plan) = metadata.get(internal) else {
+                                continue;
+                            };
+                            if &plan.policy_id != *policy_id {
+                                continue;
+                            }
+                            for write in plan
+                                .store_writes
+                                .iter()
+                                .filter(|write| &write.event == write_event)
+                            {
+                                let observed = ObservedStoreWrite {
+                                    policy_id: (*policy_id).clone(),
+                                    source_endpoint: (*endpoint).clone(),
+                                    source_to_write: origin
+                                        .witnesses()
+                                        .iter()
+                                        .find(|witness| !witness.steps().is_empty())
+                                        .map(|witness| witness.as_ref().clone()),
+                                    endpoint: write.endpoint.clone(),
+                                    call: write.call.clone(),
+                                    channel: write.channel.clone(),
+                                };
+                                if !observed_writes[index][write_index].iter().any(|retained| {
+                                    retained.policy_id == observed.policy_id
+                                        && retained.source_endpoint == observed.source_endpoint
+                                        && retained.endpoint == observed.endpoint
+                                        && retained.call.durable_key()
+                                            == observed.call.durable_key()
+                                }) {
+                                    observed_writes[index][write_index].push(observed);
+                                    changed = true;
+                                }
+                            }
                         }
                     }
                 }
@@ -4688,6 +4782,13 @@ fn seed_store_channels(
             for read in read_batch.analysis().store_reads() {
                 let mut classes = read_batch.analysis().universe().empty_set();
                 let mut contributors = BTreeSet::new();
+                let mut crossings = Vec::new();
+                let read_event = read_batch
+                    .analysis()
+                    .value_flow()
+                    .source(read.source())
+                    .expect("a bound store read retains its value-flow source")
+                    .key();
                 for (write_index, write_batch) in batches.iter().enumerate() {
                     if batch_policy_ids[read_index].is_disjoint(&batch_policy_ids[write_index]) {
                         continue;
@@ -4704,15 +4805,61 @@ fn seed_store_channels(
                             "batches of one policy share one taint universe"
                         );
                         classes = classes.union(&write_classes[write_index][position]);
-                        contributors
-                            .extend(write_contributors[write_index][position].iter().cloned());
+                        for observed in &observed_writes[write_index][position] {
+                            contributors.insert(observed.source_endpoint.clone());
+                            for internal in read_batch.policy_ids() {
+                                let Some(plan) = metadata.get(internal) else {
+                                    continue;
+                                };
+                                if plan.policy_id != observed.policy_id {
+                                    continue;
+                                }
+                                for read_metadata in plan
+                                    .store_reads
+                                    .iter()
+                                    .filter(|candidate| &candidate.event == read_event)
+                                {
+                                    if observed.channel.may_alias(&read_metadata.channel) {
+                                        crossings.push(StoreCrossingProvenance {
+                                            source_endpoint: observed.source_endpoint.clone(),
+                                            source_to_write: observed.source_to_write.clone(),
+                                            write_endpoint: observed.endpoint.clone(),
+                                            write_call: observed.call.clone(),
+                                            read_endpoint: read_metadata.endpoint.clone(),
+                                            read_call: read_metadata.call.clone(),
+                                            write_channel: observed.channel.clone(),
+                                            read_channel: read_metadata.channel.clone(),
+                                        });
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 if !classes.is_empty() {
+                    crossings.sort_by(|left, right| {
+                        left.source_endpoint
+                            .cmp(&right.source_endpoint)
+                            .then_with(|| left.write_endpoint.cmp(&right.write_endpoint))
+                            .then_with(|| left.read_endpoint.cmp(&right.read_endpoint))
+                            .then_with(|| {
+                                left.write_call
+                                    .durable_key()
+                                    .cmp(&right.write_call.durable_key())
+                            })
+                            .then_with(|| {
+                                left.read_call
+                                    .durable_key()
+                                    .cmp(&right.read_call.durable_key())
+                            })
+                    });
+                    crossings.dedup();
                     next.push(StoreReadSeed {
                         source: read.source(),
+                        event: read_event.clone(),
                         classes,
                         contributors,
+                        crossings,
                     });
                 }
             }
@@ -4732,6 +4879,7 @@ fn seed_store_channels(
 #[allow(clippy::too_many_arguments)]
 fn solve_and_project_batch(
     batch: &TaintBatch,
+    store_seeds: &[StoreReadSeed],
     metadata: &HashMap<String, PreparedTaintPlan>,
     policies: &[&LoadedPolicy],
     payloads: &mut HashMap<PolicyId, TaintProjectionPayload>,
@@ -4897,6 +5045,7 @@ fn solve_and_project_batch(
             plan,
             retained.plan().universe(),
             retained.report(),
+            store_seeds,
             budget,
             &mut dropped_for_missing_origins,
         )?;
@@ -4998,6 +5147,24 @@ fn solve_and_project_batch(
                         Some(status) => status.label().to_owned(),
                         None => "incomplete coverage".to_owned(),
                     };
+                    let (primary, obligation) = match cause {
+                        ValueFlowIncompleteCause::CallResolution { call, .. } => (
+                            Some(super::semantic_identity::policy_location(
+                                workspace,
+                                super::semantic_identity::call_site_locator(call),
+                            )?),
+                            "; this exact call has neither a completely resolved executable target nor an applicable complete external model",
+                        ),
+                        ValueFlowIncompleteCause::CallBinding { call, .. }
+                        | ValueFlowIncompleteCause::CallBindingCoverage { call, .. } => (
+                            Some(super::semantic_identity::policy_location(
+                                workspace,
+                                super::semantic_identity::call_site_locator(call),
+                            )?),
+                            "; this exact call binding is not completely covered by executable code or an applicable complete external model",
+                        ),
+                        _ => (None, ""),
+                    };
                     // The family names only the repeating cause. A corpus
                     // produces one of these per procedure, so without a family
                     // the per-policy diagnostic cap kept the first 256 by sort
@@ -5011,11 +5178,11 @@ fn solve_and_project_batch(
                             cause.label(),
                         ),
                         format!(
-                            "taint discovery is incomplete: {} for {}:{name} is {status}",
+                            "taint discovery is incomplete: {} for {}:{name} is {status}{obligation}",
                             cause.label(),
                             locator.path().as_str(),
                         ),
-                        None,
+                        primary,
                         Vec::new(),
                     ) {
                         payload.diagnostics.push(diagnostic);
@@ -5275,6 +5442,7 @@ fn project_policy_findings(
     plan: &PreparedTaintPlan,
     universe: &TaintUniverse,
     report: &TaintFindingReport,
+    store_seeds: &[StoreReadSeed],
     budget: &PolicyBudget,
     dropped_for_missing_origins: &mut usize,
 ) -> Result<Vec<TaintProjectedFinding>, String> {
@@ -5521,6 +5689,7 @@ fn project_policy_findings(
             let (projected_report, witness_refs) = project_taint_report(
                 workspace,
                 group,
+                store_crossings_for_group(store_seeds, group),
                 &pair_key,
                 &primary,
                 pair_proven,
@@ -5717,6 +5886,7 @@ fn policy_authored_arm_closures_from(
 fn project_taint_report(
     workspace: &WorkspaceAnalyzer,
     group: &ProjectedSourceGroup<'_>,
+    store_crossings: Vec<&StoreCrossingProvenance>,
     finding_key: &str,
     primary: &crate::finding::PolicySourceLocation,
     proven: bool,
@@ -5755,6 +5925,7 @@ fn project_taint_report(
     } = project_taint_witnesses(
         workspace,
         group,
+        store_crossings,
         finding_key,
         finding_incomplete || origins_truncated || witness_incomplete,
         witness_limit,
@@ -5853,6 +6024,7 @@ struct EffectiveWitnessLimits {
 fn project_taint_witnesses(
     workspace: &WorkspaceAnalyzer,
     group: &ProjectedSourceGroup<'_>,
+    store_crossings: Vec<&StoreCrossingProvenance>,
     finding_key: &str,
     finding_incomplete: bool,
     witness_limit: usize,
@@ -5902,10 +6074,17 @@ fn project_taint_witnesses(
                 }
             },
         )?;
-        let Some(projected) = projected else {
+        let Some(mut projected) = projected else {
             omitted = omitted.saturating_add(1);
             continue;
         };
+        if let Some(crossing) = store_crossings
+            .iter()
+            .find(|crossing| crossing.source_endpoint == group.source.identity)
+        {
+            projected =
+                project_store_crossing_witness(workspace, projected, crossing, witness_limits)?;
+        }
         display_candidates.push(crate::display_path::project_taint_display_candidate(
             workspace,
             origin.origin().value_flow_key().site(),
@@ -5926,6 +6105,169 @@ fn project_taint_witnesses(
             u64::try_from(omitted).unwrap_or(u64::MAX),
         ),
     })
+}
+
+fn store_crossings_for_group<'a>(
+    seeds: &'a [StoreReadSeed],
+    group: &ProjectedSourceGroup<'_>,
+) -> Vec<&'a StoreCrossingProvenance> {
+    let origin_events = group
+        .origins
+        .iter()
+        .map(|origin| origin.origin().value_flow_key())
+        .collect::<HashSet<_>>();
+    seeds
+        .iter()
+        .filter(|seed| origin_events.contains(&seed.event))
+        .flat_map(|seed| seed.crossings.iter())
+        .filter(|crossing| crossing.source_endpoint == group.source.identity)
+        .collect()
+}
+
+fn store_dimension_evidence(dimension: &TaintStoreDimension) -> StoreDimensionEvidence {
+    match dimension {
+        TaintStoreDimension::Undeclared => StoreDimensionEvidence::Undeclared,
+        TaintStoreDimension::Unproven => StoreDimensionEvidence::Unproven,
+        TaintStoreDimension::Proven(identity) => StoreDimensionEvidence::Proven {
+            identities: vec![identity.to_string()],
+        },
+        TaintStoreDimension::ProvenSet(identities) => StoreDimensionEvidence::Proven {
+            identities: identities
+                .digests()
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+        },
+    }
+}
+
+fn project_store_crossing_witness(
+    workspace: &WorkspaceAnalyzer,
+    downstream: BoundedWitness,
+    crossing: &StoreCrossingProvenance,
+    limits: EffectiveWitnessLimits,
+) -> Result<BoundedWitness, String> {
+    let mut omitted = downstream.omitted_steps_lower_bound();
+    let mut steps = if let Some(upstream) = crossing.source_to_write.as_ref() {
+        let projected = super::witness_projection::project_summary_witness_steps(
+            workspace,
+            upstream,
+            downstream.id(),
+            limits.steps,
+            limits.bytes,
+            |kind| match kind {
+                SummaryWitnessStepKind::Seed => (WitnessStepKind::Source, "taint source"),
+                SummaryWitnessStepKind::Edge(_) => {
+                    (WitnessStepKind::Propagation, "taint propagation")
+                }
+                SummaryWitnessStepKind::EndSummaryGap(_) => {
+                    (WitnessStepKind::Return, "taint summary boundary")
+                }
+            },
+        )?;
+        omitted = omitted
+            .saturating_add(u64::try_from(upstream.omitted_steps_lower_bound()).unwrap_or(u64::MAX))
+            .saturating_add(
+                u64::try_from(upstream.steps().len().saturating_sub(projected.len()))
+                    .unwrap_or(u64::MAX),
+            );
+        projected
+    } else {
+        omitted = omitted.saturating_add(1);
+        Vec::new()
+    };
+    steps.push(
+        WitnessStep::try_new(
+            WitnessStepKind::StoreWrite,
+            Some(super::semantic_identity::policy_location(
+                workspace,
+                super::semantic_identity::call_site_locator(&crossing.write_call),
+            )?),
+            "declared store write",
+            Vec::new(),
+        )
+        .map_err(|error| error.to_string())?,
+    );
+    steps.push(
+        WitnessStep::try_new_with_provenance(
+            WitnessStepKind::DeclaredStore,
+            None,
+            "policy-declared store edge",
+            Vec::new(),
+            Some(WitnessStepProvenance::DeclaredStore {
+                write_model: crossing.write_endpoint.clone(),
+                read_model: crossing.read_endpoint.clone(),
+                store: crossing.read_channel.store().to_owned(),
+                write_instance: store_dimension_evidence(crossing.write_channel.instance()),
+                write_key: store_dimension_evidence(crossing.write_channel.key()),
+                read_instance: store_dimension_evidence(crossing.read_channel.instance()),
+                read_key: store_dimension_evidence(crossing.read_channel.key()),
+            }),
+        )
+        .map_err(|error| error.to_string())?,
+    );
+    steps.push(
+        WitnessStep::try_new(
+            WitnessStepKind::StoreRead,
+            Some(super::semantic_identity::policy_location(
+                workspace,
+                super::semantic_identity::call_site_locator(&crossing.read_call),
+            )?),
+            "declared store read",
+            Vec::new(),
+        )
+        .map_err(|error| error.to_string())?,
+    );
+    steps.extend(downstream.steps().iter().skip(1).cloned());
+    while steps.len() > limits.steps {
+        let Some(index) = compressible_store_witness_step(&steps) else {
+            return mark_store_crossing_unavailable(downstream);
+        };
+        steps.remove(index);
+        omitted = omitted.saturating_add(1);
+    }
+    loop {
+        match BoundedWitness::try_new(downstream.id().clone(), steps.clone(), omitted > 0, omitted)
+        {
+            Ok(candidate)
+                if usize::try_from(candidate.retained_bytes()).unwrap_or(usize::MAX)
+                    <= limits.bytes =>
+            {
+                return Ok(candidate);
+            }
+            Ok(_)
+            | Err(ReportValueError::TooManyBytes {
+                field: "witness", ..
+            }) => {}
+            Err(error) => return Err(error.to_string()),
+        }
+        let Some(index) = compressible_store_witness_step(&steps) else {
+            return mark_store_crossing_unavailable(downstream);
+        };
+        steps.remove(index);
+        omitted = omitted.saturating_add(1);
+    }
+}
+
+fn compressible_store_witness_step(steps: &[WitnessStep]) -> Option<usize> {
+    steps.iter().enumerate().find_map(|(index, step)| {
+        (index + 1 < steps.len()
+            && matches!(
+                step.kind(),
+                WitnessStepKind::Propagation | WitnessStepKind::Return
+            ))
+        .then_some(index)
+    })
+}
+
+fn mark_store_crossing_unavailable(downstream: BoundedWitness) -> Result<BoundedWitness, String> {
+    BoundedWitness::try_new(
+        downstream.id().clone(),
+        downstream.steps().to_vec(),
+        true,
+        downstream.omitted_steps_lower_bound().saturating_add(1),
+    )
+    .map_err(|error| error.to_string())
 }
 
 /// Degrade one payload for a request-wide lane that ran out mid-run.

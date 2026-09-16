@@ -137,6 +137,7 @@ mod call_sites;
 mod cpp;
 mod csharp;
 mod go;
+pub(crate) use go::go_imported_package_at_range;
 pub(crate) use go::parse_go_tree;
 pub(crate) mod java;
 pub(crate) mod js_ts;
@@ -530,6 +531,28 @@ impl ExactExternalCallProof {
         );
         Self {
             canonical_callee: format!("{module_specifier}.{imported_name}").into_boxed_str(),
+            call_application: CallApplicationKind::PackageFunction,
+            dispatch_extensibility: None,
+            parameter_count,
+        }
+    }
+
+    /// A receiverless call to one member of the language's global object.
+    ///
+    /// `fetch(url)` writes no receiver, so nothing at the call site spells the
+    /// owner. The owner is the global object's own identity, proven by the
+    /// modeled declaration rather than by the callee's spelling, and the call
+    /// shape is a package function because no written value participates --
+    /// exactly as a direct named import is receiverless.
+    pub(crate) fn js_ts_global_function(
+        global_object: &str,
+        member: &str,
+        parameter_count: u32,
+    ) -> Self {
+        assert!(!global_object.is_empty(), "a global object must be named");
+        assert!(!member.is_empty(), "a global member must be named");
+        Self {
+            canonical_callee: format!("{global_object}.{member}").into_boxed_str(),
             call_application: CallApplicationKind::PackageFunction,
             dispatch_extensibility: None,
             parameter_count,

@@ -1,4 +1,8 @@
-use super::{TypeLookupOutcome, candidates_outcome, no_type, type_reference_outcome};
+use super::{
+    TypeLookupOutcome, candidates_outcome, exact_semantic_model_type_outcome, no_type,
+    type_reference_outcome,
+};
+use crate::analyzer::Language;
 use crate::analyzer::QueryScope;
 use crate::analyzer::QueryToken;
 use crate::analyzer::usages::get_definition::{
@@ -11,6 +15,7 @@ use crate::analyzer::usages::reference_site::ResolvedReferenceSite;
 use crate::analyzer::usages::rust_graph::{
     RustDefinitionProvider, rust_smallest_named_node_covering,
 };
+use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
 use crate::analyzer::{IAnalyzer, ProjectFile, RustAnalyzer, resolve_analyzer};
 use crate::cancellation::CancellationToken;
 use tree_sitter::{Node, Tree};
@@ -180,6 +185,15 @@ fn resolve_rust_type_with_provider(
         .filter(|unit| rust_is_type_definition(analyzer, unit))
         .collect();
     if candidates.is_empty() {
+        if let Some(outcome) = exact_semantic_model_type_outcome(
+            analyzer,
+            file,
+            Language::Rust,
+            &fqn,
+            TypeLookupTargetKind::ValueExpression,
+        ) {
+            return outcome;
+        }
         return no_type(
             "no_indexed_type_definition",
             format!("`{fqn}` resolved as a Rust type but has no indexed definition"),
@@ -393,5 +407,64 @@ fn use_service(service: Service) {
                 work,
             } if work.scope_nodes == budget.max_scope_nodes
         ));
+    }
+
+    #[test]
+    fn vec_macro_initializer_resolves_to_semantic_stdlib_owner() {
+        let source = "fn main() { let xs = vec![1i32, 2, 3]; xs; }\n";
+        let fixture = AnalyzerFixture::new_for_language(Language::Rust, &[("src/lib.rs", source)]);
+        let file = ProjectFile::new(fixture.project_root(), "src/lib.rs");
+        let tree = parse_tree_for_language(&file, Language::Rust, source).expect("parse Rust");
+        let outcome = resolve_rust_type_bounded(
+            fixture.analyzer.analyzer(),
+            &file,
+            source,
+            Some(&tree),
+            &full_expression_site(&file, source, "xs"),
+            ReceiverAnalysisBudget::default(),
+            None,
+        );
+        let BoundedResolution::Complete { value, .. } = outcome else {
+            panic!("vec receiver lookup should complete");
+        };
+        assert_eq!(value.status, TypeLookupStatus::NoType);
+        assert!(
+            value.diagnostics.iter().any(|diagnostic| {
+                diagnostic.kind == "no_indexed_type_definition"
+                    && diagnostic.message.contains("alloc.vec.Vec")
+            }),
+            "{value:#?}"
+        );
+    }
+
+    #[test]
+    fn shadowed_vec_macro_is_not_treated_as_builtin_vec() {
+        let source = concat!(
+            "macro_rules! vec { ($($value:expr),*) => { 42_i32 }; }\n",
+            "fn main() { let xs = vec![1, 2, 3]; xs; }\n",
+        );
+        let fixture = AnalyzerFixture::new_for_language(Language::Rust, &[("src/lib.rs", source)]);
+        let file = ProjectFile::new(fixture.project_root(), "src/lib.rs");
+        let tree = parse_tree_for_language(&file, Language::Rust, source).expect("parse Rust");
+        let outcome = resolve_rust_type_bounded(
+            fixture.analyzer.analyzer(),
+            &file,
+            source,
+            Some(&tree),
+            &full_expression_site(&file, source, "xs"),
+            ReceiverAnalysisBudget::default(),
+            None,
+        );
+        let BoundedResolution::Complete { value, .. } = outcome else {
+            panic!("shadowed vec receiver lookup should complete");
+        };
+        assert_eq!(value.status, TypeLookupStatus::NoType);
+        assert!(
+            value
+                .diagnostics
+                .iter()
+                .all(|diagnostic| !diagnostic.message.contains("alloc.vec.Vec")),
+            "{value:#?}"
+        );
     }
 }

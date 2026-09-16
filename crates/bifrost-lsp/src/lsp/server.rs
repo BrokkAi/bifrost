@@ -17,7 +17,7 @@ use lsp_server::{
 use lsp_types::notification::{
     Cancel, DidChangeConfiguration, DidChangeTextDocument, DidChangeWatchedFiles,
     DidChangeWorkspaceFolders, DidCloseTextDocument, DidOpenTextDocument, DidSaveTextDocument,
-    Notification as LspNotificationTrait, PublishDiagnostics,
+    Notification as LspNotificationTrait, PublishDiagnostics, ShowMessage,
 };
 use lsp_types::request::{
     CallHierarchyIncomingCalls, CallHierarchyOutgoingCalls, CallHierarchyPrepare,
@@ -35,10 +35,10 @@ use lsp_types::{
     DidChangeConfigurationParams, DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
     DidChangeWorkspaceFoldersParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
     DidSaveTextDocumentParams, DocumentChanges, Documentation, FileChangeType, Hover,
-    HoverContents, InitializeParams, MarkupContent, MarkupKind, NumberOrString, OneOf,
+    HoverContents, InitializeParams, MarkupContent, MarkupKind, MessageType, NumberOrString, OneOf,
     OptionalVersionedTextDocumentIdentifier, Position, ProgressToken, PublishDiagnosticsParams,
-    Registration, RegistrationParams, TextDocumentEdit, TextEdit, Uri, WorkDoneProgress,
-    WorkDoneProgressBegin, WorkDoneProgressCreateParams, WorkDoneProgressEnd,
+    Registration, RegistrationParams, ShowMessageParams, TextDocumentEdit, TextEdit, Uri,
+    WorkDoneProgress, WorkDoneProgressBegin, WorkDoneProgressCreateParams, WorkDoneProgressEnd,
     WorkDoneProgressReport, WorkspaceEdit,
 };
 
@@ -284,6 +284,22 @@ fn handle_dependency_pack_activation(
         return Ok(());
     }
     state.dependency_pack_activation = Some(activation.clone());
+    for message in &activation.user_messages {
+        if !state.dependency_pack_user_messages.insert(message.clone()) {
+            continue;
+        }
+        let note = Notification::new(
+            ShowMessage::METHOD.to_string(),
+            ShowMessageParams {
+                typ: MessageType::WARNING,
+                message: message.clone(),
+            },
+        );
+        connection
+            .sender
+            .send(Message::Notification(note))
+            .map_err(|error| format!("Failed to send dependency-pack guidance: {error}"))?;
+    }
     if let Some(detail) = activation.incomplete_detail.as_deref() {
         // Not an error: the collectors keep their typed suppressions, so an
         // incomplete activation costs recall, never a wrong diagnostic.
@@ -2780,6 +2796,7 @@ pub(crate) struct ServerState {
     /// The activation completion for dependency_pack_generation, when it has
     /// arrived. Requests use only this generation-matched result.
     dependency_pack_activation: Option<DependencyPackActivation>,
+    dependency_pack_user_messages: HashSet<String>,
     /// The `OverlayProject` is shared with the analyzer (via `Arc<dyn Project>`
     /// inside `WorkspaceAnalyzer`) and with request-time read paths in
     /// `handlers::util::read_document_for_uri`. did{Open,Change,Close}
@@ -3582,6 +3599,7 @@ impl ServerState {
             dependency_pack_generation: 0,
             packs_config,
             dependency_pack_activation: None,
+            dependency_pack_user_messages: HashSet::new(),
             overlay,
             completion_cache: completion::CompletionCache::new(),
             rejected_didchange_log: ThrottledLog::new(

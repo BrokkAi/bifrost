@@ -1,5 +1,6 @@
 use super::{
-    TypeLookupDiagnostic, TypeLookupOutcome, candidates_outcome_with_target_kind, no_type,
+    TypeLookupDiagnostic, TypeLookupOutcome, candidates_outcome_with_target_kind,
+    exact_semantic_model_type_outcome, no_type,
 };
 use crate::analyzer::usages::get_definition::{
     AnalyzerGoDefinitionProvider, BoundedResolution, GoDefinitionProvider,
@@ -8,7 +9,7 @@ use crate::analyzer::usages::get_definition::{
 use crate::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget;
 use crate::analyzer::usages::reference_site::ResolvedReferenceSite;
 use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
-use crate::analyzer::{GoAnalyzer, IAnalyzer, ProjectFile, resolve_analyzer};
+use crate::analyzer::{GoAnalyzer, IAnalyzer, Language, ProjectFile, resolve_analyzer};
 use crate::cancellation::CancellationToken;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use tree_sitter::Tree;
@@ -67,6 +68,15 @@ fn resolve_go_type_with_provider(
 
     let candidates = support.fqn(&resolution.fqn);
     if candidates.is_empty() {
+        if let Some(outcome) = exact_semantic_model_type_outcome(
+            analyzer,
+            file,
+            Language::Go,
+            &resolution.fqn,
+            TypeLookupTargetKind::ValueExpression,
+        ) {
+            return outcome;
+        }
         return no_type(
             "go_no_indexed_type_definition",
             format!(

@@ -27,6 +27,7 @@ use crate::analyzer::packs_document::{
     WorkspaceActivationSources, WorkspacePacksActivation, WorkspacePacksConfig,
     activate_workspace_semantic_sources,
 };
+use crate::analyzer::semantic_model::DependencyPackDiagnostic;
 use crate::analyzer::{AnalyzerConfig, DependencyPackEcosystem, WorkspaceAnalyzer};
 use crate::cancellation::CancellationToken;
 
@@ -67,6 +68,10 @@ pub(crate) struct DependencyPackActivation {
     /// complete. An incomplete activation is not an error: the collectors keep
     /// reporting typed suppressions, so the session stays correct and quiet.
     pub(crate) incomplete_detail: Option<String>,
+    /// Actionable host-facing messages derived from structured activation
+    /// diagnostics. These are separate from source diagnostics because a
+    /// missing toolchain has no honest source range to attach to.
+    pub(crate) user_messages: Vec<String>,
 }
 
 struct ActivationJob {
@@ -152,7 +157,12 @@ impl DependencyPackActivator {
         if let Some(running) = state.running.as_ref() {
             running.cancel();
         }
-        if ecosystems.is_empty() || config_error.is_some() {
+        let workspace_models_present = std::fs::symlink_metadata(
+            workspace_root
+                .join(crate::analyzer::semantic_model::WORKSPACE_SEMANTIC_MODEL_DIRECTORY),
+        )
+        .is_ok();
+        if (ecosystems.is_empty() && !workspace_models_present) || config_error.is_some() {
             let completion = DependencyPackActivation {
                 generation,
                 config: packs_config,
@@ -161,6 +171,7 @@ impl DependencyPackActivator {
                 ecosystems,
                 refresh_required: false,
                 incomplete_detail: config_error,
+                user_messages: Vec::new(),
             };
             drop(state);
             self.set_completion(completion);
@@ -329,31 +340,52 @@ fn run_job(job: &ActivationJob) -> Option<DependencyPackActivation> {
         &job.config,
         WorkspaceActivationSources {
             catalog_root: &job.workspace_root,
-            workspace_model_root: None,
+            workspace_model_root: Some(&job.workspace_root),
             config: job.packs_config.as_ref(),
-            intrinsic_shipped_models: false,
+            intrinsic_shipped_models: true,
         },
         &job.cancellation,
     );
-    let (activation, incomplete_detail, refresh_required, complete) = match outcome {
+    let (activation, incomplete_detail, refresh_required, complete, user_messages) = match outcome {
         Ok(Some(activation)) => {
             let complete = activation.outcome.complete();
             let incomplete_detail = (!complete).then(|| format!("{activation:#?}"));
             let refresh_required = activation.outcome.diagnostic_refresh_required;
+            let user_messages = activation
+                .outcome
+                .ecosystems
+                .iter()
+                .flat_map(|outcome| {
+                    outcome
+                        .discovery
+                        .diagnostics
+                        .iter()
+                        .chain(
+                            outcome
+                                .preparation
+                                .iter()
+                                .flat_map(|preparation| preparation.diagnostics.iter()),
+                        )
+                        .filter_map(move |diagnostic| {
+                            dependency_pack_guidance(outcome.ecosystem, diagnostic)
+                        })
+                })
+                .collect();
             (
                 Some(Arc::new(activation)),
                 incomplete_detail,
                 refresh_required,
                 complete,
+                user_messages,
             )
         }
-        Ok(None) => (None, None, false, true),
+        Ok(None) => (None, None, false, true, Vec::new()),
         Err(error) => {
             eprintln!(
                 "[bifrost-lsp] dependency-pack activation is unavailable, \
                  unrecognized-symbol diagnostics stay suppressed: {error}"
             );
-            (None, Some(error.to_string()), false, false)
+            (None, Some(error.to_string()), false, false, Vec::new())
         }
     };
     // One line per activation, so a rollout campaign can read activation
@@ -377,12 +409,103 @@ fn run_job(job: &ActivationJob) -> Option<DependencyPackActivation> {
         ecosystems: job.ecosystems.clone(),
         refresh_required,
         incomplete_detail,
+        user_messages,
     })
+}
+
+fn dependency_pack_guidance(
+    ecosystem: DependencyPackEcosystem,
+    diagnostic: &DependencyPackDiagnostic,
+) -> Option<String> {
+    let remediation = match (ecosystem, diagnostic.code.as_str()) {
+        (
+            DependencyPackEcosystem::Jvm,
+            "jdk.home.unavailable" | "jdk.home.invalid" | "jdk.jmods.invalid",
+        ) => {
+            "Configure JAVA_HOME to a JDK with lib/src.zip, or install a compatible JDK, then restart Bifrost."
+        }
+        (
+            DependencyPackEcosystem::Go,
+            "go.config_invalid"
+            | "go.env_failed"
+            | "go.env_invalid_json"
+            | "go.module_missing"
+            | "go.module_root_missing"
+            | "go.target_missing"
+            | "go.list_failed"
+            | "go.list_invalid_json"
+            | "go.workspace_metadata_invalid"
+            | "go.vendor_metadata_invalid"
+            | "go.package_incomplete",
+        ) => "Install Go or configure bifrost's Go executable and GOROOT, then restart Bifrost.",
+        (
+            DependencyPackEcosystem::Cargo,
+            "rust.toolchain.missing"
+            | "rust.toolchain.not_file"
+            | "rust.toolchain.invalid_utf8"
+            | "rust.toolchain.invalid_toml"
+            | "rust.toolchain.stdlib_channel_mismatch"
+            | "rust.toolchain.metadata",
+        ) => "Add or fix rust-toolchain.toml so it pins nightly-2026-08-24, then restart Bifrost.",
+        (DependencyPackEcosystem::DotNet, "csharp.dependency_unresolved") => {
+            "Restore the project with a compatible .NET SDK so project.assets.json is available, then restart Bifrost."
+        }
+        (
+            DependencyPackEcosystem::Npm,
+            "npm.lockfile.missing"
+            | "npm.lockfile.invalid"
+            | "npm.lockfile.unsupported"
+            | "npm.package.manifest_missing"
+            | "npm.declarations.missing",
+        ) => {
+            "Install the locked npm dependencies and ensure package metadata is readable, then restart Bifrost."
+        }
+        (DependencyPackEcosystem::Python, code) if code.starts_with("python.toolchain.") => {
+            "Configure the intended Python environment and exact version metadata, then restart Bifrost."
+        }
+        (DependencyPackEcosystem::Ruby, code) if code.starts_with("ruby.evidence.") => {
+            "Install the locked Ruby gems or configure their archive evidence, then restart Bifrost."
+        }
+        (DependencyPackEcosystem::Composer, code)
+            if code.starts_with("php.toolchain.") || code.starts_with("composer.evidence.") =>
+        {
+            "Install the locked Composer dependencies and configure the intended PHP version, then restart Bifrost."
+        }
+        (DependencyPackEcosystem::Cpp, "cpp.header_discovery_failed") => {
+            "Generate a current compile_commands.json with the intended compiler/toolchain, then restart Bifrost."
+        }
+        _ => return None,
+    };
+    let subject = match ecosystem {
+        DependencyPackEcosystem::Jvm => "JVM standard-library semantic packs are inactive",
+        DependencyPackEcosystem::Cargo => "Rust standard-library semantic packs are inactive",
+        DependencyPackEcosystem::Go => "Go semantic packs are incomplete",
+        DependencyPackEcosystem::DotNet => ".NET semantic packs are incomplete",
+        DependencyPackEcosystem::Npm => "npm semantic packs are incomplete",
+        DependencyPackEcosystem::Python => "Python semantic packs are incomplete",
+        DependencyPackEcosystem::Ruby => "Ruby semantic packs are incomplete",
+        DependencyPackEcosystem::Composer => "Composer semantic packs are incomplete",
+        DependencyPackEcosystem::Cpp => "C/C++ semantic packs are incomplete",
+    };
+    Some(format!(
+        "{subject} ({}): {} {remediation}",
+        diagnostic.code, diagnostic.message
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn diagnostic(code: &str) -> DependencyPackDiagnostic {
+        DependencyPackDiagnostic {
+            severity: crate::analyzer::semantic_model::DependencyPackDiagnosticSeverity::Error,
+            code: code.to_string(),
+            dependency_id: None,
+            location: None,
+            message: "discovery failed".to_string(),
+        }
+    }
 
     #[test]
     fn every_ecosystem_declares_a_dependency_input_that_maps_back_to_it() {
@@ -399,6 +522,68 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn rust_toolchain_changes_invalidate_cargo_activation() {
+        assert!(
+            ecosystems_for_dependency_input("rust-toolchain.toml")
+                .contains(&DependencyPackEcosystem::Cargo)
+        );
+    }
+
+    #[test]
+    fn readiness_guidance_is_limited_to_missing_prerequisites() {
+        let missing = dependency_pack_guidance(
+            DependencyPackEcosystem::Cargo,
+            &diagnostic("rust.toolchain.missing"),
+        )
+        .expect("missing Rust toolchain should be actionable");
+        assert!(missing.contains("rust-toolchain.toml"));
+        assert!(missing.contains("nightly-2026-08-24"));
+
+        for (ecosystem, code, expected) in [
+            (
+                DependencyPackEcosystem::Jvm,
+                "jdk.jmods.invalid",
+                "JAVA_HOME",
+            ),
+            (DependencyPackEcosystem::Go, "go.target_missing", "GOROOT"),
+            (
+                DependencyPackEcosystem::Npm,
+                "npm.declarations.missing",
+                "npm dependencies",
+            ),
+            (
+                DependencyPackEcosystem::Ruby,
+                "ruby.evidence.missing_archive_roots",
+                "Ruby gems",
+            ),
+            (
+                DependencyPackEcosystem::Composer,
+                "composer.evidence.archive_root",
+                "Composer dependencies",
+            ),
+        ] {
+            let guidance = dependency_pack_guidance(ecosystem, &diagnostic(code))
+                .unwrap_or_else(|| panic!("{code} should have remediation guidance"));
+            assert!(guidance.contains(expected), "{guidance}");
+        }
+
+        assert!(
+            dependency_pack_guidance(
+                DependencyPackEcosystem::Cargo,
+                &diagnostic("rust.rustdoc.no_external_declarations"),
+            )
+            .is_none()
+        );
+        assert!(
+            dependency_pack_guidance(
+                DependencyPackEcosystem::Jvm,
+                &diagnostic("limit.dependencies"),
+            )
+            .is_none()
+        );
     }
 
     #[test]

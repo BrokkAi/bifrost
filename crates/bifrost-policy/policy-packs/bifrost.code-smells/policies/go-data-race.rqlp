@@ -1,8 +1,9 @@
 ; Exact Go ordinary-access conflicts over a bounded spawn-rooted task slice.
 ;
-; The structural union is only a cost seed. A terminal `Go`, `TryGo`, or `Run`
-; spelling never supplies task semantics: reviewed exact API identity must bind
-; a task-spawn effect before the solver enters its callback. Open target, heap, ordering,
+; The structural union is only a cost seed. A terminal `Go`, `TryGo`,
+; `AfterFunc`, `Run`, or `HandleFunc` spelling never supplies task semantics:
+; reviewed exact API identity must bind a task-spawn effect before the solver
+; enters its callback. Open target, heap, ordering,
 ; lock, atomic, and synchronization evidence remains queryable but cannot
 ; become a finding.
 (policy
@@ -43,7 +44,11 @@
             (language go
               (concurrent-access-conflicts
                 (procedure-of
-                  (call :callee "Run"))))))))
+                  (call :callee "Run"))))
+            (language go
+              (concurrent-access-conflicts
+                (procedure-of
+                  (call :callee "HandleFunc"))))))))
     (group :name by-shared-location :by (conflict.location_id)
       (aggregate :name conflicts :op count))
     (assert :group by-shared-location :value conflicts :cardinality (exactly 0))))

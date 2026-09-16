@@ -2462,10 +2462,27 @@ fn namespace_member_matches_target(
     ctx.edges.iter().any(|edge| {
         edge.local_name == object_text
             && match &edge.kind {
-                ImportEdgeKind::Namespace => ctx
-                    .seeds
-                    .contains(&(edge.target_file.clone(), property_text.to_string())),
-                ImportEdgeKind::CommonJsRequire(export_name) => property_text == export_name,
+                // A member target seeds its owner's export as well as any
+                // export spelling the member itself, so a single-segment
+                // `ns.Owner` / `dom.Owner` access can match the seed while
+                // naming only the owner: a usage of the owner declaration,
+                // not of the scanned member (#3390). Only a property that
+                // spells the member (its own re-export, as in a CommonJS
+                // barrel) is the member's usage; longer owner-qualified
+                // chains are classified by `handle_imported_member_chain`
+                // before this walk reaches them.
+                ImportEdgeKind::Namespace => {
+                    ctx.target_member
+                        .is_none_or(|member| member == property_text)
+                        && ctx
+                            .seeds
+                            .contains(&(edge.target_file.clone(), property_text.to_string()))
+                }
+                ImportEdgeKind::CommonJsRequire(export_name) => {
+                    ctx.target_member
+                        .is_none_or(|member| member == property_text)
+                        && property_text == export_name
+                }
                 ImportEdgeKind::Named(_) | ImportEdgeKind::Default => false,
             }
             || match &edge.kind {

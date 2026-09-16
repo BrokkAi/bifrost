@@ -320,6 +320,12 @@ pub enum TaintStoreDimension {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ProvenStoreIdentities(Box<[StableDigest]>);
 
+impl ProvenStoreIdentities {
+    pub fn digests(&self) -> &[StableDigest] {
+        &self.0
+    }
+}
+
 impl TaintStoreDimension {
     /// Build a proven finite identity set.
     ///

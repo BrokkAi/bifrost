@@ -740,7 +740,7 @@ impl DependencyResolver for CargoDependencyResolver {
     }
 
     fn dependency_inputs(&self) -> &'static [&'static str] {
-        &["Cargo.toml", "Cargo.lock"]
+        &["Cargo.toml", "Cargo.lock", "rust-toolchain.toml"]
     }
 
     fn bounds(&self, _config: &AnalyzerConfig) -> DependencyResolverBounds {

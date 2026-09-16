@@ -133,17 +133,28 @@ bifrost --root . \
 `--fail-on never` keeps this demonstration command at status 0 without hiding
 the finding. The documentation test runs that exact command through the current
 `bifrost` binary and checks this complete human output. The report identifies
-the `audit(...)` call at `src/app.py:5:12` and ends with one complete policy run.
+the `audit(...)` call at `src/app.py:5:12` and reports complete analysis
+coverage.
 
 <details>
 <summary>Checked current output</summary>
 
 <!-- policy-doc-test:human:ten-minute-audit -->
 ```text
-[warning]  src/app.py:5:12
-    Review this direct audit call
+1 finding | Analysis complete
 
-summary: 1 active finding; 0 suppressed findings; dependency packs: mode default; complete; ecosystems python; 1 complete policy run
+Findings
+  [warning] bifrost.example.review-audit-call: Review this direct audit call
+    Location: src/app.py:5:12
+    Certainty: definite; proof: proven; completeness: complete
+
+
+Analysis warnings
+  None.
+
+Dependency models
+  Coverage: complete
+  Mode: default; ecosystems: python
 ```
 
 </details>

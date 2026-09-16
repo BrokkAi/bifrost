@@ -27,6 +27,7 @@ use super::finding_identity::{
 };
 use super::future_evidence::{FlowFindingEvidence, TaintFindingEvidence, TypestateFindingEvidence};
 use super::identity::PolicySemanticHash;
+use super::resolved::ResolvedEndpointIdentity;
 use super::retained::{RetainedSize, retained_extra};
 use super::scope::PolicyFindingScope;
 use super::suppression::PolicyFindingSuppression;
@@ -2305,6 +2306,8 @@ pub struct WitnessStep {
     location: Option<PolicySourceLocation>,
     label: String,
     evidence_refs: Vec<EvidenceRef>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provenance: Option<Box<WitnessStepProvenance>>,
 }
 
 impl WitnessStep {
@@ -2312,7 +2315,17 @@ impl WitnessStep {
         kind: WitnessStepKind,
         location: Option<PolicySourceLocation>,
         label: impl Into<String>,
+        evidence_refs: Vec<EvidenceRef>,
+    ) -> Result<Self, ReportValueError> {
+        Self::try_new_with_provenance(kind, location, label, evidence_refs, None)
+    }
+
+    pub fn try_new_with_provenance(
+        kind: WitnessStepKind,
+        location: Option<PolicySourceLocation>,
+        label: impl Into<String>,
         mut evidence_refs: Vec<EvidenceRef>,
+        provenance: Option<WitnessStepProvenance>,
     ) -> Result<Self, ReportValueError> {
         if evidence_refs.len() > MAX_EVIDENCE_REFS {
             return Err(ReportValueError::TooManyItems {
@@ -2330,6 +2343,7 @@ impl WitnessStep {
             location,
             label,
             evidence_refs,
+            provenance: provenance.map(Box::new),
         };
         step.validate()?;
         Ok(step)
@@ -2342,6 +2356,21 @@ impl WitnessStep {
                 field: "witness_step_evidence_refs",
                 max_items: MAX_EVIDENCE_REFS,
             });
+        }
+        if let Some(WitnessStepProvenance::DeclaredStore {
+            store,
+            write_instance,
+            write_key,
+            read_instance,
+            read_key,
+            ..
+        }) = self.provenance.as_deref()
+        {
+            validate_report_identifier(store)?;
+            write_instance.validate()?;
+            write_key.validate()?;
+            read_instance.validate()?;
+            read_key.validate()?;
         }
         Ok(())
     }
@@ -2361,6 +2390,10 @@ impl WitnessStep {
     pub fn evidence_refs(&self) -> &[EvidenceRef] {
         &self.evidence_refs
     }
+
+    pub fn provenance(&self) -> Option<&WitnessStepProvenance> {
+        self.provenance.as_deref()
+    }
 }
 
 impl RetainedSize for WitnessStep {
@@ -2369,6 +2402,81 @@ impl RetainedSize for WitnessStep {
             .saturating_add(retained_extra(&self.location))
             .saturating_add(self.label.capacity())
             .saturating_add(retained_extra(&self.evidence_refs))
+            .saturating_add(
+                self.provenance
+                    .as_deref()
+                    .map_or(0, RetainedSize::retained_size),
+            )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum WitnessStepProvenance {
+    DeclaredStore {
+        write_model: ResolvedEndpointIdentity,
+        read_model: ResolvedEndpointIdentity,
+        store: String,
+        write_instance: StoreDimensionEvidence,
+        write_key: StoreDimensionEvidence,
+        read_instance: StoreDimensionEvidence,
+        read_key: StoreDimensionEvidence,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum StoreDimensionEvidence {
+    Undeclared,
+    Unproven,
+    Proven { identities: Vec<String> },
+}
+
+impl StoreDimensionEvidence {
+    fn validate(&self) -> Result<(), ReportValueError> {
+        if let Self::Proven { identities } = self {
+            if identities.is_empty() || identities.len() > MAX_EVIDENCE_REFS {
+                return Err(ReportValueError::TooManyItems {
+                    field: "store_dimension_identities",
+                    max_items: MAX_EVIDENCE_REFS,
+                });
+            }
+            for identity in identities {
+                validate_report_identifier(identity)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl RetainedSize for WitnessStepProvenance {
+    fn retained_size(&self) -> usize {
+        size_of::<Self>().saturating_add(match self {
+            Self::DeclaredStore {
+                write_model,
+                read_model,
+                store,
+                write_instance,
+                write_key,
+                read_instance,
+                read_key,
+            } => retained_extra(write_model)
+                .saturating_add(retained_extra(read_model))
+                .saturating_add(store.capacity())
+                .saturating_add(retained_extra(write_instance))
+                .saturating_add(retained_extra(write_key))
+                .saturating_add(retained_extra(read_instance))
+                .saturating_add(retained_extra(read_key)),
+        })
+    }
+}
+
+impl RetainedSize for StoreDimensionEvidence {
+    fn retained_size(&self) -> usize {
+        size_of::<Self>().saturating_add(match self {
+            Self::Proven { identities } => retained_extra(identities),
+            Self::Undeclared | Self::Unproven => 0,
+        })
     }
 }
 
@@ -2381,6 +2489,9 @@ pub enum WitnessStepKind {
     Return,
     Sanitizer,
     Transform,
+    StoreWrite,
+    DeclaredStore,
+    StoreRead,
     Transition,
     Violation,
 }
@@ -2395,6 +2506,9 @@ impl WitnessStepKind {
             Self::Return => "return",
             Self::Sanitizer => "sanitizer",
             Self::Transform => "transform",
+            Self::StoreWrite => "store_write",
+            Self::DeclaredStore => "declared_store",
+            Self::StoreRead => "store_read",
             Self::Transition => "transition",
             Self::Violation => "violation",
         }
@@ -2476,6 +2590,30 @@ impl PolicyDiagnostic {
             primary,
             related,
         })
+    }
+
+    /// The advisory a policy publishes when one of its own selections matched
+    /// nothing in the scanned workspace.
+    ///
+    /// Nothing about such a run is incomplete: zero findings over an empty
+    /// selection is the correct answer, and downgrading the completion would
+    /// make an honest negative unusable. What the run must not do is look like
+    /// a run that proved something about rows it did find, so the note is
+    /// advisory and the verdict stays clean and complete (#2659).
+    ///
+    /// The taint evaluator states this for an endpoint set that bound nothing,
+    /// and the relational evaluator for an assertion whose group relation held
+    /// no group at all. The code, severity and impact are the contract, so they
+    /// live here and neither side restates them.
+    pub fn empty_selection(message: impl Into<String>) -> Result<Self, ReportValueError> {
+        Self::try_new(
+            PolicyDiagnosticCode::EmptySelection,
+            PolicyDiagnosticSeverity::Note,
+            PolicyDiagnosticImpact::Advisory,
+            message,
+            None,
+            Vec::new(),
+        )
     }
 
     /// One location-free diagnostic whose message is bounded, never rejected.
@@ -5113,11 +5251,19 @@ impl<'de> Deserialize<'de> for WitnessStep {
             location: Option<PolicySourceLocation>,
             label: String,
             evidence_refs: Vec<EvidenceRef>,
+            #[serde(default)]
+            provenance: Option<WitnessStepProvenance>,
         }
 
         let wire = Wire::deserialize(deserializer)?;
-        Self::try_new(wire.kind, wire.location, wire.label, wire.evidence_refs)
-            .map_err(de::Error::custom)
+        Self::try_new_with_provenance(
+            wire.kind,
+            wire.location,
+            wire.label,
+            wire.evidence_refs,
+            wire.provenance,
+        )
+        .map_err(de::Error::custom)
     }
 }
 

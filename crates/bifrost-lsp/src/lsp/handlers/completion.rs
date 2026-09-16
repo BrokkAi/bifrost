@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use lsp_types::{
@@ -7,7 +8,11 @@ use lsp_types::{
 };
 
 use crate::analyzer::common::display_identifier_for_target;
-use crate::analyzer::{CodeUnit, CodeUnitType, Project, WorkspaceAnalyzer};
+use crate::analyzer::semantic_model::SemanticModelSymbolKind;
+use crate::analyzer::usages::member_completion::{
+    MemberCompletionCandidate, complete_members, member_completion_site, semantic_completion_kind,
+};
+use crate::analyzer::{AnalyzerQueryScope, CodeUnit, CodeUnitType, Project, WorkspaceAnalyzer};
 use crate::lsp::conversion::position_to_byte_offset;
 use crate::lsp::handlers::util::{identifier_prefix_before_offset, project_file_for_uri};
 use crate::text_utils::compute_line_starts;
@@ -35,9 +40,9 @@ const READ_FAILURE_LOG_MAX_ENTRIES: usize = 256;
 /// (single-threaded request loop), invalidated by `didSave` /
 /// `didChangeWatchedFiles`.
 ///
-/// Caching the file content + line_starts avoids paying a full-file disk
-/// read and UTF-8 line scan on every keystroke. Mtime-checked so external
-/// edits (git checkout, formatter run) don't serve stale bytes.
+/// Caching the file content avoids paying a full-file disk read on every
+/// keystroke. Mtime-checked so external edits (git checkout, formatter run)
+/// don't serve stale bytes.
 ///
 /// File-content cache bound: unbounded today. An editor with thousands of
 /// files open concurrently could grow `files` without bound. Acceptable for
@@ -54,7 +59,6 @@ pub(crate) struct CompletionCache {
 struct FileCacheEntry {
     mtime: SystemTime,
     content: String,
-    line_starts: Vec<usize>,
 }
 
 impl CompletionCache {
@@ -87,15 +91,11 @@ impl Default for CompletionCache {
     }
 }
 
-/// Resolve `textDocument/completion` for the identifier prefix immediately
-/// before the cursor. Returns `None` (the LSP "no completions" shape) when:
+/// Resolve `textDocument/completion` for the identifier or member prefix
+/// immediately before the cursor. Returns `None` (the LSP "no completions" shape) when:
 /// - the URI is outside the project,
 /// - the file can't be read,
-/// - the cursor isn't sitting at the end of an identifier prefix.
-///
-/// v1 scope: simple identifier prefix only (`[A-Za-z0-9_]`). Qualified-name
-/// completion past `.` / `::` is intentionally out of scope; clients fall back
-/// to the editor's word-completion past those separators.
+/// - the cursor isn't sitting at a supported completion site.
 pub fn handle(
     cache: &mut CompletionCache,
     workspace: &WorkspaceAnalyzer,
@@ -109,28 +109,36 @@ pub fn handle(
     // Overlay short-circuit: the mtime cache is keyed on disk mtime, which the
     // editor's in-flight buffer doesn't bump. Read straight through and skip
     // the cache for any file that has an active didOpen/didChange overlay.
-    let prefix_owned: String;
-    let prefix: &str = if project.has_overlay(&project_file) {
-        let content = project.read_source(&project_file).ok()?;
-        let line_starts = compute_line_starts(&content);
-        let byte_offset = position_to_byte_offset(
-            &content,
-            &line_starts,
-            &params.text_document_position.position,
-        );
-        prefix_owned = identifier_prefix_before_offset(&content, byte_offset)?.to_string();
-        &prefix_owned
+    let content = if project.has_overlay(&project_file) {
+        Arc::new(project.read_source(&project_file).ok()?)
     } else {
-        let entry = load_or_refresh(cache, &abs_path, uri)?;
-        let byte_offset = position_to_byte_offset(
-            &entry.content,
-            &entry.line_starts,
-            &params.text_document_position.position,
-        );
-        identifier_prefix_before_offset(&entry.content, byte_offset)?
+        Arc::new(load_or_refresh(cache, &abs_path, uri)?.content.clone())
     };
+    let line_starts = compute_line_starts(&content);
+    let byte_offset = position_to_byte_offset(
+        &content,
+        &line_starts,
+        &params.text_document_position.position,
+    );
 
     let analyzer = workspace.analyzer();
+    let _query_scope = AnalyzerQueryScope::new(analyzer);
+    if let Some(site) = member_completion_site(&project_file, &content, byte_offset) {
+        let result = complete_members(analyzer, &project_file, Arc::clone(&content), &site);
+        let truncated = result.candidates.len() > MAX_RESULTS;
+        let items = result
+            .candidates
+            .into_iter()
+            .take(MAX_RESULTS)
+            .map(build_member_item)
+            .collect();
+        return Some(CompletionResponse::List(CompletionList {
+            is_incomplete: result.incomplete || truncated,
+            items,
+        }));
+    }
+
+    let prefix = identifier_prefix_before_offset(&content, byte_offset)?;
     // Escape before interpolating into the autocomplete regex. Today this is
     // a no-op (`is_ident_byte` constrains the prefix to ASCII alphanumeric +
     // `_`), but it is defence-in-depth against future widening.
@@ -163,6 +171,31 @@ pub fn handle(
         is_incomplete,
         items,
     }))
+}
+
+fn build_member_item(candidate: MemberCompletionCandidate) -> CompletionItem {
+    match candidate {
+        MemberCompletionCandidate::Workspace(unit) => CompletionItem {
+            label: unit.terminal_name().to_string(),
+            kind: Some(map_completion_kind(unit.kind())),
+            detail: unit.signature().map(str::to_string),
+            ..CompletionItem::default()
+        },
+        MemberCompletionCandidate::SemanticModel {
+            name,
+            kind,
+            signature,
+        } => CompletionItem {
+            label: name,
+            kind: Some(map_semantic_completion_kind(kind)),
+            detail: signature,
+            ..CompletionItem::default()
+        },
+    }
+}
+
+fn map_semantic_completion_kind(kind: SemanticModelSymbolKind) -> CompletionItemKind {
+    map_completion_kind(semantic_completion_kind(kind))
 }
 
 /// Return a borrowed reference to the cache entry for `abs_path`, refreshing
@@ -210,15 +243,9 @@ fn load_or_refresh<'cache>(
             return None;
         }
     };
-    let line_starts = compute_line_starts(&content);
-    cache.files.insert(
-        abs_path.to_path_buf(),
-        FileCacheEntry {
-            mtime,
-            content,
-            line_starts,
-        },
-    );
+    cache
+        .files
+        .insert(abs_path.to_path_buf(), FileCacheEntry { mtime, content });
     cache.files.get(abs_path)
 }
 

@@ -1,0 +1,213 @@
+{
+  "schema_version": 2,
+  "pack_id": "bifrost.go.stdlib.net-http-declarations",
+  "version": "1.0.0",
+  "producer": { "name": "bifrost", "version": "0.11.3" },
+  "language": "go",
+  "ecosystem": "go",
+  "compatibility": { "bifrost": ">=0.11.3, <1.0.0", "toolchains": [] },
+  "provenance": {
+    "source": "https://go.dev/src/net/http/server.go (http.Handle, http.HandleFunc, http.Serve, http.ListenAndServe, http.NewServeMux, http.ServeMux.Handle, http.ServeMux.HandleFunc, http.Handler, http.ServeMux)",
+    "revision": "go1.26.0"
+  },
+  "license": "BSD-3-Clause",
+  "completeness": "partial",
+  "safety": { "generated_code_only": false, "review_required": false },
+  "shards": [
+    {
+      "id": "go.stdlib.net-http.declarations",
+      "activation": [{}],
+      "payload": {
+        "kind": "declaration_facts",
+        "types": [
+          {
+            "id": "type.b6eedc642c6132236bae5425a063fd44b150a8ea8555340b10ef1d3082dffe9a",
+            "name": "net/http",
+            "type_kind": "module",
+            "visibility": "package",
+            "is_abstract": false,
+            "is_sealed": false,
+            "has_explicit_type_terms": false,
+            "type_parameters": [],
+            "type_parameter_constraints": [],
+            "embedded_types": [],
+            "hierarchy": [],
+            "aliases": ["http"],
+            "extension_surfaces": [],
+            "locator": { "kind": "artifact", "path": "src/net/http/server.go", "symbol": "net/http" }
+          },
+          {
+            "id": "type.93777606d63fbb9dc04087a876b5408f323d632fb8ff469033fa91b384dfd9cc",
+            "name": "net/http.Handler",
+            "type_kind": "interface",
+            "visibility": "public",
+            "is_abstract": true,
+            "is_sealed": false,
+            "has_explicit_type_terms": false,
+            "type_parameters": [],
+            "type_parameter_constraints": [],
+            "embedded_types": [],
+            "hierarchy": [],
+            "aliases": [],
+            "extension_surfaces": [],
+            "locator": { "kind": "artifact", "path": "src/net/http/server.go", "symbol": "net/http.Handler" }
+          },
+          {
+            "id": "type.4c393b735855228a04f3c05bd17a970f4301acda0f7c16507fe4453daa72660b",
+            "name": "net/http.ServeMux",
+            "type_kind": "struct",
+            "visibility": "public",
+            "is_abstract": false,
+            "is_sealed": false,
+            "has_explicit_type_terms": false,
+            "type_parameters": [],
+            "type_parameter_constraints": [],
+            "embedded_types": [],
+            "hierarchy": [],
+            "aliases": [],
+            "extension_surfaces": [],
+            "locator": { "kind": "artifact", "path": "src/net/http/server.go", "symbol": "net/http.ServeMux" }
+          }
+        ],
+        "members": [
+          {
+            "id": "member.9af6dc214e864d397e406b8857431d9aefac5766686e6d4d95adb3a67c494f10",
+            "owner": "type.b6eedc642c6132236bae5425a063fd44b150a8ea8555340b10ef1d3082dffe9a",
+            "name": "NewServeMux",
+            "member_kind": "function",
+            "visibility": "public",
+            "is_static": true,
+            "is_abstract": false,
+            "is_virtual": false,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [],
+              "returns": { "kind": "pointer", "element": { "kind": "declared", "id": "type.4c393b735855228a04f3c05bd17a970f4301acda0f7c16507fe4453daa72660b", "arguments": [], "nullable": false } }
+            },
+            "aliases": [],
+            "locator": { "kind": "artifact", "path": "src/net/http/server.go", "symbol": "net/http.NewServeMux" }
+          },
+          {
+            "id": "member.f7c17b594b5859f3dbea72f9e2190c4603ea8d4baadebf6f898bbdc08ef3a7a3",
+            "owner": "type.b6eedc642c6132236bae5425a063fd44b150a8ea8555340b10ef1d3082dffe9a",
+            "name": "HandleFunc",
+            "member_kind": "function",
+            "visibility": "public",
+            "is_static": true,
+            "is_abstract": false,
+            "is_virtual": false,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                { "name": "pattern", "type": { "kind": "named", "name": "string", "arguments": [], "nullable": false }, "optional": false, "variadic": false },
+                { "name": "handler", "type": { "kind": "named", "name": "func(net/http.ResponseWriter,*net/http.Request)", "arguments": [], "nullable": false }, "optional": false, "variadic": false }
+              ]
+            },
+            "aliases": [],
+            "locator": { "kind": "artifact", "path": "src/net/http/server.go", "symbol": "net/http.HandleFunc" }
+          },
+          {
+            "id": "member.a8b0914462fd948fbe3642097fe5e048c3614c50ec5556ad0dab49ea13ff3dfa",
+            "owner": "type.b6eedc642c6132236bae5425a063fd44b150a8ea8555340b10ef1d3082dffe9a",
+            "name": "Handle",
+            "member_kind": "function",
+            "visibility": "public",
+            "is_static": true,
+            "is_abstract": false,
+            "is_virtual": false,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                { "name": "pattern", "type": { "kind": "named", "name": "string", "arguments": [], "nullable": false }, "optional": false, "variadic": false },
+                { "name": "handler", "type": { "kind": "named", "name": "net/http.Handler", "arguments": [], "nullable": false }, "optional": false, "variadic": false }
+              ]
+            },
+            "aliases": [],
+            "locator": { "kind": "artifact", "path": "src/net/http/server.go", "symbol": "net/http.Handle" }
+          },
+          {
+            "id": "member.394649d2d0cefee027325c02c6cab04ae0035f4c17fabbbe8b193a0b5beed09a",
+            "owner": "type.b6eedc642c6132236bae5425a063fd44b150a8ea8555340b10ef1d3082dffe9a",
+            "name": "Serve",
+            "member_kind": "function",
+            "visibility": "public",
+            "is_static": true,
+            "is_abstract": false,
+            "is_virtual": false,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                { "name": "l", "type": { "kind": "named", "name": "net.Listener", "arguments": [], "nullable": false }, "optional": false, "variadic": false },
+                { "name": "handler", "type": { "kind": "named", "name": "net/http.Handler", "arguments": [], "nullable": false }, "optional": false, "variadic": false }
+              ],
+              "returns": { "kind": "named", "name": "error", "arguments": [], "nullable": false }
+            },
+            "aliases": [],
+            "locator": { "kind": "artifact", "path": "src/net/http/server.go", "symbol": "net/http.Serve" }
+          },
+          {
+            "id": "member.55c4eccff19fc50b68ff06dabf0c12527a27850d0e6a43f7793bab40e04f2124",
+            "owner": "type.b6eedc642c6132236bae5425a063fd44b150a8ea8555340b10ef1d3082dffe9a",
+            "name": "ListenAndServe",
+            "member_kind": "function",
+            "visibility": "public",
+            "is_static": true,
+            "is_abstract": false,
+            "is_virtual": false,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                { "name": "addr", "type": { "kind": "named", "name": "string", "arguments": [], "nullable": false }, "optional": false, "variadic": false },
+                { "name": "handler", "type": { "kind": "named", "name": "net/http.Handler", "arguments": [], "nullable": false }, "optional": false, "variadic": false }
+              ],
+              "returns": { "kind": "named", "name": "error", "arguments": [], "nullable": false }
+            },
+            "aliases": [],
+            "locator": { "kind": "artifact", "path": "src/net/http/server.go", "symbol": "net/http.ListenAndServe" }
+          },
+          {
+            "id": "member.54c86563d13dead12ac400f2e7ddf30b55152059bfd39bebf7b8cdc659b95768",
+            "owner": "type.4c393b735855228a04f3c05bd17a970f4301acda0f7c16507fe4453daa72660b",
+            "name": "HandleFunc",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": false,
+            "is_virtual": false,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                { "name": "pattern", "type": { "kind": "named", "name": "string", "arguments": [], "nullable": false }, "optional": false, "variadic": false },
+                { "name": "handler", "type": { "kind": "named", "name": "func(net/http.ResponseWriter,*net/http.Request)", "arguments": [], "nullable": false }, "optional": false, "variadic": false }
+              ]
+            },
+            "receiver": { "pointer": true },
+            "aliases": [],
+            "locator": { "kind": "artifact", "path": "src/net/http/server.go", "symbol": "net/http.ServeMux.HandleFunc" }
+          },
+          {
+            "id": "member.b9bc67c1cc6e6c9efce3e637210d2e5357fa90a6c70ebe2ec348b658f5b11ffc",
+            "owner": "type.4c393b735855228a04f3c05bd17a970f4301acda0f7c16507fe4453daa72660b",
+            "name": "Handle",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": false,
+            "is_virtual": false,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                { "name": "pattern", "type": { "kind": "named", "name": "string", "arguments": [], "nullable": false }, "optional": false, "variadic": false },
+                { "name": "handler", "type": { "kind": "named", "name": "net/http.Handler", "arguments": [], "nullable": false }, "optional": false, "variadic": false }
+              ]
+            },
+            "receiver": { "pointer": true },
+            "aliases": [],
+            "locator": { "kind": "artifact", "path": "src/net/http/server.go", "symbol": "net/http.ServeMux.Handle" }
+          }
+        ],
+        "relations": []
+      }
+    }
+  ]
+}

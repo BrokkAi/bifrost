@@ -4314,6 +4314,303 @@ fn bifrost_lsp_server_completion_finds_symbol_by_prefix() {
 }
 
 #[test]
+fn bifrost_lsp_server_completion_after_dot_finds_typed_rust_members() {
+    let temp = TempDir::new().expect("temp dir");
+    let temp_root = temp.path().canonicalize().expect("canon temp");
+    let source = concat!(
+        "struct Widget { value: i32 }\n",
+        "impl Widget { fn run(&self) {} }\n",
+        "fn complete(xs: Widget) {\n",
+        "    xs.\n",
+        "}\n",
+    );
+    let file_path = temp_root.join("main.rs");
+    fs::write(&file_path, source).expect("write Rust completion fixture");
+
+    let mut server = LspServer::spawn(&temp_root);
+    let root_uri = uri_for(&temp_root);
+    let file_uri = uri_for(&file_path);
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": completion_initialize_params(root_uri)
+    }));
+    let initialize = server.read_message();
+    assert_eq!(
+        initialize["result"]["capabilities"]["completionProvider"]["triggerCharacters"],
+        json!(["."]),
+        "member completion must trigger when the editor types a dot: {initialize}"
+    );
+    server.notify_value(json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}));
+
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "textDocument/completion",
+        "params": {
+            "textDocument": {"uri": file_uri},
+            "position": {"line": 3, "character": 7}
+        }
+    }));
+    let response = server.read_response_for_id(2);
+    let items = response["result"]["items"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected member completion items, got {response}"));
+    assert!(
+        items.iter().any(|item| item["label"] == "run"),
+        "{items:#?}"
+    );
+    assert!(
+        items.iter().any(|item| item["label"] == "value"),
+        "{items:#?}"
+    );
+
+    server.notify_value(json!({"jsonrpc": "2.0", "id": 3, "method": "shutdown"}));
+    let _ = server.read_response_for_id(3);
+    server.exit();
+}
+
+#[test]
+fn bifrost_lsp_server_vec_macro_completes_from_semantic_pack() {
+    let temp = TempDir::new().expect("temp dir");
+    let temp_root = temp.path().canonicalize().expect("canon temp");
+    let source = "fn main() {\n    let mut xs = vec![1i32, 2, 3];\n    xs.\n}\n";
+    let file_path = temp_root.join("main.rs");
+    fs::write(&file_path, source).expect("write Rust Vec completion fixture");
+    fs::create_dir_all(temp_root.join(".bifrost/semantic-models"))
+        .expect("create workspace semantic-model directory");
+    fs::write(
+        temp_root.join(".bifrost/semantic-models/rust-vec.json"),
+        r#"{
+  "schema_version": 2,
+  "pack_id": "workspace.rust-vec",
+  "version": "1.0.0",
+  "producer": { "name": "bifrost-test", "version": "1.0.0" },
+  "language": "rust",
+  "ecosystem": "cargo",
+  "compatibility": { "bifrost": ">=0.8.0, <1.0.0", "toolchains": [] },
+  "provenance": { "source": "workspace:.bifrost/semantic-models/rust-vec.json" },
+  "license": "MIT",
+  "completeness": "partial",
+  "safety": { "generated_code_only": false, "review_required": false },
+  "shards": [{
+    "id": "workspace.rust-vec.declarations",
+    "activation": [{ "targets": [], "configurations": [] }],
+    "payload": {
+      "kind": "declaration_facts",
+      "types": [{
+        "id": "workspace.type.alloc-vec",
+        "name": "alloc.vec.Vec",
+        "type_kind": "struct",
+        "visibility": "public",
+        "type_parameters": ["t"],
+        "hierarchy": [],
+        "aliases": ["std.vec.Vec", "Vec"],
+        "extension_surfaces": [],
+        "locator": { "kind": "artifact", "path": "alloc/src/vec/mod.rs", "symbol": "alloc.vec.Vec" }
+      }],
+      "members": [
+        {
+          "id": "workspace.member.alloc-vec.len",
+          "owner": "workspace.type.alloc-vec",
+          "name": "len",
+          "member_kind": "method",
+          "visibility": "public",
+          "receiver": { "pointer": false },
+          "signature": { "parameters": [], "returns": { "kind": "named", "name": "usize" } },
+          "aliases": [],
+          "locator": { "kind": "artifact", "path": "alloc/src/vec/mod.rs", "symbol": "alloc.vec.Vec.len" }
+        },
+        {
+          "id": "workspace.member.alloc-vec.push",
+          "owner": "workspace.type.alloc-vec",
+          "name": "push",
+          "member_kind": "method",
+          "visibility": "public",
+          "receiver": { "pointer": false },
+          "signature": { "parameters": [{ "name": "value", "type": { "kind": "type_parameter", "name": "t" } }] },
+          "aliases": [],
+          "locator": { "kind": "artifact", "path": "alloc/src/vec/mod.rs", "symbol": "alloc.vec.Vec.push" }
+        }
+      ],
+      "relations": []
+    }
+  }]
+}"#,
+    )
+    .expect("write Rust Vec semantic pack");
+    fs::create_dir_all(temp_root.join(".bifrost")).expect("create .bifrost directory");
+    fs::write(
+        temp_root.join(".bifrost/packs.json"),
+        r#"{ "schema_version": 1, "ecosystems": [] }"#,
+    )
+    .expect("write workspace-only pack activation document");
+
+    let mut server = LspServer::start_with_params(
+        &temp_root,
+        completion_initialize_params(uri_for(&temp_root)),
+    );
+    let file_uri = uri_for(&file_path);
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didSave",
+        "params": {"textDocument": {"uri": file_uri}}
+    }));
+    let _initial_publish = server.read_notification("textDocument/publishDiagnostics");
+    let _activation_refresh = server.read_notification("textDocument/publishDiagnostics");
+
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "textDocument/completion",
+        "params": {
+            "textDocument": {"uri": file_uri},
+            "position": {"line": 2, "character": 7}
+        }
+    }));
+    let response = server.read_response_for_id(2);
+    let items = response["result"]["items"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected Vec completion items, got {response}"));
+    if items.is_empty() {
+        let stderr = server.shutdown_with_stderr();
+        panic!("expected Vec completion items, got {response}; stderr: {stderr}");
+    }
+    assert!(
+        items.iter().any(|item| item["label"] == "len"),
+        "{items:#?}"
+    );
+    assert!(
+        items.iter().any(|item| item["label"] == "push"),
+        "{items:#?}"
+    );
+    assert_eq!(response["result"]["isIncomplete"], true);
+
+    server.shutdown();
+}
+
+#[test]
+fn bifrost_lsp_server_completion_after_go_package_dot_uses_semantic_pack() {
+    let temp = TempDir::new().expect("temp dir");
+    let temp_root = temp.path().canonicalize().expect("canon temp");
+    let source = "package main\n\nimport \"os\"\n\nfunc main() {\n    os.\n}\n";
+    let file_path = temp_root.join("main.go");
+    fs::write(&file_path, source).expect("write Go completion fixture");
+    fs::create_dir_all(temp_root.join(".bifrost/semantic-models"))
+        .expect("create workspace semantic-model directory");
+    fs::write(
+        temp_root.join(".bifrost/semantic-models/go-os.json"),
+        r#"{
+  "schema_version": 2,
+  "pack_id": "workspace.go-os",
+  "version": "1.0.0",
+  "producer": { "name": "bifrost-test", "version": "1.0.0" },
+  "language": "go",
+  "ecosystem": "go",
+  "compatibility": { "bifrost": ">=0.8.0, <1.0.0", "toolchains": [] },
+  "provenance": { "source": "workspace:.bifrost/semantic-models/go-os.json" },
+  "license": "BSD-3-Clause",
+  "completeness": "partial",
+  "safety": { "generated_code_only": false, "review_required": false },
+  "shards": [{
+    "id": "workspace.go-os.declarations",
+    "activation": [{ "targets": [], "configurations": [] }],
+    "payload": {
+      "kind": "declaration_facts",
+      "types": [{
+        "id": "workspace.type.go-os",
+        "name": "os",
+        "type_kind": "module",
+        "visibility": "package",
+        "type_parameters": [],
+        "hierarchy": [],
+        "aliases": ["os"],
+        "extension_surfaces": [],
+        "locator": { "kind": "artifact", "path": "os/file.go", "symbol": "os" }
+      }],
+      "members": [
+        {
+          "id": "workspace.member.go-os.open",
+          "owner": "workspace.type.go-os",
+          "name": "Open",
+          "member_kind": "function",
+          "visibility": "public",
+          "is_static": true,
+          "aliases": [],
+          "locator": { "kind": "artifact", "path": "os/file.go", "symbol": "os.Open" }
+        },
+        {
+          "id": "workspace.member.go-os.create",
+          "owner": "workspace.type.go-os",
+          "name": "Create",
+          "member_kind": "function",
+          "visibility": "public",
+          "is_static": true,
+          "aliases": [],
+          "locator": { "kind": "artifact", "path": "os/file.go", "symbol": "os.Create" }
+        }
+      ],
+      "relations": []
+    }
+  }]
+}"#,
+    )
+    .expect("write Go os semantic pack");
+    fs::write(
+        temp_root.join(".bifrost/packs.json"),
+        r#"{ "schema_version": 1, "ecosystems": [] }"#,
+    )
+    .expect("write workspace-only pack activation document");
+
+    let mut server = LspServer::start_with_params(
+        &temp_root,
+        completion_initialize_params(uri_for(&temp_root)),
+    );
+    let file_uri = uri_for(&file_path);
+
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didSave",
+        "params": {"textDocument": {"uri": file_uri}}
+    }));
+    let initial_publish = server.read_notification("textDocument/publishDiagnostics");
+    assert_eq!(initial_publish["params"]["uri"], file_uri);
+    // Pack activation refreshes the saved document after the reviewed,
+    // partial Go declaration pack has been published.
+    let activation_refresh = server.read_notification("textDocument/publishDiagnostics");
+    assert_eq!(activation_refresh["params"]["uri"], file_uri);
+
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "textDocument/completion",
+        "params": {
+            "textDocument": {"uri": file_uri},
+            "position": {"line": 5, "character": 7}
+        }
+    }));
+    let response = server.read_response_for_id(2);
+    let items = response["result"]["items"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected Go package completion items, got {response}"));
+    assert!(
+        items.iter().any(|item| item["label"] == "Open"),
+        "{items:#?}"
+    );
+    assert!(
+        items.iter().any(|item| item["label"] == "Create"),
+        "{items:#?}"
+    );
+    assert_eq!(
+        response["result"]["isIncomplete"], true,
+        "the os declaration surface is intentionally partial: {response}"
+    );
+
+    server.shutdown();
+}
+
+#[test]
 fn bifrost_lsp_server_completion_truncates_at_max_results_and_sets_is_incomplete() {
     // Generate a fixture with 501 method declarations that all match the
     // prefix `matchme_`. The handler must cap items at MAX_RESULTS=500 and
@@ -7957,6 +8254,57 @@ fn bifrost_lsp_server_default_activates_dependency_packs_off_the_request_path() 
     assert!(
         stderr.contains("ecosystems=[Python]"),
         "activation must cover only the ecosystems whose languages are present: {stderr}"
+    );
+}
+
+#[test]
+fn bifrost_lsp_server_explains_missing_jdk_for_java_stdlib_packs() {
+    let temp = TempDir::new().expect("temp dir");
+    let temp_root = temp.path().canonicalize().expect("canon temp");
+    fs::write(temp_root.join("App.java"), "class App {}\n").expect("write App.java");
+
+    // The shared subprocess harness removes JAVA_HOME deliberately, making
+    // this a deterministic reproduction of an editor launched without a JDK
+    // in its environment.
+    let mut server = LspServer::start(&temp_root);
+    let message = server.read_notification("window/showMessage");
+
+    assert_eq!(
+        message["params"]["type"], 2,
+        "expected an LSP warning: {message}"
+    );
+    let text = message["params"]["message"]
+        .as_str()
+        .unwrap_or_else(|| panic!("expected message text: {message}"));
+    assert!(text.contains("JVM standard-library semantic packs are inactive"));
+    assert!(text.contains("JAVA_HOME"));
+    assert!(text.contains("restart Bifrost"));
+
+    server.shutdown();
+}
+
+#[test]
+fn bifrost_lsp_server_explains_missing_rust_stdlib_pin() {
+    let temp = TempDir::new().expect("temp dir");
+    let temp_root = temp.path().canonicalize().expect("canon temp");
+    fs::write(temp_root.join("main.rs"), "fn main() {}\n").expect("write Rust fixture");
+
+    let mut server = LspServer::start(&temp_root);
+    let message = server.read_notification("window/showMessage");
+
+    assert_eq!(message["params"]["type"], 2, "expected warning: {message}");
+    let text = message["params"]["message"]
+        .as_str()
+        .unwrap_or_else(|| panic!("expected message text: {message}"));
+    assert!(text.contains("Rust standard-library semantic packs are inactive"));
+    assert!(text.contains("rust-toolchain.toml"));
+    assert!(text.contains("nightly-2026-08-24"));
+    assert!(text.contains("restart Bifrost"));
+
+    let stderr = server.shutdown_with_stderr();
+    assert!(
+        stderr.contains("ecosystems=[Cargo]"),
+        "Rust-only workspace must activate only Cargo: {stderr}"
     );
 }
 

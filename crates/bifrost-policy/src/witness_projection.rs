@@ -11,6 +11,32 @@ pub(super) fn project_summary_witness(
     max_bytes: usize,
     labels: impl Fn(&SummaryWitnessStepKind) -> (WitnessStepKind, &'static str),
 ) -> Result<Option<BoundedWitness>, String> {
+    let steps =
+        project_summary_witness_steps(workspace, witness, &id, max_steps, max_bytes, labels)?;
+    if steps.is_empty() {
+        return Ok(None);
+    }
+    let omitted = witness
+        .omitted_steps_lower_bound()
+        .saturating_add(witness.steps().len().saturating_sub(steps.len()));
+    BoundedWitness::try_new(
+        id,
+        steps,
+        omitted > 0,
+        u64::try_from(omitted).unwrap_or(u64::MAX),
+    )
+    .map(Some)
+    .map_err(|error| error.to_string())
+}
+
+pub(super) fn project_summary_witness_steps(
+    workspace: &WorkspaceAnalyzer,
+    witness: &SummaryWitness,
+    id: &WitnessId,
+    max_steps: usize,
+    max_bytes: usize,
+    labels: impl Fn(&SummaryWitnessStepKind) -> (WitnessStepKind, &'static str),
+) -> Result<Vec<WitnessStep>, String> {
     let mut steps = Vec::new();
     for step in witness.steps().iter().take(max_steps) {
         let (kind, label) = labels(&step.kind());
@@ -33,21 +59,5 @@ pub(super) fn project_summary_witness(
             break;
         }
     }
-    if steps.is_empty() {
-        return Ok(None);
-    }
-    // Internal truncation always carries a positive omitted lower bound, and
-    // unretained sibling alternatives do not make this witness incomplete, so
-    // no omitted step is fabricated here.
-    let omitted = witness
-        .omitted_steps_lower_bound()
-        .saturating_add(witness.steps().len().saturating_sub(steps.len()));
-    BoundedWitness::try_new(
-        id,
-        steps,
-        omitted > 0,
-        u64::try_from(omitted).unwrap_or(u64::MAX),
-    )
-    .map(Some)
-    .map_err(|error| error.to_string())
+    Ok(steps)
 }

@@ -390,6 +390,10 @@ fn is_reference_context(node: Node<'_>) -> bool {
                 | "string_value"
                 | "heredoc"
                 | "nowdoc"
+                // A `name` inside a `variable_name` is part of the variable:
+                // `$self` is a value binding named "self", never the `self`
+                // class-scope keyword a type reference spells (#3390).
+                | "variable_name"
         ) {
             return false;
         }

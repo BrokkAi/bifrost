@@ -8784,6 +8784,38 @@ impl ScalaScan<'_, '_, '_> {
         self.record_exact_callable_with_shape(callee, node, &call_shape);
     }
 
+    /// The named-argument label counterpart of [`Self::record_exact_callable`].
+    ///
+    /// The label names the callable's parameter through the declared signature
+    /// contract; the invocation itself already proved the callable at the
+    /// callee-name token. Recording the callable again at the label is a
+    /// declared-contract edge -- editor references retain it, the external
+    /// usage surface must not prove it: navigation at the label names the
+    /// argument's own binding, never the callable (#3390).
+    fn record_exact_declared_callable(&mut self, callee: CodeUnit, node: Node<'_>) {
+        let Some(call_shape) = call_site_shape_for_reference_with_parents(node, self.parents)
+        else {
+            self.sink.record(
+                ScalaResolvedReference::Exact(callee),
+                ScalaReferenceRole::Callable,
+                classify_reference_node(node),
+                UsageHitKind::DeclaredReference,
+                node.start_byte(),
+                node.end_byte(),
+            );
+            return;
+        };
+        self.sink.record_callable(
+            ScalaResolvedReference::Exact(callee),
+            ScalaReferenceRole::Callable,
+            &call_shape,
+            classify_reference_node(node),
+            UsageHitKind::DeclaredReference,
+            node.start_byte(),
+            node.end_byte(),
+        );
+    }
+
     fn record_exact_companion_callable(
         &mut self,
         callee: CodeUnit,
@@ -10163,11 +10195,11 @@ fn record_reference(
                         ctx.record_exact_owner_member(owner, name, ScalaReferenceRole::Field, node);
                     }
                     for callable in declaring_callables {
-                        ctx.record_exact_callable(callable, node);
+                        ctx.record_exact_declared_callable(callable, node);
                     }
                 } else {
                     for callable in declaring_callables {
-                        ctx.record_exact_callable(callable, node);
+                        ctx.record_exact_declared_callable(callable, node);
                     }
                 }
                 return;

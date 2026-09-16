@@ -26,6 +26,11 @@ public release bundle only for an exact generated production miss; set
 `BIFROST_SEMANTIC_PACK_DOWNLOAD=off` to disable that path. Policy-capable
 responses expose the activation mode and decisions so missing, incompatible,
 disabled, or incomplete packs cannot look like a clean negative.
+When required host evidence is absent, such as a JDK that cannot be found from
+`JAVA_HOME`, the server sends one deduplicated LSP warning explaining which
+semantic coverage is inactive and how to enable it. Because this is a
+workspace/toolchain problem rather than a source-code problem, the warning is
+not attached to an arbitrary source range.
 
 ## Editor Integrations
 

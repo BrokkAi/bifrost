@@ -1894,6 +1894,34 @@ fn go_import_paths(
         .collect()
 }
 
+pub(crate) fn go_imported_package_at_range(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    start_byte: usize,
+    end_byte: usize,
+) -> Option<String> {
+    let go = resolve_analyzer::<GoAnalyzer>(analyzer)?;
+    let tree = parse_go_tree(source)?;
+    let node = tree
+        .root_node()
+        .named_descendant_for_byte_range(start_byte, end_byte)?;
+    if !matches!(node.kind(), "identifier" | "package_identifier") {
+        return None;
+    }
+    let mut root = node;
+    while let Some(parent) = root.parent() {
+        root = parent;
+    }
+    let support = AnalyzerGoDefinitionProvider::new(go, analyzer.semantic_model_overlay());
+    let name = go_node_text(node, source);
+    if go_nearest_visible_binding(&support, root, source, name, start_byte).is_some() {
+        return None;
+    }
+    let scope = crate::analyzer::AnalyzerQueryScope::new(analyzer);
+    go_import_paths(&support, scope.token(), go, file).remove(name)
+}
+
 pub(super) fn go_definition_import_namespaces(
     support: &dyn GoDefinitionProvider,
     token: QueryToken<'_>,

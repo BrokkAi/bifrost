@@ -1,0 +1,95 @@
+{
+  "schema_version": 2,
+  "pack_id": "bifrost.web-network-typescript",
+  "version": "1.0.0",
+  "producer": { "name": "bifrost-reviewed-web-models", "version": "1.0.0" },
+  "language": "typescript",
+  "ecosystem": "npm",
+  "compatibility": {
+    "bifrost": ">=0.8.0, <1.0.0",
+    "toolchains": []
+  },
+  "provenance": {
+    "source": "WHATWG Fetch Standard, the global fetch() operation",
+    "revision": "living-standard-2026-09-15"
+  },
+  "license": "Apache-2.0",
+  "completeness": "complete",
+  "safety": { "generated_code_only": false, "review_required": false },
+  "shards": [
+    {
+      "id": "declarations.web-network.typescript",
+      "activation": [{ "targets": [], "configurations": [] }],
+      "payload": {
+        "kind": "declaration_facts",
+        "types": [
+          {
+            "id": "type.web-network.typescript.global-this",
+            "name": "globalThis",
+            "type_kind": "module",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "lib.dom/globalThis.d.ts",
+              "symbol": "globalThis"
+            }
+          }
+        ],
+        "members": [
+          {
+            "id": "member.web-network.typescript.global-this.fetch",
+            "owner": "type.web-network.typescript.global-this",
+            "name": "fetch",
+            "member_kind": "function",
+            "visibility": "public",
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                { "name": "input", "type": { "kind": "named", "name": "RequestInfo" } },
+                { "name": "init", "type": { "kind": "named", "name": "RequestInit" } }
+              ],
+              "returns": { "kind": "named", "name": "Promise" }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "lib.dom/globalThis.d.ts",
+              "symbol": "globalThis.fetch"
+            }
+          }
+        ],
+        "relations": []
+      }
+    },
+    {
+      "id": "summaries.web-network.typescript",
+      "activation": [{ "targets": [], "configurations": [] }],
+      "payload": {
+        "kind": "procedure_summaries",
+        "summaries": [
+          {
+            "id": "summary.web-network.typescript.global-this.fetch",
+            "target": {
+              "path": "lib.dom/globalThis.d.ts",
+              "symbol": "globalThis.fetch",
+              "has_receiver": false,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": { "kind": "parameter", "ordinal": 0 },
+                "exit_kind": "normal",
+                "output": { "kind": "normal_return" }
+              }
+            ],
+            "effects": [],
+            "declared_effects": [
+              { "id": "bifrost.network_io", "timing": "immediate", "certainty": "definite" }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

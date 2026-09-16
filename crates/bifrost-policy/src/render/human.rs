@@ -94,6 +94,26 @@ pub fn write_policy_human<W: Write>(
     ensure_supported_schema(report)?;
     let mut output = BoundedWriter::new(output, max_serialized_bytes);
 
+    if options.detail() == HumanRenderDetail::Concise {
+        write_concise_report(&mut output, report, options.color())?;
+        output.flush().map_err(map_io_error)?;
+        return Ok(output.bytes_written());
+    }
+
+    write_report_header(&mut output, report)?;
+    writeln!(output, "\nFindings").map_err(map_io_error)?;
+    let retained_findings = report.runs().iter().flat_map(PolicyRun::findings).count();
+    if retained_findings == 0 {
+        writeln!(output, "  No retained findings.").map_err(map_io_error)?;
+    } else {
+        for run in report.runs() {
+            for finding in run.findings() {
+                write_finding(&mut output, finding, options.color())?;
+            }
+        }
+    }
+
+    writeln!(output, "\nAnalysis warnings").map_err(map_io_error)?;
     write_schema_inference_notes(&mut output, report)?;
     for diagnostic in report.diagnostics() {
         write!(
@@ -135,28 +155,7 @@ pub fn write_policy_human<W: Write>(
         .map_err(map_io_error)?;
     }
 
-    // In non-degraded diff mode the concise view shows only what this change
-    // introduced; persisting findings stay visible in the verbose audit view.
-    let diff_hides_persisting = report.diff().is_some_and(|review| !review.degraded());
     for run in report.runs() {
-        for finding in run.findings() {
-            match options.detail() {
-                HumanRenderDetail::Concise => {
-                    let persisting = diff_hides_persisting
-                        && finding.diff().is_some_and(|diff| {
-                            diff.disposition() == FindingDiffDisposition::Persisting
-                        });
-                    if finding.suppression().is_none()
-                        && finding.scope().is_none()
-                        && finding.baseline().is_none()
-                        && !persisting
-                    {
-                        write_concise_finding(&mut output, finding, options.color())?;
-                    }
-                }
-                HumanRenderDetail::Verbose => write_finding(&mut output, finding, options.color())?,
-            }
-        }
         write_run_diagnostics(&mut output, run)?;
         write_run_obligations(&mut output, run, options.detail())?;
         if !run.completion().is_exhaustive() || run.diagnostics_truncated() {
@@ -174,39 +173,460 @@ pub fn write_policy_human<W: Write>(
             write_run_completion(&mut output, run, rule.name())?;
         }
     }
+    if !report_has_analysis_warnings(report) {
+        writeln!(output, "  None.").map_err(map_io_error)?;
+    }
+
+    write_verbose_dependency_models(&mut output, report)?;
 
     // Keep each explicit-schema finding stanza anchored by its clickable
     // location. In the audit view, descriptor details follow findings rather
     // than preceding the first one; the concise view omits rule contracts.
-    if options.detail() == HumanRenderDetail::Verbose {
-        for rule in report.rules() {
-            write_rule_detail(&mut output, rule)?;
-        }
-        for review in report
-            .suppressions()
+    writeln!(output, "\nAudit details").map_err(map_io_error)?;
+    for rule in report.rules() {
+        write_rule_detail(&mut output, rule)?;
+    }
+    for review in report
+        .suppressions()
+        .iter()
+        .filter(|review| !review.applied() || review.result_omitted())
+    {
+        write_suppression_review(&mut output, review)?;
+    }
+    for review in report
+        .scope()
+        .iter()
+        .filter(|review| !review.applied() || review.result_omitted())
+    {
+        write_scope_review(&mut output, review)?;
+    }
+    if let Some(review) = report.baseline() {
+        write_baseline_review(&mut output, review)?;
+    }
+    if let Some(review) = report.incremental() {
+        write_incremental_review(&mut output, review)?;
+    }
+    write_summary(&mut output, report)?;
+
+    output.flush().map_err(map_io_error)?;
+    Ok(output.bytes_written())
+}
+
+fn write_report_header<W: Write>(
+    output: &mut BoundedWriter<W>,
+    report: &PolicyReportDocument,
+) -> Result<(), PolicyRenderError> {
+    let active_findings = report
+        .runs()
+        .iter()
+        .flat_map(PolicyRun::findings)
+        .filter(|finding| {
+            finding.suppression().is_none()
+                && finding.scope().is_none()
+                && finding.baseline().is_none()
+        })
+        .count();
+    writeln!(
+        output,
+        "{active_findings} finding{} | Analysis {}",
+        plural_suffix(active_findings),
+        if report_analysis_complete(report) {
+            "complete"
+        } else {
+            "incomplete"
+        },
+    )
+    .map_err(map_io_error)
+}
+
+fn report_analysis_complete(report: &PolicyReportDocument) -> bool {
+    !report.runs().is_empty()
+        && report
+            .runs()
             .iter()
-            .filter(|review| !review.applied() || review.result_omitted())
-        {
-            write_suppression_review(&mut output, review)?;
+            .all(|run| run.completion().is_exhaustive() && !run.diagnostics_truncated())
+        && report.diagnostics().is_empty()
+        && !report.diagnostics_truncated()
+}
+
+fn report_has_analysis_warnings(report: &PolicyReportDocument) -> bool {
+    report.rules().iter().any(rule_has_schema_inference)
+        || !report.diagnostics().is_empty()
+        || report.diagnostics_truncated()
+        || report.runs().iter().any(|run| {
+            !run.diagnostics().is_empty()
+                || run.diagnostics_truncated()
+                || !run.completion().is_exhaustive()
+                || !run.obligations().is_empty()
+                || run.obligations_truncated()
+        })
+}
+
+fn write_verbose_dependency_models<W: Write>(
+    output: &mut BoundedWriter<W>,
+    report: &PolicyReportDocument,
+) -> Result<(), PolicyRenderError> {
+    writeln!(output, "\nDependency models").map_err(map_io_error)?;
+    let Some(review) = report.packs() else {
+        return writeln!(output, "  Not reported.").map_err(map_io_error);
+    };
+    writeln!(
+        output,
+        "  Document: {}",
+        escape_terminal_text(review.document_path())
+    )
+    .map_err(map_io_error)?;
+    writeln!(
+        output,
+        "  Coverage: {}",
+        if review.complete() {
+            "complete"
+        } else {
+            "incomplete"
         }
-        for review in report
-            .scope()
-            .iter()
-            .filter(|review| !review.applied() || review.result_omitted())
-        {
-            write_scope_review(&mut output, review)?;
+    )
+    .map_err(map_io_error)?;
+    writeln!(
+        output,
+        "  Mode: {}; ecosystems: {}",
+        dependency_pack_activation_mode(review.dependency_mode()),
+        if review.ecosystems().is_empty() {
+            "none".to_owned()
+        } else {
+            review.ecosystems().join(",")
+        },
+    )
+    .map_err(map_io_error)?;
+    for decision in review.decisions() {
+        write!(
+            output,
+            "  Decision: {} = {}",
+            escape_terminal_text(decision.pack()),
+            policy_pack_decision_status(decision.status()),
+        )
+        .map_err(map_io_error)?;
+        if let Some(reason) = decision.reason() {
+            write!(output, " ({})", escape_terminal_text(reason)).map_err(map_io_error)?;
         }
-        if let Some(review) = report.baseline() {
-            write_baseline_review(&mut output, review)?;
+        writeln!(output).map_err(map_io_error)?;
+        for summary in decision.summary_matches() {
+            writeln!(
+                output,
+                "    Summary: {} symbol {} matched {} time{}",
+                escape_terminal_text(summary.summary_id()),
+                escape_terminal_text(summary.symbol()),
+                summary.match_count(),
+                plural_suffix_u64(summary.match_count()),
+            )
+            .map_err(map_io_error)?;
         }
-        if let Some(review) = report.incremental() {
-            write_incremental_review(&mut output, review)?;
+        if decision.summary_matches_truncated() {
+            writeln!(output, "    Summary matches truncated.").map_err(map_io_error)?;
+        }
+    }
+    if review.decisions_truncated() {
+        writeln!(output, "  Decisions truncated.").map_err(map_io_error)?;
+    }
+    Ok(())
+}
+
+fn write_concise_report<W: Write>(
+    output: &mut BoundedWriter<W>,
+    report: &PolicyReportDocument,
+    color: HumanRenderColor,
+) -> Result<(), PolicyRenderError> {
+    let diff_hides_persisting = report.diff().is_some_and(|review| !review.degraded());
+    let visible_findings = report
+        .runs()
+        .iter()
+        .flat_map(PolicyRun::findings)
+        .filter(|finding| {
+            finding.suppression().is_none()
+                && finding.scope().is_none()
+                && finding.baseline().is_none()
+                && !(diff_hides_persisting
+                    && finding.diff().is_some_and(|diff| {
+                        diff.disposition() == FindingDiffDisposition::Persisting
+                    }))
+        })
+        .collect::<Vec<_>>();
+    let analysis_complete = report_analysis_complete(report);
+
+    writeln!(
+        output,
+        "{} finding{} | Analysis {}",
+        visible_findings.len(),
+        plural_suffix(visible_findings.len()),
+        if analysis_complete {
+            "complete"
+        } else {
+            "incomplete"
+        },
+    )
+    .map_err(map_io_error)?;
+
+    writeln!(output, "\nFindings").map_err(map_io_error)?;
+    if visible_findings.is_empty() {
+        writeln!(output, "  No findings reported.").map_err(map_io_error)?;
+        if !analysis_complete {
+            writeln!(
+                output,
+                "  Incomplete coverage: zero findings does not establish that the code is safe."
+            )
+            .map_err(map_io_error)?;
+        }
+    } else {
+        for finding in visible_findings {
+            write_concise_finding(output, finding, color)?;
+        }
+    }
+    let suppressed = report
+        .suppressions()
+        .iter()
+        .filter(|review| review.applied())
+        .count();
+    if suppressed > 0 {
+        writeln!(
+            output,
+            "  Suppressed: {suppressed} finding{}.",
+            plural_suffix(suppressed)
+        )
+        .map_err(map_io_error)?;
+    }
+    let scoped = report
+        .scope()
+        .iter()
+        .filter(|review| review.applied())
+        .count();
+    if scoped > 0 {
+        writeln!(
+            output,
+            "  Out of scope: {scoped} finding{}.",
+            plural_suffix(scoped)
+        )
+        .map_err(map_io_error)?;
+    }
+    if let Some(baseline) = report.baseline() {
+        writeln!(
+            output,
+            "  Baseline: {} of {} entries accepted via {}.",
+            baseline.applied_count(),
+            baseline.entry_count(),
+            escape_terminal_text(baseline.document_path()),
+        )
+        .map_err(map_io_error)?;
+    }
+    if let Some(diff) = report.diff() {
+        if diff.degraded() {
+            writeln!(
+                output,
+                "  Diff base {} is unreliable; full gating applied.",
+                escape_terminal_text(diff.base_revision()),
+            )
+            .map_err(map_io_error)?;
+        } else {
+            writeln!(
+                output,
+                "  Diff: {} new, {} persisting, {} fixed against {}.",
+                diff.new_count(),
+                diff.persisting_count(),
+                diff.fixed_count(),
+                escape_terminal_text(diff.base_revision()),
+            )
+            .map_err(map_io_error)?;
         }
     }
 
-    write_summary(&mut output, report)?;
-    output.flush().map_err(map_io_error)?;
-    Ok(output.bytes_written())
+    writeln!(output, "\nAnalysis warnings").map_err(map_io_error)?;
+    let mut warning_count = 0_usize;
+    if report.rules().iter().any(rule_has_schema_inference) {
+        warning_count = warning_count.saturating_add(1);
+        write_schema_inference_notes(output, report)?;
+    }
+    for diagnostic in report.diagnostics() {
+        warning_count = warning_count.saturating_add(1);
+        writeln!(
+            output,
+            "  Report [{}] {}: {}",
+            diagnostic_severity(diagnostic.severity()),
+            report_diagnostic_code(diagnostic.code()),
+            escape_terminal_text(diagnostic.message()),
+        )
+        .map_err(map_io_error)?;
+        if let Some(source) = diagnostic.source() {
+            write!(
+                output,
+                "    Source: {}",
+                escape_terminal_text(source.as_str())
+            )
+            .map_err(map_io_error)?;
+            if let Some(range) = diagnostic.byte_range() {
+                write!(output, ":{}-{}", range.start(), range.end()).map_err(map_io_error)?;
+            }
+            writeln!(output).map_err(map_io_error)?;
+        }
+        for related in diagnostic.related() {
+            writeln!(
+                output,
+                "    Related: {}:{}-{}: {}",
+                escape_terminal_text(related.source.as_str()),
+                related.range.start,
+                related.range.end,
+                escape_terminal_text(&related.message),
+            )
+            .map_err(map_io_error)?;
+        }
+    }
+    if report.diagnostics_truncated() {
+        warning_count = warning_count.saturating_add(1);
+        writeln!(
+            output,
+            "  Report diagnostics truncated: at least {} omitted; worst severity {}",
+            report.omitted_diagnostics_lower_bound(),
+            report
+                .worst_omitted_diagnostic_severity()
+                .map_or("unknown", diagnostic_severity),
+        )
+        .map_err(map_io_error)?;
+    }
+    for run in report.runs() {
+        for diagnostic in run.diagnostics() {
+            warning_count = warning_count.saturating_add(1);
+            write!(
+                output,
+                "  {} [{}; {}] ",
+                escape_terminal_text(run.policy_id().as_str()),
+                diagnostic_severity(diagnostic.severity()),
+                diagnostic_impact(diagnostic.impact()),
+            )
+            .map_err(map_io_error)?;
+            write_policy_diagnostic_code(output, diagnostic.code())?;
+            writeln!(output, ": {}", escape_terminal_text(diagnostic.message()))
+                .map_err(map_io_error)?;
+            if diagnostic.family_count() > 1 {
+                writeln!(output, "    Occurrences: {}", diagnostic.family_count())
+                    .map_err(map_io_error)?;
+            }
+            if let Some(primary) = diagnostic.primary() {
+                write!(output, "    Location: ").map_err(map_io_error)?;
+                write_location(output, primary).map_err(map_io_error)?;
+                writeln!(output).map_err(map_io_error)?;
+            }
+            for related in diagnostic.related() {
+                write!(
+                    output,
+                    "    Related {}: ",
+                    location_relationship(related.relationship())
+                )
+                .map_err(map_io_error)?;
+                write_location(output, related.location()).map_err(map_io_error)?;
+                writeln!(output).map_err(map_io_error)?;
+            }
+        }
+        if !run.completion().is_exhaustive() {
+            warning_count = warning_count.saturating_add(1);
+            write!(
+                output,
+                "  {}: ",
+                escape_terminal_text(run.policy_id().as_str())
+            )
+            .map_err(map_io_error)?;
+            write_completion_state(output, run)?;
+            writeln!(output).map_err(map_io_error)?;
+        }
+        if run.diagnostics_truncated() {
+            warning_count = warning_count.saturating_add(1);
+            writeln!(
+                output,
+                "  {}: diagnostics truncated",
+                escape_terminal_text(run.policy_id().as_str())
+            )
+            .map_err(map_io_error)?;
+        }
+        if !run.obligations().is_empty() || run.obligations_truncated() {
+            warning_count = warning_count.saturating_add(1);
+        }
+        write_run_obligations(output, run, HumanRenderDetail::Concise)?;
+    }
+    let suppression_reviews = report
+        .suppressions()
+        .iter()
+        .filter(|review| !review.applied() || review.result_omitted())
+        .count();
+    if suppression_reviews > 0 {
+        warning_count = warning_count.saturating_add(1);
+        writeln!(
+            output,
+            "  {suppression_reviews} suppression review{} require attention; use --verbose for identities and reasons.",
+            plural_suffix(suppression_reviews),
+        )
+        .map_err(map_io_error)?;
+    }
+    let scope_reviews = report
+        .scope()
+        .iter()
+        .filter(|review| !review.applied() || review.result_omitted())
+        .count();
+    if scope_reviews > 0 {
+        warning_count = warning_count.saturating_add(1);
+        writeln!(
+            output,
+            "  {scope_reviews} scope review{} require attention; use --verbose for identities and reasons.",
+            plural_suffix(scope_reviews),
+        )
+        .map_err(map_io_error)?;
+    }
+    if warning_count == 0 {
+        writeln!(output, "  None.").map_err(map_io_error)?;
+    }
+
+    writeln!(output, "\nDependency models").map_err(map_io_error)?;
+    if let Some(review) = report.packs() {
+        writeln!(
+            output,
+            "  Coverage: {}",
+            if review.complete() {
+                "complete"
+            } else {
+                "incomplete"
+            }
+        )
+        .map_err(map_io_error)?;
+        writeln!(
+            output,
+            "  Mode: {}; ecosystems: {}",
+            dependency_pack_activation_mode(review.dependency_mode()),
+            if review.ecosystems().is_empty() {
+                "none".to_owned()
+            } else {
+                review.ecosystems().join(",")
+            },
+        )
+        .map_err(map_io_error)?;
+        if !review.decisions().is_empty() || review.decisions_truncated() {
+            writeln!(output, "  Details: --verbose or --format json").map_err(map_io_error)?;
+        }
+    } else {
+        writeln!(output, "  Not reported.").map_err(map_io_error)?;
+    }
+    Ok(())
+}
+
+fn rule_has_schema_inference(rule: &PolicyRuleDescriptor) -> bool {
+    rule.policy_schema().origin == SchemaVersionOrigin::ImplicitCompatible
+        || rule
+            .selector_schemas()
+            .iter()
+            .any(|selector| selector.resolution().origin == SchemaVersionOrigin::ImplicitCompatible)
+        || rule.endpoint_dependencies().iter().any(|endpoint| {
+            matches!(
+                endpoint.definition_schema(),
+                EndpointDefinitionSchemaResolution::PolicyDocument { resolution }
+                    if resolution.origin == SchemaVersionOrigin::ImplicitCompatible
+            ) || endpoint_schema_resolutions(endpoint.selector_schemas())
+                .iter()
+                .any(|resolution| resolution.origin == SchemaVersionOrigin::ImplicitCompatible)
+        })
 }
 
 fn write_concise_finding<W: Write>(
@@ -214,14 +634,36 @@ fn write_concise_finding<W: Write>(
     finding: &PolicyFinding,
     color: HumanRenderColor,
 ) -> Result<(), PolicyRenderError> {
-    write_severity_marker(output, finding.severity(), color)?;
     write!(output, "  ").map_err(map_io_error)?;
+    write_severity_marker(output, finding.severity(), color)?;
+    writeln!(
+        output,
+        " {}: {}",
+        escape_terminal_text(finding.policy_id().as_str()),
+        escape_terminal_text(finding.message()),
+    )
+    .map_err(map_io_error)?;
+    write!(output, "    Location: ").map_err(map_io_error)?;
     write_location(output, finding.primary()).map_err(map_io_error)?;
     if let Some(symbol) = concise_terminal_symbol(finding) {
         write!(output, "  {}", escape_terminal_text(symbol)).map_err(map_io_error)?;
     }
     writeln!(output).map_err(map_io_error)?;
-    writeln!(output, "    {}", escape_terminal_text(finding.message())).map_err(map_io_error)?;
+    writeln!(
+        output,
+        "    Certainty: {}; proof: {}; completeness: {}",
+        finding.certainty().label(),
+        finding.proof().state().label(),
+        finding.completeness().label(),
+    )
+    .map_err(map_io_error)?;
+    if let FindingCompleteness::Partial { reasons } = finding.completeness() {
+        write!(output, "    Incomplete because:").map_err(map_io_error)?;
+        for reason in reasons {
+            write!(output, " {}", reason.label()).map_err(map_io_error)?;
+        }
+        writeln!(output).map_err(map_io_error)?;
+    }
     if let Some(path) = finding.display_path() {
         writeln!(output).map_err(map_io_error)?;
         write_concise_display_path(output, path)?;
@@ -2875,6 +3317,21 @@ fn write_run_completion<W: Write>(
         escape_terminal_text(policy_name),
     )
     .map_err(map_io_error)?;
+    write_completion_state(output, run)?;
+    if run.diagnostics_truncated() {
+        write!(output, "; diagnostics truncated").map_err(map_io_error)?;
+    }
+    if run.completion().is_reliable() {
+        writeln!(output, "; non-exhaustive").map_err(map_io_error)
+    } else {
+        writeln!(output, "; non-clean").map_err(map_io_error)
+    }
+}
+
+fn write_completion_state<W: Write>(
+    output: &mut BoundedWriter<W>,
+    run: &PolicyRun,
+) -> Result<(), PolicyRenderError> {
     match run.completion() {
         PolicyRunCompletion::Complete => write!(output, "complete").map_err(map_io_error)?,
         PolicyRunCompletion::ProvenSubset { codes } => {
@@ -2929,14 +3386,7 @@ fn write_run_completion<W: Write>(
             write!(output, ")").map_err(map_io_error)?;
         }
     }
-    if run.diagnostics_truncated() {
-        write!(output, "; diagnostics truncated").map_err(map_io_error)?;
-    }
-    if run.completion().is_reliable() {
-        writeln!(output, "; non-exhaustive").map_err(map_io_error)
-    } else {
-        writeln!(output, "; non-clean").map_err(map_io_error)
-    }
+    Ok(())
 }
 
 fn write_capability<W: Write>(
