@@ -225,6 +225,7 @@ struct PredeclaredShadowing {
     append: bool,
     copy: bool,
     panic: bool,
+    recover: bool,
     close: bool,
     boolean_true: bool,
     boolean_false: bool,
@@ -240,6 +241,7 @@ impl PredeclaredShadowing {
             "append" => self.append = true,
             "copy" => self.copy = true,
             "panic" => self.panic = true,
+            "recover" => self.recover = true,
             "close" => self.close = true,
             "true" => self.boolean_true = true,
             "false" => self.boolean_false = true,
@@ -256,6 +258,7 @@ impl PredeclaredShadowing {
             append: self.append || other.append,
             copy: self.copy || other.copy,
             panic: self.panic || other.panic,
+            recover: self.recover || other.recover,
             close: self.close || other.close,
             boolean_true: self.boolean_true || other.boolean_true,
             boolean_false: self.boolean_false || other.boolean_false,
@@ -271,6 +274,7 @@ impl PredeclaredShadowing {
             "append" => self.append,
             "copy" => self.copy,
             "panic" => self.panic,
+            "recover" => self.recover,
             "close" => self.close,
             "true" => self.boolean_true,
             "false" => self.boolean_false,
@@ -5267,7 +5271,9 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
             return None;
         }
         let name = node_text(self.prepared.source(), node)?;
-        if self.binding_value(name, node.start_byte()).is_some()
+        if self.predeclared_shadowed.shadows(name)
+            || self.package_shadowing.shadows(name)
+            || self.binding_value(name, node.start_byte()).is_some()
             || self
                 .omitted_capture_names
                 .iter()
@@ -12209,6 +12215,10 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
                     .map(|target| {
                         CallableTargetResolution::Proven(CallableTarget::Local(target.id))
                     })
+            })
+            .or_else(|| {
+                self.package_function_target(direct_function)
+                    .map(|target| CallableTargetResolution::Proven(CallableTarget::Local(target)))
             })
             .unwrap_or(CallableTargetResolution::Unknown);
         let metadata = self.metadata(invoke)?;

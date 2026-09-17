@@ -171,7 +171,7 @@ checksum = "dc0b364ead1874514c8c2855ab558056ebfeb775653e7ae45ff72f28f8f3166c"
 
 [[package]]
 name = "brokk-bifrost"
-version = "0.11.4"
+version = "0.11.5"
 dependencies = [
  "bincode",
  "brokk-bifrost-analysis",
@@ -222,7 +222,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-analysis"
-version = "0.11.4"
+version = "0.11.5"
 dependencies = [
  "arc-swap",
  "bincode",
@@ -292,7 +292,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-core"
-version = "0.11.4"
+version = "0.11.5"
 dependencies = [
  "bincode",
  "git2",
@@ -317,7 +317,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-cpp"
-version = "0.11.4"
+version = "0.11.5"
 dependencies = [
  "brokk-bifrost-core",
  "proptest",
@@ -332,7 +332,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-csharp"
-version = "0.11.4"
+version = "0.11.5"
 dependencies = [
  "brokk-bifrost-core",
  "brokk-tree-sitter-c-sharp",
@@ -342,7 +342,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-flow"
-version = "0.11.4"
+version = "0.11.5"
 dependencies = [
  "brokk-bifrost-analysis",
  "brokk-bifrost-core",
@@ -355,7 +355,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-go"
-version = "0.11.4"
+version = "0.11.5"
 dependencies = [
  "brokk-bifrost-core",
  "rayon",
@@ -367,7 +367,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-js-ts"
-version = "0.11.4"
+version = "0.11.5"
 dependencies = [
  "brokk-bifrost-core",
  "brokk-tree-sitter-javascript",
@@ -381,7 +381,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-jvm"
-version = "0.11.4"
+version = "0.11.5"
 dependencies = [
  "brokk-bifrost-core",
  "brokk-tree-sitter-kotlin",
@@ -395,7 +395,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-lsp"
-version = "0.11.4"
+version = "0.11.5"
 dependencies = [
  "brokk-bifrost-analysis",
  "brokk-bifrost-flow",
@@ -420,7 +420,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-mcp"
-version = "0.11.4"
+version = "0.11.5"
 dependencies = [
  "brokk-bifrost-analysis",
  "brokk-bifrost-flow",
@@ -449,7 +449,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-php"
-version = "0.11.4"
+version = "0.11.5"
 dependencies = [
  "brokk-bifrost-core",
  "mago-allocator",
@@ -464,7 +464,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-policy"
-version = "0.11.4"
+version = "0.11.5"
 dependencies = [
  "brokk-bifrost-analysis",
  "brokk-bifrost-flow",
@@ -485,7 +485,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-python"
-version = "0.11.4"
+version = "0.11.5"
 dependencies = [
  "brokk-bifrost-core",
  "rayon",
@@ -498,7 +498,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-rql"
-version = "0.11.4"
+version = "0.11.5"
 dependencies = [
  "brokk-bifrost-analysis",
  "brokk-bifrost-core",
@@ -518,7 +518,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-ruby"
-version = "0.11.4"
+version = "0.11.5"
 dependencies = [
  "brokk-bifrost-core",
  "serde_json",
@@ -528,7 +528,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-runtime"
-version = "0.11.4"
+version = "0.11.5"
 dependencies = [
  "brokk-bifrost-analysis",
  "brokk-bifrost-flow",
@@ -543,7 +543,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-rust"
-version = "0.11.4"
+version = "0.11.5"
 dependencies = [
  "brokk-bifrost-core",
  "brokk-tree-sitter-rust",
@@ -560,7 +560,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-semantic-packs"
-version = "0.11.4"
+version = "0.11.5"
 dependencies = [
  "brokk-bifrost-analysis",
  "brokk-bifrost-flow",
