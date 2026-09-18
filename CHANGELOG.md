@@ -13,9 +13,42 @@ projection and its commit history does not contain every source commit.
   `sync.Cond` synchronization, preserving joins, parallel-sibling behavior,
   cleanup ordering, and explicit unsupported boundaries through reviewed
   semantic packs.
+- Go data-race analysis now resolves the `http.Handler` interface
+  registration forms (`http.Handle`, `(*http.ServeMux).Handle`, `http.Serve`,
+  and `http.ListenAndServe`) against the handler argument's exact dynamic
+  type, so a registered workspace handler struct is a spawned `ServeHTTP`
+  task with the argument bound as its receiver and an
+  `http.HandlerFunc(f)` conversion spawns the resolved `f`. An
+  interface-typed variable, an unresolved constructor, and a middleware
+  wrapper whose result type stays open keep the reviewed
+  `unsupported_synchronization:net/http.Handler` boundary. The
+  `bifrost.go.stdlib.net-http` and `bifrost.go.stdlib.net-http-declarations`
+  packs are 1.1.0, and the built-in `bifrost.code-smells` pack is 2.15.0 so
+  the public Go data-race policy also seeds roots that call `Handle`,
+  `Serve`, and `ListenAndServe`.
+- The JavaScript and TypeScript value-flow engine now consumes the reviewed
+  `child_process.execSync` procedure summaries for dispatch. A require-bound
+  receiver whose exact external member is modeled by an activated, complete,
+  override-covering summary closes its residual dynamic-dispatch arm and its
+  dispatch coverage, so a runtime-values source reaches the exact
+  `execSync(command)` sink on a conclusive `ProvenBySummary` run with definite
+  findings. A visible member write or module-object escape refuses the
+  closure, and an unmodeled external callee keeps the run inconclusive.
 
 ### Changed
 
+- Zero-configuration JDK pack production is cheaper and reusable. A process
+  that finds a production already recorded for the same installed JDK (its
+  `release` digest plus every selected JMOD's relative path, length, and
+  modification time) answers from the semantic-pack catalog without reading a
+  single archive: on a JDK 25 box a warm zero-configuration scan fell from
+  23.4 s to 17.1 s at `BIFROST_PARALLELISM=1` and from 23.4 s to 17.5 s at the
+  default, and a fresh session on a warm zero-configuration Java workspace
+  settles in about 18 s instead of about 25 s. The per-module JMOD read and
+  class-table walk now run under the process's parallelism, which cut the
+  producer itself from 13.4 s to 4.7 s at the default parallelism. A first
+  production at `BIFROST_PARALLELISM=1` is unchanged, and the produced pack is
+  byte-identical to the previous producer's.
 - Policy CI and incremental type-flow evaluation now reuse prepared workspace
   and analyzer-cache state across policy units while retaining timing,
   cancellation, and incomplete-run evidence in CLI/SARIF reports.
@@ -24,9 +57,52 @@ projection and its commit history does not contain every source commit.
   extraction while preserving curated-pack installation and typed diagnostics.
 - The analyzer's forward fact-resolution engine restores unbudgeted lexical and
   typed preload sessions with cancellation and explicit incompleteness.
+- Python type-flow guard reconvergence now preserves classes proven by a
+  narrowing arm across multi-arm joins, while retaining explicit unknown and
+  unmodeled remainders.
+- Class-set summaries now name a guard-seeded source by its content (program
+  point, arm classification, class, and binding) instead of by its position in
+  the plan's seeding order, and a persisted summary whose event the live plan
+  does not seed is an attributed cache miss instead of an analyzer store error.
+  The Python absent-member policy previously aborted on Dramatiq with
+  `persisted class-set source event does not map uniquely to the live plan`.
 
 ### Fixed
 
+- JavaScript and TypeScript runtime keyed reads prove the pristine-input claim
+  across the whole workspace instead of only the reading module. Every other
+  JavaScript or TypeScript module is inspected for a write to the Node runtime
+  root, including the reflective `globalThis.process` and `global.process`
+  routes, so a multi-module workspace whose siblings are readable, parseable,
+  and write-free now publishes the exact reviewed `process.env`/`process.argv`
+  endpoint. A sibling write keeps the read `mutation-incomplete`, and an
+  unreadable, unparseable, or budget-uncovered sibling keeps it
+  `coverage-limited`. A declaration export such as `export function f() {}` or
+  `export const x = ...` no longer counts as an unknown effect on its own
+  module, so a module-scope read beside one keeps its exact endpoint;
+  re-exports and `export default <expression>` still do not.
+- JavaScript and TypeScript runtime keyed reads through computed containers
+  (`process['env']['KEY']`) publish the structural identity of the binding
+  their access chain starts from, so one such read no longer makes every
+  endpoint of its procedure incomplete.
+- A JavaScript or TypeScript module that replaces a member of a bound external
+  module object no longer publishes that member's exact external identity. A
+  member write, a computed-key write, an `Object.assign`, a `delete`, or any
+  other module-object escape refuses the mint through the same structural proof
+  the summary closure already used, so call bindings, dispatch rows, and
+  navigation stop asserting an exactness the module replaced. The reference
+  resolves instead to the binding the write introduces where the workspace makes
+  one visible, and otherwise to an open boundary that names the write site. A
+  write to a sibling member, and a module whose specifier resolves inside the
+  workspace, are unaffected.
+- The resource-lifecycle policy now discharges a close that a workspace helper
+  performs on the resource it is handed. A caller whose helper provably closes
+  the passed resource on every normal and exceptional exit path is reported
+  clean, including a helper reached through another helper inside the
+  interprocedural bound. A helper that closes on only some paths, closes a
+  different object, closes a resource no caller argument binds to, or depends
+  on itself keeps the finding, and the finding's reason names the helper and
+  the exit path that stayed open.
 - MCP request admission and execution now share one resolved request budget,
   so fallback-ladder timeouts return typed diagnostics instead of panicking.
 - Cross-language I4 claim checks now restrict identity contradictions to the
@@ -34,6 +110,9 @@ projection and its commit history does not contain every source commit.
   language declarations.
 - Release smoke tests now pass the resolved release tag when verifying the
   published DeepSeek Harness checksum.
+- JavaScript and TypeScript receiver queries now preserve explicit competing
+  or truncated import ambiguity under neutral semantic gates instead of
+  rewriting that boundary as an unknown result.
 
 ## [0.11.4] - 2026-09-15
 

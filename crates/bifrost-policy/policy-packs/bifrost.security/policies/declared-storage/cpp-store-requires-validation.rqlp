@@ -1,0 +1,26 @@
+; Declared-storage required validation, C specialization.
+(policy
+  :schema-version 1
+  :id "bifrost.security.cpp.store-requires-validation"
+  :name "Stored request value requires the configured validator (C++)"
+  :message "a request value reached the declared job store without passing the configured validator"
+  :severity warning
+  :description "Diagnoses request values that reach the declared job-store write without passing through the validator the workspace configured. The observed store write and the required validator are exact proven calls named by the reviewed endpoint-set documents; selecting this policy without that configuration fails activation rather than reporting a clean pass."
+  :help-uri "https://bifrost.brokk.ai/static-analysis-policies/#declared-storage"
+  :tags ["security" "c" "provenance" "declared-storage"]
+  :analysis (analysis
+    :type flow
+    :mode may
+    :call-modeling (call-modeling :unmodeled paranoid)
+    :origins (endpoint-set :entries [
+      (origin :id request-param
+        :display-name "request parameter"
+        :selector (rql :schema-version 1
+          (language cpp
+            (call-sites-to :proof proven
+              (enclosing-decl (function :name "request_param")))))
+        :bind return-value)])
+    :observations (endpoint-set :include-files [
+      (endpoint-set-file :path ".bifrost/endpoint-sets/observations/cpp-declared-store-write.rqlp")])
+    :kills (endpoint-set :include-files [
+      (endpoint-set-file :path ".bifrost/endpoint-sets/kills/cpp-required-validator.rqlp")])))

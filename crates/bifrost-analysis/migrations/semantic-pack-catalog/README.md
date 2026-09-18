@@ -28,3 +28,7 @@ Current history:
 - `0007-acquisition-absence-receipts.sql`: records restart-safe verified
   acquisition absence and invalidates it through a trigger-maintained semantic
   catalog mutation epoch.
+- `0008-generated-source-identities.sql`: records the read-free identity a
+  generated production was learned under (a JDK's release digest and JMOD
+  listing), so a later process can find the production without reading its
+  artifacts. The row cascades with the production it names.

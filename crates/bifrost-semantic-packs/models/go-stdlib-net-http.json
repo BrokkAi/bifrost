@@ -1,13 +1,13 @@
 {
   "schema_version": 2,
   "pack_id": "bifrost.go.stdlib.net-http",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "producer": { "name": "bifrost", "version": "0.11.3" },
   "language": "go",
   "ecosystem": "go",
   "compatibility": { "bifrost": ">=0.11.3, <1.0.0", "toolchains": [] },
   "provenance": {
-    "source": "https://go.dev/src/net/http/server.go (http.Handle, http.HandleFunc, http.Serve, http.ListenAndServe, http.NewServeMux, http.ServeMux.Handle, http.ServeMux.HandleFunc)",
+    "source": "https://go.dev/src/net/http/server.go (http.Handle, http.HandleFunc, http.Serve, http.ListenAndServe, http.NewServeMux, http.ServeMux.Handle, http.ServeMux.HandleFunc, net/http.HandlerFunc)",
     "revision": "go1.26.0"
   },
   "license": "BSD-3-Clause",
@@ -48,28 +48,28 @@
             "target": { "path": "src/net/http/server.go", "symbol": "net/http.Handle(pattern string, handler net/http.Handler)", "has_receiver": false, "parameter_count": 2 },
             "completeness": "complete",
             "transfers": [],
-            "concurrency_effects": [{ "kind": "unsupported", "protocol": "net/http.Handler" }]
+            "concurrency_effects": [{ "kind": "task_spawn", "callable": { "kind": "parameter", "ordinal": 1 } }]
           },
           {
             "id": "net-http.serve-mux.handle",
             "target": { "path": "src/net/http/server.go", "symbol": "net/http.ServeMux.Handle(pattern string, handler net/http.Handler)", "has_receiver": true, "parameter_count": 2 },
             "completeness": "complete",
             "transfers": [],
-            "concurrency_effects": [{ "kind": "unsupported", "protocol": "net/http.Handler" }]
+            "concurrency_effects": [{ "kind": "task_spawn", "callable": { "kind": "parameter", "ordinal": 1 } }]
           },
           {
             "id": "net-http.serve",
             "target": { "path": "src/net/http/server.go", "symbol": "net/http.Serve(l net.Listener, handler net/http.Handler)", "has_receiver": false, "parameter_count": 2 },
             "completeness": "complete",
             "transfers": [],
-            "concurrency_effects": [{ "kind": "unsupported", "protocol": "net/http.Handler" }]
+            "concurrency_effects": [{ "kind": "task_spawn", "callable": { "kind": "parameter", "ordinal": 1 } }]
           },
           {
             "id": "net-http.listen-and-serve",
             "target": { "path": "src/net/http/server.go", "symbol": "net/http.ListenAndServe(addr string, handler net/http.Handler)", "has_receiver": false, "parameter_count": 2 },
             "completeness": "complete",
             "transfers": [],
-            "concurrency_effects": [{ "kind": "unsupported", "protocol": "net/http.Handler" }]
+            "concurrency_effects": [{ "kind": "task_spawn", "callable": { "kind": "parameter", "ordinal": 1 } }]
           }
         ]
       }

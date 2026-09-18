@@ -25,8 +25,8 @@ use brokk_bifrost_js_ts::syntax::{
 };
 use brokk_bifrost_js_ts::ts_owners::ts_unwrap_expression;
 
-const JAVASCRIPT_ADAPTER_VERSION: &[u8] = b"javascript-value-semantics-v17";
-const TYPESCRIPT_ADAPTER_VERSION: &[u8] = b"typescript-value-semantics-v21";
+const JAVASCRIPT_ADAPTER_VERSION: &[u8] = b"javascript-value-semantics-v19";
+const TYPESCRIPT_ADAPTER_VERSION: &[u8] = b"typescript-value-semantics-v23";
 
 #[derive(Debug, Clone, Copy)]
 enum JsTsSemanticFlavor {
@@ -375,12 +375,15 @@ impl ProgramSemanticsLowerer for JsTsSemanticLowerer {
 }
 
 const fn procedure_owns_receiver(kind: ProcedureKind, properties: ProcedureProperties) -> bool {
-    matches!(kind, ProcedureKind::Initializer)
-        || (!properties.is_static
-            && matches!(
-                kind,
-                ProcedureKind::Method | ProcedureKind::Constructor | ProcedureKind::Function
-            ))
+    // A synthetic frame is the module body: `this` at file scope is the
+    // module's own binding, not a receiver formal of the frame.
+    !properties.is_synthetic
+        && (matches!(kind, ProcedureKind::Initializer)
+            || (!properties.is_static
+                && matches!(
+                    kind,
+                    ProcedureKind::Method | ProcedureKind::Constructor | ProcedureKind::Function
+                )))
 }
 
 fn js_ts_capabilities() -> SemanticCapabilities {

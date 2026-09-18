@@ -18,7 +18,8 @@ use crate::analyzer::semantic_model::{
     CompiledCondWaiters, CompiledLockCondition, CompiledLockMode, CompiledSummaryInput,
     CompiledSummaryOutput, CompiledSyncMapOperation, CompiledTaskSpawnCondition, Completeness,
     ProcedureSummaryDeclarationKey, ProcedureSummaryMemberKey, SemanticModelMatchDisposition,
-    SemanticModelMemberTargetDisposition, SemanticModelOverlayDisposition, TypeKind, Visibility,
+    SemanticModelMemberTargetDisposition, SemanticModelOverlayDisposition, TypeKind, TypeRef,
+    Visibility,
 };
 use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 use brokk_bifrost_core::analyzer::model::{Language, LanguageDialect, StructuredImportPathKind};
@@ -33,6 +34,22 @@ use brokk_bifrost_flow::concurrency::{
 };
 use brokk_bifrost_flow::typestate::TypestateObjectKey;
 
+/// The reviewed interface whose registration forms dispatch to the dynamic
+/// type's `ServeHTTP` method (issue #3428).
+const NET_HTTP_HANDLER_TYPE: &str = "net/http.Handler";
+
+/// The two exact callable bindings one modeled interface-form `net/http`
+/// handler registration resolves to, bound next to the effect it spawns.
+///
+/// A spawn the model dispatches through an object the caller names carries
+/// that object as its task's receiver; the func-value forms carry `None` and
+/// keep their callable in the caller's own value.
+struct TaskSpawnCallableBinding {
+    callable: ValueId,
+    targets: Vec<ProcedureHandle>,
+    receiver: Option<ValueId>,
+}
+
 pub(super) struct WorkspaceConcurrencyProvider<'a> {
     workspace: &'a WorkspaceAnalyzer,
     dispatch_sessions: PreparedWorkspaceDispatchPool<'a>,
@@ -44,13 +61,20 @@ pub(super) struct WorkspaceConcurrencyProvider<'a> {
         crate::hash::HashMap<(String, u32, u32), Option<ResolvedMemberDeclaration>>,
     >,
     /// Whether a callee's receiver binds by reference, keyed by its file and
-    /// member name, so one declaration scan serves every call to it.
-    receiver_bindings: std::cell::RefCell<crate::hash::HashMap<(String, String), bool>>,
+    /// its declaration's anchor span, so one declaration scan serves every
+    /// call to it. Two types in one file may declare same-named methods, so
+    /// the file and member name alone are not a declaration identity.
+    receiver_bindings: std::cell::RefCell<crate::hash::HashMap<(String, usize, usize), bool>>,
     parameter_bindings:
         std::cell::RefCell<crate::hash::HashMap<(ProcedureHandle, u32), Option<bool>>>,
     backing_parameters: std::cell::RefCell<crate::hash::HashMap<(ProcedureHandle, u32), bool>>,
     reference_free_parameters:
         std::cell::RefCell<crate::hash::HashMap<(ProcedureHandle, u32), bool>>,
+    /// Whether a formal's declared type is an interface that boxes one
+    /// reference payload, keyed like the other parameter questions so one
+    /// declaration scan serves every call to it.
+    payload_boxing_parameters:
+        std::cell::RefCell<crate::hash::HashMap<(ProcedureHandle, u32), Option<bool>>>,
     /// Whether a member locator names a field whose payload binds by reference,
     /// keyed by its file and span, so one declaration lookup serves every access
     /// repeating it. `None` is retained when the declaration's type shape is not
@@ -80,6 +104,7 @@ impl<'a> WorkspaceConcurrencyProvider<'a> {
             parameter_bindings: std::cell::RefCell::default(),
             backing_parameters: std::cell::RefCell::default(),
             reference_free_parameters: std::cell::RefCell::default(),
+            payload_boxing_parameters: std::cell::RefCell::default(),
             reference_members: std::cell::RefCell::default(),
         }
     }
@@ -258,6 +283,93 @@ impl<'a> WorkspaceConcurrencyProvider<'a> {
             return None;
         }
         method.receiver.map(|receiver| receiver.pointer)
+    }
+
+    /// The declared type of the selected summary's `ordinal`-th parameter,
+    /// read from the active declaration overlay.
+    ///
+    /// The four `net/http` interface registration forms and the two func-value
+    /// forms both model one task spawn on parameter ordinal 1, so the spawn
+    /// shape alone cannot tell them apart (issue #3428). The declaration facts
+    /// carry the parameter's own type -- `net/http.Handler` for the interface
+    /// forms, a function type for the func forms -- and this reads them from
+    /// the member's structured signature, never the rendered symbol.
+    ///
+    /// This is a presence read, so it deliberately does not go through
+    /// `member_target_on_owner`: that lookup answers resolution questions and
+    /// reports `Incomplete` for every record of a pack whose manifest declares
+    /// partial completeness, which the reviewed `net/http` declaration pack
+    /// does. Competing records, or records that disagree about this parameter's
+    /// type, are not one exact declared type and answer `None`.
+    fn modeled_parameter_type<'s>(
+        &'s self,
+        summary: &crate::analyzer::semantic_model::CompiledProcedureSummary,
+        ordinal: u32,
+    ) -> Option<&'s TypeRef> {
+        let overlay = self
+            .active_models
+            .as_ref()?
+            .semantic_model_overlay()?
+            .as_ref();
+        let (owner, member) =
+            crate::analyzer::semantic::split_qualified_member(&summary.target.symbol)?;
+        let language = LanguageDialect::Standard(Language::Go).semantic_pack_label();
+        let mut owners = overlay
+            .symbols_named(owner)
+            .records
+            .into_iter()
+            .filter(|symbol| {
+                symbol.owner_id.is_none()
+                    && symbol.qualified_name == owner
+                    && symbol.language == language
+            });
+        let owner_symbol = owners.next()?;
+        if owners.next().is_some() {
+            return None;
+        }
+        let ordinal = usize::try_from(ordinal).ok()?;
+        let parameter_count = usize::try_from(summary.target.parameter_count).ok()?;
+        let mut declared = None;
+        let mut stated = 0_usize;
+        for record in overlay.members_of(&owner_symbol.id).records {
+            if record.language != language
+                || record.name != member
+                || record.has_receiver() != summary.target.has_receiver
+            {
+                continue;
+            }
+            let signature = record.structured_signature()?;
+            if signature.parameters.len() != parameter_count {
+                return None;
+            }
+            let parameter = &signature.parameters.get(ordinal)?.r#type;
+            if declared.is_some_and(|previous| previous != parameter) {
+                return None;
+            }
+            declared = Some(parameter);
+            stated += 1;
+        }
+        if stated == 0 { None } else { declared }
+    }
+
+    /// Whether this spawn's callable names a parameter the reviewed
+    /// declaration publishes as the exact `net/http.Handler` interface.
+    fn spawn_callable_is_net_http_handler(
+        &self,
+        summary: &crate::analyzer::semantic_model::CompiledProcedureSummary,
+        callable: &CompiledSummaryInput,
+    ) -> bool {
+        let CompiledSummaryInput::Parameter { ordinal } = callable else {
+            return false;
+        };
+        matches!(
+            self.modeled_parameter_type(summary, *ordinal),
+            Some(TypeRef::Named {
+                name,
+                arguments,
+                nullable: false,
+            }) if name == NET_HTTP_HANDLER_TYPE && arguments.is_empty()
+        )
     }
 
     /// Resolve a deferred receiver through its original source only when the
@@ -664,11 +776,13 @@ impl<'a> WorkspaceConcurrencyProvider<'a> {
     ) -> Result<ConcurrencyAnswer<Vec<ResolvedConcurrencyEffect>>, SemanticProviderError> {
         let (selected, mut reasons) = self.exact_model_summary(call, request)?.into_parts();
         let mut effects = Vec::new();
-        for effect in selected
-            .into_iter()
-            .flat_map(|summary| &summary.concurrency_effects)
-        {
-            match self.bind_effect(call, effect, request)? {
+        for (summary, effect) in selected.into_iter().flat_map(|summary| {
+            summary
+                .concurrency_effects
+                .iter()
+                .map(move |effect| (summary, effect))
+        }) {
+            match self.bind_effect(call, summary, effect, request)? {
                 ConcurrencyAnswer::Proven(Some(effect)) => effects.push(effect),
                 ConcurrencyAnswer::Proven(None) => {}
                 ConcurrencyAnswer::Open {
@@ -719,6 +833,7 @@ impl<'a> WorkspaceConcurrencyProvider<'a> {
     fn bind_effect(
         &self,
         call: &CallSiteHandle,
+        summary: &crate::analyzer::semantic_model::CompiledProcedureSummary,
         effect: &CompiledConcurrencyEffect,
         request: &mut SemanticRequest<'_>,
     ) -> Result<ConcurrencyAnswer<Option<ResolvedConcurrencyEffect>>, SemanticProviderError> {
@@ -777,7 +892,8 @@ impl<'a> WorkspaceConcurrencyProvider<'a> {
                 condition,
                 timer,
             } => {
-                let (targets, mut reasons) = Self::callback_targets(call, callable).into_parts();
+                let (binding, mut reasons) =
+                    self.bind_task_spawn_callable(call, summary, callable, request)?;
                 let group = if let Some(group) = group {
                     match self.canonical_actual(call, group, request)? {
                         ConcurrencyAnswer::Proven(Some(group)) => Some(group),
@@ -843,26 +959,18 @@ impl<'a> WorkspaceConcurrencyProvider<'a> {
                 } else {
                     None
                 };
-                let effect = (!targets.is_empty()).then(|| {
-                    let row = call
-                        .procedure()
-                        .semantics()
-                        .call_site(call.id())
-                        .expect("owned modeled call");
-                    let callable = Self::actual_input(row, callable)
-                        .expect("callback targets require an actual callable value");
-                    ResolvedConcurrencyEffect::TaskSpawn {
-                        callable,
-                        targets,
-                        group,
-                        condition: match condition {
-                            Some(CompiledTaskSpawnCondition::CallResultTrue) => {
-                                ResolvedTaskSpawnCondition::CallResultTrue
-                            }
-                            None => ResolvedTaskSpawnCondition::Unconditional,
-                        },
-                        timer,
-                    }
+                let effect = binding.map(|binding| ResolvedConcurrencyEffect::TaskSpawn {
+                    callable: binding.callable,
+                    targets: binding.targets,
+                    receiver: binding.receiver,
+                    group,
+                    condition: match condition {
+                        Some(CompiledTaskSpawnCondition::CallResultTrue) => {
+                            ResolvedTaskSpawnCondition::CallResultTrue
+                        }
+                        None => ResolvedTaskSpawnCondition::Unconditional,
+                    },
+                    timer,
                 });
                 if reasons.is_empty() {
                     ConcurrencyAnswer::Proven(effect)
@@ -1221,6 +1329,89 @@ impl<'a> WorkspaceConcurrencyProvider<'a> {
                 }
             }
         })
+    }
+
+    /// Bind the callable one modeled task spawn runs.
+    ///
+    /// The func-value forms resolve the spawn's argument through the
+    /// callable-reference events #3408 records. The `net/http.Handler`
+    /// interface forms resolve the argument's dynamic type instead (issue
+    /// #3428): the analyzer's handler-dispatch proof names the `ServeHTTP`
+    /// method of the argument's exact workspace type -- with the argument as
+    /// the task's receiver -- or the conversion's own argument for an exact
+    /// `http.HandlerFunc` conversion. An inexact dynamic type keeps the
+    /// reviewed typed boundary this summary carried before, and a bounded
+    /// proof that stops reports the exhaustion.
+    fn bind_task_spawn_callable(
+        &self,
+        call: &CallSiteHandle,
+        summary: &crate::analyzer::semantic_model::CompiledProcedureSummary,
+        callable: &CompiledSummaryInput,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<(Option<TaskSpawnCallableBinding>, Vec<ConcurrencyOpenReason>), SemanticProviderError>
+    {
+        if !self.spawn_callable_is_net_http_handler(summary, callable) {
+            let (targets, reasons) = Self::callback_targets(call, callable).into_parts();
+            let binding = (!targets.is_empty()).then(|| TaskSpawnCallableBinding {
+                callable: Self::actual_input(
+                    call.procedure()
+                        .semantics()
+                        .call_site(call.id())
+                        .expect("owned modeled call"),
+                    callable,
+                )
+                .expect("callback targets require an actual callable value"),
+                targets,
+                receiver: None,
+            });
+            return Ok((binding, reasons));
+        }
+        let procedure = call.procedure();
+        let row = procedure
+            .semantics()
+            .call_site(call.id())
+            .expect("owned modeled call");
+        let Some(handler) = Self::actual_input(row, callable) else {
+            return Ok((None, vec![ConcurrencyOpenReason::UnknownLocation]));
+        };
+        match crate::analyzer::go_http_handler_dispatch(
+            self.workspace,
+            self.active_models.as_ref(),
+            procedure,
+            handler,
+            request,
+        )? {
+            crate::analyzer::GoHttpHandlerDispatch::ServeHttp { method } => Ok((
+                Some(TaskSpawnCallableBinding {
+                    callable: handler,
+                    targets: vec![method],
+                    receiver: Some(handler),
+                }),
+                Vec::new(),
+            )),
+            crate::analyzer::GoHttpHandlerDispatch::HandlerFuncConversion { argument } => {
+                let (targets, reasons) =
+                    brokk_bifrost_flow::concurrency::source_callable_targets(procedure, argument)
+                        .into_parts();
+                let binding = (!targets.is_empty()).then_some(TaskSpawnCallableBinding {
+                    callable: argument,
+                    targets,
+                    receiver: None,
+                });
+                Ok((binding, reasons))
+            }
+            crate::analyzer::GoHttpHandlerDispatch::Open {
+                reason: crate::analyzer::GoHttpHandlerOpenReason::NotExact,
+            } => Ok((
+                None,
+                vec![ConcurrencyOpenReason::UnsupportedSynchronization(
+                    NET_HTTP_HANDLER_TYPE.into(),
+                )],
+            )),
+            crate::analyzer::GoHttpHandlerDispatch::Open {
+                reason: crate::analyzer::GoHttpHandlerOpenReason::BudgetExhausted,
+            } => Ok((None, vec![ConcurrencyOpenReason::BudgetExhausted])),
+        }
     }
 
     /// The exact object a modeled construction returns.
@@ -1591,6 +1782,23 @@ impl ConcurrencyProvider for WorkspaceConcurrencyProvider<'_> {
         )
     }
 
+    fn allocation_boxes_reference_payload(
+        &self,
+        procedure: &ProcedureHandle,
+        allocation: AllocationId,
+    ) -> Option<bool> {
+        let semantics = procedure.semantics();
+        let site = semantics.allocation(allocation)?;
+        let mapping = semantics.source_mapping(site.source)?;
+        let file = super::witness_projection::locator_file(self.workspace, &mapping.locator);
+        let source = self.workspace.analyzer().indexed_source(&file)?;
+        crate::analyzer::usages::get_definition::allocation_boxes_reference_payload_at_offset(
+            &file,
+            &source,
+            mapping.locator.anchor().span().start_byte() as usize,
+        )
+    }
+
     fn index_uses_separate_associative_storage(
         &self,
         procedure: &ProcedureHandle,
@@ -1705,19 +1913,20 @@ impl ConcurrencyProvider for WorkspaceConcurrencyProvider<'_> {
         if locator.language() != LanguageDialect::Standard(Language::Go) {
             return true;
         }
-        let Some(member) = locator
-            .declaration()
-            .segments()
-            .last()
-            .and_then(|segment| segment.name())
-        else {
-            return false;
-        };
-        let key = (locator.path().as_str().to_owned(), member.to_owned());
+        // Go declares a method at file scope, so the lexical path names the
+        // file and the member but not the owner type: two types in one file
+        // can declare same-named methods. The anchor span is what tells them
+        // apart, so it is part of the identity this answer is cached under.
+        let span = locator.anchor().span();
+        let key = (
+            locator.path().as_str().to_owned(),
+            span.start_byte() as usize,
+            span.end_byte() as usize,
+        );
         if let Some(cached) = self.receiver_bindings.borrow().get(&key) {
             return *cached;
         }
-        let resolved = !self.declares_value_receiver(locator, member);
+        let resolved = !self.declares_value_receiver(locator);
         self.receiver_bindings.borrow_mut().insert(key, resolved);
         resolved
     }
@@ -1811,6 +2020,38 @@ impl ConcurrencyProvider for WorkspaceConcurrencyProvider<'_> {
         };
         let resolved = resolve() == Some(true);
         self.backing_parameters.borrow_mut().insert(key, resolved);
+        resolved
+    }
+
+    fn parameter_boxes_reference_payload(
+        &self,
+        procedure: &ProcedureHandle,
+        ordinal: u32,
+    ) -> Option<bool> {
+        let key = (procedure.clone(), ordinal);
+        if let Some(cached) = self.payload_boxing_parameters.borrow().get(&key) {
+            return *cached;
+        }
+        let resolve = || {
+            let locator = procedure.semantics().locator();
+            if locator.language() != LanguageDialect::Standard(Language::Go) {
+                return None;
+            }
+            let file = super::witness_projection::locator_file(self.workspace, locator);
+            let source = self.workspace.analyzer().indexed_source(&file)?;
+            let span = locator.anchor().span();
+            crate::analyzer::usages::get_definition::parameter_boxes_reference_payload_at_span(
+                &file,
+                &source,
+                span.start_byte() as usize,
+                span.end_byte() as usize,
+                usize::try_from(ordinal).ok()?,
+            )
+        };
+        let resolved = resolve();
+        self.payload_boxing_parameters
+            .borrow_mut()
+            .insert(key, resolved);
         resolved
     }
 
@@ -2087,8 +2328,13 @@ fn complete_exclusive_dispatch_is_external_only(
     ) {
         (false, true) => Some(false),
         (true, false) => Some(true),
-        // There is no target domain to classify when both are empty, and
-        // source plus external arms remain mixed even with complete proofs.
+        // An empty target set is a target domain when the resolver proved the
+        // call expression names no callee: dispatching to nothing is then the
+        // complete source-only answer.
+        (true, true) if result.resolver_proved_no_callee() => Some(false),
+        // Otherwise there is no target domain to classify when both are
+        // empty, and source plus external arms remain mixed even with
+        // complete proofs.
         (true, true) | (false, false) => None,
     }
 }
@@ -2194,33 +2440,30 @@ impl WorkspaceConcurrencyProvider<'_> {
     /// from any value receiver keeps the caller's object out of a callee that
     /// might copy it, without resolving which declaration the call reaches. A
     /// name with no receiver at all is not a method and answers `false`.
+    /// Whether the declaration a Go procedure's locator names declares a
+    /// value receiver.
+    ///
+    /// Go declares a method at file scope, so the procedure's lexical path
+    /// does not carry the owner type and a name match would answer for any
+    /// same-named method in the file. The locator's anchor span names the
+    /// exact declaration, and only that declaration's signature decides
+    /// whether binding the receiver copies the caller's object.
     fn declares_value_receiver(
         &self,
         locator: &crate::analyzer::semantic::SemanticLocator,
-        member: &str,
     ) -> bool {
         let analyzer = self.workspace.analyzer();
         let file = super::witness_projection::locator_file(self.workspace, locator);
-        for unit in analyzer.get_declarations(&file) {
-            // A Go method's display name carries its owner, as in `box.bump`.
-            // Compare the interned last segment so the member is read from
-            // structure rather than from the rendered name.
-            let declares_member = unit.fq().last().is_some_and(|segment| {
-                brokk_bifrost_core::analyzer::fq_name::segment_interner()
-                    .resolve(segment)
-                    .0
-                    == member
-            });
-            if !unit.is_function() || !declares_member {
+        let Some(declaration) = super::dispatch::declaration_at_locator(analyzer, locator, &file)
+        else {
+            return false;
+        };
+        for metadata in analyzer.signature_metadata(&declaration) {
+            let Some(receiver) = metadata.extension_receiver_type_identity() else {
                 continue;
-            }
-            for metadata in analyzer.signature_metadata(&unit) {
-                let Some(receiver) = metadata.extension_receiver_type_identity() else {
-                    continue;
-                };
-                if !receiver.is_pointer() {
-                    return true;
-                }
+            };
+            if !receiver.is_pointer() {
+                return true;
             }
         }
         false

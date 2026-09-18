@@ -1,0 +1,19 @@
+; Reviewed application configuration: the storage obligation's observation.
+;
+; The value operand of every proven JobStore.put call is where the
+; required-validation obligation attaches: a request value reaching this
+; operand must have passed the configured validator first.
+(endpoint-set-document
+  :schema-version 1
+  :kind observations
+  :language python
+  :rql-schema-version 1
+  :set (endpoint-set :entries [
+      (observation :id job-store-put-value
+        :display-name "JobStore.put stored value"
+        :selector (rql :schema-version 1
+          (language python
+            (call-sites-to :proof proven
+              (enclosing-decl
+                (inside-decl (class :name "JobStore") (method :name "put"))))))
+        :observed-operand (argument :index 1))]))

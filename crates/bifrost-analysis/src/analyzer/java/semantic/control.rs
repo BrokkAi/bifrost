@@ -1994,34 +1994,32 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             let resource_normal_route =
                 builder.normal_cleanup_completion(resource_region, after_resource);
             let resource_boundary = self.point(builder, node, Vec::new())?;
-            self.add_gap(
-                builder,
-                resource_boundary,
-                SemanticGapSubject::Point,
-                SemanticCapability::ResourceManagement,
-                SemanticGapKind::Unsupported,
-                    "resource acquisition and partial-initialization cleanup are not yet lowered exactly",
-            )?;
-            self.add_gap(
-                builder,
-                resource_boundary,
-                SemanticGapSubject::Point,
-                SemanticCapability::ExceptionalControlFlow,
-                SemanticGapKind::Unsupported,
-                "resource acquisition can raise implicit exceptions not yet represented",
-            )?;
-            let resources = node
-                .child_by_field_name("resources")
-                .map(named_children)
-                .unwrap_or_default();
-            let initializers = resources
-                .into_iter()
-                .filter_map(|resource| {
-                    resource
-                        .child_by_field_name("value")
-                        .or_else(|| first_runtime_named_child(resource))
-                })
-                .collect::<Vec<_>>();
+            let initializers = try_with_resources_values(node);
+            // A resource that another initializer follows can also be closed by
+            // that later initializer's failure: Java releases every resource
+            // that already initialized. That partial-initialization close chain
+            // is not lowered, so it opens exactly the values it can close and
+            // nothing else. The last resource has no later initializer, and a
+            // single-resource statement has no partial-initialization close at
+            // all, so those acquisitions stay exact.
+            for initializer in initializers
+                .iter()
+                .take(initializers.len().saturating_sub(1))
+            {
+                let value = self.expression_value(
+                    builder,
+                    *initializer,
+                    expression_value_kind(*initializer),
+                )?;
+                self.add_gap(
+                    builder,
+                    resource_boundary,
+                    SemanticGapSubject::Value(value),
+                    SemanticCapability::ResourceManagement,
+                    SemanticGapKind::Unsupported,
+                    "a later resource initializer can fail and close this resource, and that partial-initialization close chain is not yet lowered",
+                )?;
+            }
             if initializers.is_empty() {
                 self.edge(builder, entry, EdgeTarget::normal(resource_boundary))?;
             } else {
@@ -2726,24 +2724,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         scope: step.region.outer_scope,
                     });
                 }
-                CleanupBody::OpaqueResource(_) => {
-                    self.add_gap(
-                        builder,
-                        step.entry,
-                        SemanticGapSubject::Point,
-                        SemanticCapability::ResourceManagement,
-                        SemanticGapKind::Unsupported,
-                        "resource close order, suppression, and value effects are not yet lowered",
-                    )?;
-                    self.add_gap(
-                        builder,
-                        step.entry,
-                        SemanticGapSubject::Point,
-                        SemanticCapability::ExceptionalControlFlow,
-                        SemanticGapKind::Unsupported,
-                        "resource close can raise or suppress exceptions not yet represented",
-                    )?;
-                    self.edge(builder, step.entry, step.next)?;
+                CleanupBody::OpaqueResource(node) => {
+                    self.lower_implicit_resource_closes(builder, node, step, stack)?;
                 }
                 CleanupBody::OpaqueMonitor(_) => {
                     self.add_gap(
@@ -2769,6 +2751,156 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         self.edge(builder, from, plan.target())
     }
 
+    /// Lower the implicit close of a try-with-resources statement.
+    ///
+    /// Java releases every successfully initialized resource at the
+    /// construct's own exit, in reverse declaration order, on both the normal
+    /// and the exceptional continuation of the guarded body. Each release is a
+    /// real close operation on the resource value the construct acquired, so
+    /// the typestate engine binds it to the tracked subject identity instead
+    /// of to the spelled resource variable.
+    ///
+    /// Every close site is anchored at the try statement, which is the source
+    /// fact the resource-lifecycle selector names for the construct, and each
+    /// publishes the close operation's own normal and exceptional
+    /// continuations. A close that throws still released its resource, so its
+    /// exceptional continuation enters the *next* close in the chain, and only
+    /// the last release in the chain propagates from the enclosing scope: an
+    /// earlier failure cannot skip a later release, and this region never runs
+    /// twice.
+    fn lower_implicit_resource_closes(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        step: CleanupSpecialization<CleanupRegion<'tree>>,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), JavaLoweringError> {
+        let mut values = try_with_resources_values(node);
+        // Java closes in reverse declaration order, so the execution order runs
+        // from the last declared resource to the first.
+        values.reverse();
+        if values.is_empty() {
+            // Only an error-recovered resource specification has no resource
+            // value at all; the grammar requires at least one resource. Keep
+            // the construct reachable and report the gap instead of inventing a
+            // close.
+            self.add_gap(
+                builder,
+                step.entry,
+                SemanticGapSubject::Point,
+                SemanticCapability::ResourceManagement,
+                SemanticGapKind::Unsupported,
+                "a malformed resource specification declares no resource value, so its implicit close is not represented",
+            )?;
+            self.edge(builder, step.entry, step.next)?;
+            return Ok(());
+        }
+        // The cleanup entry is the first release Java performs, so reusing it
+        // keeps one point per release without adding a relay.
+        let mut invokes = Vec::with_capacity(values.len());
+        for index in 0..values.len() {
+            invokes.push(if index == 0 {
+                step.entry
+            } else {
+                self.point(builder, node, Vec::new())?
+            });
+        }
+        let last = values.len() - 1;
+        let mut continuations = Vec::with_capacity(values.len());
+        for (index, value_node) in values.into_iter().enumerate() {
+            let invoke = invokes[index];
+            let normal = self.point(builder, node, Vec::new())?;
+            let exceptional = self.point(builder, node, Vec::new())?;
+            let receiver =
+                self.expression_value(builder, value_node, expression_value_kind(value_node))?;
+            let callee = self.source_value(builder, value_node, SemanticValueKind::Callable)?;
+            let thrown = self.source_value(builder, value_node, SemanticValueKind::Exception)?;
+            let metadata = self.metadata(invoke)?;
+            self.append_effect(
+                builder,
+                invoke,
+                SemanticEffect::CallableReference {
+                    result: callee,
+                    callable: CallableValue {
+                        kind: CallableReferenceKind::BoundMethod,
+                        targets: CallableTargetResolution::Unknown,
+                        target_evidence: metadata.evidence,
+                        bound_receiver: Some(receiver),
+                        environment: None,
+                    },
+                },
+            )?;
+            let call_site = self.session.add_call_site(
+                builder,
+                CallSiteScaffold {
+                    point: invoke,
+                    callee,
+                    receiver: Some(receiver),
+                    arguments: Box::new([]),
+                    normal_results: Box::new([]),
+                    result: None,
+                    thrown: Some(thrown),
+                    declared_targets: CallableTargetResolution::Unknown,
+                    normal_continuation: normal,
+                    exceptional_continuation: exceptional,
+                },
+            )?;
+            self.resolution_gaps(
+                builder,
+                invoke,
+                callee,
+                call_site,
+                &CallableTargetResolution::Unknown,
+            )?;
+            self.edge(builder, invoke, EdgeTarget::normal(normal))?;
+            self.edge(
+                builder,
+                invoke,
+                EdgeTarget {
+                    point: exceptional,
+                    kind: ControlEdgeKind::Exceptional,
+                },
+            )?;
+            continuations.push((normal, exceptional, index == last));
+        }
+        // A close that throws still released its resource, so its exceptional
+        // continuation continues with the releases that remain and then
+        // propagates from the enclosing scope.
+        for (index, (normal, exceptional, is_last)) in continuations.iter().copied().enumerate() {
+            let next = invokes
+                .get(index + 1)
+                .copied()
+                .map(EdgeTarget::normal)
+                .unwrap_or(step.next);
+            self.edge(builder, normal, next)?;
+            if is_last {
+                self.abrupt(
+                    builder,
+                    exceptional,
+                    step.region.outer_scope,
+                    CompletionKind::Throw,
+                    None,
+                    stack,
+                )?;
+            } else {
+                // The remaining releases run as part of the same unwinding, so
+                // the edge that resumes the chain stays exceptional. Publishing
+                // it as a normal edge would lose the in-flight completion here
+                // and let a later release's own exit class stand in for the
+                // class this hop arrived with.
+                self.edge(
+                    builder,
+                    exceptional,
+                    EdgeTarget {
+                        point: invokes[index + 1],
+                        kind: ControlEdgeKind::Exceptional,
+                    },
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     fn edge(
         &self,
         builder: &mut ProcedureCfgBuilder,
@@ -2785,4 +2917,30 @@ fn decimal_integer_value(source: &str, node: Node<'_>) -> Option<i64> {
         .then(|| node_text(source, node))
         .flatten()
         .and_then(|text| text.parse().ok())
+}
+
+/// The resource value expressions of a try-with-resources statement, in
+/// declaration order.
+///
+/// A resource is a `variable_declarator` (or a bare access expression naming
+/// an existing resource), so its value is the declarator's `value` field, or,
+/// for the access form, its own expression. Java closes the resources in
+/// reverse declaration order, and both the acquisition lowering and the
+/// implicit-close lowering need the same list, so it is derived once here.
+fn try_with_resources_values(node: Node<'_>) -> Vec<Node<'_>> {
+    assert_eq!(
+        node.kind(),
+        "try_with_resources_statement",
+        "only a try-with-resources statement declares a resource specification"
+    );
+    node.child_by_field_name("resources")
+        .map(named_children)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|resource| {
+            resource
+                .child_by_field_name("value")
+                .or_else(|| first_runtime_named_child(resource))
+        })
+        .collect()
 }

@@ -875,6 +875,7 @@ pub struct DispatchResult {
     boundaries: Box<[DispatchBoundary]>,
     coverage: CandidateCoverage,
     complete_receiver_hint_refinable: bool,
+    resolver_proved_no_callee: bool,
 }
 
 impl DispatchResult {
@@ -906,6 +907,7 @@ impl DispatchResult {
             boundaries: boundaries.into_boxed_slice(),
             coverage,
             complete_receiver_hint_refinable: false,
+            resolver_proved_no_callee: false,
         };
         let has_unresolved = result
             .boundaries
@@ -963,6 +965,25 @@ impl DispatchResult {
     pub(crate) fn mark_complete_receiver_hint_refinable(&mut self) {
         debug_assert_eq!(self.coverage, CandidateCoverage::Truncated);
         self.complete_receiver_hint_refinable = true;
+    }
+
+    /// Whether the resolver proved this call expression names no callable
+    /// target at all. A Go call whose callee is a declaration an activated
+    /// model publishes, and which positive declaration facts rule out as an
+    /// applicable function, is a conversion to a modeled type: there is no
+    /// callee, so the empty target set is the complete answer rather than an
+    /// unreached one.
+    pub const fn resolver_proved_no_callee(&self) -> bool {
+        self.resolver_proved_no_callee
+    }
+
+    pub(crate) fn mark_resolver_proved_no_callee(&mut self) {
+        debug_assert_eq!(self.coverage, CandidateCoverage::Exhaustive);
+        debug_assert!(
+            self.candidates.is_empty() && self.boundaries.is_empty(),
+            "a proven no-callee answer retains no dispatch arm"
+        );
+        self.resolver_proved_no_callee = true;
     }
 
     /// Return the receiver shape proved by one exhaustive dispatch result.

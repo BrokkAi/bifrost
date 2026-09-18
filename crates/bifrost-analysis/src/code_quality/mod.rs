@@ -337,6 +337,7 @@ mod git_hotspots;
 mod maintainability_size;
 mod secret_like_code;
 mod structural_clone_smells;
+pub mod structured_quality;
 mod test_assertion_smells;
 mod unused_imports;
 
@@ -367,11 +368,21 @@ pub use maintainability_size::{
     find_long_method_and_god_object_smells, report_long_method_and_god_object_smells,
 };
 pub use secret_like_code::{
-    ReportSecretLikeCodeParams, ReportSecretLikeCodeResult, report_secret_like_code,
+    ReportSecretLikeCodeParams, ReportSecretLikeCodeResult, SecretConfidence, SecretFinding,
+    SecretLocation, SecretRedactionSpan, SecretScanDiagnostic, SecretScanDiagnosticKind,
+    report_secret_like_code,
 };
 pub use structural_clone_smells::{
     ReportStructuralCloneSmellsParams, ReportStructuralCloneSmellsResult,
     report_structural_clone_smells,
+};
+pub use structured_quality::{
+    QUALITY_FINDINGS_SCHEMA_ID, QUALITY_FINDINGS_SCHEMA_VERSION, QualityCompletion,
+    QualityEvidence, QualityFinding, QualityFindingKind, QualityLocation,
+    QualityLocationUnavailableReason, QualityParameter, QualityRange, QualityReason,
+    QualitySubject, QualityTruncation, StructuralCloneQualityFinding,
+    StructuralCloneQualityMetrics, StructuredQualityFindings, TestAssertionQualityFinding,
+    TestAssertionQualityMetrics,
 };
 pub use test_assertion_smells::{
     ReportTestAssertionSmellsParams, ReportTestAssertionSmellsResult, report_test_assertion_smells,

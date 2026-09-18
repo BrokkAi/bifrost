@@ -556,6 +556,30 @@ impl ExternalMemberDeclaration {
     }
 }
 
+/// What a class declaration binds under one member name, beyond the instance
+/// stores the class-set field-store survey collects.
+///
+/// The survey only sees writes through a receiver, so a class-level binding is
+/// a value it could not have observed. Naming the binding separates two cases
+/// the survey cannot tell apart: a declared procedure, which
+/// [`TypeFlowAdapter::member_lookup`] already names exactly and which no
+/// instance-attribute slot describes, and any other class-level binding, whose
+/// value stays open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClassBodyMemberBinding {
+    /// The class body binds nothing under this name. The surveyed instance
+    /// stores are the whole slot.
+    Unbound,
+    /// The class body declares this member as a plain procedure. Reading it
+    /// yields that method; `member_lookup` names the declaration, and no
+    /// instance-attribute value exists for a store survey to classify.
+    Procedure,
+    /// The class body binds a value this adapter does not classify here: a
+    /// class-level assignment, a decorated definition whose result is
+    /// arbitrary, or a declaration the adapter could not read.
+    Unclassified,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MemberLookup {
     Present(MemberLookupHit),
@@ -816,7 +840,10 @@ fn portable_source_path(site: &SourceSite) -> WorkspaceRelativePath {
         .expect("a semantic source site has a portable workspace-relative path")
 }
 
-fn source_site_kind_tag(kind: SourceSiteKind) -> u8 {
+/// The persisted tag of one source-site kind. A class-set summary names its
+/// guard sources by a key derived from this tag, so the mapping is shared
+/// rather than restated.
+pub fn source_site_kind_tag(kind: SourceSiteKind) -> u8 {
     match kind {
         SourceSiteKind::ConstructorCall => 0,
         SourceSiteKind::Literal => 1,
@@ -1180,13 +1207,15 @@ pub trait TypeFlowAdapter: Send + Sync {
         false
     }
 
-    fn field_slot_is_complete(
+    /// What the class declaration itself binds under this member name,
+    /// beyond the instance stores the field-store survey collected.
+    fn class_body_member_binding(
         &self,
         _workspace: &WorkspaceAnalyzer,
         _class: &ClassIdentity,
         _member: &str,
-    ) -> bool {
-        false
+    ) -> ClassBodyMemberBinding {
+        ClassBodyMemberBinding::Unclassified
     }
 
     /// Whether repeated accesses to this instance field use ordinary storage,

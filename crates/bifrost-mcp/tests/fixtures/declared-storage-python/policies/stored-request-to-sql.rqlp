@@ -1,0 +1,48 @@
+; Declared-storage SQL flow, Python specialization.
+;
+; A request value (Flask `request.args.get`) that the application persists
+; through its declared job store and later reads back must never reach the
+; SQL text of a sqlite3 Cursor.execute call. The write-to-read edge is the
+; workspace's reviewed store declaration, not an observed database
+; connection; the policy binds no flow without it. Parameter binding
+; (`execute("... ?", (term,))`) keeps the value out of the SQL structure
+; and is the documented remediation.
+(policy
+  :schema-version 1
+  :id "bifrost.security.python.stored-request-to-sql"
+  :name "Stored request value reaches SQLite SQL (Python)"
+  :message "a request value stored in the declared job store reached sqlite3 Cursor.execute SQL text"
+  :severity error
+  :description "Reports Flask request values that cross the declared job-store persistence boundary and reach the SQL argument of sqlite3 Cursor.execute. Selection is exact: proven calls of the declared APIs only, never same-named members of unrelated classes. The store, key, and instance contracts come from the reviewed endpoint-set document, whose absence fails activation rather than passing."
+  :help-uri "https://bifrost.brokk.ai/static-analysis-policies/#declared-storage"
+  :tags ["security" "python" "sql-injection" "cwe-89" "declared-storage"]
+  :analysis (analysis
+    :type taint
+    :mode may
+    :call-modeling (call-modeling :unmodeled require-model)
+    :sources (endpoint-set :entries [
+      (source :id flask-request-args-get
+        :display-name "Flask request.args.get"
+        :categories [input.user-controlled io.external]
+        :selector (rql :schema-version 1
+          (language python
+            (call-sites-to :proof proven
+              (enclosing-decl
+                (inside-decl (class :name "RequestValues") (method :name "get"))))))
+        :bind return-value
+        :labels [attacker-controlled])])
+    :sinks (endpoint-set :entries [
+      (sink :id sqlite3-cursor-execute
+        :display-name "sqlite3 Cursor.execute SQL"
+        :categories [sql.structure]
+        :selector (rql :schema-version 1
+          (language python
+            (call-sites-to :proof proven
+              (enclosing-decl
+                (inside-decl (class :name "Cursor") (method :name "execute"))))))
+        :dangerous-operand (argument :index 0)
+        :accepts [attacker-controlled])])
+    :stores (endpoint-set :include-files [
+      (endpoint-set-file :path ".bifrost/endpoint-sets/stores/python-declared-store.rqlp")]))
+  :classification (classification
+    :fallback (classification-id :taxonomy "CWE" :id "89")))

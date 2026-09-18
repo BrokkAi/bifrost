@@ -31,6 +31,9 @@ pub(crate) fn compose_taint_policy(
     endpoint_dependencies: &[ResolvedEndpointDependency],
     match_manifests: &[ResolvedMatchDirectoryManifest],
     limits: CompositionLimits,
+    // Workspace-authored endpoint-set imports deferred at the built-in
+    // catalog boundary: a required set may stand empty until activation.
+    deferred_imports: bool,
 ) -> Result<ComposedTaintPolicy, CompositionError> {
     let universe = EndpointUniverse::try_new(endpoint_dependencies, limits)?;
     let mut resolved_catalogs = Vec::new();
@@ -42,6 +45,7 @@ pub(crate) fn compose_taint_policy(
         match_manifests,
         &mut resolved_catalogs,
         limits,
+        deferred_imports,
     )?;
     let sinks = select_sinks(
         policy_id,
@@ -51,6 +55,7 @@ pub(crate) fn compose_taint_policy(
         match_manifests,
         &mut resolved_catalogs,
         limits,
+        deferred_imports,
     )?;
 
     let sanitizers = compose_auxiliary_set(
@@ -195,6 +200,7 @@ fn select_sources(
     manifests: &[ResolvedMatchDirectoryManifest],
     resolved_catalogs: &mut Vec<ResolvedCatalogIdentity>,
     limits: CompositionLimits,
+    deferred_imports: bool,
 ) -> Result<RoleSelection<ResolvedTaintSourceDefinition>, CompositionError> {
     let mut identities = Vec::new();
     let mut used_manifests = Vec::new();
@@ -238,7 +244,7 @@ fn select_sources(
     }
     identities.sort();
     identities.dedup();
-    if identities.is_empty() {
+    if identities.is_empty() && !deferred_imports {
         return Err(CompositionError::EmptyResolvedEndpointSet {
             role: EndpointRole::Source,
         });
@@ -275,6 +281,7 @@ fn select_sinks(
     manifests: &[ResolvedMatchDirectoryManifest],
     resolved_catalogs: &mut Vec<ResolvedCatalogIdentity>,
     limits: CompositionLimits,
+    deferred_imports: bool,
 ) -> Result<RoleSelection<ResolvedTaintSinkDefinition>, CompositionError> {
     let mut identities = Vec::new();
     let mut used_manifests = Vec::new();
@@ -318,7 +325,7 @@ fn select_sinks(
     }
     identities.sort();
     identities.dedup();
-    if identities.is_empty() {
+    if identities.is_empty() && !deferred_imports {
         return Err(CompositionError::EmptyResolvedEndpointSet {
             role: EndpointRole::Sink,
         });
@@ -1026,6 +1033,7 @@ mod tests {
             &dependencies,
             &[],
             CompositionLimits::default(),
+            false,
         )
         .unwrap();
 
@@ -1116,6 +1124,7 @@ mod tests {
             &dependencies,
             &[],
             CompositionLimits::default(),
+            false,
         )
         .unwrap();
 
@@ -1192,6 +1201,7 @@ mod tests {
                 &dependencies,
                 &[],
                 CompositionLimits::default(),
+                false,
             ),
             Err(CompositionError::FindingCombinationPrecedence(_))
         ));
@@ -1208,6 +1218,7 @@ mod tests {
             &dependencies,
             &[],
             CompositionLimits::default(),
+            false,
         )
         .unwrap();
         assert!(
@@ -1236,6 +1247,7 @@ mod tests {
             &dependencies,
             &[],
             CompositionLimits::default(),
+            false,
         )
         .unwrap();
 
@@ -1258,6 +1270,7 @@ mod tests {
                 &dependencies,
                 &[],
                 CompositionLimits::default(),
+                false,
             ),
             Err(CompositionError::FindingCombinationPrecedence(_))
         ));

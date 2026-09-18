@@ -1289,81 +1289,17 @@ pub fn is_bare_companion_method_value_reference(node: Node<'_>) -> bool {
 }
 
 pub fn is_type_like_reference(node: Node<'_>, source: &str) -> bool {
-    node.kind() == "type_identifier"
-        || is_constructor_like_reference(node, source)
-        || is_anonymous_instance_mixin_type_reference(node, source)
-        || is_infix_type_operator_reference(node)
-        || parent_kind(node).is_some_and(|kind| {
-            matches!(
-                kind,
-                "type" | "generic_type" | "parameterized_type" | "extends_clause"
-            )
-        })
-}
-
-/// Tree-sitter parses Scala 2-style anonymous mixins such as
-/// `new Base with First with Mixin` as a left-associated `infix_expression`
-/// chain. Only the right-hand operands of a `with` chain rooted at an
-/// `instance_expression` are type roles; an ordinary term infix expression is
-/// not.
-fn is_anonymous_instance_mixin_type_reference(node: Node<'_>, source: &str) -> bool {
-    let mut operand = node;
-    while let Some(parent) = operand.parent().filter(|parent| {
-        matches!(
-            parent.kind(),
-            "generic_type" | "applied_constructor_type" | "annotated_type" | "type"
-        ) && (parent.child_by_field_name("type") == Some(operand)
-            || parent.named_child(0) == Some(operand))
-    }) {
-        operand = parent;
-    }
-
-    let Some(expression) = operand.parent().filter(|parent| {
-        parent.kind() == "infix_expression"
-            && parent.child_by_field_name("right") == Some(operand)
-            && parent
-                .child_by_field_name("operator")
-                .is_some_and(|operator| node_text(operator, source).trim() == "with")
-    }) else {
-        return false;
-    };
-
-    let Some(mut left) = expression.child_by_field_name("left") else {
-        return false;
-    };
-    loop {
-        let mut constructed = left;
-        while constructed.kind() == "call_expression" {
-            let Some(function) = constructed.child_by_field_name("function") else {
-                return false;
-            };
-            constructed = function;
-        }
-        if constructed.kind() == "instance_expression" {
-            return true;
-        }
-        let Some(previous) = left.child_by_field_name("left").filter(|_| {
-            left.kind() == "infix_expression"
-                && left
-                    .child_by_field_name("operator")
-                    .is_some_and(|operator| node_text(operator, source).trim() == "with")
-        }) else {
-            return false;
-        };
-        left = previous;
-    }
+    is_type_like_reference_with_parents(node, source, &ParentIndex::unindexed())
 }
 
 /// In `A TypeOperator B`, the grammar exposes `TypeOperator` as the exact
 /// `operator` field of `infix_type`, even when it is an ordinary `identifier`.
 pub fn is_infix_type_operator_reference(node: Node<'_>) -> bool {
-    node.parent().is_some_and(|parent| {
-        parent.kind() == "infix_type" && parent.child_by_field_name("operator") == Some(node)
-    })
+    is_infix_type_operator_reference_with_parents(node, &ParentIndex::unindexed())
 }
 
 pub fn is_scala_object_reference(node: Node<'_>) -> bool {
-    is_singleton_type_reference(node)
+    is_singleton_type_reference_with_parents(node, &ParentIndex::unindexed())
         || is_stable_type_qualifier(node)
         || qualified_stable_type_expression_shape_role(node).is_some_and(|role| {
             matches!(
@@ -1582,25 +1518,145 @@ fn qualified_stable_type_expression_role<'tree>(
 }
 
 pub fn is_scala_class_reference(node: Node<'_>, source: &str) -> bool {
-    is_type_like_reference(node, source)
-        && !is_singleton_type_reference(node)
-        && !is_stable_type_qualifier(node)
-        && !is_extractor_reference(node)
-        && !is_infix_pattern_operator(node)
-        && !node.parent().is_some_and(|parent| {
+    is_scala_class_reference_with_parents(node, source, &ParentIndex::unindexed())
+}
+
+pub fn is_scala_class_reference_with_parents<'tree>(
+    node: Node<'tree>,
+    source: &str,
+    parents: &ParentIndex<'tree>,
+) -> bool {
+    is_type_like_reference_with_parents(node, source, parents)
+        && !is_singleton_type_reference_with_parents(node, parents)
+        && !is_stable_type_qualifier_with_parents(node, parents)
+        && !is_extractor_reference_with_parents(node, parents)
+        && !is_infix_pattern_operator_with_parents(node, parents)
+        && !parents.parent(node).is_some_and(|parent| {
             parent.kind() == "call_expression"
                 && parent.child_by_field_name("function") == Some(node)
         })
 }
 
-fn is_singleton_type_reference(node: Node<'_>) -> bool {
-    node.parent()
+fn is_type_like_reference_with_parents<'tree>(
+    node: Node<'tree>,
+    source: &str,
+    parents: &ParentIndex<'tree>,
+) -> bool {
+    node.kind() == "type_identifier"
+        || is_constructor_like_reference_with_parents(node, source, parents)
+        || is_anonymous_instance_mixin_type_reference_with_parents(node, source, parents)
+        || is_infix_type_operator_reference_with_parents(node, parents)
+        || parent_kind_with_parents(node, parents).is_some_and(|kind| {
+            matches!(
+                kind,
+                "type" | "generic_type" | "parameterized_type" | "extends_clause"
+            )
+        })
+}
+
+/// Tree-sitter parses Scala 2-style anonymous mixins such as
+/// `new Base with First with Mixin` as a left-associated `infix_expression`
+/// chain. Only the right-hand operands of a `with` chain rooted at an
+/// `instance_expression` are type roles; an ordinary term infix expression is
+/// not.
+fn is_anonymous_instance_mixin_type_reference_with_parents<'tree>(
+    node: Node<'tree>,
+    source: &str,
+    parents: &ParentIndex<'tree>,
+) -> bool {
+    let mut operand = node;
+    while let Some(parent) = parents.parent(operand).filter(|parent| {
+        matches!(
+            parent.kind(),
+            "generic_type" | "applied_constructor_type" | "annotated_type" | "type"
+        ) && (parent.child_by_field_name("type") == Some(operand)
+            || parent.named_child(0) == Some(operand))
+    }) {
+        operand = parent;
+    }
+
+    let Some(expression) = parents.parent(operand).filter(|parent| {
+        parent.kind() == "infix_expression"
+            && parent.child_by_field_name("right") == Some(operand)
+            && parent
+                .child_by_field_name("operator")
+                .is_some_and(|operator| node_text(operator, source).trim() == "with")
+    }) else {
+        return false;
+    };
+
+    let Some(mut left) = expression.child_by_field_name("left") else {
+        return false;
+    };
+    loop {
+        let mut constructed = left;
+        while constructed.kind() == "call_expression" {
+            let Some(function) = constructed.child_by_field_name("function") else {
+                return false;
+            };
+            constructed = function;
+        }
+        if constructed.kind() == "instance_expression" {
+            return true;
+        }
+        let Some(previous) = left.child_by_field_name("left").filter(|_| {
+            left.kind() == "infix_expression"
+                && left
+                    .child_by_field_name("operator")
+                    .is_some_and(|operator| node_text(operator, source).trim() == "with")
+        }) else {
+            return false;
+        };
+        left = previous;
+    }
+}
+
+pub fn is_infix_type_operator_reference_with_parents<'tree>(
+    node: Node<'tree>,
+    parents: &ParentIndex<'tree>,
+) -> bool {
+    parents.parent(node).is_some_and(|parent| {
+        parent.kind() == "infix_type" && parent.child_by_field_name("operator") == Some(node)
+    })
+}
+
+pub fn is_constructor_like_reference_with_parents<'tree>(
+    node: Node<'tree>,
+    source: &str,
+    parents: &ParentIndex<'tree>,
+) -> bool {
+    let prefix = source[..node.start_byte()].trim_end();
+    prefix.ends_with("new")
+        || parent_kind_with_parents(node, parents)
+            .is_some_and(|kind| matches!(kind, "call_expression" | "type"))
+}
+
+fn parent_kind_with_parents<'tree>(
+    node: Node<'tree>,
+    parents: &ParentIndex<'tree>,
+) -> Option<&'static str> {
+    parents.parent(node).map(|parent| parent.kind())
+}
+
+fn is_singleton_type_reference_with_parents<'tree>(
+    node: Node<'tree>,
+    parents: &ParentIndex<'tree>,
+) -> bool {
+    parents
+        .parent(node)
         .is_some_and(|parent| parent.kind() == "singleton_type")
 }
 
 pub fn is_stable_type_qualifier(node: Node<'_>) -> bool {
-    let Some(parent) = node
-        .parent()
+    is_stable_type_qualifier_with_parents(node, &ParentIndex::unindexed())
+}
+
+pub fn is_stable_type_qualifier_with_parents<'tree>(
+    node: Node<'tree>,
+    parents: &ParentIndex<'tree>,
+) -> bool {
+    let Some(parent) = parents
+        .parent(node)
         .filter(|parent| parent.kind() == "stable_type_identifier")
     else {
         return false;
@@ -1644,7 +1700,14 @@ pub fn is_extractor_reference_with_parents<'tree>(
 }
 
 pub fn is_infix_pattern_operator(node: Node<'_>) -> bool {
-    node.parent().is_some_and(|parent| {
+    is_infix_pattern_operator_with_parents(node, &ParentIndex::unindexed())
+}
+
+pub fn is_infix_pattern_operator_with_parents<'tree>(
+    node: Node<'tree>,
+    parents: &ParentIndex<'tree>,
+) -> bool {
+    parents.parent(node).is_some_and(|parent| {
         parent.kind() == "infix_pattern" && parent.child_by_field_name("operator") == Some(node)
     })
 }
@@ -1963,16 +2026,30 @@ fn is_bare_term_reference(node: Node<'_>) -> bool {
 }
 
 pub fn is_field_expression_value(node: Node<'_>) -> bool {
-    node.parent().is_some_and(|parent| {
+    is_field_expression_value_with_parents(node, &ParentIndex::unindexed())
+}
+
+fn is_field_expression_value_with_parents<'tree>(
+    node: Node<'tree>,
+    parents: &ParentIndex<'tree>,
+) -> bool {
+    parents.parent(node).is_some_and(|parent| {
         parent.kind() == "field_expression" && parent.child_by_field_name("value") == Some(node)
     })
 }
 
 pub fn is_qualified_stable_root(node: Node<'_>) -> bool {
-    if is_field_expression_value(node) {
+    is_qualified_stable_root_with_parents(node, &ParentIndex::unindexed())
+}
+
+pub fn is_qualified_stable_root_with_parents<'tree>(
+    node: Node<'tree>,
+    parents: &ParentIndex<'tree>,
+) -> bool {
+    if is_field_expression_value_with_parents(node, parents) {
         return true;
     }
-    let Some(mut path) = node.parent().filter(|parent| {
+    let Some(mut path) = parents.parent(node).filter(|parent| {
         matches!(
             parent.kind(),
             "stable_identifier" | "stable_type_identifier"
@@ -1998,13 +2075,11 @@ pub fn is_qualified_stable_root(node: Node<'_>) -> bool {
 }
 
 pub fn is_constructor_like_reference(node: Node<'_>, source: &str) -> bool {
-    let prefix = source[..node.start_byte()].trim_end();
-    prefix.ends_with("new")
-        || parent_kind(node).is_some_and(|kind| matches!(kind, "call_expression" | "type"))
+    is_constructor_like_reference_with_parents(node, source, &ParentIndex::unindexed())
 }
 
 pub fn parent_kind(node: Node<'_>) -> Option<&str> {
-    node.parent().map(|parent| parent.kind())
+    parent_kind_with_parents(node, &ParentIndex::unindexed())
 }
 
 pub fn has_ancestor_kind(node: Node<'_>, kind: &str) -> bool {
@@ -2057,7 +2132,15 @@ pub fn is_owner_qualified_this(qualifier: Node<'_>, source: &str) -> bool {
 }
 
 pub fn stable_type_qualifier(node: Node<'_>, source: &str) -> Option<String> {
-    let parent = node.parent()?;
+    stable_type_qualifier_with_parents(node, source, &ParentIndex::unindexed())
+}
+
+pub fn stable_type_qualifier_with_parents<'tree>(
+    node: Node<'tree>,
+    source: &str,
+    parents: &ParentIndex<'tree>,
+) -> Option<String> {
+    let parent = parents.parent(node)?;
     if parent.kind() != "stable_type_identifier" || parent.end_byte() != node.end_byte() {
         return None;
     }
@@ -2924,6 +3007,7 @@ object Outer {
     def run[A](value: A)(using context: Context): A = value
     val result = run[Int](value = 1)(using context)
     val selected: Outer.Item = Outer.Item(1)
+    val method = transform _
     val matched = selected match {
       case Outer.Item(value) => value
       case other: Outer.Item => other.value
@@ -2974,6 +3058,31 @@ object Outer {
                 is_call_function_reference_with_parents(node, &parents),
                 is_call_function_reference(node),
                 "call function at {node:?}"
+            );
+            assert_eq!(
+                is_qualified_stable_root_with_parents(node, &parents),
+                is_qualified_stable_root(node),
+                "qualified stable root at {node:?}"
+            );
+            assert_eq!(
+                is_scala_class_reference_with_parents(node, source, &parents),
+                is_scala_class_reference(node, source),
+                "Scala class reference at {node:?}"
+            );
+            assert_eq!(
+                is_stable_type_qualifier_with_parents(node, &parents),
+                is_stable_type_qualifier(node),
+                "stable type qualifier at {node:?}"
+            );
+            assert_eq!(
+                is_infix_pattern_operator_with_parents(node, &parents),
+                is_infix_pattern_operator(node),
+                "infix pattern operator at {node:?}"
+            );
+            assert_eq!(
+                stable_type_qualifier_with_parents(node, source, &parents),
+                stable_type_qualifier(node, source),
+                "stable qualifier path at {node:?}"
             );
             assert_eq!(
                 field_expression_for_member_with_parents(node, &parents),

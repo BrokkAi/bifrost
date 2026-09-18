@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use crate::CancellationToken;
 use crate::analyzer::DependencyPackEcosystem;
-use crate::analyzer::canonical_hash::{CanonicalHasher, lower_hex_string};
+use crate::analyzer::canonical_hash::{CanonicalHasher, is_lower_sha256, lower_hex_string};
 use crate::analyzer::topology::DependencyScope;
 use crate::hash::{HashSet, set_with_capacity};
 
@@ -19,6 +19,8 @@ use super::{
 };
 
 const DEPENDENCY_INPUT_DOMAIN: &[u8] = b"bifrost.semantic-pack.dependency-input.v1";
+const DEPENDENCY_SOURCE_IDENTITY_DOMAIN: &[u8] =
+    b"bifrost.semantic-pack.dependency-source-identity.v1";
 const GENERATED_PRODUCTION_LOCK_RETRY: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,6 +59,60 @@ pub struct ResolvedDependencyArtifact {
     /// dependency discovery approved. The stored path must also remain its own
     /// canonical path so a replaced symlink cannot redirect the later read.
     pub expected_sha256: Option<String>,
+    /// A digest the adapter can compute from cheap filesystem metadata without
+    /// reading the artifact's bytes.
+    ///
+    /// It exists only to find an already recorded generated production before
+    /// the exact read; it never decides what a production contains. Absent
+    /// means "this artifact has no read-free identity", and preparation then
+    /// reads the artifact exactly as it did before.
+    pub source_identity: Option<ArtifactSourceIdentity>,
+}
+
+/// A read-free digest of one artifact's filesystem state.
+///
+/// The ecosystem adapter derives it from a structured projection of the
+/// resolved artifact (a JDK's release digest plus every selected JMOD's
+/// relative path, byte length, and modification time), never from artifact
+/// bytes: computing it must not cost the read it exists to avoid.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactSourceIdentity(String);
+
+impl ArtifactSourceIdentity {
+    pub fn from_digest(digest: String) -> Self {
+        assert!(
+            is_lower_sha256(&digest),
+            "artifact source identity must be a lowercase SHA-256 digest"
+        );
+        Self(digest)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A read-free digest of one whole resolved dependency.
+///
+/// It folds the same adapter, evidence, provenance, and production-profile
+/// frame as [`generated_production_key`] around each artifact's
+/// [`ArtifactSourceIdentity`], so two callers with different limits cannot see
+/// each other's mapping.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DependencySourceIdentity(String);
+
+impl DependencySourceIdentity {
+    pub fn from_digest(digest: String) -> Self {
+        assert!(
+            is_lower_sha256(&digest),
+            "dependency source identity must be a lowercase SHA-256 digest"
+        );
+        Self(digest)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,6 +132,7 @@ impl ResolvedDependencyArtifact {
             module: None,
             input: ResolvedDependencyArtifactInput::File(path),
             expected_sha256: None,
+            source_identity: None,
         }
     }
 
@@ -91,6 +148,7 @@ impl ResolvedDependencyArtifact {
             module: None,
             input: ResolvedDependencyArtifactInput::File(path),
             expected_sha256: Some(expected_sha256),
+            source_identity: None,
         }
     }
 
@@ -106,6 +164,7 @@ impl ResolvedDependencyArtifact {
             module: Some(module),
             input: ResolvedDependencyArtifactInput::File(path),
             expected_sha256: None,
+            source_identity: None,
         }
     }
 
@@ -124,6 +183,7 @@ impl ResolvedDependencyArtifact {
                 relative_paths,
             },
             expected_sha256: None,
+            source_identity: None,
         }
     }
 
@@ -146,7 +206,23 @@ impl ResolvedDependencyArtifact {
                 relative_paths,
             },
             expected_sha256: None,
+            source_identity: None,
         }
+    }
+
+    /// Attach the read-free identity an adapter derived for this artifact.
+    ///
+    /// Only an adapter that can prove the identity from the resolved artifact's
+    /// structured metadata may attach one; preparation reuses a production
+    /// without reading anything when every artifact of a dependency carries
+    /// one.
+    pub fn with_source_identity(mut self, identity: ArtifactSourceIdentity) -> Self {
+        assert!(
+            self.expected_sha256.is_none(),
+            "a digest-bound artifact is already pinned to an exact byte digest"
+        );
+        self.source_identity = Some(identity);
+        self
     }
 
     pub fn path(&self) -> &Path {
@@ -1127,6 +1203,51 @@ pub fn prepare_dependency_semantic_packs(
             continue;
         }
 
+        // A read-free identity lets a later process (or the next test in a
+        // suite) find an already produced pack without reading the artifacts at
+        // all. Everything below is unchanged when the accelerator misses: the
+        // exact read is still the one authority for what a production contains.
+        let source_identity = dependency_source_identity(adapter, dependency, limits);
+        if let Some(identity) = source_identity.as_ref() {
+            let reusable = {
+                let _scope = crate::profiling::scope("semantic_pack.lookup_source_identity");
+                reusable_generated_pack_by_source_identity(
+                    catalog,
+                    &adapter.producer(),
+                    identity,
+                    dependency,
+                )
+            };
+            match reusable {
+                Ok(Some(prepared)) => {
+                    remember_dependency_source_identity(
+                        catalog,
+                        source_identity.as_ref(),
+                        &prepared.production.key,
+                        &dependency.id,
+                        &mut diagnostics,
+                    );
+                    record_reused_generated_pack(
+                        prepared,
+                        dependency,
+                        &mut diagnostics,
+                        &mut evidence,
+                        &mut packs,
+                        &mut profile,
+                    );
+                    continue;
+                }
+                Ok(None) => {}
+                Err(error) => diagnostics.warning(
+                    "catalog.source_identity",
+                    Some(&dependency.id),
+                    format!(
+                        "could not consult the read-free dependency identity, so its artifacts will be read: {error}"
+                    ),
+                ),
+            }
+        }
+
         let artifact_read_scope = crate::profiling::scope("semantic_pack.read_exact_artifacts");
         let mut exact_artifacts = Vec::with_capacity(dependency.artifacts.len());
         for artifact in &dependency.artifacts {
@@ -1251,6 +1372,13 @@ pub fn prepare_dependency_semantic_packs(
         };
         match reusable {
             Ok(Some(prepared)) => {
+                remember_dependency_source_identity(
+                    catalog,
+                    source_identity.as_ref(),
+                    &prepared.production.key,
+                    &dependency.id,
+                    &mut diagnostics,
+                );
                 record_reused_generated_pack(
                     prepared,
                     dependency,
@@ -1308,6 +1436,13 @@ pub fn prepare_dependency_semantic_packs(
         };
         match reusable {
             Ok(Some(prepared)) => {
+                remember_dependency_source_identity(
+                    catalog,
+                    source_identity.as_ref(),
+                    &prepared.production.key,
+                    &dependency.id,
+                    &mut diagnostics,
+                );
                 record_reused_generated_pack(
                     prepared,
                     dependency,
@@ -1350,6 +1485,13 @@ pub fn prepare_dependency_semantic_packs(
             };
             match reusable {
                 Ok(Some(prepared)) => {
+                    remember_dependency_source_identity(
+                        catalog,
+                        source_identity.as_ref(),
+                        &prepared.production.key,
+                        &dependency.id,
+                        &mut diagnostics,
+                    );
                     record_reused_generated_pack(
                         prepared,
                         dependency,
@@ -1452,6 +1594,16 @@ pub fn prepare_dependency_semantic_packs(
         };
         match install {
             Ok(installed) => {
+                // The exact read has just proven this production for this
+                // dependency, so this process also leaves behind the read-free
+                // mapping that lets a later process find it without reading.
+                remember_dependency_source_identity(
+                    catalog,
+                    source_identity.as_ref(),
+                    &production.key,
+                    &dependency.id,
+                    &mut diagnostics,
+                );
                 let activation_evidence =
                     activation_evidence(dependency, production.key.input_digest());
                 evidence.push(activation_evidence.clone());
@@ -1813,6 +1965,63 @@ fn reusable_generated_pack(
         status: DependencyPackPreparationStatus::Reused,
         evidence: activation_evidence(dependency, input_digest),
     }))
+}
+
+/// The generated production a read-free dependency identity was learned under,
+/// or `None` when this catalog has not learned that identity.
+///
+/// The identity names a candidate; the production itself still comes from the
+/// fully verified key lookup, so a row that outlives its pack, or one recorded
+/// at another cache epoch, reads as an ordinary miss.
+fn reusable_generated_pack_by_source_identity(
+    catalog: &SemanticPackCatalog,
+    producer: &Producer,
+    identity: &DependencySourceIdentity,
+    dependency: &ResolvedDependency,
+) -> Result<Option<PreparedDependencyPack>, CatalogError> {
+    let Some(production) =
+        catalog.generated_production_by_source_identity(identity.as_str(), producer)?
+    else {
+        return Ok(None);
+    };
+    let input_digest = production.key.input_digest().to_owned();
+    Ok(Some(PreparedDependencyPack {
+        dependency_id: dependency.id.clone(),
+        completeness: production.completeness,
+        production,
+        status: DependencyPackPreparationStatus::Reused,
+        evidence: activation_evidence(dependency, &input_digest),
+    }))
+}
+
+/// Record the read-free identity under which `key`'s production was observed.
+///
+/// The mapping is a pure accelerator: it only lets a later process skip the
+/// read that would otherwise recompute the same key. A read-only catalog, or a
+/// failure to write the row, therefore costs a diagnostic and not a missed
+/// pack, and preparation carries on with the read it has already done.
+fn remember_dependency_source_identity(
+    catalog: &SemanticPackCatalog,
+    identity: Option<&DependencySourceIdentity>,
+    key: &GeneratedProductionKey,
+    dependency_id: &str,
+    diagnostics: &mut BoundedDependencyDiagnostics,
+) {
+    let Some(identity) = identity else {
+        return;
+    };
+    if !catalog.is_writable() {
+        return;
+    }
+    if let Err(error) = catalog.install_generated_source_identity(identity.as_str(), key) {
+        diagnostics.warning(
+            "catalog.source_identity",
+            Some(dependency_id),
+            format!(
+                "could not record the read-free dependency identity, so a later process will read its artifacts again: {error}"
+            ),
+        );
+    }
 }
 
 const PACK_UNAVAILABLE_MESSAGE: &str = "resolved dependency has no exact locally producible artifact or compatible installed \
@@ -2178,23 +2387,90 @@ fn dependency_input_digest(
     limits: &DependencyPackLimits,
 ) -> String {
     let mut hasher = CanonicalHasher::new(DEPENDENCY_INPUT_DOMAIN);
+    hash_dependency_frame(&mut hasher, adapter, dependency);
+    hasher.sequence("artifacts", artifacts, |hasher, artifact| {
+        hash_artifact_slot(hasher, artifact.role, artifact.kind, artifact.module());
+        hasher.field("sha256", artifact.sha256().as_bytes());
+    });
+    hash_production_profile(&mut hasher, limits);
+    lower_hex_string(&hasher.finish())
+}
+
+/// Derive the read-free identity of one resolved dependency.
+///
+/// `None` means the exact read must happen: some artifact carries no read-free
+/// identity, or one is already bound to an exact byte digest, so no catalog
+/// answer can be trusted without reading.
+pub fn dependency_source_identity(
+    adapter: &dyn DependencyPackAdapter,
+    dependency: &ResolvedDependency,
+    limits: &DependencyPackLimits,
+) -> Option<DependencySourceIdentity> {
+    if dependency.artifacts.is_empty()
+        || dependency.artifacts.iter().any(|artifact| {
+            artifact.expected_sha256.is_some() || artifact.source_identity.is_none()
+        })
+    {
+        return None;
+    }
+    let mut hasher = CanonicalHasher::new(DEPENDENCY_SOURCE_IDENTITY_DOMAIN);
+    hash_dependency_frame(&mut hasher, adapter, dependency);
+    hasher.sequence("artifacts", &dependency.artifacts, |hasher, artifact| {
+        hash_artifact_slot(
+            hasher,
+            artifact.role,
+            artifact.kind,
+            artifact.module.as_deref(),
+        );
+        hasher.field(
+            "source_identity",
+            artifact
+                .source_identity
+                .as_ref()
+                .expect("every artifact carries a source identity here")
+                .as_str()
+                .as_bytes(),
+        );
+    });
+    hash_production_profile(&mut hasher, limits);
+    Some(DependencySourceIdentity::from_digest(lower_hex_string(
+        &hasher.finish(),
+    )))
+}
+
+/// Hash the frame both dependency digests share: who produced the pack and
+/// which dependency the pack describes.
+///
+/// The two digests differ only in how they name each artifact's contribution
+/// (exact bytes versus a read-free identity), so a mapping recorded under one
+/// can never be resolved as the other. Each caller hashes its own artifact
+/// sequence and then [`hash_production_profile`], so the order of fields in
+/// the canonical hash stays exactly what it was before this frame was shared.
+fn hash_dependency_frame(
+    hasher: &mut CanonicalHasher,
+    adapter: &dyn DependencyPackAdapter,
+    dependency: &ResolvedDependency,
+) {
     hasher.field("adapter_name", adapter.adapter_name().as_bytes());
     hasher.field("adapter_version", adapter.adapter_version().as_bytes());
-    hash_evidence(&mut hasher, &dependency.evidence);
+    hash_evidence(hasher, &dependency.evidence);
     let mut provenance: Vec<_> = dependency.provenance.iter().collect();
     provenance.sort_by(|left, right| (&left.key, &left.value).cmp(&(&right.key, &right.value)));
     hasher.sequence("provenance", &provenance, |hasher, entry| {
         hasher.field("key", entry.key.as_bytes());
         hasher.field("value", entry.value.as_bytes());
     });
-    hasher.sequence("artifacts", artifacts, |hasher, artifact| {
-        hasher.field("role", artifact.role.as_str().as_bytes());
-        hasher.field("kind", artifact_kind_name(artifact.kind).as_bytes());
-        hasher.field("module", artifact.module().unwrap_or("").as_bytes());
-        hasher.field("sha256", artifact.sha256().as_bytes());
-    });
-    hash_production_profile(&mut hasher, limits);
-    lower_hex_string(&hasher.finish())
+}
+
+fn hash_artifact_slot(
+    hasher: &mut CanonicalHasher,
+    role: DependencyArtifactRole,
+    kind: ExternalArtifactKind,
+    module: Option<&str>,
+) {
+    hasher.field("role", role.as_str().as_bytes());
+    hasher.field("kind", artifact_kind_name(kind).as_bytes());
+    hasher.field("module", module.unwrap_or("").as_bytes());
 }
 
 /// Hash every limit that can change the compiled bytes of a generated

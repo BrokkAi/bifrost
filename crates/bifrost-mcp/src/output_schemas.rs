@@ -8,6 +8,9 @@
 //! `mcp_common::build_server_spec_with_hidden` is the only place that reads it.
 
 use brokk_bifrost_analysis::blast_radius::{BlastRadiusResult, MissingTestsResult};
+use brokk_bifrost_analysis::code_quality::{
+    ReportStructuralCloneSmellsResult, ReportTestAssertionSmellsResult,
+};
 use brokk_bifrost_analysis::cyclomatic_complexity_diff::CyclomaticComplexityDiffResult;
 use brokk_bifrost_analysis::searchtools::{
     ActiveWorkspaceResult, GetDefinitionResult, SearchSymbolsResult,
@@ -38,6 +41,14 @@ const OUTPUT_SCHEMAS: &[(&str, OutputSchemaSource)] = &[
     (
         "search_symbols",
         generate_output_schema::<SearchSymbolsResult>,
+    ),
+    (
+        "report_test_assertion_smells",
+        generate_output_schema::<ReportTestAssertionSmellsResult>,
+    ),
+    (
+        "report_structural_clone_smells",
+        generate_output_schema::<ReportStructuralCloneSmellsResult>,
     ),
     (
         "get_definitions_by_location",

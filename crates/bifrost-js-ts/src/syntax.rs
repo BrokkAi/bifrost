@@ -1,6 +1,7 @@
 use crate::imports::{
     CommonJsRequireBindingKind, commonjs_require_module_specifier_from_declarator,
-    parse_commonjs_require_bindings_from_node,
+    js_ts_module_identity, parse_commonjs_require_bindings_from_node,
+    require_call_module_specifier,
 };
 use brokk_bifrost_core::analyzer::tree_walk::subtree_contains;
 use brokk_bifrost_core::analyzer::usages::model::{ImportBinding, ImportKind};
@@ -68,6 +69,15 @@ impl JsTsImportBinder {
             truncated_names: HashSet::default(),
             lexical_bindings: None,
         }
+    }
+
+    /// This binder's own lexical binding index, when it was built with one.
+    ///
+    /// Every binder [`compute_import_binder_for_root`] produces carries it, so
+    /// a caller that holds a binder holds the index too and need not walk the
+    /// file again to rebuild it.
+    pub fn lexical_bindings(&self) -> Option<&JsTsLexicalBindingIndex> {
+        self.lexical_bindings.as_ref()
     }
 
     fn with_lexical_bindings(lexical_bindings: JsTsLexicalBindingIndex) -> Self {
@@ -493,10 +503,11 @@ pub struct JsTsRuntimeRead {
     pub range: Range,
     pub root_range: Range,
     pub container_range: Range,
-    /// The structured query seed that represents this access. Dot-member
-    /// reads are field accesses themselves; a subscript read is represented
-    /// by its statically resolved container field so it does not require
-    /// mapping every subscript expression to the field-access kind.
+    /// The structured query seed that represents this access, resolved by
+    /// [`runtime_keyed_access_seed`]. Dot-member reads are field accesses
+    /// themselves; a subscript read is represented by the base of its
+    /// subscript chain, so it does not require mapping every subscript
+    /// expression to the field-access kind.
     pub candidate_anchor: Range,
     pub key_range: Range,
     pub lexical_resolution: JsTsRuntimeRootResolution,
@@ -1150,6 +1161,45 @@ pub fn static_member_property<'tree>(
     static_property_name(property, source)
 }
 
+/// The AST node whose structural fact represents a two-segment runtime keyed
+/// access.
+///
+/// A dot-member read is its own field access. The JS/TS structural kind table
+/// has no subscript fact, so a subscript read is represented by the base of
+/// its subscript chain: a dot-member container names its own field-access
+/// fact, while a computed container resolves to the binding the chain starts
+/// from (`process['env']['KEY']` is represented by `process`). Callers use
+/// this node's structural identity instead of re-deriving it from the
+/// container occurrence or from source text.
+///
+/// Returns `None` when `node` is not a member or subscript expression with
+/// exactly one container and one key segment; the same normalized shape
+/// [`static_runtime_keyed_access`] accepts.
+pub fn runtime_keyed_access_seed<'tree>(
+    node: Node<'tree>,
+    bindings: &JsTsLexicalBindingIndex,
+    source: &str,
+) -> Option<Node<'tree>> {
+    if !matches!(node.kind(), "member_expression" | "subscript_expression") {
+        return None;
+    }
+    let (root, segments) = runtime_path(node, source)?;
+    let (_, _, segments) = normalized_runtime_path(bindings, root, segments, source)?;
+    if segments.len() != 2 {
+        return None;
+    }
+    if node.kind() == "member_expression" {
+        return Some(node);
+    }
+    // `runtime_path` already returns transparent nodes, so the container
+    // segment is unwrapped; an inner object still needs the same unwrap.
+    let mut seed = segments[0].node;
+    while seed.kind() == "subscript_expression" {
+        seed = transparent_runtime_node(seed.child_by_field_name("object")?);
+    }
+    Some(seed)
+}
+
 /// Resolve a syntactically static keyed access on the Node runtime globals.
 ///
 /// This is deliberately narrower than [`static_member_property`]. Ordinary
@@ -1638,6 +1688,353 @@ fn runtime_write_targets<'tree>(
     targets
 }
 
+/// The source evidence that refuses the mutation-free proof for one module
+/// member (#3406, #3427).
+///
+/// Each variant that can point at source carries the exact range that refused
+/// the proof, so a caller can name the write site rather than report an
+/// unattributed refusal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum JsTsModuleMemberMutation {
+    /// A write-shaped target names the member, or names a dynamic key that
+    /// can be the member.
+    Write(Range),
+    /// The module object escapes to a writer this file-local walk cannot see.
+    Escape(Range),
+    /// The bounded walk did not finish, so this file proves nothing.
+    Budget,
+}
+
+/// Which member of the module object one write-shaped target names.
+enum WrittenMember {
+    /// The target statically names this member.
+    Named(String),
+    /// The target's key is computed, so it can name any member.
+    Any,
+}
+
+/// Every write this file makes to the members a namespace, default, or
+/// `require` binding reads from `module`, and every escape that could let a
+/// writer this walk cannot see make one (#3406, #3427).
+///
+/// Minting an exact external member identity for a `require("M").member(...)` /
+/// `import * as ns from "M"; ns.member(...)` reference, and closing that call's
+/// dispatch to the reviewed external member, are honest only while the member
+/// value read at the reference can still be the module's own. Two
+/// source-visible evidence families poison that proof, and both fail closed:
+///
+///  1. A write-shaped target (assignment, augmented assignment, update, the
+///     left side of a for-in/of, or `delete`) whose member-access receiver
+///     resolves to `module`. A statically named key refuses that member; a
+///     computed key refuses every member, because it can name any of them.
+///  2. Any use of an object-capable module binding outside its own declarator
+///     name and member-access object position. An alias, a call argument, an
+///     export, or a computed escape can carry the shared module object to a
+///     writer this file-local walk cannot see, so the proof refuses every
+///     member instead of tracking the value further.
+///
+/// Named (destructured) bindings import only the member value, never the
+/// object, so they cannot patch the module and are not tracked. A relative or
+/// absolute specifier has no module identity at all, so it matches no binding
+/// and the proof holds vacuously. Both walks are iterative and capped;
+/// exhausting the cap refuses every member.
+///
+/// The walks are file-wide, so a caller that asks about several members of one
+/// module -- a scan classifying every external callee in a file -- collects this
+/// once instead of rewalking the file per member.
+#[derive(Clone, Debug, Default)]
+pub struct JsTsModuleMemberWrites {
+    /// The first refusal that covers every member of the module.
+    every_member: Option<JsTsModuleMemberMutation>,
+    /// The first write to each member this file names statically.
+    named: HashMap<String, Range>,
+}
+
+impl JsTsModuleMemberWrites {
+    /// Collect from a caller that already built this file's lexical binding
+    /// index and import binder. Both are inputs to the proof, and rebuilding
+    /// them here would walk the file twice more than the proof itself needs.
+    pub fn collect_with(
+        root: Node<'_>,
+        source: &str,
+        module: &str,
+        lexical: &JsTsLexicalBindingIndex,
+        imports: &JsTsImportBinder,
+    ) -> Self {
+        module_member_writes(root, source, module, lexical, imports)
+    }
+
+    /// Collect for a caller that holds neither.
+    pub fn collect(root: Node<'_>, source: &str, module: &str) -> Self {
+        Self::collect_with(
+            root,
+            source,
+            module,
+            &JsTsLexicalBindingIndex::build(root, source),
+            &compute_import_binder_for_root(source, root),
+        )
+    }
+
+    /// What in this file can replace `member`, or `None` when nothing can.
+    ///
+    /// A write this file makes to `member` itself is the most specific refusal,
+    /// so it is reported ahead of one that merely covers every member.
+    pub fn mutation(&self, member: &str) -> Option<JsTsModuleMemberMutation> {
+        self.named
+            .get(member)
+            .copied()
+            .map(JsTsModuleMemberMutation::Write)
+            .or(self.every_member)
+    }
+}
+
+/// Whether no write in this file can replace the member a namespace, default,
+/// or `require` binding reads from `module` (#3406).
+///
+/// The one-member shorthand for [`JsTsModuleMemberWrites`], for a caller that
+/// asks about a single member once and has no refusal to report.
+pub fn module_member_is_mutation_free(
+    root: Node<'_>,
+    source: &str,
+    module: &str,
+    member: &str,
+) -> bool {
+    JsTsModuleMemberWrites::collect(root, source, module)
+        .mutation(member)
+        .is_none()
+}
+
+fn module_member_writes(
+    root: Node<'_>,
+    source: &str,
+    module: &str,
+    lexical: &JsTsLexicalBindingIndex,
+    imports: &JsTsImportBinder,
+) -> JsTsModuleMemberWrites {
+    const MAX_VISITED: usize = 200_000;
+    let refused = |mutation: JsTsModuleMemberMutation| JsTsModuleMemberWrites {
+        every_member: Some(mutation),
+        named: HashMap::default(),
+    };
+    let module_matches = |specifier: &str| {
+        js_ts_module_identity(specifier).is_some_and(|identity| identity.specifier == module)
+    };
+    // `require` declarators and TS import-equals clauses at any scope, since
+    // the top-level import binder only sees program-scope requires. The scope
+    // retains shadowing identity. `import_require_clause` carries its
+    // specifier directly; ordinary requires carry it on the call.
+    let mut required: HashMap<String, Vec<(JsTsLexicalBindingScope, bool)>> = HashMap::default();
+    let mut visited = 0usize;
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        visited += 1;
+        if visited > MAX_VISITED {
+            return refused(JsTsModuleMemberMutation::Budget);
+        }
+        if node.kind() == "variable_declarator"
+            && let Some(name) = node.child_by_field_name("name")
+            && name.kind() == "identifier"
+            && let Some(value) = node.child_by_field_name("value")
+            && let Some(specifier) = require_call_module_specifier(value, source)
+            && module_matches(&specifier)
+            && let Some(scope) = variable_binding_scope(node)
+        {
+            required
+                .entry(slice(name, source).to_string())
+                .or_default()
+                .push((scope, false));
+        }
+        if node.kind() == "import_require_clause" {
+            let mut cursor = node.walk();
+            let children: Vec<_> = node.named_children(&mut cursor).collect();
+            if let [name, specifier] = children.as_slice()
+                && name.kind() == "identifier"
+                && specifier.kind() == "string"
+                && module_matches(&unquote(slice(*specifier, source)))
+            {
+                required
+                    .entry(slice(*name, source).to_string())
+                    .or_default()
+                    .push((node_scope(root), true));
+            }
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+    let top_level_binding = |name: &str, byte: usize| match imports.binding_at(name, byte) {
+        JsTsImportBindingResolution::Exact(event)
+            if matches!(
+                event.binding.kind,
+                ImportKind::Namespace | ImportKind::CommonJsRequire | ImportKind::Default
+            ) && module_matches(&event.binding.module_specifier) =>
+        {
+            Some(event.binding.module_specifier.clone())
+        }
+        _ => None,
+    };
+    let scoped_require = |name: &str, byte: usize| {
+        required.get(name).is_some_and(|bindings| {
+            bindings.iter().any(|(bound, import_clause)| {
+                match lexical.binding_scope_at(name, byte) {
+                    Some(scope) => scope == *bound,
+                    // An import-equals binding is not a lexical declarator, so
+                    // a program-scope use has no lexical scope entry either.
+                    None => *import_clause,
+                }
+            })
+        })
+    };
+    let module_receiver = |node: Node<'_>| -> bool {
+        if node.kind() == "call_expression" {
+            return require_call_module_specifier(node, source)
+                .is_some_and(|specifier| module_matches(&specifier));
+        }
+        if node.kind() != "identifier" {
+            return false;
+        }
+        let name = slice(node, source);
+        top_level_binding(name, node.start_byte()).is_some()
+            || scoped_require(name, node.start_byte())
+    };
+    let escape_free = |node: Node<'_>| -> bool {
+        let Some(parent) = node.parent() else {
+            return false;
+        };
+        match parent.kind() {
+            "variable_declarator" => parent.child_by_field_name("name") == Some(node),
+            "member_expression" | "subscript_expression" => {
+                parent.child_by_field_name("object") == Some(node)
+            }
+            "namespace_import" | "import_clause" | "import_require_clause" => true,
+            _ => false,
+        }
+    };
+    let written_member = |access: JsTsRuntimeAccessKey| match access {
+        JsTsRuntimeAccessKey::Property(name) => Some(WrittenMember::Named(name)),
+        JsTsRuntimeAccessKey::Dynamic | JsTsRuntimeAccessKey::Unsupported => {
+            Some(WrittenMember::Any)
+        }
+        JsTsRuntimeAccessKey::Index(_) => None,
+    };
+    let member_write = |target: Node<'_>| -> Option<WrittenMember> {
+        if let Some((receiver, segments)) = runtime_path(target, source) {
+            if !module_receiver(receiver) {
+                return None;
+            }
+            return segments
+                .into_iter()
+                .next()
+                .and_then(|segment| written_member(segment.access));
+        }
+        // `require("M").member = ...`: the runtime-path walk stops at the call
+        // root, so resolve the object and the first access directly.
+        if !matches!(target.kind(), "member_expression" | "subscript_expression") {
+            return None;
+        }
+        let object = target.child_by_field_name("object")?;
+        if !module_receiver(object) {
+            return None;
+        }
+        let access = if target.kind() == "member_expression" {
+            static_member_property(target, source)
+                .map(|(_, name)| JsTsRuntimeAccessKey::Property(name))
+                .unwrap_or(JsTsRuntimeAccessKey::Dynamic)
+        } else {
+            target
+                .child_by_field_name("index")
+                .map(|index| runtime_subscript_access(index, source).1)
+                .unwrap_or(JsTsRuntimeAccessKey::Unsupported)
+        };
+        written_member(access)
+    };
+    let mut write_budget = JsTsRuntimeTraversalBudget {
+        remaining: usize::MAX,
+        exhausted: false,
+        visited_nodes: 0,
+    };
+    let mut writes = JsTsModuleMemberWrites::default();
+    // The earliest refusal in the file is the one reported, so a caller naming
+    // the site names the first thing a reader would find.
+    let mut refuse_every_member = |mutation: JsTsModuleMemberMutation| {
+        if writes
+            .every_member
+            .is_none_or(|first| mutation_start_byte(mutation) < mutation_start_byte(first))
+        {
+            writes.every_member = Some(mutation);
+        }
+    };
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        visited += 1;
+        if visited > MAX_VISITED {
+            return refused(JsTsModuleMemberMutation::Budget);
+        }
+        let target = match node.kind() {
+            "assignment_expression" | "augmented_assignment_expression" => {
+                node.child_by_field_name("left")
+            }
+            "update_expression" => node.child_by_field_name("argument"),
+            "for_in_statement" | "for_of_statement" => node.child_by_field_name("left"),
+            "unary_expression" => node
+                .child(0)
+                .filter(|operator| slice(*operator, source) == "delete")
+                .and_then(|_| node.child_by_field_name("argument")),
+            _ => None,
+        };
+        if let Some(target) = target {
+            for target in runtime_write_targets(target, &mut write_budget) {
+                let range = node_source_range(target);
+                match member_write(target) {
+                    Some(WrittenMember::Named(name)) => {
+                        writes
+                            .named
+                            .entry(name)
+                            .and_modify(|first| {
+                                if range.start_byte < first.start_byte {
+                                    *first = range;
+                                }
+                            })
+                            .or_insert(range);
+                    }
+                    Some(WrittenMember::Any) => {
+                        refuse_every_member(JsTsModuleMemberMutation::Write(range));
+                    }
+                    None => {}
+                }
+            }
+        }
+        if matches!(
+            node.kind(),
+            "identifier" | "shorthand_property_identifier_pattern"
+        ) {
+            let name = slice(node, source);
+            let bound = top_level_binding(name, node.start_byte()).is_some()
+                || scoped_require(name, node.start_byte());
+            if bound && !escape_free(node) {
+                refuse_every_member(JsTsModuleMemberMutation::Escape(node_source_range(node)));
+            }
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+    writes
+}
+
+/// Where a refusal starts, so the earliest one in the file is the one reported.
+/// An exhausted budget refuses the whole file and has no position of its own.
+fn mutation_start_byte(mutation: JsTsModuleMemberMutation) -> usize {
+    match mutation {
+        JsTsModuleMemberMutation::Write(range) | JsTsModuleMemberMutation::Escape(range) => {
+            range.start_byte
+        }
+        JsTsModuleMemberMutation::Budget => usize::MAX,
+    }
+}
+
 /// Extract bounded AST-derived runtime-root keyed accesses and write facts.
 /// This is deliberately syntax-only: `root_name` and `container` are
 /// candidates for the semantic model to activate, never runtime identity by
@@ -1733,6 +2130,8 @@ pub fn extract_js_ts_runtime_reads(
                 }
                 None => JsTsRuntimeExecutionContext::Program,
             };
+            let candidate_anchor = runtime_keyed_access_seed(node, &bindings, source)
+                .expect("a normalized runtime read names its structural seed");
             reads.push(JsTsRuntimeRead {
                 binding_name: slice(path_root, source).to_string(),
                 root_name,
@@ -1741,11 +2140,7 @@ pub fn extract_js_ts_runtime_reads(
                 range: node_source_range(node),
                 root_range: node_source_range(path_root),
                 container_range: node_source_range(container.node),
-                candidate_anchor: if node.kind() == "subscript_expression" {
-                    node_source_range(container.node)
-                } else {
-                    node_source_range(node)
-                },
+                candidate_anchor: node_source_range(candidate_anchor),
                 key_range: key.key_range,
                 lexical_resolution,
                 mutation,
@@ -1882,6 +2277,19 @@ fn runtime_call_is_local(
         })
 }
 
+/// Whether an `export_statement` only declares a name in this module.
+///
+/// A declaration export introduces no evaluation of its own: `export function
+/// f() {}`, `export class C {}`, and `export const x = ...` all stay in this
+/// module, and any initializer is still visited as its own node. A re-export
+/// names a `source` and `export default <expression>` names a `value`, so both
+/// still run code this module does not contain.
+fn export_declaration_only(node: Node<'_>) -> bool {
+    node.child_by_field_name("declaration").is_some()
+        && node.child_by_field_name("source").is_none()
+        && node.child_by_field_name("value").is_none()
+}
+
 fn runtime_effect_coverage_with_bindings_bounded(
     bindings: &JsTsLexicalBindingIndex,
     root: Node<'_>,
@@ -1909,7 +2317,9 @@ fn runtime_effect_coverage_with_bindings_bounded(
         ) {
             return (JsTsRuntimeEffectCoverage::Unknown, !budget.exhausted);
         }
-        if matches!(node.kind(), "import_statement" | "export_statement") {
+        if matches!(node.kind(), "import_statement")
+            || (node.kind() == "export_statement" && !export_declaration_only(node))
+        {
             return (JsTsRuntimeEffectCoverage::Unknown, !budget.exhausted);
         }
         if node.kind() == "call_expression"
@@ -1956,7 +2366,9 @@ fn runtime_effect_coverage_scoped(
         ) {
             return (JsTsRuntimeEffectCoverage::Unknown, !budget.exhausted);
         }
-        if matches!(node.kind(), "import_statement" | "export_statement") {
+        if matches!(node.kind(), "import_statement")
+            || (node.kind() == "export_statement" && !export_declaration_only(node))
+        {
             return (JsTsRuntimeEffectCoverage::Unknown, !budget.exhausted);
         }
         if node.kind() == "call_expression"
@@ -3396,13 +3808,18 @@ mod tests {
 
     #[test]
     fn runtime_reads_use_container_anchor_for_static_subscript_properties() {
-        let source = "process.env['CONFIG_TOKEN']; process.env.REMOTE_DIRECTORY;";
+        let source = "process.env['CONFIG_TOKEN']; process.env.REMOTE_DIRECTORY; \
+                      process['env']['CONFIG_TOKEN']; process['env'].REMOTE_DIRECTORY;";
         let tree = parse_javascript(source);
         let facts = extract_js_ts_runtime_reads(tree.root_node(), source, 32);
         let bracket = facts
             .reads
             .iter()
-            .find(|read| read.access == JsTsRuntimeAccessKey::Property("CONFIG_TOKEN".into()))
+            .find(|read| {
+                read.access == JsTsRuntimeAccessKey::Property("CONFIG_TOKEN".into())
+                    && &source[read.range.start_byte..read.range.end_byte]
+                        == "process.env['CONFIG_TOKEN']"
+            })
             .expect("bracket property read");
         assert_eq!(
             &source[bracket.range.start_byte..bracket.range.end_byte],
@@ -3418,6 +3835,29 @@ mod tests {
             .find(|read| read.access == JsTsRuntimeAccessKey::Property("REMOTE_DIRECTORY".into()))
             .expect("dot property read");
         assert_eq!(dot.candidate_anchor, dot.range);
+        let computed = facts
+            .reads
+            .iter()
+            .find(|read| {
+                read.access == JsTsRuntimeAccessKey::Property("CONFIG_TOKEN".into())
+                    && &source[read.range.start_byte..read.range.end_byte]
+                        == "process['env']['CONFIG_TOKEN']"
+            })
+            .expect("computed-container property read");
+        assert_eq!(
+            &source[computed.candidate_anchor.start_byte..computed.candidate_anchor.end_byte],
+            "process"
+        );
+        let computed_member = facts
+            .reads
+            .iter()
+            .find(|read| {
+                read.access == JsTsRuntimeAccessKey::Property("REMOTE_DIRECTORY".into())
+                    && &source[read.range.start_byte..read.range.end_byte]
+                        == "process['env'].REMOTE_DIRECTORY"
+            })
+            .expect("computed-container member read");
+        assert_eq!(computed_member.candidate_anchor, computed_member.range);
     }
 
     #[test]
@@ -3694,6 +4134,54 @@ function read() {
             js_ts_runtime_effect_coverage(parse_javascript(open).root_node(), open),
             JsTsRuntimeEffectCoverage::Unknown
         );
+    }
+
+    #[test]
+    fn runtime_declaration_exports_keep_the_module_scope_closed() {
+        // A declaration export introduces no evaluation of its own: the
+        // exported function body belongs to its own scope, so a module-scope
+        // read beside it stays exact. Re-exports and `export default
+        // <expression>` still run code this module does not contain.
+        let declared =
+            "const read = process.env.DFB_INPUT;\nexport function helper() { return 1; }\n";
+        let tree = parse_javascript(declared);
+        let facts = extract_js_ts_runtime_reads(tree.root_node(), declared, 64);
+        assert!(facts.complete, "{facts:#?}");
+        assert_eq!(
+            facts.effect_coverage,
+            JsTsRuntimeEffectCoverage::ClosedLocalCalls,
+            "{facts:#?}"
+        );
+        let read = facts
+            .reads
+            .iter()
+            .find(|read| read.access == JsTsRuntimeAccessKey::Property("DFB_INPUT".into()))
+            .expect("the module-scope read is extracted");
+        assert_eq!(read.mutation, JsTsRuntimeMutationEvidence::NoKnownWrite);
+        assert_eq!(read.execution, JsTsRuntimeExecutionContext::Program);
+
+        for source in [
+            "const read = process.env.DFB_INPUT;\nexport { helper } from \"./helper\";\n",
+            "const read = process.env.DFB_INPUT;\nexport default helper();\n",
+        ] {
+            let tree = parse_javascript(source);
+            let facts = extract_js_ts_runtime_reads(tree.root_node(), source, 64);
+            assert_eq!(
+                facts.effect_coverage,
+                JsTsRuntimeEffectCoverage::Unknown,
+                "{facts:#?}"
+            );
+            let read = facts
+                .reads
+                .iter()
+                .find(|read| read.access == JsTsRuntimeAccessKey::Property("DFB_INPUT".into()))
+                .expect("the module-scope read is extracted");
+            assert_eq!(
+                read.mutation,
+                JsTsRuntimeMutationEvidence::UnknownEffects,
+                "{facts:#?}"
+            );
+        }
     }
 
     #[test]
@@ -4296,5 +4784,157 @@ function read() {
         let use_byte = source.find("task.status").expect("task use");
 
         assert!(!bindings.is_bound_at("task", use_byte));
+    }
+
+    fn assert_module_member_mutation(source: &str, free: bool) {
+        for parse in [parse_javascript, parse_typescript] {
+            let tree = parse(source);
+            assert_eq!(
+                module_member_is_mutation_free(
+                    tree.root_node(),
+                    source,
+                    "child_process",
+                    "execSync"
+                ),
+                free,
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn module_member_mutation_free_holds_for_read_only_receivers() {
+        for source in [
+            r#"const cp = require("child_process");
+function run(command) { cp.execSync(command); }
+"#,
+            r#"const cp = require("node:child_process");
+cp.execSync("ls");
+cp.readFileSync("x");
+"#,
+            r#"import * as cp from "child_process";
+cp.execSync("ls");
+"#,
+            r#"import cp from "child_process";
+cp.execSync("ls");
+"#,
+            r#"import cp = require("child_process");
+cp.execSync("ls");
+"#,
+            // A write to a different member of the same module is not a write
+            // to the closed member.
+            r#"const cp = require("child_process");
+cp.readFileSync = wrap;
+cp.execSync("ls");
+"#,
+            // A destructured binding imports the member value, not the object:
+            // rebinding it cannot patch the module.
+            r#"const { execSync } = require("child_process");
+execSync = fake;
+"#,
+            // A same-named member of an unrelated object is not the module
+            // member.
+            r#"const cp = require("child_process");
+function run(opts) { opts.execSync = fake; cp.execSync("ls"); }
+"#,
+            // A shadowed binding is not the module binding.
+            r#"const cp = require("child_process");
+function g(cp) { cp.execSync = fake; }
+cp.execSync("ls");
+"#,
+            // No module binding anywhere: nothing here can patch the module.
+            r#"function run(opts) { opts.execSync = fake; }
+"#,
+        ] {
+            assert_module_member_mutation(source, true);
+        }
+    }
+
+    #[test]
+    fn module_member_mutation_poisons_writes_and_escapes() {
+        for source in [
+            r#"const cp = require("child_process");
+cp.execSync = fake;
+"#,
+            r#"const cp = require("child_process");
+cp.execSync += suffix;
+"#,
+            r#"const cp = require("child_process");
+cp.execSync++;
+"#,
+            r#"const cp = require("child_process");
+delete cp.execSync;
+"#,
+            r#"const cp = require("child_process");
+for (cp.execSync of batches) {}
+"#,
+            r#"const cp = require("child_process");
+cp["execSync"] = fake;
+"#,
+            r#"const cp = require("child_process");
+cp[selected] = fake;
+"#,
+            r#"require("child_process").execSync = fake;
+"#,
+            r#"function patch() {
+  const cp = require("child_process");
+  cp.execSync = fake;
+}
+"#,
+            r#"import * as cp from "child_process";
+cp.execSync = fake;
+"#,
+            r#"const cp = require("node:child_process");
+cp.execSync = fake;
+"#,
+            // An alias can carry the module object to an unseen writer.
+            r#"const cp = require("child_process");
+const aliased = cp;
+"#,
+            r#"const cp = require("child_process");
+patch(cp);
+"#,
+            r#"const cp = require("child_process");
+Object.assign(cp, { execSync: fake });
+"#,
+            r#"const cp = require("child_process");
+export { cp };
+"#,
+            r#"const cp = require("child_process");
+module.exports = cp;
+"#,
+        ] {
+            assert_module_member_mutation(source, false);
+        }
+    }
+
+    #[test]
+    fn module_member_mutation_tracks_typescript_import_equals_requires() {
+        for (source, free) in [
+            (
+                r#"import cp = require("child_process");
+cp.execSync("ls");
+"#,
+                true,
+            ),
+            (
+                r#"import cp = require("child_process");
+cp.execSync = fake;
+"#,
+                false,
+            ),
+        ] {
+            let tree = parse_typescript(source);
+            assert_eq!(
+                module_member_is_mutation_free(
+                    tree.root_node(),
+                    source,
+                    "child_process",
+                    "execSync"
+                ),
+                free,
+                "{source}"
+            );
+        }
     }
 }

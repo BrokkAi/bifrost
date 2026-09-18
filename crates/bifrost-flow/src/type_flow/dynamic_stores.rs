@@ -214,6 +214,23 @@ pub(super) fn survey(
             }
         })
         .collect::<Vec<_>>();
+    // A write through the enclosing procedure's own stable receiver is bounded
+    // by that procedure's class whatever any single root observes: `self`
+    // names an instance of the declaring class or one of its descendants,
+    // which is the same bound the `SelfReceiver` arm below records. Keeping
+    // that bound where an observation fails scopes the write to its own
+    // hierarchy instead of reopening every class in the workspace, which one
+    // unobservable `setattr` in an unrelated module otherwise does.
+    let structural_receiver_classes = writes
+        .iter()
+        .map(|write| {
+            let receiver = write.receiver?;
+            stable_receivers
+                .get(&write.procedure.durable_key())
+                .filter(|stable| stable.contains(&receiver))?;
+            adapter.enclosing_class(workspace, &write.procedure)
+        })
+        .collect::<Vec<_>>();
     // A write whose receiver reaches a root parameter takes its identity from
     // an actual argument supplied by some caller. A root whose survey failed
     // may have carried that caller, so such a write cannot be trusted as
@@ -355,7 +372,13 @@ pub(super) fn survey(
                 continue;
             }
             let Some(observation) = &observations[index] else {
-                effect.evidence.reason = Some(UnknownReason::UnmodeledLoad);
+                open_or_bound(
+                    workspace,
+                    adapter,
+                    effect,
+                    structural_receiver_classes[index].as_ref(),
+                    UnknownReason::UnmodeledLoad,
+                );
                 continue;
             };
             let observed = match observation {
@@ -378,7 +401,13 @@ pub(super) fn survey(
             let sources = match observed {
                 Ok(Some(sources)) => sources,
                 Ok(None) => {
-                    effect.evidence.reason = Some(UnknownReason::UnmodeledLoad);
+                    open_or_bound(
+                        workspace,
+                        adapter,
+                        effect,
+                        structural_receiver_classes[index].as_ref(),
+                        UnknownReason::UnmodeledLoad,
+                    );
                     continue;
                 }
                 Err(CorrelationError::Cancelled { .. }) => {
@@ -452,7 +481,13 @@ pub(super) fn survey(
                 }
             }
             if !identity_observed {
-                effect.evidence.reason = Some(UnknownReason::UnmodeledLoad);
+                open_or_bound(
+                    workspace,
+                    adapter,
+                    effect,
+                    structural_receiver_classes[index].as_ref(),
+                    UnknownReason::UnmodeledLoad,
+                );
             }
         }
     }
@@ -461,7 +496,13 @@ pub(super) fn survey(
             if effect.evidence.reason.is_none()
                 && (effect.classes.is_empty() || caller_dependent[index])
             {
-                effect.evidence.reason = Some(reason.clone());
+                open_or_bound(
+                    workspace,
+                    adapter,
+                    effect,
+                    structural_receiver_classes[index].as_ref(),
+                    reason.clone(),
+                );
             }
         }
     }
@@ -483,6 +524,22 @@ fn mark_unsurveyed(
         if write.procedure.durable_key() == root.durable_key() {
             caller_dependent[index] = true;
         }
+    }
+}
+
+/// Record what a write's receiver can be when an observation failed: the
+/// structural bound its own `self` states, or the honest open reason when the
+/// receiver has no such bound.
+fn open_or_bound(
+    workspace: &WorkspaceAnalyzer,
+    adapter: &dyn TypeFlowAdapter,
+    effect: &mut ScopedDynamicWrite,
+    structural_class: Option<&ClassIdentity>,
+    reason: UnknownReason,
+) {
+    match structural_class {
+        Some(class) => add_bound(workspace, adapter, effect, class),
+        None => effect.evidence.reason = Some(reason),
     }
 }
 

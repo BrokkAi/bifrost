@@ -46,10 +46,10 @@ use super::syntax::{
     is_bare_companion_method_value_reference, is_call_function_reference_with_parents,
     is_constructor_like_reference, is_declaration_name, is_enclosing_template_qualifier_reference,
     is_extractor_reference_with_parents, is_field_expression_value, is_identifier_node,
-    is_infix_pattern_operator, is_owner_qualified_this, is_qualified_stable_root,
-    is_scala_case_pattern_binder_with_parents, is_scala_class_reference,
+    is_infix_pattern_operator, is_owner_qualified_this, is_qualified_stable_root_with_parents,
+    is_scala_case_pattern_binder_with_parents, is_scala_class_reference_with_parents,
     is_scala_named_argument_assignment, is_scala_object_reference, is_semantic_call_argument,
-    is_stable_type_qualifier, is_terminal_stable_field_reference,
+    is_stable_type_qualifier_with_parents, is_terminal_stable_field_reference,
     named_argument_invocation_owner_with_parents, node_text, parenthesized_arity,
     qualified_stable_type_reference_with_parents, resolve_stable_object_expression,
     scala_callable_alternative_is_candidate, scala_callable_alternative_matches,
@@ -9549,8 +9549,9 @@ fn record_reference(
         // a separate `instance_expression` case (avoids double counting).
         "type_identifier" => {
             let text = node_text(node, ctx.source);
-            if node
-                .parent()
+            if ctx
+                .parents
+                .parent(node)
                 .filter(|parent| parent.kind() == "projected_type")
                 .is_some_and(|projection| projection.child_by_field_name("selector") == Some(node))
             {
@@ -9572,7 +9573,7 @@ fn record_reference(
             if record_qualified_stable_reference(node, token, ctx, bindings) {
                 return;
             }
-            if is_stable_type_qualifier(node)
+            if is_stable_type_qualifier_with_parents(node, ctx.parents)
                 && bindings.resolve_symbol(text).is_unknown()
                 && !bindings.is_shadowed(text)
                 && let Some(ScalaResolvedReference::Exact(target)) =
@@ -9658,7 +9659,7 @@ fn record_reference(
                 (bindings.resolve_symbol(text).is_unknown() && !bindings.is_shadowed(text))
                     .then(|| ctx.visible_object_reference(node.start_byte(), text))
                     .flatten()
-            } else if is_scala_class_reference(node, ctx.source) {
+            } else if is_scala_class_reference_with_parents(node, ctx.source, ctx.parents) {
                 ctx.visible_type_reference(token, node, text)
             } else {
                 None
@@ -10310,7 +10311,7 @@ fn record_reference(
                 record_unqualified_type_application(node, token, name, ctx, bindings);
                 return;
             }
-            if is_scala_class_reference(node, ctx.source)
+            if is_scala_class_reference_with_parents(node, ctx.source, ctx.parents)
                 && !bare_companion_method_value
                 && let Some(target) = ctx.visible_type_reference(token, node, name)
             {
@@ -10778,7 +10779,7 @@ fn record_qualified_root_owner_reference(
     ctx: &mut ScalaScan<'_, '_, '_>,
     bindings: &LocalInferenceEngine<ScalaLocalBinding>,
 ) -> bool {
-    if !is_qualified_stable_root(node)
+    if !is_qualified_stable_root_with_parents(node, ctx.parents)
         || !bindings.resolve_symbol(name).is_unknown()
         || bindings.is_shadowed(name)
     {
@@ -10861,7 +10862,7 @@ fn record_foreign_type_reference(
     bindings: &LocalInferenceEngine<ScalaLocalBinding>,
 ) {
     if ctx.workspace.is_none()
-        || !is_scala_class_reference(node, ctx.source)
+        || !is_scala_class_reference_with_parents(node, ctx.source, ctx.parents)
         || is_declaration_name(node)
         || !bindings.resolve_symbol(text).is_unknown()
         || bindings.is_shadowed(text)
@@ -10894,7 +10895,7 @@ fn record_foreign_type_reference(
     // constructor's arity family. The argument list belongs to the
     // `instance_expression`, which the shape helper reads from the outermost
     // type node rather than from the leaf.
-    if let Some(constructed) = foreign_constructed_type_root(node)
+    if let Some(constructed) = foreign_constructed_type_root(node, ctx.parents)
         && let Some(call_shape) =
             call_site_shape_for_reference_with_parents(constructed, ctx.parents)
     {
@@ -10916,10 +10917,13 @@ fn record_foreign_type_reference(
 /// `None` when the leaf is not the constructed type of any `new`. Only the
 /// last segment of a qualified type is the type itself; `lib` in
 /// `new lib.Stats()` names a package.
-fn foreign_constructed_type_root(node: Node<'_>) -> Option<Node<'_>> {
+fn foreign_constructed_type_root<'tree>(
+    node: Node<'tree>,
+    parents: &ParentIndex<'tree>,
+) -> Option<Node<'tree>> {
     let mut constructed = node;
     loop {
-        let parent = constructed.parent()?;
+        let parent = parents.parent(constructed)?;
         if parent.kind() == "instance_expression" {
             return Some(constructed);
         }
@@ -12420,20 +12424,20 @@ fn self_type_field_resolution(
         .map_or(FieldResolution::NoMatch, FieldResolution::Resolved)
 }
 
-fn companion_method_value_context(
-    mut node: Node<'_>,
+fn companion_method_value_context<'tree>(
+    mut node: Node<'tree>,
     token: QueryToken<'_>,
-    ctx: &ScalaScan<'_, '_, '_>,
+    ctx: &ScalaScan<'_, '_, 'tree>,
     bindings: &LocalInferenceEngine<ScalaLocalBinding>,
 ) -> ScalaMethodValueContext {
-    if let Some(method_value) = scala_method_value_wrapper(node) {
+    if let Some(method_value) = scala_method_value_wrapper_with_parents(node, ctx.parents) {
         node = method_value;
-    } else if let Some(generic) = node.parent().filter(|parent| {
+    } else if let Some(generic) = ctx.parents.parent(node).filter(|parent| {
         parent.kind() == "generic_function" && parent.child_by_field_name("function") == Some(node)
     }) {
         node = generic;
     }
-    if let Some(postfix) = node.parent().filter(|parent| {
+    if let Some(postfix) = ctx.parents.parent(node).filter(|parent| {
         if parent.kind() != "postfix_expression" {
             return false;
         }
@@ -12445,19 +12449,20 @@ fn companion_method_value_context(
     }) {
         node = postfix;
     }
-    if let Some(expected_type) = node
-        .parent()
-        .and_then(|definition| match definition.kind() {
-            "val_definition" | "var_definition"
-                if definition.child_by_field_name("value") == Some(node) =>
-            {
-                definition.child_by_field_name("type")
-            }
-            "function_definition" if definition.child_by_field_name("body") == Some(node) => {
-                definition.child_by_field_name("return_type")
-            }
-            _ => None,
-        })
+    if let Some(expected_type) =
+        ctx.parents
+            .parent(node)
+            .and_then(|definition| match definition.kind() {
+                "val_definition" | "var_definition"
+                    if definition.child_by_field_name("value") == Some(node) =>
+                {
+                    definition.child_by_field_name("type")
+                }
+                "function_definition" if definition.child_by_field_name("body") == Some(node) => {
+                    definition.child_by_field_name("return_type")
+                }
+                _ => None,
+            })
     {
         if expected_type.kind() != "function_type" {
             return ScalaMethodValueContext::Incompatible;
@@ -12479,7 +12484,7 @@ fn call_parameter_method_value_context(
     ctx: &ScalaScan<'_, '_, '_>,
     bindings: &LocalInferenceEngine<ScalaLocalBinding>,
 ) -> ScalaMethodValueContext {
-    let Some(arguments) = node.parent() else {
+    let Some(arguments) = ctx.parents.parent(node) else {
         return ScalaMethodValueContext::Unknown;
     };
     if arguments.kind() != "arguments" {
@@ -12493,7 +12498,7 @@ fn call_parameter_method_value_context(
     else {
         return ScalaMethodValueContext::Unknown;
     };
-    let Some(call) = arguments.parent() else {
+    let Some(call) = ctx.parents.parent(arguments) else {
         return ScalaMethodValueContext::Unknown;
     };
     if call.kind() != "call_expression" || call.child_by_field_name("arguments") != Some(arguments)
@@ -12664,7 +12669,7 @@ fn record_exact_callable_reference(
     node: Node<'_>,
     ctx: &mut ScalaScan<'_, '_, '_>,
 ) {
-    if is_explicit_eta_reference(node, ctx.source)
+    if is_explicit_eta_reference_with_parents(node, ctx.source, ctx.parents)
         || is_unapplied_type_application(node, ctx.parents)
     {
         ctx.record_exact(method, ScalaReferenceRole::Callable, node);
@@ -12686,17 +12691,21 @@ fn is_unapplied_type_application<'tree>(node: Node<'tree>, parents: &ParentIndex
     })
 }
 
-fn is_explicit_eta_reference(mut node: Node<'_>, source: &str) -> bool {
-    if scala_method_value_wrapper(node).is_some() {
+fn is_explicit_eta_reference_with_parents<'tree>(
+    mut node: Node<'tree>,
+    source: &str,
+    parents: &ParentIndex<'tree>,
+) -> bool {
+    if scala_method_value_wrapper_with_parents(node, parents).is_some() {
         return true;
     }
-    if let Some(generic) = node.parent().filter(|parent| {
+    if let Some(generic) = parents.parent(node).filter(|parent| {
         parent.kind() == "generic_function" && parent.child_by_field_name("function") == Some(node)
     }) {
         node = generic;
     }
-    let Some(postfix) = node
-        .parent()
+    let Some(postfix) = parents
+        .parent(node)
         .filter(|parent| parent.kind() == "postfix_expression")
     else {
         return false;
@@ -12711,13 +12720,17 @@ fn is_explicit_eta_reference(mut node: Node<'_>, source: &str) -> bool {
 /// The released grammar represents `method _` as `method_value`, while older
 /// grammars use a postfix expression. Preserve the whole value node so callers
 /// can read its expected function type from the surrounding context.
-fn scala_method_value_wrapper(mut node: Node<'_>) -> Option<Node<'_>> {
-    if let Some(generic) = node.parent().filter(|parent| {
+fn scala_method_value_wrapper_with_parents<'tree>(
+    mut node: Node<'tree>,
+    parents: &ParentIndex<'tree>,
+) -> Option<Node<'tree>> {
+    if let Some(generic) = parents.parent(node).filter(|parent| {
         parent.kind() == "generic_function" && parent.child_by_field_name("function") == Some(node)
     }) {
         node = generic;
     }
-    node.parent()
+    parents
+        .parent(node)
         .filter(|parent| parent.kind() == "method_value")
 }
 
@@ -12886,7 +12899,7 @@ fn record_extension_scope_parameterless_method(
     member: &str,
     ctx: &mut ScalaScan<'_, '_, '_>,
 ) -> bool {
-    for extension in enclosing_extension_definitions(node) {
+    for extension in enclosing_extension_definitions_with_parents(node, ctx.parents) {
         let Some(receiver_type) =
             scala_extension_receiver_type_node_local(extension.child_by_field_name("parameters"))
         else {
@@ -12951,9 +12964,12 @@ fn record_extension_scope_parameterless_method(
     false
 }
 
-fn enclosing_extension_definitions(mut node: Node<'_>) -> Vec<Node<'_>> {
+fn enclosing_extension_definitions_with_parents<'tree>(
+    mut node: Node<'tree>,
+    parents: &ParentIndex<'tree>,
+) -> Vec<Node<'tree>> {
     let mut definitions = Vec::new();
-    while let Some(parent) = node.parent() {
+    while let Some(parent) = parents.parent(node) {
         if parent.kind() == "extension_definition" {
             definitions.push(parent);
         }

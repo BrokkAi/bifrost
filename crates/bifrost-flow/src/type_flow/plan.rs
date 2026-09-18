@@ -27,6 +27,7 @@ use crate::analyzer::semantic::{
     SemanticCallSite, SemanticCapability, SemanticEffect, SemanticGapDischarge, SemanticLocator,
     SemanticProviderError, SemanticValueKind, SemanticWork, SourceSite, SourceSiteKind, SourceSpan,
     StableDigest, TypeFlowAdapter, UnknownReason, ValueFlowEndpoint, ValueFlowSnapshot, ValueId,
+    source_site_kind_tag,
 };
 use crate::analyzer::{ProjectFile, WorkspaceAnalyzer};
 use crate::dataflow::SemanticInputStatus;
@@ -52,7 +53,7 @@ use super::correlations::{
 use super::field_refinement::{self, FieldLoadRefinement, FieldVersion};
 use super::field_slots::{FieldSlotIndex, MemberStoreEvidence, receiver_values};
 use super::refinement_sources::DefinitionSources;
-use super::summary::class_set_local_structure_digest;
+use super::summary::{class_atom_fingerprint, class_set_local_structure_digest};
 
 /// Restrict the dependency relation to transfers that preserve runtime class.
 /// Computation result seeds are added separately by `seed_procedure`.
@@ -424,6 +425,13 @@ impl From<ValueFlowPlanError> for TypeFlowPlanError {
     }
 }
 
+/// Domain separator for [`SeedTables::content_keyed_event_key`].
+const CONTENT_KEYED_EVENT: &[u8] = b"bifrost-type-flow-content-keyed-event-v1";
+
+/// Set on every content-derived ordinal so it cannot collide with a counter
+/// ordinal, which starts at zero and counts up.
+const CONTENT_KEYED_ORDINAL_BIT: u32 = 1 << 31;
+
 /// One spec under construction plus the reporting record parallel to it.
 struct SeedTables {
     sources: Vec<(ValueFlowSourceSpec, ClassAtom, SourceSite)>,
@@ -510,6 +518,50 @@ impl SeedTables {
             ),
             site,
         ));
+    }
+
+    /// An event key whose ordinal states what the event is, not how many
+    /// events the plan had already seeded at its site.
+    ///
+    /// [`Self::event_key`] numbers an event with a per-plan counter over
+    /// (site, kind). A guard publishes an admitted narrowing source only when
+    /// an input reaching it independently admits the proven class, and that
+    /// depends on the root the guard was reached from, so the same guard seeds
+    /// a different number of sources under different roots and renumbers every
+    /// later event at its site. A persisted summary names its events by this
+    /// key, so under the counter a restored fact could name no live source, or
+    /// worse, silently name the wrong one (#3430). A guard source therefore
+    /// derives its ordinal from its own content: its arm classification, the
+    /// class it states, the binding it states it about, and the program point
+    /// that states it. The high bit separates the two spaces, so a content
+    /// ordinal can never equal a counter ordinal at one site.
+    ///
+    /// `discriminator` separates the seeding roles that share this space.
+    fn content_keyed_event_key(
+        &self,
+        point: &ProgramPointHandle,
+        discriminator: &[u8],
+        site_kind: SourceSiteKind,
+        atom: &ClassAtom,
+        carrier: &ValueFlowCarrier,
+        procedure: &SemanticLocator,
+    ) -> ValueFlowEventKey {
+        let mut digest = LengthDelimitedDigest::new(CONTENT_KEYED_EVENT);
+        digest.push(discriminator);
+        digest.push(&point.id().get().to_le_bytes());
+        digest.push(&[source_site_kind_tag(site_kind)]);
+        digest.push(class_atom_fingerprint(atom).as_bytes());
+        carrier
+            .stable_key()
+            .expect("a guarded binding carrier has a stable key")
+            .push_procedure_local_identity(&mut digest, procedure);
+        let ordinal = u32::from_le_bytes(
+            digest.finish().as_bytes()[..4]
+                .try_into()
+                .expect("a digest yields four leading bytes"),
+        ) | CONTENT_KEYED_ORDINAL_BIT;
+        ValueFlowEventKey::at_point(point, ordinal, ValueFlowEventKind::Source)
+            .expect("a live point with a retained source mapping yields an event key")
     }
 
     fn event_key(
@@ -951,17 +1003,32 @@ fn guard_transfers(
                         kind,
                     )
                     .expect("a workspace guard retains its source file");
-                    let key = tables.event_key(&point, ValueFlowEventKind::Source);
+                    let key = tables.content_keyed_event_key(
+                        &point,
+                        b"guard-arm",
+                        kind,
+                        &atom,
+                        &carrier,
+                        procedure.semantics().locator(),
+                    );
                     source_evidence.insert(key.clone(), (atom.clone(), kind));
                     // The arm's own source is an ordinary plan source: a
-                    // later guard classifies it like any other.
-                    match &atom {
-                        ClassAtom::Class(class) => sources_by_class
-                            .entry(class.clone())
-                            .or_default()
-                            .push(key.clone()),
-                        ClassAtom::Unknown(_) => unknown_sources.push(key.clone()),
-                    }
+                    // later guard classifies it like any other. The atom also
+                    // decides where the source stops: a proven class reaches
+                    // the reconvergence, an unknown remainder ends there.
+                    let ends_at_join = match &atom {
+                        ClassAtom::Class(class) => {
+                            sources_by_class
+                                .entry(class.clone())
+                                .or_default()
+                                .push(key.clone());
+                            None
+                        }
+                        ClassAtom::Unknown(_) => {
+                            unknown_sources.push(key.clone());
+                            join
+                        }
+                    };
                     tables.sources.push((
                         ValueFlowSourceSpec::new(
                             key.clone(),
@@ -990,15 +1057,23 @@ fn guard_transfers(
                         }
                     }
                     // The guard conditions this binding only until its false
-                    // arm or reconvergence. A later conjunct can also reach
-                    // the false arm. Copies made inside the protected arm keep
-                    // their remainder on their own carriers.
+                    // arm, where a later conjunct can also reach it. Copies
+                    // made inside the protected arm keep their remainder on
+                    // their own carriers.
+                    //
+                    // What ends at the reconvergence depends on what the arm
+                    // established. An unknown remainder is conditional on the
+                    // arm being taken, so it stops where the arms merge. A
+                    // class the arm proved is an ordinary value on that path
+                    // and merges at the reconvergence like any other reaching
+                    // value, exactly as a replacement does; killing it there
+                    // would leave only the other arms' candidates (#3431).
                     let false_target = guard
                         .false_edge
                         .and_then(|edge| semantics.control_edge(edge))
                         .map(|edge| edge.target_point);
                     if replacement_inputs.is_none() {
-                        for target in [false_target, join].into_iter().flatten() {
+                        for target in [false_target, ends_at_join].into_iter().flatten() {
                             kill_at_predecessors(procedure, &mut kills, target, &carrier, &key);
                         }
                     }
@@ -1073,6 +1148,17 @@ fn guard_transfers(
 /// The guard's immediate postdominator: the point where its arms reconverge
 /// and a conditional remainder stops applying. Postdominators are derived once
 /// per procedure and reused by every guard in it.
+///
+/// Only the ordinary flow reconverges. An abnormal exit inside one arm -- a
+/// lowered implicit abort, a throw, or a call's exceptional continuation that
+/// no handler catches -- ends that path at the procedure's exceptional exit
+/// without ever reaching the code after the guard, so it carries no value into
+/// the merge there. The exceptional exit therefore does not take part, which
+/// the request states by naming the normal exit as both exits: a point that can
+/// reach only the exceptional exit is not analyzable and the reconvergence
+/// intersection skips it. Counting that path would strip the arms' join of its
+/// postdominance, drop the kill that ends the remainder, and let an unmodeled
+/// guard keep weakening every later use of the binding (#3410).
 fn guard_join(
     procedure: &ProcedureHandle,
     joins: &mut Option<Postdominators<ProgramPointId>>,
@@ -1082,12 +1168,13 @@ fn guard_join(
 ) -> Result<Option<ProgramPointId>, TypeFlowPlanError> {
     let semantics = procedure.semantics();
     if joins.is_none() {
+        let normal_exit = semantics.normal_exit_point();
         *joins = Some(
             postdominators(
                 semantics,
                 semantics.entry_point(),
-                semantics.normal_exit_point(),
-                semantics.exceptional_exit_point(),
+                normal_exit,
+                normal_exit,
                 &mut CfgAlgorithmRequest::new(cfg_budget, cancellation),
             )
             .map_err(TypeFlowPlanError::GuardControl)?,
@@ -1120,7 +1207,15 @@ fn push_guard_remainder(
         SourceSiteKind::ConditionalNarrowingGuard,
     )
     .expect("a workspace guard retains its source file");
-    let key = tables.event_key(point, ValueFlowEventKind::Source);
+    let atom = ClassAtom::Unknown(reason);
+    let key = tables.content_keyed_event_key(
+        point,
+        b"guard-remainder",
+        SourceSiteKind::ConditionalNarrowingGuard,
+        &atom,
+        carrier,
+        procedure.semantics().locator(),
+    );
     tables.sources.push((
         ValueFlowSourceSpec::new(
             key.clone(),
@@ -1131,7 +1226,7 @@ fn push_guard_remainder(
             EvidenceCompleteness::Complete,
         )
         .when_sources_reach(inputs),
-        ClassAtom::Unknown(reason),
+        atom,
         site,
     ));
     key
@@ -3514,6 +3609,131 @@ mod tests {
             shared_second,
             build(&second, &mut ProcedureRefinements::default()),
             "request reuse does not change the second root plan"
+        );
+    }
+
+    /// #3430: a guard seeds an admitted narrowing source only when an input
+    /// reaching it independently admits the proven class, so the root a guard
+    /// is reached from decides how many sources its site seeds. Under the
+    /// per-site counter, that renumbered every later source at the site, and a
+    /// summary persisted under one root then named the wrong live source under
+    /// the other, or none. A guard source's key must state what the source is.
+    #[test]
+    fn guard_sources_key_by_content_not_by_seeding_position() {
+        use crate::analyzer::semantic::{SemanticRequest, type_flow_adapter};
+        use crate::analyzer::{AnalyzerConfig, Language};
+        use crate::inline_project::InlineTestProject;
+        use crate::value_flow::ValueFlowCache;
+
+        let project = InlineTestProject::with_language(Language::Python)
+            .file(
+                "app.py",
+                "class Tag:\n    def label(self):\n        return \"tag\"\n\ndef get_logger(module, name=None):\n    logger_fqn = module\n    if name is not None:\n        if isinstance(name, Tag):\n            name = name.label()\n        logger_fqn += \".\" + name\n    return logger_fqn\n\nclass Middleware:\n    def __init__(self, worker):\n        self.logger = get_logger(\"m\", type(self))\n        self.worker = worker\n\nclass Worker:\n    def start(self):\n        return Middleware(self)\n\ndef worker_process(broker):\n    worker = Worker()\n    return worker.start()\n"
+            )
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let cancellation = CancellationToken::default();
+        let mut materialization_budget = SemanticBudget::default();
+        let artifact = workspace
+            .materialize_program_semantics(
+                &project.file("app.py"),
+                &mut SemanticRequest::new(&mut materialization_budget, &cancellation),
+            )
+            .expect("fixture semantics materialize")
+            .available_value()
+            .cloned()
+            .expect("fixture semantics remain available");
+        let root = |name: &str| {
+            artifact
+                .procedures()
+                .iter()
+                .find(|procedure| {
+                    procedure
+                        .locator()
+                        .declaration()
+                        .segments()
+                        .last()
+                        .and_then(|segment| segment.name())
+                        == Some(name)
+                })
+                .and_then(|procedure| artifact.procedure_handle(procedure.id()))
+                .unwrap_or_else(|| panic!("fixture declares {name}"))
+        };
+        let guarded = root("get_logger");
+        let adapter =
+            type_flow_adapter(Language::Python).expect("Python registers a type-flow adapter");
+        let mut field_budget = SemanticBudget::default();
+        let field_slots =
+            FieldSlotIndex::build(&workspace, adapter, &mut field_budget, &cancellation)
+                .expect("fixture field slots build");
+        let provider = WorkspaceValueFlowProvider::new(&workspace, ValueFlowCache::default());
+        let build = |root: &ProcedureHandle| {
+            let mut budget = SemanticBudget::default();
+            TypeFlowPlan::build(
+                &workspace,
+                adapter,
+                &field_slots,
+                root,
+                &provider,
+                ClosureLimits { max_procedures: 16 },
+                &mut budget,
+                &cancellation,
+                &mut ProcedureRefinements::default(),
+            )
+            .unwrap_or_else(|error| panic!("plan for {root:?} builds: {error}"))
+        };
+        // Every guard source the guarded procedure seeds, by what it states.
+        let guard_sources = |plan: &TypeFlowPlan| {
+            plan.value_flow()
+                .sources()
+                .filter(|(_, spec)| *spec.point().procedure() == guarded)
+                .filter(|(source, _)| {
+                    matches!(
+                        plan.source_site(*source).kind,
+                        SourceSiteKind::NarrowingGuard | SourceSiteKind::ConditionalNarrowingGuard
+                    )
+                })
+                .map(|(source, spec)| {
+                    (
+                        plan.source_site(source).kind,
+                        format!("{:?}", plan.atom(source)),
+                        spec.key().clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let from_guarded = guard_sources(&build(&guarded));
+        let from_chain = guard_sources(&build(&root("worker_process")));
+        assert!(
+            from_guarded.len() >= 2,
+            "the guard site seeds an admitted source beside its remainder: {from_guarded:?}"
+        );
+        assert_eq!(
+            from_guarded, from_chain,
+            "one guard source keeps one key whichever root reaches its site"
+        );
+        // The property the keys must have: each states what its source is, so
+        // a plan that seeds one fewer source here leaves the others' keys
+        // alone. Under the per-plan counter these were 0 and 1, and dropping
+        // the admitted source moved every later source's key onto its sibling.
+        for (kind, atom, key) in &from_guarded {
+            assert_ne!(
+                key.ordinal() & CONTENT_KEYED_ORDINAL_BIT,
+                0,
+                "a guard source states its own identity, not its position: {kind:?} {atom}"
+            );
+        }
+        let mut ordinals = from_guarded
+            .iter()
+            .map(|(.., key)| key.ordinal())
+            .collect::<Vec<_>>();
+        ordinals.sort_unstable();
+        ordinals.dedup();
+        assert_eq!(
+            ordinals.len(),
+            from_guarded.len(),
+            "sources that state different things keep different keys: {from_guarded:?}"
         );
     }
 

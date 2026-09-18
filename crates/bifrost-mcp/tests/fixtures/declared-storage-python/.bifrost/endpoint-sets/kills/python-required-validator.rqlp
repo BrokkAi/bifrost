@@ -1,0 +1,19 @@
+; Reviewed application configuration: the required validator.
+;
+; Only a value that passed through SearchTermValidator.validate satisfies
+; the storage obligation. A function merely named `validate` is not this
+; kill, and neither is a call of this exact method on some other value.
+(endpoint-set-document
+  :schema-version 1
+  :kind kills
+  :language python
+  :rql-schema-version 1
+  :set (endpoint-set :entries [
+      (kill :id search-term-validator-validate
+        :selector (rql :schema-version 1
+          (language python
+            (call-sites-to :proof proven
+              (enclosing-decl
+                (inside-decl (class :name "SearchTermValidator") (method :name "validate"))))))
+        :input (argument :index 0)
+        :output return-value)]))

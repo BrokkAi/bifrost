@@ -1,8 +1,16 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 
-import { COMPONENTS, SCHEMA_VERSION, classifyChangeSet } from "./ci-impact.mjs";
+import {
+  COMPONENTS,
+  SCHEMA_VERSION,
+  changedPathsFromPullRequestGit,
+  classifyChangeSet,
+} from "./ci-impact.mjs";
 
 function fixture(name) {
   return readFileSync(new URL(`../fixtures/ci-impact/${name}.txt`, import.meta.url), "utf8")
@@ -57,6 +65,48 @@ test("documentation-only changes select the docs baseline", () => {
   });
   assert.equal(decision.mode, "docs");
   assert.deepEqual(selected(decision), []);
+});
+
+test("pull request paths exclude changes added only to a diverged base branch", () => {
+  const repository = mkdtempSync(join(tmpdir(), "bifrost-ci-impact-"));
+  const git = (...args) =>
+    execFileSync("git", args, {
+      cwd: repository,
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        GIT_AUTHOR_NAME: "CI impact test",
+        GIT_AUTHOR_EMAIL: "ci-impact@example.invalid",
+        GIT_COMMITTER_NAME: "CI impact test",
+        GIT_COMMITTER_EMAIL: "ci-impact@example.invalid",
+      },
+    }).trim();
+
+  try {
+    git("init", "-q", "-b", "master");
+    git("config", "commit.gpgsign", "false");
+    writeFileSync(join(repository, "README.md"), "base\n");
+    git("add", "README.md");
+    git("commit", "-q", "-m", "base");
+    git("switch", "-q", "-c", "docs");
+    writeFileSync(join(repository, "guide.md"), "documentation\n");
+    git("add", "guide.md");
+    git("commit", "-q", "-m", "docs");
+    const head = git("rev-parse", "HEAD");
+
+    git("switch", "-q", "master");
+    writeFileSync(join(repository, "source.rs"), "fn added_on_base() {}\n");
+    git("add", "source.rs");
+    git("commit", "-q", "-m", "base branch source change");
+    const base = git("rev-parse", "HEAD");
+
+    assert.deepEqual(changedPathsFromPullRequestGit(base, head, repository), {
+      changedPaths: ["guide.md"],
+      diffFailed: false,
+    });
+  } finally {
+    rmSync(repository, { recursive: true, force: true });
+  }
 });
 
 test("documentation mixed with component changes retains component validation", () => {

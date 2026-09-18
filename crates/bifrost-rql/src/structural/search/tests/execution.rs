@@ -10839,6 +10839,17 @@ fn go_channel_backing_transport_publishes_slice_and_map_storage() {
 }
 
 #[test]
+fn go_channel_interface_element_transports_the_sent_reference() {
+    let (_project, workspace) = heap_identity_workspace();
+    let result = heap_identity_conflicts(&workspace, "channelInterfacePayload");
+    assert_proven_unordered_unprotected_conflict(
+        &result,
+        "an interface element boxes the sent reference and the assertion on the \
+         receive expression keeps that object",
+    );
+}
+
+#[test]
 fn go_channel_transport_does_not_fabricate_payload_identity() {
     let (_project, workspace) = heap_identity_workspace();
     for root in ["channelStructValueCopy", "channelHelperValueCopy"] {
@@ -10860,7 +10871,6 @@ fn go_channel_transport_does_not_fabricate_payload_identity() {
     }
     for root in [
         "channelMultipleSends",
-        "channelInterfacePayload",
         "channelParameterPayload",
         "channelReassignedHelper",
         "channelLoopSend",
@@ -12591,6 +12601,126 @@ fn go_concurrent_access_conflicts_keep_repeated_fresh_index_storage_complete() {
         "fresh repeated slice allocations must not hide an identity diagnostic: {result:#?}"
     );
     assert_no_concurrent_conflicts(&result);
+}
+
+/// A dynamic element that the bounded scalar domain decides is one element,
+/// exactly like a literal index (issue #2903). The producer sees only a
+/// value, because Go evaluates the index expression into a temporary.
+#[test]
+fn go_concurrent_access_conflicts_prove_decided_local_index_race() {
+    let (_project, workspace) = go_invocation_identity_workspace();
+    let result = go_invocation_conflicts(&workspace, "sharedLocalIndexWriters");
+    assert_proven_unordered_unprotected_conflict(
+        &result,
+        "two children that select one decided element of one slice must race",
+    );
+}
+
+/// The same shape with two locals that decide different elements. The
+/// backing store is shared and proven, so only the element separates them.
+#[test]
+fn go_concurrent_access_conflicts_reject_disjoint_local_index_elements() {
+    let (_project, workspace) = go_invocation_identity_workspace();
+    let result = go_invocation_conflicts(&workspace, "disjointLocalIndexWriters");
+    assert_eq!(
+        result.completion(),
+        CodeQueryCompletion::Complete,
+        "disjoint decided elements must resolve completely: {result:#?}"
+    );
+    assert!(
+        result.diagnostics.is_empty(),
+        "disjoint decided elements must not hide an identity diagnostic: {result:#?}"
+    );
+    assert_no_concurrent_conflicts(&result);
+}
+
+/// A structured integer step (`at += 3`) keeps the element exact, so the
+/// stepped local and the matching literal name one location.
+#[test]
+fn go_concurrent_access_conflicts_prove_stepped_local_index_race() {
+    let (_project, workspace) = go_invocation_identity_workspace();
+    let result = go_invocation_conflicts(&workspace, "steppedLocalIndexWriters");
+    assert_proven_unordered_unprotected_conflict(
+        &result,
+        "a stepped local and the literal it reaches must name one element",
+    );
+}
+
+/// Passing the local's address to an unmodeled callee invalidates the
+/// element. The pair must stay open rather than keep the pre-call value.
+#[test]
+fn go_concurrent_access_conflicts_keep_mutated_local_index_open() {
+    let (_project, workspace) = go_invocation_identity_workspace();
+    let result = go_invocation_conflicts(&workspace, "mutatedLocalIndexWriters");
+    assert_no_proven_conflicts_with_explicit_evidence(&result);
+}
+
+/// An index with no bounded value at all keeps its element open. This is the
+/// negative control for every decided-index result above.
+#[test]
+fn go_concurrent_access_conflicts_keep_unknown_local_index_open() {
+    let (_project, workspace) = go_invocation_identity_workspace();
+    let result = go_invocation_conflicts(&workspace, "unknownLocalIndexWriters");
+    assert_no_proven_conflicts_with_explicit_evidence(&result);
+}
+
+/// Two counted loops that own disjoint halves of one slice. The induction
+/// bounds are the only separation: the slice is one proven object, and the
+/// overlapping and widened controls below share every other property.
+#[test]
+fn go_concurrent_access_conflicts_reject_disjoint_loop_index_ranges() {
+    let (_project, workspace) = go_invocation_identity_workspace();
+    let result = go_invocation_conflicts(&workspace, "disjointLoopRangeWriters");
+    assert_no_concurrent_conflicts(&result);
+}
+
+/// The same two loops with ranges that meet at one element must keep their
+/// pair, which is what proves the rejection above came from the bounds.
+#[test]
+fn go_concurrent_access_conflicts_keep_overlapping_loop_index_ranges_open() {
+    let (_project, workspace) = go_invocation_identity_workspace();
+    let result = go_invocation_conflicts(&workspace, "overlappingLoopRangeWriters");
+    assert_no_proven_conflicts_with_explicit_evidence(&result);
+    find_concurrent_relation(&result, |value| {
+        value.location_kind == "index" && value.verdict == "conflict" && value.proof == "open"
+    });
+}
+
+/// A loop longer than the scalar join limit widens its induction bound away,
+/// so the disjointness proof is unavailable and the pair stays open.
+#[test]
+fn go_concurrent_access_conflicts_keep_widened_loop_index_ranges_open() {
+    let (_project, workspace) = go_invocation_identity_workspace();
+    let result = go_invocation_conflicts(&workspace, "widenedLoopRangeWriters");
+    assert_no_proven_conflicts_with_explicit_evidence(&result);
+    find_concurrent_relation(&result, |value| {
+        value.location_kind == "index" && value.verdict == "conflict" && value.proof == "open"
+    });
+}
+
+/// Equal index syntax over two distinct backing stores must stay separate:
+/// a decided element never composes an identity without its own object.
+#[test]
+fn go_concurrent_access_conflicts_keep_distinct_slices_with_one_index_clean() {
+    let (_project, workspace) = go_invocation_identity_workspace();
+    let result = go_invocation_conflicts(&workspace, "distinctSliceLocalIndexWriters");
+    assert_eq!(
+        result.completion(),
+        CodeQueryCompletion::Complete,
+        "distinct slices must resolve completely: {result:#?}"
+    );
+    assert_no_concurrent_conflicts(&result);
+}
+
+/// Distinct index syntax over one backing store must still race.
+#[test]
+fn go_concurrent_access_conflicts_prove_aliased_slice_with_one_index_race() {
+    let (_project, workspace) = go_invocation_identity_workspace();
+    let result = go_invocation_conflicts(&workspace, "aliasedSliceLocalIndexWriters");
+    assert_proven_unordered_unprotected_conflict(
+        &result,
+        "one slice reached through an alias must keep its element race",
+    );
 }
 
 /// A repeated worker sends its fresh cell before receiving from a two-slot
@@ -14585,6 +14715,107 @@ func repeatedFreshIndexStorage(index int) {
             values[index]++
         }()
     }
+}
+
+func indexWriter(values []int, at int) { values[at] = 1 }
+
+func mutateIndex(at *int) { *at = 7 }
+
+// Two children select the same element of one slice through a local that
+// never changes. The element is dynamic in the producer's view.
+func sharedLocalIndexWriters() {
+    values := make([]int, 4)
+    at := 2
+    go indexWriter(values, at)
+    go indexWriter(values, at)
+}
+
+// The same shape over two locals that select different elements.
+func disjointLocalIndexWriters() {
+    values := make([]int, 4)
+    first := 0
+    second := 1
+    go indexWriter(values, first)
+    go indexWriter(values, second)
+}
+
+// A structured integer step keeps the element exact across the update.
+func steppedLocalIndexWriters() {
+    values := make([]int, 4)
+    at := 0
+    at += 3
+    go indexWriter(values, at)
+    go indexWriter(values, 3)
+}
+
+// Passing the local's address lets an unmodeled callee change it, so the
+// element is no longer decided.
+func mutatedLocalIndexWriters() {
+    values := make([]int, 4)
+    at := 0
+    mutateIndex(&at)
+    go indexWriter(values, at)
+    go indexWriter(values, 0)
+}
+
+// The index is a caller parameter with no bounded value at all.
+func unknownLocalIndexWriters(at int) {
+    values := make([]int, 4)
+    go indexWriter(values, at)
+    go indexWriter(values, at)
+}
+
+// Two counted loops own disjoint halves of one slice. Only the induction
+// bounds separate them; the backing store is the same object.
+func disjointLoopRangeWriters() {
+    values := make([]int, 8)
+    for lower := 0; lower < 4; lower++ {
+        go indexWriter(values, lower)
+    }
+    for upper := 4; upper < 8; upper++ {
+        go indexWriter(values, upper)
+    }
+}
+
+// The same two loops with ranges that meet at one element.
+func overlappingLoopRangeWriters() {
+    values := make([]int, 8)
+    for lower := 0; lower < 5; lower++ {
+        go indexWriter(values, lower)
+    }
+    for upper := 4; upper < 8; upper++ {
+        go indexWriter(values, upper)
+    }
+}
+
+// A loop whose trip count exceeds the scalar join limit widens away its
+// bound, so the same two-loop shape can no longer be separated.
+func widenedLoopRangeWriters() {
+    values := make([]int, 8)
+    for lower := 0; lower < 1000; lower++ {
+        go indexWriter(values, lower)
+    }
+    for upper := 4; upper < 8; upper++ {
+        go indexWriter(values, upper)
+    }
+}
+
+// Equal index syntax over two distinct backing stores.
+func distinctSliceLocalIndexWriters() {
+    written := make([]int, 4)
+    read := make([]int, 4)
+    at := 1
+    go indexWriter(written, at)
+    go indexWriter(read, at)
+}
+
+// Distinct index syntax over one backing store.
+func aliasedSliceLocalIndexWriters() {
+    values := make([]int, 4)
+    alias := values
+    at := 1
+    go indexWriter(values, at)
+    go indexWriter(alias, at)
 }
 
 func publishedWorker(ch chan *cell) {
@@ -19261,7 +19492,16 @@ fn semantic_budget_exhaustion_is_a_reason_label_and_a_diagnostic() {
             semantic: CodeQuerySemanticLimits {
                 rows_per_dimension: Some(CodeQuerySemanticRowLimits::from_rows(|dimension| {
                     if dimension == SemanticBudgetDimension::ProgramPoints {
-                        26
+                        // #3410's Python implicit-abort lowering added the
+                        // unresolved read's claims point and its abort route,
+                        // so this fixture's sink now consumes a 28-point ledger
+                        // where it consumed 26. The budget stays the reported
+                        // reason the sink is unreached while the cap sits in the
+                        // measured [28, 31] window; above it the reason becomes
+                        // the unresolved root parameter, and below it the query
+                        // stops before emitting the row. 30 keeps the pin inside
+                        // that window instead of on its edge.
+                        30
                     } else {
                         1 << 20
                     }
@@ -21848,6 +22088,22 @@ func parentAfterRunRoot(t *testing.T) {
 	shared = 2
 }
 
+func prefixOrderedRoot(t *testing.T) {
+	t.Run("a", func(st *testing.T) {
+		shared = 1
+		st.Parallel()
+	})
+	shared = 2
+}
+
+func suffixRaceRoot(t *testing.T) {
+	t.Run("a", func(st *testing.T) {
+		st.Parallel()
+		shared = 1
+	})
+	shared = 2
+}
+
 func conditionalRoot(t *testing.T, flag bool) {
 	t.Run("a", func(st *testing.T) {
 		if flag {
@@ -22000,6 +22256,43 @@ func sameNameRoot(t *testing.T) {
                     == brokk_bifrost_flow::concurrency::ConcurrentOrdering::HappensBefore
         }),
         "the Run join must order the subtest before the parent write: {parent:#?}"
+    );
+
+    // Split at Parallel (issue #3407): a write before the Parallel call runs
+    // while the parent is blocked in Run, so the parent's post-Run write is
+    // ordered after it.
+    let prefix = report("prefixOrderedRoot");
+    assert!(
+        !prefix.conflicts.iter().any(|conflict| {
+            conflict.proven
+                && conflict.ordering
+                    == brokk_bifrost_flow::concurrency::ConcurrentOrdering::Unordered
+        }),
+        "the pre-Parallel write is ordered before the parent write: {prefix:#?}"
+    );
+    assert!(
+        prefix.conflicts.iter().any(|conflict| {
+            conflict.proven
+                && conflict.exhaustive
+                && conflict.ordering
+                    == brokk_bifrost_flow::concurrency::ConcurrentOrdering::HappensBefore
+        }),
+        "the Run join must order the pre-Parallel write before the parent write: {prefix:#?}"
+    );
+
+    // Split at Parallel (issue #3407): a write after the Parallel call runs
+    // once the parent function returns, so the parent's continuation races it.
+    let suffix = report("suffixRaceRoot");
+    assert!(
+        suffix.conflicts.iter().any(|conflict| {
+            conflict.proven
+                && conflict.exhaustive
+                && conflict.ordering
+                    == brokk_bifrost_flow::concurrency::ConcurrentOrdering::Unordered
+                && conflict.protection
+                    == brokk_bifrost_flow::concurrency::ConcurrentProtection::Unprotected
+        }),
+        "the post-Parallel write races the parent's continuation: {suffix:#?}"
     );
 
     // Conditional: a Parallel call on some paths but not others keeps the

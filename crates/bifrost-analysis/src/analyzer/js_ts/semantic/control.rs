@@ -96,7 +96,9 @@ pub(super) fn lower_procedure<'tree, 'targets>(
         _ => {}
     }
     let body_entry = context.point(&mut builder, spec.body, Vec::new())?;
-    let initial = if spec.body.kind() == "statement_block" {
+    // The module body is a statement sequence too; it is spelled `program`
+    // because a file has no braces around its top-level statements (#3374).
+    let initial = if matches!(spec.body.kind(), "statement_block" | "program") {
         Work::Statement {
             node: spec.body,
             entry: body_entry,
@@ -258,6 +260,31 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             },
         )?;
 
+        let evaluations =
+            self.append_assignment_target_store(builder, terminal, node, left, right, value)?;
+        self.edge(builder, terminal, next)?;
+        self.schedule_expressions(
+            builder,
+            entry,
+            &evaluations,
+            EdgeTarget::normal(terminal),
+            scope,
+            stack,
+        )
+    }
+
+    /// Store an assignment's value into its target, returning the child
+    /// expressions the caller must still schedule. Shared by `=` and the
+    /// augmented operators, whose targets read the same three shapes.
+    fn append_assignment_target_store(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        terminal: ProgramPointId,
+        node: Node<'tree>,
+        left: Node<'tree>,
+        right: Node<'tree>,
+        value: ValueId,
+    ) -> Result<Vec<Node<'tree>>, TsLoweringError> {
         let evaluations = if left.kind() == "identifier" {
             let name = node_text(self.prepared.source(), left).ok_or_else(|| {
                 TsLoweringError::Invalid("assignment has invalid target range".into())
@@ -382,11 +409,58 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 .filter(|child| child.kind() != "comment")
                 .collect()
         };
+        Ok(evaluations)
+    }
+
+    fn augmented_assignment_expression(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), TsLoweringError> {
+        let left = required_field(node, "left")?;
+        let right = required_field(node, "right")?;
+        if !matches!(
+            left.kind(),
+            "identifier" | "member_expression" | "subscript_expression"
+        ) {
+            return self.unhandled_control_syntax(builder, node, entry, next);
+        }
+        if operation_can_throw_implicitly(node) {
+            self.implicit_exception_gap(builder, entry, node)?;
+        }
+        self.add_gap(
+            builder,
+            entry,
+            SemanticGapSubject::Point,
+            SemanticCapability::Calls,
+            SemanticGapKind::Unknown,
+            "augmented-assignment operator evaluation requires value refinement",
+        )?;
+        // `x += y` stores a value that derives from the current target and the
+        // operand, whatever the refined operator semantics turn out to be:
+        // compound assignment reads the target and combines it with the
+        // operand. The result stays language-defined unknown, but both sides
+        // flow into it the way they do for `x = x + y`.
+        let terminal = self.point(builder, node, Vec::new())?;
+        let left_value = self.expression_value(builder, left, expression_value_kind(left))?;
+        let right_value = self.expression_value(builder, right, expression_value_kind(right))?;
+        let result = self.expression_value(builder, node, expression_value_kind(node))?;
+        self.session.append_language_defined_value_flows(
+            builder,
+            terminal,
+            [left_value, right_value],
+            result,
+        )?;
+        self.append_assignment_target_store(builder, terminal, node, left, right, result)?;
         self.edge(builder, terminal, next)?;
         self.schedule_expressions(
             builder,
             entry,
-            &evaluations,
+            &[left, right],
             EdgeTarget::normal(terminal),
             scope,
             stack,
@@ -791,10 +865,20 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             scope
         };
         match node.kind() {
-            "statement_block" | "program" => {
+            "statement_block" => {
                 let children = named_children(node)
                     .into_iter()
                     .filter(|child| child.kind() != "comment")
+                    .collect::<Vec<_>>();
+                self.schedule_statements(builder, entry, &children, next, scope, stack)
+            }
+            // The module body executes the file-scope statements. A file-scope
+            // declaration is enumerated as a sibling of this frame, so the
+            // body schedules only the statements it actually runs (#3374).
+            "program" => {
+                let children = named_children(node)
+                    .into_iter()
+                    .filter(|child| child.kind() != "comment" && !is_file_scope_declaration(*child))
                     .collect::<Vec<_>>();
                 self.schedule_statements(builder, entry, &children, next, scope, stack)
             }
@@ -1423,13 +1507,79 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     stack,
                 )
             }
-            "augmented_assignment_expression"
-            | "update_expression"
+            "augmented_assignment_expression" => {
+                self.augmented_assignment_expression(builder, node, entry, next, scope, stack)
+            }
+            "template_string" | "template_substitution" => {
+                let substitutions = named_children(node)
+                    .into_iter()
+                    .filter(|child| child.kind() == "template_substitution")
+                    .collect::<Vec<_>>();
+                // A template with no substitution is a plain string literal:
+                // it takes the shared expression-children path so its value
+                // keeps the string intrinsic's own shape.
+                if node.kind() == "template_string" && substitutions.is_empty() {
+                    if operation_can_throw_implicitly(node) {
+                        self.implicit_exception_gap(builder, entry, node)?;
+                    }
+                    self.expression_children(builder, node, entry, next, scope, stack)
+                } else {
+                    if operation_can_throw_implicitly(node) {
+                        self.implicit_exception_gap(builder, entry, node)?;
+                    }
+                    // A template string derives its value from every substituted
+                    // expression, and a substitution from the expression it
+                    // renders. String conversion stays unrefined behind the gap,
+                    // but the operands flow into the result the way they do for
+                    // `a + b`.
+                    self.add_gap(
+                        builder,
+                        entry,
+                        SemanticGapSubject::Point,
+                        SemanticCapability::Calls,
+                        SemanticGapKind::Unknown,
+                        "template-string conversion requires value refinement",
+                    )?;
+                    let terminal = self.point(builder, node, Vec::new())?;
+                    let result =
+                        self.expression_value(builder, node, expression_value_kind(node))?;
+                    // A template string reads its substitutions; a substitution
+                    // reads the expression it renders.
+                    let operands = if node.kind() == "template_string" {
+                        substitutions.clone()
+                    } else {
+                        named_children(node)
+                            .into_iter()
+                            .filter(|child| child.kind() != "comment")
+                            .collect()
+                    };
+                    let operand_values = operands
+                        .iter()
+                        .map(|child| {
+                            self.expression_value(builder, *child, expression_value_kind(*child))
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    self.session.append_language_defined_value_flows(
+                        builder,
+                        terminal,
+                        operand_values,
+                        result,
+                    )?;
+                    self.edge(builder, terminal, next)?;
+                    self.schedule_expressions(
+                        builder,
+                        entry,
+                        &operands,
+                        EdgeTarget::normal(terminal),
+                        scope,
+                        stack,
+                    )
+                }
+            }
+            "update_expression"
             | "sequence_expression"
             | "pair"
             | "spread_element"
-            | "template_string"
-            | "template_substitution"
             | "computed_property_name"
             | "jsx_expression"
             | "jsx_attribute"

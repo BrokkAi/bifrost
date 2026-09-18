@@ -27,7 +27,7 @@
 use super::*;
 
 use crate::analyzer::semantic::{
-    ArgumentDomain, CallArgumentExpansion, CallInvocationMode, CallSiteHandle,
+    ArgumentDomain, BackingStoreOffset, CallArgumentExpansion, CallInvocationMode, CallSiteHandle,
     CallableReferenceKind, CallableTarget, CallableTargetResolution, CallerReceiverBinding,
     CaptureMode, CaptureSource, ContentIdentity, GuardPredicate, MemoryAccessKind,
     MemoryLocationKind, SemanticCapability, SemanticEffect, SemanticGapDischarge,
@@ -1061,12 +1061,40 @@ fn build_result_use_index(
         // identity through call application. Address-of uses an `Address`
         // target, while dereferences and type assertions carry additional
         // effects at their point, so neither can satisfy this proof.
-        if let [event] = point.events.as_ref()
-            && let SemanticEffect::Assignment { target, value } = event.effect
-            && semantics
-                .value(target)
+        //
+        // A wrapper that states its alias edge also carries a `ValueFlow` row
+        // naming the same source and target, because parentheses denote the
+        // operand's own value rather than a copy (issue #3405). Only a row
+        // that keeps the two values one object -- ordinary local flow or the
+        // same header at offset zero -- restates the assignment; a transfer
+        // into distinct storage, a boxing or unboxing wrapper, or an offset
+        // window is an operation and disqualifies the point.
+        let assignment = point.events.iter().find_map(|event| match event.effect {
+            SemanticEffect::Assignment { target, value } => Some((target, value)),
+            _ => None,
+        });
+        let transparent = assignment.filter(|(target, value)| {
+            semantics
+                .value(*target)
                 .is_some_and(|target| target.kind == SemanticValueKind::Temporary)
-        {
+                && point.events.iter().all(|event| match event.effect {
+                    SemanticEffect::Assignment {
+                        target: event_target,
+                        value: event_value,
+                    } => (event_target, event_value) == (*target, *value),
+                    SemanticEffect::ValueFlow {
+                        kind:
+                            ValueFlowKind::Local
+                            | ValueFlowKind::BackingStore {
+                                offset: BackingStoreOffset::Zero,
+                            },
+                        source,
+                        target: event_target,
+                    } => (event_target, source) == (*target, *value),
+                    _ => false,
+                })
+        });
+        if let Some((target, value)) = transparent {
             let exact_range = |value| {
                 semantics
                     .value(value)

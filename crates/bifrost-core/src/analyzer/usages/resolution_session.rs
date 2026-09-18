@@ -198,12 +198,6 @@ impl ResolutionSession {
         self.cancellation.as_ref()
     }
 
-    /// Maximum provider rows needed to either consume the remaining scope
-    /// budget or observe the first row that proves exhaustion.
-    pub fn scope_lookahead_limit(&self) -> usize {
-        self.remaining_scope_steps().saturating_add(1)
-    }
-
     pub fn mark_scope_incomplete(&self) {
         self.stop(ResolutionStop::Exceeded(ReceiverBudgetLimit::ScopeNodes));
     }

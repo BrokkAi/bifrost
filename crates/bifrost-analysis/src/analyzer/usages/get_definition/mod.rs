@@ -1356,6 +1356,25 @@ pub fn allocation_binds_by_reference_at_offset(
     }
 }
 
+/// Whether the allocation expression at `offset` boxes a reference payload
+/// when it is bound into an interface wrapper.
+///
+/// `Some(true)` names an allocation a wrapper keeps by reference: a pointed-to
+/// object or a channel. `Some(false)` proves an inline value or a slice or map
+/// header, whose descriptor the wrapper copies. `None` means the shape is
+/// unavailable, so the wrapper stays unnamed. The caller must hold a semantic
+/// Allocation row at this offset, exactly as for the binding-mode question.
+pub fn allocation_boxes_reference_payload_at_offset(
+    file: &ProjectFile,
+    source: &str,
+    offset: usize,
+) -> Option<bool> {
+    match language_for_file(file) {
+        Language::Go => go::allocation_boxes_reference_payload_at_offset(file, source, offset),
+        _ => None,
+    }
+}
+
 /// Whether one exact indexed Go callable result binds by reference.
 ///
 /// The analyzer declaration range identifies the callable; the Go adapter then
@@ -1404,6 +1423,25 @@ pub fn parameter_preserves_backing_at_span(
 ) -> Option<bool> {
     match language_for_file(file) {
         Language::Go => go::parameter_preserves_backing_at_span(file, source, start, end, ordinal),
+        _ => None,
+    }
+}
+
+/// Whether one exact Go callable parameter's declared type is an interface
+/// that boxes one reference payload. A copied interface argument still carries
+/// the caller's object inside the wrapper. Unavailable or ambiguous type
+/// declarations remain unknown.
+pub fn parameter_boxes_reference_payload_at_span(
+    file: &ProjectFile,
+    source: &str,
+    start: usize,
+    end: usize,
+    ordinal: usize,
+) -> Option<bool> {
+    match language_for_file(file) {
+        Language::Go => {
+            go::parameter_boxes_reference_payload_at_span(file, source, start, end, ordinal)
+        }
         _ => None,
     }
 }
@@ -1795,6 +1833,11 @@ pub(super) struct JsTsDefinitionContext {
     pub(super) imports: JsTsImportBinder,
     pub(super) aliases: Arc<AliasResolver>,
     pub(super) syntax_index: Arc<JsTsReceiverSyntaxIndex>,
+    /// This file's module-member write evidence, shared by every reference the
+    /// batch resolves in it. The proof walks the whole file, so asking it per
+    /// reference would make a file's resolution quadratic in its own size
+    /// (#3427).
+    pub(super) module_member_writes: Arc<crate::analyzer::js_ts::JsTsModuleMemberWriteMemo>,
 }
 
 #[derive(Clone)]
@@ -1947,6 +1990,7 @@ impl<'a> DefinitionBatchContext<'a> {
                     imports: compute_jsts_import_binder(source, tree),
                     aliases: Arc::clone(host.alias_resolver()),
                     syntax_index,
+                    module_member_writes: Arc::default(),
                 }
             })
             .clone()

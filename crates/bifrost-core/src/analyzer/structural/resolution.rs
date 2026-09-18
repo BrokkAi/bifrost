@@ -246,68 +246,6 @@ labelled_enum! {
 }
 
 labelled_enum! {
-    /// The persisted shape of a partial-path or typed-frontier completion.
-    ResolutionCompletionKind, ALL_RESOLUTION_COMPLETION_KINDS {
-        Complete => "complete",
-        Incomplete => "incomplete",
-    }
-}
-
-labelled_enum! {
-    /// The persisted discriminator for an incomplete resolution reason.
-    ResolutionCompletionReasonKind, ALL_RESOLUTION_COMPLETION_REASON_KINDS {
-        CyclicExpansion => "cyclic_expansion",
-        InconsistentPrecedence => "inconsistent_precedence",
-        OpenBoundary => "open_boundary",
-        UnsupportedSemantic => "unsupported_semantic",
-    }
-}
-
-labelled_enum! {
-    /// The persisted discriminator for one partial-path witness step.
-    ResolutionWitnessKind, ALL_RESOLUTION_WITNESS_KINDS {
-        Node => "node",
-        Candidate => "candidate",
-        Boundary => "boundary",
-    }
-}
-
-labelled_enum! {
-    /// The coarse persisted outcome; a rejected outcome carries its reason separately.
-    CandidateOutcomeKind, ALL_CANDIDATE_OUTCOME_KINDS {
-        Selected => "selected",
-        Rejected => "rejected",
-    }
-}
-
-labelled_enum! {
-    /// The open persisted vocabulary for why structured lowering withheld a claim.
-    ResolutionGapOriginKind, ALL_RESOLUTION_GAP_ORIGIN_KINDS {
-        UnsupportedTypeSyntax => "unsupported_type_syntax",
-        UnsupportedExpression => "unsupported_expression",
-        UnsupportedRoute => "unsupported_route",
-        UnsupportedScopeOrBinder => "unsupported_scope_or_binder",
-        AmbiguousQualifiedType => "ambiguous_qualified_type",
-        InferredType => "inferred_type",
-        PostfixArrayDimensions => "postfix_array_dimensions",
-        AmbiguousNumericLiteral => "ambiguous_numeric_literal",
-        ImplicitConstructor => "implicit_constructor",
-        UnsupportedHierarchyTraversal => "unsupported_hierarchy_traversal",
-        UnsupportedVisibility => "unsupported_visibility",
-        UnsupportedImplicitReceiver => "unsupported_implicit_receiver",
-        UnsupportedCallApplicability => "unsupported_call_applicability",
-        UnsupportedPlacementBoundary => "unsupported_placement_boundary",
-        MalformedSyntax => "malformed_syntax",
-        QualifiedReference => "qualified_reference",
-        UnsupportedActivationSourceOrder => "unsupported_activation_source_order",
-        UnsupportedActivationScopeWide => "unsupported_activation_scope_wide",
-        UnsupportedActivationDeclaredHead => "unsupported_activation_declared_head",
-        MissingBinder => "missing_binder",
-        UnsupportedMemberScope => "unsupported_member_scope",
-    }
-}
-
-labelled_enum! {
     /// The visibility a declaration states, as far as an adapter can read it
     /// from source. `Unknown` is never equal to `Public`: an adapter that
     /// cannot read a modifier says so.
@@ -452,20 +390,16 @@ pub enum CandidateOutcome {
 impl CandidateOutcome {
     /// The value domain the `resolution_candidate.outcome` row field publishes
     /// (issue #2515).
-    pub const LABELS: &'static [&'static str] = CandidateOutcomeKind::LABELS;
-
-    pub const fn kind(self) -> CandidateOutcomeKind {
-        match self {
-            CandidateOutcome::Selected => CandidateOutcomeKind::Selected,
-            CandidateOutcome::Rejected(_) => CandidateOutcomeKind::Rejected,
-        }
-    }
+    pub const LABELS: &'static [&'static str] = &["selected", "rejected"];
 
     /// The coarse label. The rejection reason is a separate field on every
     /// surface that renders an outcome, so the label stays a two-value
     /// vocabulary a filter can be written against.
     pub const fn label(self) -> &'static str {
-        self.kind().label()
+        match self {
+            CandidateOutcome::Selected => "selected",
+            CandidateOutcome::Rejected(_) => "rejected",
+        }
     }
 
     pub const fn is_selected(self) -> bool {
@@ -726,14 +660,6 @@ mod tests {
         check!(ALL_MEMBER_DISPATCH_TIERS, MemberDispatchTier);
         check!(ALL_HIERARCHY_RELATIONS, HierarchyRelation);
         check!(ALL_BOUNDARY_STATUSES, BoundaryStatus);
-        check!(ALL_RESOLUTION_COMPLETION_KINDS, ResolutionCompletionKind);
-        check!(
-            ALL_RESOLUTION_COMPLETION_REASON_KINDS,
-            ResolutionCompletionReasonKind
-        );
-        check!(ALL_RESOLUTION_WITNESS_KINDS, ResolutionWitnessKind);
-        check!(ALL_CANDIDATE_OUTCOME_KINDS, CandidateOutcomeKind);
-        check!(ALL_RESOLUTION_GAP_ORIGIN_KINDS, ResolutionGapOriginKind);
         check!(ALL_DECLARED_VISIBILITIES, DeclaredVisibility);
         check!(ALL_ENVIRONMENT_AXES, EnvironmentAxis);
         check!(ALL_METHOD_FAMILY_RELATIONS, MethodFamilyRelation);
@@ -799,17 +725,12 @@ mod tests {
         assert!(CandidateOutcome::Selected.is_selected());
         assert_eq!(CandidateOutcome::Selected.rejection(), None);
         assert_eq!(CandidateOutcome::Selected.label(), "selected");
-        assert_eq!(
-            CandidateOutcome::Selected.kind(),
-            CandidateOutcomeKind::Selected
-        );
 
         for &reason in ALL_REJECTION_REASONS {
             let outcome = CandidateOutcome::Rejected(reason);
             assert!(!outcome.is_selected());
             assert_eq!(outcome.rejection(), Some(reason));
             assert_eq!(outcome.label(), "rejected");
-            assert_eq!(outcome.kind(), CandidateOutcomeKind::Rejected);
 
             let json = serde_json::to_value(outcome).expect("serialize outcome");
             let back: CandidateOutcome = serde_json::from_value(json).expect("deserialize outcome");

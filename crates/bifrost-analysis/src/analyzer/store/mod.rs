@@ -10,12 +10,8 @@ pub mod policy_units;
 pub mod query;
 mod read_keys;
 mod relational_query;
-mod resolution;
-mod resolution_prepare;
 pub(crate) mod writer;
 pub(crate) use relational_query::RelationalStoreOutcome;
-pub use resolution::PreparedResolutionBundle;
-pub use resolution_prepare::{ResolutionInteriorPreparation, prepare_resolution_bundle};
 
 use std::borrow::Cow;
 use std::cell::RefCell;

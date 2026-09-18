@@ -2878,6 +2878,28 @@ pub fn execute_code_query_detailed_eager_index(
     limits: CodeQueryExecutionLimits,
     cancellation: Option<&CancellationToken>,
 ) -> DetailedCodeQueryResult {
+    execute_code_query_detailed_eager_index_in_scope(
+        analyzer,
+        query,
+        limits,
+        cancellation,
+        CodeQueryExecutionScope::whole_workspace(),
+    )
+}
+
+/// Eager structural execution over an explicit query execution scope.
+///
+/// `CodeQueryExecutionScope::whole_workspace()` preserves the behavior of the
+/// historical whole-workspace entry point. A narrowed scope restricts seed
+/// enumeration while retaining the scope's full workspace file set for
+/// dependency and provider lookups.
+pub fn execute_code_query_detailed_eager_index_in_scope(
+    analyzer: &dyn IAnalyzer,
+    query: &CodeQuery,
+    limits: CodeQueryExecutionLimits,
+    cancellation: Option<&CancellationToken>,
+    execution_scope: CodeQueryExecutionScope<'_>,
+) -> DetailedCodeQueryResult {
     let scope = AnalyzerQueryScope::new(analyzer);
     let token = scope.token();
     let access_mode = match benchmark_structural_access_mode() {
@@ -2902,7 +2924,7 @@ pub fn execute_code_query_detailed_eager_index(
         OccurrenceDerivationOptions::ROWS_ONLY,
         None,
         None,
-        CodeQueryExecutionScope::whole_workspace(),
+        execution_scope,
         None,
     )
 }
@@ -3089,6 +3111,24 @@ pub fn execute_code_query_detailed_eager_index_workspace(
     limits: CodeQueryExecutionLimits,
     cancellation: Option<&CancellationToken>,
 ) -> DetailedCodeQueryResult {
+    execute_code_query_detailed_eager_index_workspace_in_scope(
+        workspace,
+        query,
+        limits,
+        cancellation,
+        CodeQueryExecutionScope::whole_workspace(),
+    )
+}
+
+/// Eager workspace-backed structural execution over an explicit query
+/// execution scope.
+pub fn execute_code_query_detailed_eager_index_workspace_in_scope(
+    workspace: &WorkspaceAnalyzer,
+    query: &CodeQuery,
+    limits: CodeQueryExecutionLimits,
+    cancellation: Option<&CancellationToken>,
+    execution_scope: CodeQueryExecutionScope<'_>,
+) -> DetailedCodeQueryResult {
     let scope = AnalyzerQueryScope::new(workspace.analyzer());
     let token = scope.token();
     let access_mode = match benchmark_structural_access_mode() {
@@ -3113,7 +3153,7 @@ pub fn execute_code_query_detailed_eager_index_workspace(
         OccurrenceDerivationOptions::ROWS_ONLY,
         None,
         None,
-        CodeQueryExecutionScope::whole_workspace(),
+        execution_scope,
         None,
     )
 }

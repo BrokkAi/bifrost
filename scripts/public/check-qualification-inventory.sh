@@ -48,5 +48,31 @@ require_count '*.whl' exactly 10
 require_count '*.vsix' exactly 1
 require_count '*.tgz' at-least 2
 require_count '*.sha256' at-least 7
+require_count 'bifrost-semantic-pack' exactly 0
+require_count 'bifrost-semantic-pack.sha256' exactly 0
+require_count 'bifrost-semantic-pack-v*-x86_64-unknown-linux-gnu.tar.gz' exactly 1
+require_count 'bifrost-semantic-pack-v*-x86_64-unknown-linux-gnu.tar.gz.sha256' exactly 1
+
+installer_name="$(basename -- "$(find "$bundle" -type f -name 'bifrost-semantic-pack-v*-x86_64-unknown-linux-gnu.tar.gz' -print -quit)")"
+release_tag="${installer_name#bifrost-semantic-pack-}"
+release_tag="${release_tag%-x86_64-unknown-linux-gnu.tar.gz}"
+case "$release_tag" in
+  v[0-9]*.[0-9]*.[0-9]*) ;;
+  *) die "qualification bundle has a non-release-tag semantic-pack installer: $installer_name" ;;
+esac
+
+installer_checksum="$(sha256sum "$bundle/$installer_name" | awk '{print $1}')"
+sidecar_name="$installer_name.sha256"
+sidecar_digest="$(awk 'NR == 1 { print $1; exit }' "$bundle/$sidecar_name")"
+sidecar_record_name="$(awk 'NR == 1 { print $2; exit }' "$bundle/$sidecar_name")"
+sidecar_record_name="${sidecar_record_name#\*}"
+if [[ ! "$sidecar_digest" =~ ^[0-9a-f]{64}$ ]] ||
+  [[ "$sidecar_record_name" != "$installer_name" ]] ||
+  [[ "$sidecar_digest" != "$installer_checksum" ]]; then
+  die "qualification bundle has an invalid semantic-pack installer checksum sidecar: $sidecar_name"
+fi
+
+echo "  semantic-pack installer: $installer_name"
+echo "  semantic-pack installer checksum: verified"
 [[ -f "$bundle/THIRD_PARTY_LICENSES.html" ]] ||
   die "qualification bundle has no THIRD_PARTY_LICENSES.html"

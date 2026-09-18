@@ -1,7 +1,7 @@
 {
   "schema_version": 2,
   "id": "bifrost.code-smells",
-  "version": "2.14.0",
+  "version": "2.15.0",
   "name": "Bifrost code smells",
   "description": "Curated structured RQLP checks for bug-prone and potentially expensive source patterns.",
   "policies": [
@@ -57,8 +57,8 @@
     {
       "path": "policies/go-data-race.rqlp",
       "id": "bifrost.correctness.go-data-race",
-      "authored_hash": "898c128e19df533e0ce1db1c574c73e8b2640cb6f50c986a8c10309cbe0ee586",
-      "resolved_semantic_hash": "898c128e19df533e0ce1db1c574c73e8b2640cb6f50c986a8c10309cbe0ee586",
+      "authored_hash": "4e2a3cc7715440600870e968765ec8b8b503b43f13c84845ecc0d78e4e79636f",
+      "resolved_semantic_hash": "4e2a3cc7715440600870e968765ec8b8b503b43f13c84845ecc0d78e4e79636f",
       "category": "correctness",
       "supported_languages": [
         "go"

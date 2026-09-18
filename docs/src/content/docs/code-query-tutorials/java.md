@@ -3,7 +3,7 @@ title: Java
 description: Query Java member calls, constructors, annotations, exceptions, and control flow with query_code.
 ---
 
-> Last verified end to end: 2026-08-04 (`query_code` schema version 1).
+> Last verified end to end: 2026-09-16 (`query_code` schema version 1).
 
 For exact inbound and outbound symbol edges, proof tiers, and adapter-specific caveats, see [Reference Traversal](../reference-traversal/).
 
@@ -429,6 +429,42 @@ counting `for` stays plain `loop`).
 }
 ```
 
+## Match A Resource Release
+
+`resource_release` matches a construct that releases a resource at its own
+exit. In Java that is a `try`-with-resources statement: the statement carries
+the implicit `close` of every resource its clause declares, so the construct,
+not a spelled `close` call, is the source fact a lifecycle rule names.
+
+<!-- code-query-case:resource-release:rql -->
+```lisp
+(language java (resource_release))
+```
+
+<!-- code-query-case:resource-release:json -->
+```json
+{"languages":["java"],"match":{"kind":"resource_release"}}
+```
+
+<!-- code-query-case:resource-release:expected -->
+```json
+{
+  "results": [
+    {
+      "enclosing_symbol": "QueryResource.release",
+      "end_line": 17,
+      "kind": "resource_release",
+      "language": "java",
+      "path": "java/QueryHierarchy.java",
+      "result_type": "structural_match",
+      "start_line": 15,
+      "text": "try (QueryHandle handle = new QueryHandle()) {…"
+    }
+  ],
+  "truncated": false
+}
+```
+
 ## Match A Lexical Scope
 
 `block` matches a statement list that opens a scope of its own: a method body,
@@ -530,6 +566,18 @@ class QueryRoot {
 
 class QueryLeaf extends QueryRoot {
     void leafMember() {}
+}
+
+class QueryHandle implements AutoCloseable {
+    public void close() {}
+}
+
+class QueryResource {
+    void release() {
+        try (QueryHandle handle = new QueryHandle()) {
+            handle.hashCode();
+        }
+    }
 }
 ```
 

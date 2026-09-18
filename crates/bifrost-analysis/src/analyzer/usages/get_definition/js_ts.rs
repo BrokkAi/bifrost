@@ -19,11 +19,11 @@ use brokk_bifrost_js_ts::providers::JsTsSource;
 use brokk_bifrost_js_ts::syntax::parse_js_ts_tree;
 use brokk_bifrost_js_ts::syntax::{
     JsTsDestructuringSource, JsTsImportBinder, JsTsImportBindingResolution,
-    JsTsLexicalBindingIndex, MAX_STATIC_IMPORT_BINDINGS_PER_NAME, destructured_property_key_source,
-    direct_property_definitions, is_declaration_identifier, is_explicit_object_literal_key,
-    is_export_alias_identifier, is_known_js_ts_global, js_program_is_external_module,
-    js_ts_statement_module_specifier, pattern_binder_identifiers, slice, static_member_property,
-    typescript_enclosing_enum_initializer,
+    JsTsLexicalBindingIndex, JsTsModuleMemberMutation, MAX_STATIC_IMPORT_BINDINGS_PER_NAME,
+    destructured_property_key_source, direct_property_definitions, is_declaration_identifier,
+    is_explicit_object_literal_key, is_export_alias_identifier, is_known_js_ts_global,
+    js_program_is_external_module, js_ts_statement_module_specifier, pattern_binder_identifiers,
+    slice, static_member_property, typescript_enclosing_enum_initializer,
 };
 /// The receiver-owner / type-text cluster this route drives now lives beside the
 /// rest of the JS/TS language logic, so the usage graph can call it without
@@ -864,6 +864,31 @@ pub(super) fn resolve_js_ts(
             format!("`{reference}` resolves through an active JS/TS declaration-model return type"),
             UnindexedClaim::resolved_external(reference, ClaimSubjectRole::Member),
         );
+    }
+
+    // #3427: a member read off an external module object answers from this
+    // file's own write before any import route answers from the module, because
+    // the write replaced the value the reference reads.
+    if let Some(outcome) = focused.and_then(|node| {
+        jsts_replaced_external_module_member(
+            analyzer,
+            host,
+            support,
+            file,
+            language,
+            source,
+            tree.root_node(),
+            site,
+            imports,
+            aliases,
+            &batch.module_member_writes,
+            &lexical_bindings,
+            node,
+            reference,
+            value_position,
+        )
+    }) {
+        return outcome;
     }
 
     if let Some(member_expression) =
@@ -2276,6 +2301,136 @@ fn jsts_local_dotted_outcome(
         });
     }
     outcome
+}
+
+/// The same-file answer for a member read off an external module object this
+/// file replaces (#3427).
+///
+/// `const cp = require("child_process"); cp.execSync = f; cp.execSync(x)` reads
+/// the value the write installed, not `child_process`'s own export, so the
+/// import routes must not answer for the module and no exact external member
+/// identity may be minted for it. The evidence is the #3406 proof: a write to
+/// the member, a computed-key write that can name it, an `Object.assign` or any
+/// other module-object escape, and a `delete` each refuse it and name the range
+/// that refused it.
+///
+/// A refused reference then resolves through the same structured
+/// property-definition and reaching evidence an ordinary same-file receiver
+/// uses, so an arrow assigned to the member resolves to that arrow. When no
+/// workspace binding is visible the answer is an open boundary that names the
+/// refusing site instead of the module's member.
+///
+/// Only an unresolvable specifier is in scope. A bare specifier that does
+/// resolve to workspace files names real exports, and those exports stay the
+/// definition this route would otherwise displace.
+#[allow(clippy::too_many_arguments)]
+fn jsts_replaced_external_module_member(
+    analyzer: &dyn IAnalyzer,
+    host: &dyn JsTsSource,
+    support: &dyn BoundedDefinitionLookup,
+    file: &ProjectFile,
+    language: Language,
+    source: &str,
+    root: Node<'_>,
+    site: &ResolvedReferenceSite,
+    imports: &JsTsImportBinder,
+    aliases: &AliasResolver,
+    module_member_writes: &crate::analyzer::js_ts::JsTsModuleMemberWriteMemo,
+    lexical_bindings: &JsTsLexicalBindingIndex,
+    focused: Node<'_>,
+    reference: &str,
+    value_position: bool,
+) -> Option<DefinitionLookupOutcome> {
+    let (qualifier, member) = reference.split_once('.')?;
+    // One member off the module object is the shape the proof covers. A deeper
+    // chain reads off a value the module member returned, which this file-local
+    // write evidence says nothing about.
+    if member.contains(['.', ':']) {
+        return None;
+    }
+    let bindings = jsts_all_visible_import_bindings(
+        imports,
+        lexical_bindings,
+        root,
+        qualifier,
+        site.focus_start_byte,
+    );
+    if bindings.is_empty()
+        || !bindings.iter().all(|binding| {
+            matches!(
+                binding.kind,
+                ImportKind::Namespace | ImportKind::CommonJsRequire
+            )
+        })
+    {
+        return None;
+    }
+    let mut mutation = None;
+    for binding in &bindings {
+        if !crate::analyzer::resolve_js_ts_module_specifier(
+            file,
+            &binding.module_specifier,
+            language,
+            Some(aliases),
+        )
+        .is_empty()
+        {
+            return None;
+        }
+        mutation = mutation.or_else(|| {
+            module_member_writes
+                .writes(
+                    root,
+                    source,
+                    &binding.module_specifier,
+                    lexical_bindings,
+                    imports,
+                )
+                .mutation(member)
+                .map(|mutation| (binding.module_specifier.clone(), mutation))
+        });
+    }
+    let (module, mutation) = mutation?;
+
+    let local = jsts_exact_local_dotted_candidates(
+        JstsDottedLookup {
+            analyzer,
+            host,
+            support,
+            file,
+            root,
+            source,
+            reference,
+            receiver: qualifier,
+            value_position,
+            before_byte: site.range.start_byte,
+        },
+        lexical_bindings,
+        focused,
+        &[],
+    );
+    if let Some(local) = local.filter(|local| !local.candidates.is_empty()) {
+        return Some(jsts_local_dotted_outcome(analyzer, reference, local));
+    }
+    let cause = match mutation {
+        JsTsModuleMemberMutation::Write(range) => format!(
+            "a write at line {} replaces it",
+            range.start_line.saturating_add(1)
+        ),
+        JsTsModuleMemberMutation::Escape(range) => format!(
+            "`{qualifier}` escapes at line {} to a writer that can replace it",
+            range.start_line.saturating_add(1)
+        ),
+        JsTsModuleMemberMutation::Budget => {
+            "this module's write evidence exceeded its traversal budget".to_string()
+        }
+    };
+    Some(no_definition(
+        "replaced_external_module_member",
+        format!(
+            "`{reference}` does not read `{module}.{member}`: {cause}, and the replacement has no visible workspace definition at this reference"
+        ),
+    ))
 }
 
 /// Resolves an exact same-file property read from structured stores and CFG

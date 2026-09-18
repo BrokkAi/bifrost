@@ -57,19 +57,22 @@ use brokk_bifrost_analysis::CancellationToken;
 use brokk_bifrost_analysis::analyzer::common::language_for_file;
 use brokk_bifrost_analysis::analyzer::lexical_definitions::formal_parameter_slots;
 use brokk_bifrost_analysis::analyzer::read_ledger::ReadLedger;
+use brokk_bifrost_analysis::analyzer::semantic::cfg_algorithms::{
+    CfgAlgorithmBudget, CfgAlgorithmError, CfgAlgorithmRequest, forward_reachability_avoiding,
+};
 use brokk_bifrost_analysis::analyzer::semantic::ids::StableDigest;
 use brokk_bifrost_analysis::analyzer::semantic::workspace_oracle::{
     ProcedureRangeLookupStatus, procedures_in_artifact,
 };
 use brokk_bifrost_analysis::analyzer::semantic::{
     AbstractObject, AccessPath, AccessPathAtPoint, AccessPathRoot, AliasQuery, AliasRelation,
-    CallBinding, CallInvocationMode, CallSiteHandle, CallSiteId, CallTransferSet,
-    CandidateCoverage, DispatchOracle, DispatchResult, EvidenceCompleteness,
-    FreshObjectPublicationKind, FreshObjectPublicationQuery, HeapOracle, IcfgExitProfile,
-    IcfgProvider, IcfgProviderBehaviorIdentity, IcfgSnapshot, IcfgSnapshotLimits, ObservationPhase,
-    OracleCallContext, OracleLimits, ProcedureHandle, ProcedurePortHandle, ProcedurePortKind,
-    ProgramPointHandle, ProofStatus, SemanticArtifact, SemanticArtifactCollector,
-    SemanticArtifactLeaseError, SemanticBudget, SemanticBudgetDimension,
+    ArgumentCardinality, CallArgumentEndpoint, CallBinding, CallInvocationMode, CallSiteHandle,
+    CallSiteId, CallTransferSet, CandidateCoverage, DispatchOracle, DispatchResult,
+    EvidenceCompleteness, FreshObjectPublicationKind, FreshObjectPublicationQuery, HeapOracle,
+    IcfgExitProfile, IcfgProvider, IcfgProviderBehaviorIdentity, IcfgSnapshot, IcfgSnapshotLimits,
+    ObservationPhase, OracleCallContext, OracleLimits, ProcedureHandle, ProcedurePortHandle,
+    ProcedurePortKind, ProgramPointHandle, ProgramPointId, ProofStatus, SemanticArtifact,
+    SemanticArtifactCollector, SemanticArtifactLeaseError, SemanticBudget, SemanticBudgetDimension,
     SemanticBudgetScopeSnapshot, SemanticExecutionBudget, SemanticExecutionWork, SemanticLocator,
     SemanticOutcome, SemanticProviderError, SemanticRequest, SemanticWork, ValueAtPoint,
     ValueFlowOracle, ValueHandle, WorkspaceIcfgProvider,
@@ -284,6 +287,9 @@ pub(crate) struct CompiledTypestatePolicy {
     result_contract_artifact_leases: usize,
     binding_omissions: Box<[String]>,
     binding_omission_subjects: HashSet<TypestateSubjectKey>,
+    /// Why a workspace helper did not discharge one subject's obligation.
+    /// Keyed by subject so a finding can name the helpers it called.
+    close_contract_reasons: HashMap<TypestateSubjectKey, Vec<String>>,
 }
 
 struct TypestateEvaluationFailure {
@@ -312,6 +318,17 @@ pub(crate) struct TypestatePolicyCompiler<'a> {
     selectors: super::selector_compiler::PolicySelectorSession<'a>,
     syntax_trees: HashMap<ProjectFile, tree_sitter::Tree>,
     formal_names: HashMap<FormalPortKey, Box<[String]>>,
+    /// Close contracts already computed, keyed by the formal they answer for
+    /// and the recursion depth that was still available when they were asked.
+    ///
+    /// Depth is part of the key because a deeper walk may discharge a contract
+    /// this walk cannot: the same formal must be recomputed, not answered with
+    /// the shallower, more conservative result.
+    close_contracts: HashMap<(FormalPortKey, u32), CloseContract>,
+    /// The formals whose contracts are being computed right now, so a
+    /// recursive helper that closes through itself answers `Cycle` instead of
+    /// recursing forever.
+    close_contract_stack: Vec<FormalPortKey>,
     binding_omissions: Vec<String>,
     binding_omission_procedures: HashSet<SemanticLocator>,
 }
@@ -336,6 +353,111 @@ impl FormalPortKey {
             kind: formal.kind(),
         }
     }
+}
+
+/// What one resolved close call acts on, in the performing procedure's terms.
+///
+/// Only three answers matter to a close contract: the call closes one of the
+/// performing procedure's own formal parameters, a different formal of that
+/// same procedure, or an object no caller argument binds to. Keeping that
+/// classification at collection time avoids retaining a full durable object
+/// identity for every close the workspace resolves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloseSiteTarget {
+    /// The close acts on formal `ordinal` of the procedure that performs it.
+    Formal { ordinal: u32 },
+    /// The close acts on a receiver, local, allocation, or static of the
+    /// performing procedure: an object no caller argument binds to.
+    NonFormal,
+    /// The close acts on a slot that belongs to another procedure or artifact.
+    Foreign,
+}
+
+/// One close call resolved inside one workspace procedure.
+#[derive(Debug, Clone)]
+struct CloseSiteFact {
+    /// The procedure whose body performs the close. Retained so a contract can
+    /// walk exactly the control-flow graph its own points came from.
+    procedure: ProcedureHandle,
+    target: CloseSiteTarget,
+    /// The close call's own invoke point. Every control path that performs the
+    /// close passes it, including the exceptional continuation of the close
+    /// itself, so it is the barrier a reachability walk cuts.
+    point: ProgramPointHandle,
+    /// Whether the heap analysis proved the close acts on exactly that target.
+    proven: bool,
+}
+
+/// Which analysis-root exits stay reachable when every proven close is a
+/// barrier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CloseExitGap {
+    normal: bool,
+    exceptional: bool,
+}
+
+impl CloseExitGap {
+    /// The exits that stay reachable when every proven close is a barrier,
+    /// phrased as the second half of the contract reason.
+    fn describe(self) -> &'static str {
+        match (self.normal, self.exceptional) {
+            (true, true) => "its normal and exceptional exits are reachable without a close of it",
+            (true, false) => "its normal exit is reachable without a close of it",
+            (false, true) => "its exceptional exit is reachable without a close of it",
+            // A gap with no reachable exit is the discharged answer, so the
+            // caller never asks for a description of it.
+            (false, false) => unreachable!("a discharged close contract has no exit gap"),
+        }
+    }
+}
+
+/// What a caller learns about closing one formal parameter of one workspace
+/// callee.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CloseContract {
+    /// Every path from the callee's entry to either exit passes a proven close
+    /// of this formal, directly or through a discharged nested call.
+    Discharged,
+    /// Some exit keeps a path that performs no proven close of this formal.
+    Partial(CloseExitGap),
+    /// The callee provably closes a different formal parameter instead.
+    DifferentObject,
+    /// The callee provably closes something that is not one of its formals.
+    UnboundClose,
+    /// The recursion bound stopped the proof before reaching a close.
+    BeyondBound,
+    /// The callee's contract depends on itself.
+    Cycle,
+    /// This callee resolves no close call at all.
+    NoEvidence,
+}
+
+/// One authored argument-form release event, as the compile lowered it.
+///
+/// A workspace helper close is discharged through this same vocabulary: the
+/// policy already says what "an argument of this call was closed" means, and
+/// the interprocedural contract proves that meaning for the callee body.
+#[derive(Debug, Clone)]
+struct ArgumentFormReleaseEvent {
+    phase: EndpointObservationPhase,
+    event: ProtocolEventKey,
+    policy_event: PolicyTypestateEventId,
+    order: u32,
+}
+
+/// One call whose actual provably binds one exact object to one callee formal.
+///
+/// The caller-side discharge and the nested-call walk of a close contract ask
+/// the same question in the same words, so they share this answer: which
+/// workspace procedure receives `object` in which of its formal parameters at
+/// which call site.
+#[derive(Clone)]
+struct ExactArgumentBinding {
+    call: CallSiteHandle,
+    /// The call's own invoke point, the barrier a discharge would cut.
+    point: ProgramPointHandle,
+    /// The callee's formal parameter the object is handed to.
+    formal: ProcedurePortHandle,
 }
 
 struct PolicyIcfgProvider<'a> {
@@ -1843,6 +1965,11 @@ fn project_finding(
             .map_err(|error| error.to_string())?;
 
     let violations = policy_violations(spec, compiled, finding)?;
+    let close_contract_reasons = compiled
+        .close_contract_reasons
+        .get(bound_subject.key())
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
     let mut projected = Vec::with_capacity(violations.len());
     for violation in violations {
         let facts = TypestatePolicyProjectionFacts::try_new(
@@ -1879,6 +2006,7 @@ fn project_finding(
             finding,
             &acquisitions,
             &spellings,
+            close_contract_reasons,
             &finding_key,
             &policy.definition().report,
             budget,
@@ -2033,6 +2161,7 @@ fn projected_report(
     finding: &TypestateFinding,
     acquisitions: &[&brokk_bifrost_analysis::analyzer::semantic::SemanticLocator],
     spellings: &[&brokk_bifrost_analysis::analyzer::semantic::SemanticLocator],
+    close_contract_reasons: &[String],
     finding_key: &str,
     report_options: &PolicyReportOptions,
     budget: &PolicyBudget,
@@ -2041,7 +2170,7 @@ fn projected_report(
     let certainty = match finding.certainty() {
         TypestateFindingCertainty::Must => FindingCertainty::Definite,
         TypestateFindingCertainty::May | TypestateFindingCertainty::Inconclusive => {
-            FindingCertainty::possible(certainty_reasons(finding)?)
+            FindingCertainty::possible(certainty_reasons(finding, close_contract_reasons)?)
                 .map_err(|error| error.to_string())?
         }
     };
@@ -2168,7 +2297,10 @@ fn projected_report(
     ))
 }
 
-fn certainty_reasons(finding: &TypestateFinding) -> Result<Vec<CertaintyReason>, String> {
+fn certainty_reasons(
+    finding: &TypestateFinding,
+    close_contract_reasons: &[String],
+) -> Result<Vec<CertaintyReason>, String> {
     let uncertainty = finding.evidence().uncertainty();
     let mut reasons = Vec::new();
     if uncertainty.contains(TypestateUncertainty::AmbiguousDispatch) {
@@ -2203,6 +2335,14 @@ fn certainty_reasons(finding: &TypestateFinding) -> Result<Vec<CertaintyReason>,
             TypestateFindingCertainty::Must => return Ok(reasons),
         };
         reasons.push(CertaintyReason::analyzer_ambiguity(code).map_err(|error| error.to_string())?);
+    }
+    // A helper call the contract did not discharge is the concrete reason this
+    // finding kept its obligation, so it belongs in the report beside the
+    // generic path uncertainty above.
+    for reason in close_contract_reasons {
+        reasons.push(CertaintyReason::MayEvidence {
+            reason: reason.clone(),
+        });
     }
     Ok(reasons)
 }
@@ -2354,6 +2494,147 @@ fn require_uninterrupted_semantic_outcome<T>(
     }
 }
 
+/// The protocol events the automaton treats as a close.
+///
+/// An event is a release event when some transition on it leads into a state a
+/// terminal expectation accepts: that is the structural meaning of "the policy
+/// is satisfied", and it does not depend on how a policy spells the event, so
+/// a policy that calls its close something else still earns a contract.
+fn release_event_keys(protocol: &CompiledProtocol) -> HashSet<ProtocolEventKey> {
+    let accepted = protocol
+        .terminal_expectations()
+        .iter()
+        .flat_map(|expectation| expectation.expected_states().iter().copied())
+        .collect::<HashSet<_>>();
+    protocol
+        .transitions()
+        .iter()
+        .filter(|transition| accepted.contains(&transition.to()))
+        .filter_map(|transition| protocol.event(transition.on()))
+        .map(|event| event.key().clone())
+        .collect()
+}
+
+/// The authored release events a workspace-helper close is discharged through.
+///
+/// Only an argument-form release describes "the object this call was handed is
+/// closed". The injected binding names the caller's own call site and subject,
+/// so the reviewed argument position is not part of the claim and every
+/// argument-form release row applies.
+fn argument_form_release_events(
+    spec: &ResolvedTypestatePolicySpec,
+    release_events: &HashSet<ProtocolEventKey>,
+) -> Result<Vec<ArgumentFormReleaseEvent>, TypestatePolicyCompileError> {
+    let mut releases = Vec::new();
+    for (event_order, event) in spec.automaton.events.iter().enumerate() {
+        let ResolvedTypestateEventTrigger::Calls { subject, phase, .. } = &event.trigger else {
+            continue;
+        };
+        if !matches!(subject, TypestateCallBinding::ArgumentIndex { .. }) {
+            continue;
+        }
+        let event_key = ProtocolEventKey::new(event.id.as_str())
+            .map_err(|error| TypestatePolicyCompileError::UnsupportedBinding(error.to_string()))?;
+        if !release_events.contains(&event_key) {
+            continue;
+        }
+        let order = u32::try_from(event_order).map_err(|_| {
+            TypestatePolicyCompileError::UnsupportedBinding(
+                "too many ordered typestate events".to_owned(),
+            )
+        })?;
+        releases.push(ArgumentFormReleaseEvent {
+            phase: *phase,
+            event: event_key,
+            policy_event: event.id.clone(),
+            order,
+        });
+    }
+    Ok(releases)
+}
+
+/// How many workspace call frames a close contract may follow.
+///
+/// The bound matches the interprocedural depth the analyzer itself inlines, so
+/// a discharge never claims more than the call graph the rest of the compile
+/// reasons about.
+fn close_contract_depth() -> u32 {
+    IcfgSnapshotLimits::default().max_call_depth
+}
+
+fn cfg_algorithm_error(
+    error: CfgAlgorithmError<ProgramPointId>,
+    operation: &str,
+) -> TypestatePolicyCompileError {
+    match error {
+        CfgAlgorithmError::Cancelled { .. } => TypestatePolicyCompileError::QueryIncomplete {
+            completion: CodeQueryCompletion::Cancelled,
+            detail: format!("{operation} was cancelled"),
+        },
+        CfgAlgorithmError::ExceededBudget(exceeded) => query_budget_error(
+            CodeQueryDiagnosticCode::SemanticBudgetExhausted,
+            format!("{operation} exceeded its CFG work budget: {exceeded:?}"),
+        ),
+        CfgAlgorithmError::InvalidNode(node) => {
+            unreachable!("a procedure graph only yields its own program points: {node:?}")
+        }
+    }
+}
+
+/// The reason a workspace callee did not discharge its caller's obligation.
+///
+/// Every reason but `NoEvidence` names what the caller would have to fix, and
+/// each one names the callee so a finding that keeps the obligation can be
+/// traced to the helper that failed to remove it. `NoEvidence` is silent: a
+/// call that resolves no close at all is not a helper that failed, it is just
+/// a call.
+fn close_contract_reason(formal: &ProcedurePortHandle, contract: &CloseContract) -> Option<String> {
+    let callee = procedure_display_name(formal.procedure());
+    match contract {
+        CloseContract::Discharged | CloseContract::NoEvidence => None,
+        CloseContract::Partial(gap) => Some(format!(
+            "the helper {callee} closes the argument only on some paths: {}",
+            gap.describe()
+        )),
+        CloseContract::DifferentObject => Some(format!(
+            "the helper {callee} closes a different resource than the argument bound at this call"
+        )),
+        CloseContract::UnboundClose => Some(format!(
+            "the helper {callee} closes a resource that no caller argument binds to"
+        )),
+        CloseContract::BeyondBound => Some(format!(
+            "the helper {callee} closes the argument only through a chain deeper than the interprocedural analysis bound"
+        )),
+        CloseContract::Cycle => Some(format!(
+            "the helper {callee} closes the argument only through a call cycle"
+        )),
+    }
+}
+
+/// The source-facing name of a procedure, taken from its declaration locator.
+///
+/// This is the name a reader of the finding sees in the code, which is what a
+/// reason has to name to be actionable.
+fn procedure_display_name(procedure: &ProcedureHandle) -> String {
+    procedure
+        .semantics()
+        .locator()
+        .declaration()
+        .segments()
+        .iter()
+        .rev()
+        .find_map(|segment| segment.name())
+        .unwrap_or("an unnamed helper")
+        .to_owned()
+}
+
+/// How many distinct helper reasons one subject's findings may carry.
+///
+/// A subject can call many helpers; a finding carries enough reasons to name
+/// the ones a reader can act on without letting a pathological workspace grow
+/// the report without bound.
+const MAX_CLOSE_CONTRACT_REASONS: usize = 32;
+
 impl<'a> TypestatePolicyCompiler<'a> {
     pub(crate) fn new(
         workspace: &'a WorkspaceAnalyzer,
@@ -2376,6 +2657,8 @@ impl<'a> TypestatePolicyCompiler<'a> {
             ),
             syntax_trees: HashMap::new(),
             formal_names: HashMap::new(),
+            close_contracts: HashMap::new(),
+            close_contract_stack: Vec::new(),
             binding_omissions: Vec::new(),
             binding_omission_procedures: HashSet::new(),
         }
@@ -2649,6 +2932,16 @@ impl<'a> TypestatePolicyCompiler<'a> {
             });
         }
 
+        // The protocol's release events are identified from the automaton, not
+        // from an event name, so a policy that spells its close differently
+        // still gets an interprocedural contract for as long as the close
+        // event is what leaves the obligation satisfied.
+        let release_events = release_event_keys(&protocol);
+        let argument_form_releases = argument_form_release_events(spec, &release_events)?;
+        // Every close call this compile resolves in a workspace body, kept
+        // before any subject filter so a callee's contract does not depend on
+        // which caller happened to name it.
+        let mut close_sites: Vec<CloseSiteFact> = Vec::new();
         let mut events = Vec::new();
         for (event_order, event) in spec.automaton.events.iter().enumerate() {
             let order = u32::try_from(event_order).map_err(|_| {
@@ -2690,11 +2983,17 @@ impl<'a> TypestatePolicyCompiler<'a> {
             }
             for trigger in self.event_selections(policy, &selectors, &event.trigger)? {
                 let endpoint = trigger.endpoint.clone();
+                let release_event =
+                    matches!(&event.trigger, ResolvedTypestateEventTrigger::Calls { .. })
+                        && release_events.contains(&event_key);
                 for resolved in self.resolve_selection(
                     trigger.selection,
                     &trigger.binding,
                     Some(trigger.phase),
                 )? {
+                    if release_event {
+                        self.note_close_sites(&resolved, &mut close_sites);
+                    }
                     for object in &resolved.objects {
                         for subject in subjects.iter().filter(|subject| {
                             event.applies_to_subjects.contains(&subject.endpoint)
@@ -2911,6 +3210,30 @@ impl<'a> TypestatePolicyCompiler<'a> {
                         .contains(&(binding.subject.clone(), call.clone()))
                 })
         });
+        // A workspace callee that provably closes the object it is handed on
+        // every exit path discharges its caller's obligation. The discharge is
+        // expressed in the policy's own argument-form release events, bound to
+        // the caller's call, so it is the reviewed close vocabulary applied to
+        // a call the contract proved. A call that already carries one of those
+        // events at the same site, order, and subject keeps the authored
+        // binding alone: the binding plan admits one event per observation
+        // order.
+        let CloseDischarges {
+            injections: mut close_discharges,
+            reasons: close_contract_reasons,
+        } = self.close_discharge_bindings(&subjects, &close_sites, &argument_form_releases)?;
+        let mut observed = events
+            .iter()
+            .map(|binding| (binding.subject.clone(), binding.order, binding.site.clone()))
+            .collect::<HashSet<_>>();
+        close_discharges.retain(|injection| {
+            observed.insert((
+                injection.subject.clone(),
+                injection.order,
+                injection.site.clone(),
+            ))
+        });
+        events.extend(close_discharges);
         let escape_event =
             internal_escape_event_key(spec.automaton.events.iter().map(|event| event.id.as_str()));
         let escape_order = u32::try_from(spec.automaton.events.len()).map_err(|_| {
@@ -3160,6 +3483,7 @@ impl<'a> TypestatePolicyCompiler<'a> {
             result_contract_artifact_leases,
             binding_omissions: std::mem::take(&mut self.binding_omissions).into_boxed_slice(),
             binding_omission_subjects: incomplete_subjects,
+            close_contract_reasons,
         })
     }
 
@@ -4198,6 +4522,445 @@ impl<'a> TypestatePolicyCompiler<'a> {
         self.formal_names.insert(formal_key, names);
         Ok(matches)
     }
+
+    /// Record every close call one resolved release selection names.
+    ///
+    /// This collection is deliberately independent of subjects: a callee's
+    /// contract is a property of the callee's own body, so it must not depend
+    /// on which caller first happened to name the close. The target is kept in
+    /// the performing procedure's terms because that is the only form a
+    /// contract can compare against its own formal parameters.
+    fn note_close_sites(&self, resolved: &ResolvedSelection, close_sites: &mut Vec<CloseSiteFact>) {
+        let Some(call) = resolved.call.as_ref() else {
+            return;
+        };
+        let procedure = call.procedure();
+        let row = procedure
+            .semantics()
+            .call_site(call.id())
+            .expect("validated call handle resolves");
+        let point = procedure
+            .point_handle(row.point)
+            .expect("validated call point has a scoped handle");
+        let performing = procedure.durable_key();
+        for object in &resolved.objects {
+            let target = match object.object.identity() {
+                AccessPathRoot::ProcedurePort(port)
+                    if port.procedure().durable_key() == performing =>
+                {
+                    match port.kind() {
+                        ProcedurePortKind::Parameter { ordinal } => {
+                            CloseSiteTarget::Formal { ordinal }
+                        }
+                        _ => CloseSiteTarget::NonFormal,
+                    }
+                }
+                AccessPathRoot::ProcedurePort(_) => CloseSiteTarget::Foreign,
+                _ => CloseSiteTarget::NonFormal,
+            };
+            close_sites.push(CloseSiteFact {
+                procedure: procedure.clone(),
+                target,
+                point: point.clone(),
+                proven: matches!(object.quality.proof(), ProofStatus::Proven),
+            });
+        }
+    }
+
+    /// The close contract of one workspace callee's formal parameter: whether
+    /// every path from the callee's entry to one of its exits provably closes
+    /// the object that formal is handed.
+    ///
+    /// The answer is memoized per formal and remaining depth, and guarded by an
+    /// in-progress stack, so a helper that closes through itself answers
+    /// `Cycle` instead of recursing without end.
+    fn close_contract(
+        &mut self,
+        formal: &ProcedurePortHandle,
+        close_sites: &[CloseSiteFact],
+    ) -> Result<CloseContract, TypestatePolicyCompileError> {
+        self.close_contract_at_depth(formal, close_sites, close_contract_depth())
+    }
+
+    fn close_contract_at_depth(
+        &mut self,
+        formal: &ProcedurePortHandle,
+        close_sites: &[CloseSiteFact],
+        remaining_depth: u32,
+    ) -> Result<CloseContract, TypestatePolicyCompileError> {
+        let key = FormalPortKey::of(formal);
+        if let Some(contract) = self.close_contracts.get(&(key.clone(), remaining_depth)) {
+            return Ok(contract.clone());
+        }
+        if self.close_contract_stack.contains(&key) {
+            return Ok(CloseContract::Cycle);
+        }
+        if remaining_depth == 0 {
+            return Ok(CloseContract::BeyondBound);
+        }
+        self.close_contract_stack.push(key.clone());
+        let computed = self.compute_close_contract(formal, close_sites, remaining_depth);
+        self.close_contract_stack.pop();
+        let contract = computed?;
+        // `Cycle` describes where this walk had already been, not a property of
+        // the formal, so it is never memoized.
+        if contract != CloseContract::Cycle {
+            self.close_contracts
+                .insert((key, remaining_depth), contract.clone());
+        }
+        Ok(contract)
+    }
+
+    fn compute_close_contract(
+        &mut self,
+        formal: &ProcedurePortHandle,
+        close_sites: &[CloseSiteFact],
+        remaining_depth: u32,
+    ) -> Result<CloseContract, TypestatePolicyCompileError> {
+        let ProcedurePortKind::Parameter { ordinal } = formal.kind() else {
+            return Ok(CloseContract::UnboundClose);
+        };
+        let callee = formal.procedure().clone();
+        let performing = callee.durable_key();
+        let mut barriers = Vec::new();
+        let mut different_formal = false;
+        let mut unbound = false;
+        for fact in close_sites
+            .iter()
+            .filter(|fact| fact.procedure.durable_key() == performing)
+        {
+            if !fact.proven {
+                continue;
+            }
+            match fact.target {
+                CloseSiteTarget::Formal { ordinal: closed } if closed == ordinal => {
+                    barriers.push(fact.point.id())
+                }
+                CloseSiteTarget::Formal { .. } => different_formal = true,
+                CloseSiteTarget::NonFormal | CloseSiteTarget::Foreign => unbound = true,
+            }
+        }
+        // A nested call that provably hands this same formal to a callee whose
+        // own contract is discharged is a close of it too, so the walk cuts at
+        // the call that performs it. The nested walk runs even when this body
+        // performs no close of its own: a helper that only forwards the formal
+        // to another helper still closes it.
+        let handed = AccessPathRoot::ProcedurePort(formal.clone());
+        let calls = callee
+            .semantics()
+            .call_sites()
+            .iter()
+            .filter_map(|row| callee.call_site_handle(row.id))
+            .collect::<Vec<_>>();
+        let mut nested_undecided = false;
+        for call in calls {
+            for binding in self.exact_argument_bindings(&call, &handed)? {
+                let nested = self.close_contract_at_depth(
+                    &binding.formal,
+                    close_sites,
+                    remaining_depth - 1,
+                )?;
+                if nested == CloseContract::Discharged {
+                    barriers.push(binding.point.id());
+                } else if nested != CloseContract::NoEvidence {
+                    // A helper this body hands the formal to does not prove a
+                    // close of it on every path. That keeps the obligation, so
+                    // the exits below stay reachable and the caller gets this
+                    // callee's gap rather than silence.
+                    nested_undecided = true;
+                }
+            }
+        }
+        if barriers.is_empty() && !nested_undecided {
+            if different_formal {
+                return Ok(CloseContract::DifferentObject);
+            }
+            if unbound {
+                return Ok(CloseContract::UnboundClose);
+            }
+            return Ok(CloseContract::NoEvidence);
+        }
+        barriers.sort_unstable();
+        barriers.dedup();
+        let graph = callee.semantics();
+        let mut budget = CfgAlgorithmBudget::default();
+        let mut request = CfgAlgorithmRequest::new(&mut budget, self.selectors.cancellation());
+        let reachable = forward_reachability_avoiding(
+            graph,
+            graph.entry_point(),
+            |point| barriers.binary_search(&point).is_ok(),
+            &mut request,
+        )
+        .map_err(|error| cfg_algorithm_error(error, "interprocedural close reachability"))?;
+        let normal = reachable.contains(graph, graph.normal_exit_point());
+        let exceptional = reachable.contains(graph, graph.exceptional_exit_point());
+        let work = reachable.work();
+        drop(reachable);
+        self.selectors
+            .remaining_semantic_traversal_steps()
+            .map_err(typestate_selector_error)?;
+        if !self
+            .selectors
+            .execution_budget()
+            .charge_traversal(work.node_visits + work.edge_visits)
+        {
+            return Err(query_budget_error(
+                CodeQueryDiagnosticCode::SemanticBudgetExhausted,
+                "interprocedural close reachability exhausted the shared traversal budget",
+            ));
+        }
+        if !normal && !exceptional {
+            return Ok(CloseContract::Discharged);
+        }
+        Ok(CloseContract::Partial(CloseExitGap {
+            normal,
+            exceptional,
+        }))
+    }
+
+    /// Every call at which one actual provably denotes exactly `object` and
+    /// provably binds that object into a workspace callee's formal parameter.
+    ///
+    /// Every gate here is an exactness gate: a partial dispatch, an open
+    /// argument group, an unproven mapping, or an object set with more than one
+    /// candidate all answer "no" rather than "maybe". A discharge claims an
+    /// obligation is gone, so an inexact question must never produce one.
+    fn exact_argument_bindings(
+        &mut self,
+        call: &CallSiteHandle,
+        object: &AccessPathRoot,
+    ) -> Result<Vec<ExactArgumentBinding>, TypestatePolicyCompileError> {
+        let row = call
+            .procedure()
+            .semantics()
+            .call_site(call.id())
+            .expect("validated call handle resolves");
+        let point = call
+            .procedure()
+            .point_handle(row.point)
+            .expect("validated call point has a scoped handle");
+        let oracle = self.selectors.workspace().semantic_oracle_provider();
+        let leases = self.selectors.begin_semantic_lease_window();
+        let mut found: Vec<ExactArgumentBinding> = Vec::new();
+        {
+            let dispatch_outcome = self
+                .selectors
+                .continue_semantic_in_window(&leases, |request| oracle.resolve_call(call, request))
+                .map_err(typestate_selector_error)?;
+            require_uninterrupted_semantic_outcome(&dispatch_outcome, "close-contract dispatch")?;
+            self.selectors
+                .require_execution_budget("close-contract dispatch")
+                .map_err(typestate_selector_error)?;
+            let dispatch = dispatch_outcome
+                .is_complete()
+                .then(|| dispatch_outcome.available_value())
+                .flatten()
+                .filter(|dispatch| {
+                    dispatch.coverage() == CandidateCoverage::Exhaustive
+                        && !dispatch.candidates().is_empty()
+                        && dispatch.boundaries().is_empty()
+                        && dispatch
+                            .candidates()
+                            .iter()
+                            .all(|candidate| matches!(candidate.proof(), ProofStatus::Proven))
+                });
+            let Some(dispatch) = dispatch else {
+                drop(dispatch_outcome);
+                leases
+                    .finish_scalar((), "close-contract dispatch")
+                    .map_err(typestate_selector_error)?;
+                return Ok(found);
+            };
+            for candidate in dispatch.candidates() {
+                let bindings_outcome = self
+                    .selectors
+                    .continue_semantic_in_window(&leases, |request| {
+                        oracle.call_bindings(call, candidate, &OracleCallContext::empty(), request)
+                    })
+                    .map_err(typestate_selector_error)?;
+                require_uninterrupted_semantic_outcome(
+                    &bindings_outcome,
+                    "close-contract argument binding",
+                )?;
+                self.selectors
+                    .require_execution_budget("close-contract argument binding")
+                    .map_err(typestate_selector_error)?;
+                if !bindings_outcome.is_complete() {
+                    continue;
+                }
+                let Some(bindings) = bindings_outcome.available_value() else {
+                    continue;
+                };
+                if bindings.coverage() != CandidateCoverage::Exhaustive {
+                    continue;
+                }
+                for binding in bindings.bindings() {
+                    let CallBinding::ArgumentGroup(group) = binding else {
+                        continue;
+                    };
+                    if group.coverage() != CandidateCoverage::Exhaustive {
+                        continue;
+                    }
+                    let proven = group
+                        .mappings()
+                        .iter()
+                        .filter(|mapping| matches!(mapping.proof(), ProofStatus::Proven))
+                        .count();
+                    if !matches!(
+                        group.cardinality(),
+                        ArgumentCardinality::Exact(count) if count == proven
+                    ) {
+                        continue;
+                    }
+                    for mapping in group.mappings() {
+                        if !matches!(mapping.proof(), ProofStatus::Proven)
+                            || !mapping.value().preserves_reference_identity()
+                        {
+                            continue;
+                        }
+                        let formal = mapping.value().formal().clone();
+                        if !matches!(formal.kind(), ProcedurePortKind::Parameter { .. }) {
+                            continue;
+                        }
+                        let CallArgumentEndpoint::Value(actual) = mapping.value().actual() else {
+                            continue;
+                        };
+                        let at_point = ValueAtPoint::new(
+                            actual.clone(),
+                            point.clone(),
+                            ObservationPhase::BeforeEffects,
+                            OracleCallContext::empty(),
+                        )
+                        .expect("the bound actual is scoped to the call's own procedure");
+                        let pointees_outcome = self
+                            .selectors
+                            .continue_semantic_in_window(&leases, |request| {
+                                oracle.pointees(&at_point, request)
+                            })
+                            .map_err(typestate_selector_error)?;
+                        require_uninterrupted_semantic_outcome(
+                            &pointees_outcome,
+                            "close-contract heap analysis",
+                        )?;
+                        self.selectors
+                            .require_execution_budget("close-contract heap analysis")
+                            .map_err(typestate_selector_error)?;
+                        let exact = pointees_outcome.is_complete()
+                            && pointees_outcome.available_value().is_some_and(|result| {
+                                let objects = result.objects();
+                                if !objects.coverage().is_exhaustive() {
+                                    return false;
+                                }
+                                let mut candidates = objects.candidates().iter();
+                                match (candidates.next(), candidates.next()) {
+                                    (Some(candidate), None) => {
+                                        candidate.is_proven_complete()
+                                            && candidate.value().identity() == object
+                                    }
+                                    _ => false,
+                                }
+                            });
+                        if exact
+                            && !found
+                                .iter()
+                                .any(|existing| existing.call == *call && existing.formal == formal)
+                        {
+                            found.push(ExactArgumentBinding {
+                                call: call.clone(),
+                                point: point.clone(),
+                                formal,
+                            });
+                        }
+                    }
+                }
+            }
+            drop(dispatch_outcome);
+        }
+        leases
+            .finish_scalar((), "close-contract argument binding")
+            .map_err(typestate_selector_error)?;
+        Ok(found)
+    }
+
+    /// Discharge each tracked subject whose own analysis root hands it to a
+    /// workspace helper that provably closes it on every exit.
+    ///
+    /// The injected events are the policy's own argument-form release events:
+    /// the caller's call binds the subject as an argument exactly as the
+    /// reviewed argument-form close does, so the same rows describe it. A
+    /// callee that keeps its obligation produces a reason instead, which the
+    /// report shows beside the finding it did not discharge.
+    fn close_discharge_bindings(
+        &mut self,
+        subjects: &[CompiledTypestateSubject],
+        close_sites: &[CloseSiteFact],
+        releases: &[ArgumentFormReleaseEvent],
+    ) -> Result<CloseDischarges, TypestatePolicyCompileError> {
+        let mut injections = Vec::new();
+        let mut reasons = HashMap::<TypestateSubjectKey, Vec<String>>::new();
+        if releases.is_empty() {
+            return Ok(CloseDischarges {
+                injections,
+                reasons,
+            });
+        }
+        for subject in subjects {
+            let object = subject.object.identity().clone();
+            let calls = subject
+                .root
+                .semantics()
+                .call_sites()
+                .iter()
+                .filter_map(|row| subject.root.call_site_handle(row.id))
+                .collect::<Vec<_>>();
+            for call in calls {
+                let bindings = self.exact_argument_bindings(&call, &object)?;
+                for binding in bindings {
+                    let contract = self.close_contract(&binding.formal, close_sites)?;
+                    if contract == CloseContract::Discharged {
+                        let site = TypestateObservationSite::call_site(
+                            call.clone(),
+                            TypestateBindingContext::root(),
+                        );
+                        for release in releases {
+                            injections.push(PendingEventBinding {
+                                event: release.event.clone(),
+                                policy_event: release.policy_event.clone(),
+                                subject: subject.key.clone(),
+                                site: site.clone(),
+                                phase: EventObservationPhase::Endpoint(release.phase),
+                                order: release.order,
+                                role: TypestateObjectRole::Argument,
+                                quality: TypestateBindingQuality::proven_unique(),
+                                endpoint: None,
+                                modeled_external_effect: None,
+                                alias_derived: false,
+                            });
+                        }
+                    } else if let Some(reason) = close_contract_reason(&binding.formal, &contract) {
+                        let entry = reasons.entry(subject.key.clone()).or_default();
+                        if entry.len() < MAX_CLOSE_CONTRACT_REASONS && !entry.contains(&reason) {
+                            entry.push(reason);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(CloseDischarges {
+            injections,
+            reasons,
+        })
+    }
+}
+
+/// What one compile's helper-close scan produced.
+struct CloseDischarges {
+    /// Release rows that discharge one tracked subject at a call its own
+    /// analysis root makes.
+    injections: Vec<PendingEventBinding>,
+    /// Why a workspace helper kept a subject's obligation, keyed by subject so
+    /// its finding can carry the reasons.
+    reasons: HashMap<TypestateSubjectKey, Vec<String>>,
 }
 
 #[derive(Clone)]

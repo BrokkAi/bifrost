@@ -101,6 +101,9 @@ use crate::util::throttled_log::ThrottledLog;
 use brokk_bifrost_rql::{QuerySourceEdit, query_source_help_at, validate_query_source};
 use semver::Version;
 
+const BIFROST_LSP_PROTOCOL_VERSION: u64 = 1;
+const BIFROST_ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// Run the LSP server over stdio. `fallback_root` is used when the client does
 /// not advertise usable workspace folders or legacy root params. Returns when
 /// the client sends `exit` (after the standard `shutdown` request) or the
@@ -134,14 +137,9 @@ pub(crate) fn run_with_connection(
             );
         }
     };
-    let server_capabilities = server_capabilities_json(&init_params)?;
+    let initialize_result = initialize_result_json(&init_params)?;
     connection
-        .initialize_finish(
-            init_id,
-            serde_json::json!({
-                "capabilities": server_capabilities,
-            }),
-        )
+        .initialize_finish(init_id, initialize_result)
         .map_err(|err| format!("LSP initialize failed: {err}"))?;
 
     let workspace_config = collect_workspace_config(&init_params, fallback_root.as_path())?;
@@ -233,8 +231,43 @@ fn server_capabilities_json(params: &InitializeParams) -> Result<serde_json::Val
             "callHierarchyProvider".to_string(),
             serde_json::Value::Bool(true),
         );
+        let experimental = object
+            .entry("experimental")
+            .or_insert_with(|| serde_json::json!({}));
+        let experimental = experimental.as_object_mut().ok_or_else(|| {
+            "Failed to extend non-object LSP experimental capabilities".to_string()
+        })?;
+        experimental.insert(
+            "bifrost".to_string(),
+            serde_json::json!({
+                "protocolVersion": BIFROST_LSP_PROTOCOL_VERSION,
+                "engineVersion": engine_version()?,
+            }),
+        );
     }
     Ok(capabilities)
+}
+
+fn initialize_result_json(params: &InitializeParams) -> Result<serde_json::Value, String> {
+    Ok(serde_json::json!({
+        "capabilities": server_capabilities_json(params)?,
+    }))
+}
+
+fn engine_version() -> Result<&'static str, String> {
+    let version = Version::parse(BIFROST_ENGINE_VERSION).map_err(|err| {
+        format!("Invalid Bifrost package version {BIFROST_ENGINE_VERSION}: {err}")
+    })?;
+    if !version.pre.is_empty()
+        || !version.build.is_empty()
+        || BIFROST_ENGINE_VERSION
+            != format!("{}.{}.{}", version.major, version.minor, version.patch)
+    {
+        return Err(format!(
+            "Bifrost package version must be stable three-component semver: {BIFROST_ENGINE_VERSION}"
+        ));
+    }
+    Ok(BIFROST_ENGINE_VERSION)
 }
 
 fn main_loop(
@@ -4724,6 +4757,41 @@ mod tests {
     use super::*;
     use lsp_types::notification::Progress;
     use serde_json::json;
+
+    #[test]
+    fn initialize_result_serializes_package_engine_identity_without_losing_capabilities() {
+        let params: InitializeParams = serde_json::from_value(json!({
+            "processId": null,
+            "rootUri": null,
+            "capabilities": {}
+        }))
+        .unwrap();
+
+        let result = initialize_result_json(&params).unwrap();
+        assert_eq!(
+            result.pointer("/capabilities/experimental/bifrost"),
+            Some(&json!({
+                "protocolVersion": 1,
+                "engineVersion": env!("CARGO_PKG_VERSION")
+            }))
+        );
+        assert_eq!(
+            result.pointer("/capabilities/typeHierarchyProvider"),
+            Some(&json!(true))
+        );
+        assert_eq!(
+            result.pointer("/capabilities/textDocumentSync/openClose"),
+            Some(&json!(true))
+        );
+
+        let parsed = Version::parse(engine_version().unwrap()).unwrap();
+        assert!(parsed.pre.is_empty());
+        assert!(parsed.build.is_empty());
+        assert_eq!(
+            engine_version().unwrap(),
+            format!("{}.{}.{}", parsed.major, parsed.minor, parsed.patch)
+        );
+    }
 
     /// A session with zero workspace roots has nothing to analyze and no
     /// identity to cache under, so it must build the empty analyzer directly

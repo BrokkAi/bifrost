@@ -24,7 +24,7 @@ use crate::analyzer::tree_sitter_analyzer::{
 use crate::analyzer::{GoAnalyzer, Language, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 
-const ADAPTER_VERSION: &[u8] = b"go-value-semantics-v74";
+const ADAPTER_VERSION: &[u8] = b"go-value-semantics-v76";
 
 impl_program_semantics_provider!(GoAnalyzer, GoSemanticLowerer);
 
@@ -2808,6 +2808,56 @@ fn go_type_is_reference(
     )
 }
 
+/// The interface type node a type denotes, resolving parentheses and named
+/// type declarations. The predeclared `any` alias denotes the empty interface
+/// but has no `interface_type` node, so its identifier is returned instead.
+fn go_type_interface_node<'tree>(
+    mut kind: Node<'tree>,
+    source: &str,
+    named_types: &GoNamedTypeDefinitions<'tree>,
+    mut use_byte: usize,
+) -> Option<Node<'tree>> {
+    let definition_count = named_types.values().map(Vec::len).sum::<usize>();
+    for _ in 0..=definition_count {
+        match kind.kind() {
+            "parenthesized_type" => kind = first_named_child(kind)?,
+            "type_identifier" => {
+                let name = node_text(source, kind)?;
+                if name == "any" {
+                    return visible_go_named_type(named_types, "any", kind.start_byte())
+                        .is_none()
+                        .then_some(kind);
+                }
+                let definition = visible_go_named_type(named_types, name, use_byte)?;
+                use_byte = definition.underlying.start_byte();
+                kind = definition.underlying;
+            }
+            "interface_type" => return Some(kind),
+            _ => return None,
+        }
+    }
+    None
+}
+
+fn go_type_is_interface(
+    kind: Node<'_>,
+    source: &str,
+    named_types: &GoNamedTypeDefinitions<'_>,
+    use_byte: usize,
+) -> bool {
+    go_type_interface_node(kind, source, named_types, use_byte).is_some()
+}
+
+fn go_type_is_empty_interface(
+    kind: Node<'_>,
+    source: &str,
+    named_types: &GoNamedTypeDefinitions<'_>,
+    use_byte: usize,
+) -> bool {
+    go_type_interface_node(kind, source, named_types, use_byte)
+        .is_some_and(|node| node.kind() != "interface_type" || named_children(node).is_empty())
+}
+
 fn go_channel_payload_copy_from_type(
     kind: Node<'_>,
     source: &str,
@@ -2828,6 +2878,14 @@ fn go_channel_payload_copy_from_type(
         "map_type" => Some(SynchronizationPayloadCopy::BackingStore {
             identity: IndexedLocationIdentity::Aggregate,
         }),
+        // An interface element boxes one reference payload. The sent
+        // reference keeps its object identity inside the wrapper, exactly as
+        // a direct `pointer_type` element does; the operand check
+        // (`expression_supports_channel_payload_copy`) keeps a boxed
+        // non-reference payload, such as a slice or map header, unnamed.
+        _ if go_type_is_interface(element, source, named_types, use_byte) => {
+            Some(SynchronizationPayloadCopy::Reference)
+        }
         _ => None,
     }
 }
@@ -5433,6 +5491,22 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
         }
     }
 
+    /// The flow kind for a destination that holds the source's own value
+    /// without copying it.
+    ///
+    /// Go's parenthesized expression is a spelling rather than an operation,
+    /// so the wrapper names the operand's value: the same object, and the
+    /// same indexed backing store for a slice or map header, which is the
+    /// relation a binding copy of that header already states.
+    fn source_alias_flow_kind(&self, value: ValueId) -> ValueFlowKind {
+        match self.value_storage_kinds.get(&value) {
+            Some(GoStorageKind::Slice | GoStorageKind::Map) => ValueFlowKind::BackingStore {
+                offset: BackingStoreOffset::Zero,
+            },
+            _ => ValueFlowKind::Local,
+        }
+    }
+
     fn append_binding_assignment(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
@@ -6327,48 +6401,13 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
         )
     }
 
-    fn type_is_empty_interface(&self, mut node: Node<'tree>, mut byte: usize) -> bool {
-        let limit = self
-            .named_type_definitions
-            .values()
-            .map(Vec::len)
-            .sum::<usize>()
-            .saturating_add(1);
-        for _ in 0..=limit {
-            match node.kind() {
-                "parenthesized_type" => {
-                    let Some(child) = first_named_child(node) else {
-                        return false;
-                    };
-                    node = child;
-                }
-                "type_identifier" => {
-                    let Some(name) = node_text(self.prepared.source(), node) else {
-                        return false;
-                    };
-                    if name == "any" {
-                        return visible_go_named_type(
-                            self.named_type_definitions,
-                            "any",
-                            node.start_byte(),
-                        )
-                        .is_none();
-                    }
-                    let Some(definition) =
-                        visible_go_named_type(self.named_type_definitions, name, byte)
-                    else {
-                        return false;
-                    };
-                    byte = definition.underlying.start_byte();
-                    node = definition.underlying;
-                }
-                "interface_type" => {
-                    return named_children(node).is_empty();
-                }
-                _ => return false,
-            }
-        }
-        false
+    fn type_is_empty_interface(&self, node: Node<'tree>, byte: usize) -> bool {
+        go_type_is_empty_interface(
+            node,
+            self.prepared.source(),
+            self.named_type_definitions,
+            byte,
+        )
     }
 
     fn expression_type_identity(&self, node: Node<'tree>, byte: usize) -> Option<GoTypeIdentity> {
@@ -8432,8 +8471,22 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
         let boundary = self.point(builder, node, Vec::new())?;
         let old = self.expression_value(builder, operand, self.expression_value_kind(operand))?;
         let computed = self.source_value(builder, node, SemanticValueKind::Temporary)?;
-        self.session
-            .append_language_defined_value_flows(builder, boundary, [old], computed)?;
+        // `x++` and `x--` change a numeric value by exactly one, which the
+        // syntax states without any type reasoning. Publishing that step as a
+        // structured offset instead of an opaque flow is what lets a bounded
+        // scalar consumer follow a loop induction variable across its update
+        // (issue #2903); an opaque flow ends the value's history there.
+        self.append_effect(
+            builder,
+            boundary,
+            SemanticEffect::ValueFlow {
+                kind: ValueFlowKind::IntegerOffset {
+                    offset: SignedIntegerMagnitude::new(node.kind() == "dec_statement", 1),
+                },
+                source: old,
+                target: computed,
+            },
+        )?;
         if let Some((name, target)) = binding {
             let kind = self.binding_flow_kind(name, target, node.end_byte());
             self.append_binding_assignment(builder, boundary, target, computed, kind)?;
@@ -8806,12 +8859,27 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
             if let Some(identity) = self.value_types.get(&target).cloned() {
                 self.value_types.insert(computed, identity);
             }
-            self.session.append_language_defined_value_flows(
-                builder,
-                boundary,
-                [left_value, right_value],
-                computed,
-            )?;
+            // `x += n` and `x -= n` over an exact integer literal apply the
+            // same structured step as `x++`, so they publish the same offset
+            // relation. Every other operator, and any right operand that is
+            // not a represented integer literal, keeps the opaque flow.
+            match go_update_integer_offset(self.prepared.source(), node, source_node) {
+                Some(offset) => self.append_effect(
+                    builder,
+                    boundary,
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::IntegerOffset { offset },
+                        source: left_value,
+                        target: computed,
+                    },
+                )?,
+                None => self.session.append_language_defined_value_flows(
+                    builder,
+                    boundary,
+                    [left_value, right_value],
+                    computed,
+                )?,
+            }
             let kind = self.binding_flow_kind(name, target, node.end_byte());
             self.append_binding_assignment(builder, boundary, target, computed, kind)?;
         } else if let Some((_, location)) = compound_static_target {
@@ -11247,6 +11315,21 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
                         SemanticEffect::Assignment {
                             target: result,
                             value: source,
+                        },
+                    )?;
+                    // Parentheses are a spelling, not an operation: the
+                    // wrapper denotes the operand's own value, so a consumer
+                    // that reads it reads the same object. Stating the
+                    // relation is what lets an assertion on the wrapper see
+                    // the identity the operand carried, including a reference
+                    // that arrived as a channel payload (issue #3405).
+                    self.append_effect(
+                        builder,
+                        terminal,
+                        SemanticEffect::ValueFlow {
+                            kind: self.source_alias_flow_kind(source),
+                            source,
+                            target: result,
                         },
                     )?;
                     self.edge(builder, terminal, next)?;
@@ -14465,6 +14548,26 @@ fn go_string_literal_text<'source>(source: &'source str, node: Node<'_>) -> Opti
     }
     let text = node_text(source, node)?;
     Some(text)
+}
+
+/// The exact integer step one Go compound assignment applies to its target.
+///
+/// `x += n` and `x -= n` change the target by the literal `n`. Every other
+/// operator, and any right operand that is not a represented integer literal,
+/// has no exact step and keeps the opaque assignment flow. The operator comes
+/// from the statement's own AST field, so no source text is scanned.
+fn go_update_integer_offset(
+    source: &str,
+    statement: Node<'_>,
+    right: Node<'_>,
+) -> Option<SignedIntegerMagnitude> {
+    let negative = match statement.child_by_field_name("operator")?.kind() {
+        "+=" => false,
+        "-=" => true,
+        _ => return None,
+    };
+    let magnitude = go_integer_literal_value(source, right)?;
+    Some(SignedIntegerMagnitude::new(negative, magnitude))
 }
 
 /// The magnitude of one tree-sitter-classified Go integer literal.
@@ -18357,6 +18460,7 @@ func send(
     maps chan map[int]int,
     structs chan cell,
     interfaces chan any,
+    interfaceSlices chan any,
     pointer *cell,
     slice []int,
     mapping map[int]int,
@@ -18367,6 +18471,7 @@ func send(
     maps <- mapping
     structs <- value
     interfaces <- pointer
+    interfaceSlices <- slice
 }
 "#;
         let procedures = lower_fixture(SOURCE);
@@ -18412,7 +18517,17 @@ func send(
                 ..
             }))
         ));
-        for channel in ["structs", "interfaces"] {
+        assert!(matches!(
+            payloads.get("interfaces"),
+            Some(Some(SynchronizationPayload::Send {
+                copy: SynchronizationPayloadCopy::Reference,
+                ..
+            }))
+        ));
+        // An interface element boxes whatever the operand copies. A boxed
+        // slice header names no single transported object here, so its send
+        // endpoint stays unknown rather than claiming the reference rule.
+        for channel in ["structs", "interfaceSlices"] {
             assert!(
                 matches!(
                     payloads.get(channel),

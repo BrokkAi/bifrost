@@ -25,6 +25,10 @@ struct EnclosingBinding {
 }
 
 pub(super) fn callable_name(source: &str, node: Node<'_>) -> Option<Box<str>> {
+    if node.kind() == "program" {
+        return Some("<file>".into());
+    }
+
     if matches!(node.kind(), "field_definition" | "public_field_definition") {
         let name = node
             .child_by_field_name("name")
@@ -143,11 +147,30 @@ pub(super) fn callable_shape<'tree>(
     Node<'tree>,
     ProcedureProperties,
 )> {
-    let (kind, segment_kind, body, generator, is_static) = match node.kind() {
+    let (kind, segment_kind, body, generator, is_static, is_synthetic) = match node.kind() {
+        // The module body executes file-scope statements, so it is a procedure
+        // in its own right: without it a file-scope load could never join an
+        // executable `MemoryLoad` (#3374). Its statements are not a block, so
+        // the body is the program node itself. A module scope that holds only
+        // declarations has no statement to run and stays outside the frame.
+        "program" => {
+            if !module_body_has_statements(node) {
+                return None;
+            }
+            (
+                ProcedureKind::Initializer,
+                DeclarationSegmentKind::Initializer,
+                node,
+                false,
+                true,
+                true,
+            )
+        }
         "function_declaration" | "function_expression" => (
             ProcedureKind::Function,
             DeclarationSegmentKind::Function,
             node.child_by_field_name("body")?,
+            false,
             false,
             false,
         ),
@@ -157,11 +180,13 @@ pub(super) fn callable_shape<'tree>(
             node.child_by_field_name("body")?,
             true,
             false,
+            false,
         ),
         "arrow_function" => (
             ProcedureKind::Lambda,
             DeclarationSegmentKind::Lambda,
             node.child_by_field_name("body")?,
+            false,
             false,
             false,
         ),
@@ -171,6 +196,7 @@ pub(super) fn callable_shape<'tree>(
             node.child_by_field_name("body")?,
             has_child_kind(node, "*"),
             has_child_kind(node, "static") || has_child_kind(node, "static get"),
+            false,
         ),
         "class_static_block" => (
             ProcedureKind::Initializer,
@@ -178,6 +204,7 @@ pub(super) fn callable_shape<'tree>(
             node.child_by_field_name("body")?,
             false,
             true,
+            false,
         ),
         "field_definition" | "public_field_definition" => (
             ProcedureKind::Initializer,
@@ -185,6 +212,7 @@ pub(super) fn callable_shape<'tree>(
             node.child_by_field_name("value")?,
             false,
             has_child_kind(node, "static"),
+            false,
         ),
         _ => return None,
     };
@@ -200,7 +228,7 @@ pub(super) fn callable_shape<'tree>(
             is_async,
             is_generator: generator,
             is_static,
-            is_synthetic: false,
+            is_synthetic,
             invocation: if generator {
                 ProcedureInvocationKind::Deferred
             } else {
@@ -251,6 +279,66 @@ pub(super) fn callable_field_belongs_to_procedure(
         "method_definition" => !matches!(field, Some("name" | "decorator")),
         _ => true,
     }
+}
+
+/// A statement that declares a name or a type in the file scope instead of
+/// executing in the module body's value flow.
+///
+/// The file scope owns exactly the declarations that are direct statements of
+/// the module body, so only such a child is a file-scope declaration. The
+/// module body frame is the frame of the statements around them, and it lists
+/// each declaration as a sibling rather than as a child: the declared
+/// procedure and declaration container keep the file scope as their lexical
+/// parent and declaration path, exactly as Ruby and Scala enumerate the
+/// members of a synthetic body. The body then schedules only the statements it
+/// actually runs (#3374).
+///
+/// An `export` wrapper is transparent: `export function f() {}` declares `f`
+/// in the file scope exactly as the unwrapped form does, while
+/// `export const x = ...` and `export default <expression>` execute in the
+/// body and stay with it.
+pub(super) fn is_file_scope_declaration(node: Node<'_>) -> bool {
+    if !node
+        .parent()
+        .is_some_and(|parent| parent.kind() == "program")
+    {
+        return false;
+    }
+    let declaration = if node.kind() == "export_statement" {
+        match node.child_by_field_name("declaration") {
+            Some(declaration) => declaration,
+            None => return false,
+        }
+    } else {
+        node
+    };
+    matches!(
+        declaration.kind(),
+        "function_declaration"
+            | "generator_function_declaration"
+            | "function_signature"
+            | "class_declaration"
+            | "abstract_class_declaration"
+            | "interface_declaration"
+            | "enum_declaration"
+            | "type_alias_declaration"
+            | "internal_module"
+            // `declare ...` is ambient: it declares names and types for the
+            // type checker and emits no runtime value flow at all (#3374).
+            | "ambient_declaration"
+    )
+}
+
+/// Whether the module body has a statement for its frame to run.
+///
+/// A comment is not a statement, and a file-scope declaration is enumerated as
+/// a sibling of the frame. A module scope without a statement therefore has no
+/// value flow to lower and allocates no frame.
+pub(super) fn module_body_has_statements(node: Node<'_>) -> bool {
+    assert_eq!(node.kind(), "program");
+    named_children(node)
+        .into_iter()
+        .any(|child| child.kind() != "comment" && !is_file_scope_declaration(child))
 }
 
 #[derive(Debug, PartialEq, Eq)]

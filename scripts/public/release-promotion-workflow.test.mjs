@@ -49,6 +49,10 @@ const uvCliPreparer = readFileSync(
 );
 const readinessPath = fileURLToPath(new URL("../../.github/workflows/release-readiness.yml", import.meta.url));
 const readiness = existsSync(readinessPath) ? readFileSync(readinessPath, "utf8") : null;
+const offlinePackAcceptance = readFileSync(
+  new URL("./accept-offline-semantic-pack-install.sh", import.meta.url),
+  "utf8",
+);
 const postReleaseSmoke = readFileSync(
   new URL("../../.github/workflows/post-release-smoke.yml", import.meta.url),
   "utf8",
@@ -216,10 +220,10 @@ test("GitHub releases use the exact curated changelog entry", () => {
 
 test("release readiness qualifies and assembles attributable semantic-pack partial bundles", () => {
   const tool = jobBlock(readiness, "semantic-pack-tool");
-  assert.match(tool, /^    needs: preflight$/mu);
+  assert.match(tool, /^    needs: \[preflight, notices\]$/mu);
   assert.match(
     tool,
-    /cargo build --locked --release --features release-tooling -p brokk-bifrost-semantic-packs --bin bifrost-semantic-pack/u,
+    /cargo zigbuild --locked --release --features release-tooling[\s\S]*-p brokk-bifrost-semantic-packs --bin bifrost-semantic-pack/u,
   );
   assert.match(tool, /sha256sum bifrost-semantic-pack > bifrost-semantic-pack\.sha256/u);
   assert.match(tool, /name: semantic-pack-tool-\$\{\{ needs\.preflight\.outputs\.commit \}\}/u);
@@ -255,6 +259,42 @@ test("release readiness qualifies and assembles attributable semantic-pack parti
   assert.match(
     qualification,
     /rm -f qualification-bundle\/bifrost-semantic-pack qualification-bundle\/bifrost-semantic-pack\.sha256/u,
+  );
+  assert.doesNotMatch(qualification, /rm -f[^\n]*x86_64-unknown-linux-gnu/u);
+});
+
+readinessTest("release-promoted semantic-pack installer is target-qualified Linux", () => {
+  const tool = jobBlock(readiness, "semantic-pack-tool");
+  const installerName = "bifrost-semantic-pack-${RELEASE_TAG}-x86_64-unknown-linux-gnu";
+  assert.match(tool, /^      - name: Stage exact semantic-pack tool$/mu);
+  assert.match(tool, /RELEASE_TAG: \$\{\{ needs\.preflight\.outputs\.tag \}\}$/mu);
+  assert.ok(
+    tool.includes(`installer_name="${installerName}"`),
+    "semantic-pack installer must carry the release tag and GNU/Linux target",
+  );
+  assert.ok(
+    tool.includes(`sha256sum "\${installer_name}.tar.gz" > "\${installer_name}.tar.gz.sha256"`),
+    "semantic-pack installer must have a matching checksum sidecar",
+  );
+  assert.match(tool, /cargo zigbuild[\s\S]*x86_64-unknown-linux-gnu\.2\.28/u);
+  assert.match(tool, /verify-linux-release-elf\.sh[\s\S]*x86_64-unknown-linux-gnu/u);
+  assert.match(tool, /THIRD_PARTY_LICENSES\.html/u);
+  assert.match(tool, /SUPPLEMENTAL_THIRD_PARTY_NOTICES\.txt/u);
+
+  const qualification = jobBlock(readiness, "qualification");
+  assert.match(
+    qualification,
+    /bash scripts\/public\/check-qualification-inventory\.sh qualification-bundle/u,
+  );
+
+  const releaseJob = jobBlock(release, "release");
+  const assetSelection = stepBlocks(releaseJob).find((step) =>
+    /Select exact qualified GitHub assets/u.test(step),
+  );
+  assert.ok(assetSelection, "expected release asset selection step");
+  assert.match(
+    assetSelection,
+    /\^bifrost-semantic-pack-v\.\*-x86_64-unknown-linux-gnu\\\\\.tar\\\\\.gz\(\\\\\.sha256\)\?\$/u,
   );
 });
 
@@ -713,7 +753,10 @@ readinessTest("release readiness gives the Linux x86 binary an independent criti
   assert.doesNotMatch(jobBlock(readiness, "build"), /target: x86_64-unknown-linux-gnu/u);
 
   const policySmoke = jobBlock(readiness, "policy-scan-smoke");
-  assert.match(policySmoke, /^    needs: \[preflight, semantic-pack-tool, build-linux-x86-64, semantic-pack-python\]$/mu);
+  assert.match(policySmoke, /^    needs: \[preflight, semantic-pack-tool, semantic-pack-bundle, build-linux-x86-64\]$/mu);
+  assert.match(policySmoke, /accept-offline-semantic-pack-install\.sh/u);
+  assert.match(offlinePackAcceptance, /docker run --rm --network none/u);
+  assert.match(offlinePackAcceptance, /BIFROST_SEMANTIC_PACK_DOWNLOAD=off/u);
   assert.doesNotMatch(policySmoke, /^    needs: \[preflight, build,/mu);
 
   for (const job of ["agent-plugin-package", "pi-package", "vscode-package", "npm-package"]) {
@@ -746,6 +789,19 @@ readinessTest("release readiness separates pinned GNU builds from portable binar
     const staging = gnuJob.indexOf("- name: Stage Unix archive");
     assert.ok(verifier >= 0 && verifier < staging, "ELF verification must precede archive staging");
   }
+
+  const compatibilityVerifier = linuxBuild.indexOf(
+    "python3 scripts/public/verify-lsp-compatibility.py",
+  );
+  const linuxStaging = linuxBuild.indexOf("- name: Stage Unix archive");
+  assert.ok(
+    compatibilityVerifier >= 0 && compatibilityVerifier < linuxStaging,
+    "the exact shipped binary must prove its structured LSP identity before archive staging",
+  );
+  assert.match(
+    linuxBuild,
+    /--engine-version "\$\{\{ needs\.preflight\.outputs\.version \}\}"/u,
+  );
 
   const linkerSetup = build.match(
     /^      - name: Install pinned GNU\/Linux linker toolchain\n[\s\S]*?(?=^      - name: Set up Android NDK)/mu,

@@ -50,6 +50,13 @@ pub const JAVA_KIND_TABLE: &[(&str, NormalizedKind)] = &[
     ("method_invocation", NormalizedKind::Call),
     ("method_reference", NormalizedKind::Call),
     ("object_creation_expression", NormalizedKind::Call),
+    // The implicit `close` of a try-with-resources statement runs at the
+    // construct's own exit, so the statement is the source fact the
+    // resource-lifecycle selector names for that release.
+    (
+        "try_with_resources_statement",
+        NormalizedKind::ResourceRelease,
+    ),
     ("field_access", NormalizedKind::FieldAccess),
     ("method_declaration", NormalizedKind::Method),
     ("constructor_declaration", NormalizedKind::Constructor),

@@ -1,9 +1,13 @@
-name: policy-sarif
+name: Policy and code-quality analysis
 
 on:
   push:
     branches: [master]
+    paths-ignore:
+      - 'docs/**'
   pull_request:
+    paths-ignore:
+      - 'docs/**'
 
 permissions:
   contents: read
@@ -15,7 +19,8 @@ concurrency:
 
 jobs:
   scan:
-    name: bifrost code-smells scan
+    name: Bifrost policy and code-quality analysis
+    if: ${{ !github.event.repository.private }}
     runs-on: ubuntu-latest
     # A cold release-mode repository scan is primarily serial. Cache-invalidating
     # analyzer changes can require both sides of the PR diff to be rebuilt, so

@@ -5,16 +5,19 @@
 //! .reportTestAssertionSmells`.
 
 use super::{
-    ReportLines, append_ambiguous_path_notes, pick_weight, resolve_project_files,
-    sanitize_table_cell,
+    pick_weight, resolve_project_files,
+    structured_quality::{
+        MAX_QUALITY_FINDINGS, QualityEvidenceCache, QualityFinding, QualityFindingKind,
+        StructuredQualityFindings, TestAssertionQualityFinding, TestAssertionQualityMetrics,
+        parameters, reasons, render_quality_findings,
+    },
 };
 use crate::analyzer::{IAnalyzer, TestAssertionSmell, TestAssertionWeights};
-use crate::path_utils::{AmbiguousPathInput, rel_path_string};
+use crate::path_utils::AmbiguousPathInput;
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_TEST_ASSERTION_MIN_SCORE: i32 = 4;
 const DEFAULT_TEST_ASSERTION_MAX_FINDINGS: i32 = 80;
-const MAX_TEST_ASSERTION_FINDINGS: usize = 500;
 const MAX_TEST_ASSERTION_CANDIDATES: usize = 10_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,12 +79,13 @@ impl Default for ReportTestAssertionSmellsParams {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct ReportTestAssertionSmellsResult {
     pub report: String,
     pub truncated: bool,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub ambiguous_paths: Vec<AmbiguousPathInput>,
+    pub structured: StructuredQualityFindings,
 }
 
 pub fn report_test_assertion_smells(
@@ -98,7 +102,7 @@ pub fn report_test_assertion_smells(
     } else {
         DEFAULT_TEST_ASSERTION_MAX_FINDINGS as usize
     };
-    let findings_cap = requested_findings_cap.min(MAX_TEST_ASSERTION_FINDINGS);
+    let findings_cap = requested_findings_cap.min(MAX_QUALITY_FINDINGS);
     let defaults = TestAssertionWeights::defaults();
     let weights = TestAssertionWeights {
         no_assertion_weight: pick_weight(params.no_assertion_weight, defaults.no_assertion_weight),
@@ -149,7 +153,7 @@ pub fn report_test_assertion_smells(
     };
 
     let resolved = resolve_project_files(analyzer, params.file_paths);
-    let mut truncated = resolved.input_truncated;
+    let mut analysis_truncated = false;
     let ambiguous_paths = resolved.ambiguous_paths.clone();
     let mut findings: Vec<TestAssertionSmell> = Vec::new();
     let mut remaining_candidates = MAX_TEST_ASSERTION_CANDIDATES;
@@ -158,7 +162,7 @@ pub fn report_test_assertion_smells(
             continue;
         }
         if remaining_candidates == 0 {
-            truncated = true;
+            analysis_truncated = true;
             break;
         }
         let analysis =
@@ -166,7 +170,7 @@ pub fn report_test_assertion_smells(
         if let Some(inspected_candidates) = analysis.inspected_candidates {
             remaining_candidates = remaining_candidates.saturating_sub(inspected_candidates);
         }
-        truncated |= analysis.truncated;
+        analysis_truncated |= analysis.truncated;
         findings.extend(analysis.findings);
         if analysis.truncated {
             break;
@@ -179,77 +183,85 @@ pub fn report_test_assertion_smells(
         .collect();
     filtered.sort_by(test_assertion_smell_cmp);
 
-    if filtered.is_empty() {
-        let suffix = if truncated {
-            " The request or analysis was truncated before completion."
-        } else {
-            ""
-        };
-        return ReportTestAssertionSmellsResult {
-            report: format!("No test assertion smells met minScore {threshold}.{suffix}"),
-            truncated,
-            ambiguous_paths,
-        };
-    }
+    let shown = findings_cap.min(filtered.len());
+    let retained = filtered.iter().take(shown);
+    let mut evidence_cache = QualityEvidenceCache::new();
+    let structured_findings = retained
+        .map(|finding| structured_test_assertion_finding(analyzer, &mut evidence_cache, finding))
+        .collect();
+    let parameters = parameters(
+        threshold,
+        &[
+            ("noAssertion", weights.no_assertion_weight),
+            ("tautology", weights.tautological_assertion_weight),
+            ("constantTruth", weights.constant_truth_weight),
+            ("constantEquality", weights.constant_equality_weight),
+            ("nullnessOnly", weights.nullness_only_weight),
+            ("shallowOnly", weights.shallow_assertion_only_weight),
+            ("overspecifiedLiteral", weights.overspecified_literal_weight),
+            ("anonymousDouble", weights.anonymous_test_double_weight),
+            (
+                "repeatedAnonymousDouble",
+                weights.repeated_anonymous_test_double_weight,
+            ),
+            ("assertionCredit", weights.meaningful_assertion_credit),
+            (
+                "assertionCreditCap",
+                weights.meaningful_assertion_credit_cap,
+            ),
+            (
+                "largeLiteralThreshold",
+                weights.large_literal_length_threshold,
+            ),
+        ],
+    );
+    let structured = StructuredQualityFindings::new(
+        QualityFindingKind::TestAssertion,
+        parameters,
+        structured_findings,
+        !resolved.input_truncated
+            && resolved.skipped_inputs == 0
+            && resolved.ambiguous_paths.is_empty(),
+        !analysis_truncated,
+        requested_findings_cap,
+        filtered.len(),
+    );
+    let truncated = !structured.completion.complete();
 
-    let total = filtered.len();
-    let shown = findings_cap.min(total);
-    let rows_truncated = total > shown;
-    let request_or_analysis_truncated = truncated;
-    truncated |= rows_truncated;
-
-    let mut lines = ReportLines::with_capacity(shown + 8);
-    lines.line("## Test assertion smells");
-    lines.blank();
-    lines.line(format!("- Min score: {threshold}"));
-    lines.line(format!("- Findings shown: {shown} of {total}"));
-    lines.line(format!(
-        "- Weights: {}",
-        format_weights!(
-            "noAssertion" => weights.no_assertion_weight,
-            "tautology" => weights.tautological_assertion_weight,
-            "constantTruth" => weights.constant_truth_weight,
-            "constantEquality" => weights.constant_equality_weight,
-            "nullnessOnly" => weights.nullness_only_weight,
-            "shallowOnly" => weights.shallow_assertion_only_weight,
-            "overspecifiedLiteral" => weights.overspecified_literal_weight,
-            "anonymousDouble" => weights.anonymous_test_double_weight,
-            "repeatedAnonymousDouble" => weights.repeated_anonymous_test_double_weight,
-            "assertionCredit" => weights.meaningful_assertion_credit,
-            "assertionCreditCap" => weights.meaningful_assertion_credit_cap,
-            "largeLiteralThreshold" => weights.large_literal_length_threshold,
-        )
-    ));
-    append_ambiguous_path_notes(&mut lines, &ambiguous_paths);
-    lines.blank();
-    lines.line("| Score | Kind | Assertions | Symbol | File | Reasons | Excerpt |");
-    lines.line("|------:|------|-----------:|--------|------|---------|---------|");
-    for finding in filtered.iter().take(shown) {
-        let reasons = sanitize_table_cell(&finding.reasons.join(", "));
-        let kind = sanitize_table_cell(&finding.assertion_kind);
-        let symbol = sanitize_table_cell(&finding.enclosing_fq_name);
-        let file = sanitize_table_cell(&rel_path_string(&finding.file));
-        let excerpt = sanitize_table_cell(&finding.excerpt);
-        lines.line(format!(
-            "| {score} | `{kind}` | {assertions} | `{symbol}` | `{file}` | `{reasons}` | `{excerpt}` |",
-            score = finding.score,
-            assertions = finding.assertion_count,
-        ));
-    }
-    if rows_truncated || request_or_analysis_truncated {
-        lines.blank();
-        if rows_truncated && !request_or_analysis_truncated {
-            lines.line("- Note: output truncated; increase maxFindings to see more.");
-        } else {
-            lines.line("- Note: request or analysis truncated before completion.");
-        }
-    }
+    let report = render_quality_findings(
+        &structured,
+        &ambiguous_paths,
+        format!("No test assertion smells met minScore {threshold}"),
+    );
 
     ReportTestAssertionSmellsResult {
-        report: lines.build(),
+        report,
         truncated,
         ambiguous_paths,
+        structured,
     }
+}
+
+fn structured_test_assertion_finding(
+    analyzer: &dyn IAnalyzer,
+    evidence_cache: &mut QualityEvidenceCache,
+    finding: &TestAssertionSmell,
+) -> QualityFinding {
+    QualityFinding::TestAssertion(TestAssertionQualityFinding {
+        assertion_kind: finding.assertion_kind.clone(),
+        reasons: reasons(&finding.reasons),
+        metrics: TestAssertionQualityMetrics {
+            score: finding.score,
+            assertion_count: finding.assertion_count,
+        },
+        evidence: evidence_cache.evidence(
+            analyzer,
+            &finding.file,
+            &finding.enclosing_fq_name,
+            Some(finding.start_byte),
+            finding.excerpt.clone(),
+        ),
+    })
 }
 
 fn test_assertion_smell_cmp(a: &TestAssertionSmell, b: &TestAssertionSmell) -> std::cmp::Ordering {

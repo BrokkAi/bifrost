@@ -65,6 +65,65 @@ When the document is absent, the shared host path selects every ecosystem that
 serves a language present in the workspace. An explicit `enable` entry can
 satisfy a pack's `review_required` gate; it cannot bypass compatibility checks.
 
+## Offline image-build installation
+
+A release can provide a standalone semantic-pack installer for
+`x86_64-unknown-linux-gnu`. The release asset name is
+`bifrost-semantic-pack-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz`, with a
+`.sha256` sidecar for that exact filename. The archive includes the installer
+and its license notices. Verify both release assets and the bundle
+before building an image-owned catalog:
+
+```bash
+release_tag=v0.11.4
+installer_archive="bifrost-semantic-pack-${release_tag}-x86_64-unknown-linux-gnu.tar.gz"
+base_url="https://github.com/BrokkAi/bifrost/releases/download/${release_tag}"
+
+curl --fail --silent --show-error --location --remote-name \
+  "${base_url}/${installer_archive}" \
+  "${base_url}/${installer_archive}.sha256" \
+  "${base_url}/bifrost-semantic-packs-${release_tag}.tar.gz" \
+  "${base_url}/bifrost-semantic-packs-${release_tag}.tar.gz.sha256"
+sha256sum --check "${installer_archive}.sha256"
+sha256sum --check "bifrost-semantic-packs-${release_tag}.tar.gz.sha256"
+tar -xzf "$installer_archive"
+installer_dir="${installer_archive%.tar.gz}"
+chmod +x "$installer_dir/bifrost-semantic-pack"
+
+rm -rf "$release_tag-extracted"
+mkdir "$release_tag-extracted"
+tar -xzf "bifrost-semantic-packs-${release_tag}.tar.gz" -C "$release_tag-extracted"
+mkdir -p workspace/.bifrost/semantic-pack-catalog
+"./$installer_dir/bifrost-semantic-pack" install \
+  "$release_tag-extracted/bifrost-semantic-packs" \
+  workspace/.bifrost/semantic-pack-catalog
+```
+
+Then pin that explicit catalog in the image's workspace configuration:
+
+```json
+{
+  "schema_version": 1,
+  "catalog": ".bifrost/semantic-pack-catalog",
+  "ecosystems": ["jvm"]
+}
+```
+
+Set `BIFROST_SEMANTIC_PACK_DOWNLOAD=off` so a released facade cannot try to
+download generated productions at runtime. Use the ecosystems required by the
+image and explicit `enable` controls for packs marked as requiring review. An
+empty `ecosystems` list explicitly turns off dependency discovery and therefore
+does not activate an installed JDK pack.
+
+Installed, reviewed packs can activate only when the runtime discovers the
+exact coordinates and artifacts they model. Curated catalog entries do not
+relax that requirement. Generated-production reuse remains keyed to the exact
+artifact digest and producer identity; a Linux runtime cannot reuse a production
+made from a different operating-system or toolchain artifact merely because the
+pack id or ecosystem matches. Missing, corrupt, incompatible, unsupported, or
+version-mismatched pack state remains a typed incomplete result. It is not
+silently treated as clean or replaced by name-only activation.
+
 ## Released-facade generated-pack acquisition
 
 Generic analysis, explicit catalog activation, direct consumers of
@@ -1145,6 +1204,16 @@ global exposure with `env` static-property and `argv` static-index
 keyed-read behaviors, and a child-process summaries pack modeling the
 exact `execSync(command)` member. TSX workspaces use the TypeScript
 packs.
+
+With the reviewed summaries active, the engine consumes them for dispatch:
+a require-bound or namespace-bound receiver whose exact external member the
+resolver proved closes its residual dynamic-dispatch arm, the declaration
+pack's dispatch reports exhaustive coverage, and a policy run whose only
+external callee is the modeled call concludes `ProvenBySummary` with
+definite findings. `Complete` stays reserved for proof derived from
+analyzed code, so a summary-closed run never claims it. A member write or a
+module-object escape anywhere in the workspace refuses the closure, and a
+callee the activated packs do not summarize keeps the run inconclusive.
 
 Runtime-values activation is a layered contract. An exposure authored as
 `enabled` is intrinsically eligible within its model; it never bypasses

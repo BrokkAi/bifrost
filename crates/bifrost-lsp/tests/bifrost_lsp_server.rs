@@ -67,6 +67,39 @@ fn semantic_token_initialize_params(root_uri: String) -> Value {
     })
 }
 
+#[test]
+fn bifrost_lsp_initialize_advertises_structured_engine_compatibility() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canonical root");
+    let root_uri = uri_for(&root);
+    let (server, response) = LspServer::start_with_params_and_result(
+        &root,
+        json!({"processId": null, "rootUri": root_uri, "capabilities": {}}),
+    );
+
+    assert!(response["error"].is_null(), "{response}");
+    assert_eq!(
+        response.pointer("/result/capabilities/experimental/bifrost/protocolVersion"),
+        Some(&json!(1))
+    );
+    assert_eq!(
+        response.pointer("/result/capabilities/experimental/bifrost/engineVersion"),
+        Some(&json!(env!("CARGO_PKG_VERSION")))
+    );
+    assert_eq!(
+        response.pointer("/result/capabilities/typeHierarchyProvider"),
+        Some(&json!(true)),
+        "existing vendor capabilities must remain present"
+    );
+    assert_eq!(
+        response.pointer("/result/capabilities/textDocumentSync/openClose"),
+        Some(&json!(true)),
+        "standard capabilities must remain present"
+    );
+
+    server.shutdown();
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DecodedSemanticToken {
     line: u64,

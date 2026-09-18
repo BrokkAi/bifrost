@@ -12,15 +12,15 @@ use crate::analyzer::jvm::scala_artifact::ScalaSourceJarPackProducer;
 use crate::analyzer::semantic::{LengthDelimitedDigest, StableDigest};
 use crate::analyzer::semantic_model::{
     ActivationSelector, ArtifactProducerLimits, ArtifactProduction, ArtifactProductionRequest,
-    AuthoredPayload, AuthoredSemanticModelPack, AuthoredShard, BoundedDependencyDiagnostics,
-    CatalogCoordinate, Compatibility, Completeness, DependencyArtifactRole,
-    DependencyDiscoveryOutcome, DependencyDiscoveryProfile, DependencyPackAdapter,
-    DependencyPackDiagnostic, DependencyPackDiagnosticSeverity, DependencyPackLimits,
-    DependencyPackProduction, DependencyProvenance, ExactDependencyArtifact, ExternalArtifactKind,
-    ExternalArtifactPackProducer, HierarchyFact, Locator, MemberFact, MemberKind, NameSelector,
-    Producer, ProducerDiagnostic, ProducerDiagnosticSeverity, Provenance, ResolvedDependency,
-    ResolvedDependencyArtifact, Safety, SemanticModelActivationEvidence, Signature,
-    SuppressedDiagnostics, TypeFact, TypeKind, TypeRef, Visibility,
+    ArtifactSourceIdentity, AuthoredPayload, AuthoredSemanticModelPack, AuthoredShard,
+    BoundedDependencyDiagnostics, CatalogCoordinate, Compatibility, Completeness,
+    DependencyArtifactRole, DependencyDiscoveryOutcome, DependencyDiscoveryProfile,
+    DependencyPackAdapter, DependencyPackDiagnostic, DependencyPackDiagnosticSeverity,
+    DependencyPackLimits, DependencyPackProduction, DependencyProvenance, ExactDependencyArtifact,
+    ExternalArtifactKind, ExternalArtifactPackProducer, HierarchyFact, Locator, MemberFact,
+    MemberKind, NameSelector, Producer, ProducerDiagnostic, ProducerDiagnosticSeverity, Provenance,
+    ResolvedDependency, ResolvedDependencyArtifact, Safety, SemanticModelActivationEvidence,
+    Signature, SuppressedDiagnostics, TypeFact, TypeKind, TypeRef, Visibility,
     normalize_artifact_locator_paths, read_exact_artifact_while,
 };
 use crate::analyzer::{
@@ -41,6 +41,7 @@ use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::SystemTime;
 use tree_sitter::Parser;
 use zip::ZipArchive;
 
@@ -82,6 +83,8 @@ const MAX_ARTIFACT_MEMBERS: usize = 32_768;
 const MAX_MEMBER_SURFACE_OWNERS: usize = 64;
 const JVM_EXTERNAL_DISPATCH_BEHAVIOR_DOMAIN: &[u8] = b"bifrost-jvm-external-dispatch-behavior/v1";
 const JVM_EXTERNAL_INDEX_MEMO_DOMAIN: &[u8] = b"bifrost-jvm-external-index-memo/v1";
+/// Domain of the read-free identity of one JDK's selected JMOD set.
+const JDK_JMOD_SET_SOURCE_IDENTITY_DOMAIN: &[u8] = b"bifrost-jvm.jdk-jmod-set-source-identity/v1";
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct JvmExternalDeclarationIndex {
@@ -554,8 +557,8 @@ fn discover_jdk_semantic_pack_dependencies(
         if !seen_homes.insert(home.clone()) {
             continue;
         }
-        let version = match read_jdk_release_version(&home) {
-            Ok(version) => version,
+        let release = match read_jdk_release(&home) {
+            Ok(release) => release,
             Err(message) => {
                 discovery.diagnostics.push(DependencyPackDiagnostic {
                     severity: if configured {
@@ -571,14 +574,13 @@ fn discover_jdk_semantic_pack_dependencies(
                 continue;
             }
         };
+        let version = release.version.clone();
         let source = [home.join("lib").join("src.zip"), home.join("src.zip")]
             .into_iter()
             .find(|path| path.is_file());
         let dependency = if !configured {
             match discover_jdk_jmods(&home) {
-                Ok(Some(relative_paths)) => {
-                    resolved_jdk_jmod_dependency(version.clone(), home, relative_paths)
-                }
+                Ok(Some(jmods)) => resolved_jdk_jmod_dependency(&release, home, jmods),
                 Ok(None) => resolved_jdk_dependency(version.clone(), source),
                 Err(message) => {
                     discovery.diagnostics.push(DependencyPackDiagnostic {
@@ -594,16 +596,9 @@ fn discover_jdk_semantic_pack_dependencies(
         } else if let Some(source) = source {
             let mut dependency = resolved_jdk_dependency(version.clone(), Some(source));
             match discover_jdk_jmods(&home) {
-                Ok(Some(relative_paths)) => {
-                    dependency
-                        .artifacts
-                        .push(ResolvedDependencyArtifact::source_set(
-                            DependencyArtifactRole::Binary,
-                            ExternalArtifactKind::JdkJmodSet,
-                            home.clone(),
-                            relative_paths,
-                        ));
-                }
+                Ok(Some(jmods)) => dependency
+                    .artifacts
+                    .push(jdk_jmod_set_artifact(&release, &home, &jmods)),
                 Ok(None) => {}
                 Err(message) => discovery.diagnostics.push(DependencyPackDiagnostic {
                     severity: if configured {
@@ -620,9 +615,7 @@ fn discover_jdk_semantic_pack_dependencies(
             dependency
         } else {
             match discover_jdk_jmods(&home) {
-                Ok(Some(relative_paths)) => {
-                    resolved_jdk_jmod_dependency(version.clone(), home, relative_paths)
-                }
+                Ok(Some(jmods)) => resolved_jdk_jmod_dependency(&release, home, jmods),
                 Ok(None) => resolved_jdk_dependency(version.clone(), None),
                 Err(message) => {
                     discovery.diagnostics.push(DependencyPackDiagnostic {
@@ -685,7 +678,21 @@ fn jdk_dependency_priority(dependency: &ResolvedDependency) -> u8 {
     }
 }
 
-fn discover_jdk_jmods(home: &Path) -> Result<Option<Vec<PathBuf>>, String> {
+/// One selected JMOD archive with the filesystem metadata that stands in for
+/// its bytes in the read-free source identity.
+///
+/// The discovery already inspects every candidate archive to prove it is a
+/// real regular file, so the length and modification time cost no extra read.
+/// `modified` is `None` when the filesystem would not report one, which is the
+/// signal that this archive gets no identity at all rather than an identity
+/// that spells "unknown" the same way a real timestamp would.
+struct JdkJmodFile {
+    relative_path: PathBuf,
+    bytes: u64,
+    modified: Option<SystemTime>,
+}
+
+fn discover_jdk_jmods(home: &Path) -> Result<Option<Vec<JdkJmodFile>>, String> {
     let jmods = home.join("jmods");
     let metadata = match fs::symlink_metadata(&jmods) {
         Ok(metadata) => metadata,
@@ -719,9 +726,13 @@ fn discover_jdk_jmods(home: &Path) -> Result<Option<Vec<PathBuf>>, String> {
         if metadata.file_type().is_symlink() || !metadata.is_file() {
             continue;
         }
-        paths.push(PathBuf::from("jmods").join(name));
+        paths.push(JdkJmodFile {
+            relative_path: PathBuf::from("jmods").join(name),
+            bytes: metadata.len(),
+            modified: metadata.modified().ok(),
+        });
     }
-    paths.sort_unstable();
+    paths.sort_unstable_by(|left, right| left.relative_path.cmp(&right.relative_path));
     if paths.len() > MAX_JDK_JMOD_FILES {
         return Err(format!(
             "JDK jmods directory contains more than {MAX_JDK_JMOD_FILES} bounded archives"
@@ -790,7 +801,18 @@ impl std::fmt::Display for JdkVersion {
     }
 }
 
-fn read_jdk_release_version(home: &Path) -> Result<JdkVersion, String> {
+/// A JDK home's `release` file: the version it declares, and the exact bytes
+/// that declared it.
+///
+/// Those bytes are the JDK-level half of the read-free JMOD set identity
+/// ([`jdk_jmod_set_source_identity`]). The discovery reads the file anyway to
+/// learn the version, so identity costs no additional read.
+struct JdkRelease {
+    version: JdkVersion,
+    bytes: Vec<u8>,
+}
+
+fn read_jdk_release(home: &Path) -> Result<JdkRelease, String> {
     const MAX_RELEASE_BYTES: u64 = 64 * 1024;
 
     let release_path = home.join("release");
@@ -822,8 +844,13 @@ fn read_jdk_release_version(home: &Path) -> Result<JdkVersion, String> {
     if values.next().is_some() {
         return Err("JDK release file declares JAVA_VERSION more than once".to_owned());
     }
-    JdkVersion::parse(raw)
-        .map_err(|error| format!("JDK JAVA_VERSION {raw:?} is not a dotted JDK version: {error}"))
+    let version = JdkVersion::parse(raw).map_err(|error| {
+        format!("JDK JAVA_VERSION {raw:?} is not a dotted JDK version: {error}")
+    })?;
+    Ok(JdkRelease {
+        version,
+        bytes: release_bytes,
+    })
 }
 
 fn resolved_jdk_dependency(
@@ -865,18 +892,70 @@ fn resolved_jdk_dependency(
 }
 
 fn resolved_jdk_jmod_dependency(
-    version: JdkVersion,
+    release: &JdkRelease,
     home: PathBuf,
-    relative_paths: Vec<PathBuf>,
+    jmods: Vec<JdkJmodFile>,
 ) -> ResolvedDependency {
-    let mut dependency = resolved_jdk_dependency(version, None);
-    dependency.artifacts = vec![ResolvedDependencyArtifact::source_set(
+    let mut dependency = resolved_jdk_dependency(release.version.clone(), None);
+    dependency.artifacts = vec![jdk_jmod_set_artifact(release, &home, &jmods)];
+    dependency
+}
+
+/// The `JdkJmodSet` artifact of one JDK home, carrying the read-free identity
+/// of the selected archives when the discovery could derive one.
+///
+/// The identity only decides whether a later process looks in the catalog
+/// before reading; a JDK with no derivable identity (an archive without a
+/// modification time) produces exactly the artifact it produced before.
+fn jdk_jmod_set_artifact(
+    release: &JdkRelease,
+    home: &Path,
+    jmods: &[JdkJmodFile],
+) -> ResolvedDependencyArtifact {
+    let artifact = ResolvedDependencyArtifact::source_set(
         DependencyArtifactRole::Binary,
         ExternalArtifactKind::JdkJmodSet,
-        home,
-        relative_paths,
-    )];
-    dependency
+        home.to_path_buf(),
+        jmods
+            .iter()
+            .map(|jmod| jmod.relative_path.clone())
+            .collect(),
+    );
+    match jdk_jmod_set_source_identity(&release.bytes, jmods) {
+        Some(identity) => artifact.with_source_identity(identity),
+        None => artifact,
+    }
+}
+
+/// Derive the read-free identity of one JDK's selected JMOD set from the
+/// `release` bytes and each archive's relative path, length, and modification
+/// time.
+///
+/// This is the same stand-in for artifact bytes the external declaration index
+/// already uses ([`push_artifact_file_evidence`]): cheap filesystem metadata
+/// that changes whenever the installed JDK changes. It never decides what a
+/// production contains, so a false match would only cost a lookup; the exact
+/// read and its digests remain the authority for the pack's contents.
+fn jdk_jmod_set_source_identity(
+    release_bytes: &[u8],
+    jmods: &[JdkJmodFile],
+) -> Option<ArtifactSourceIdentity> {
+    if jmods.is_empty() {
+        return None;
+    }
+    let mut digest = LengthDelimitedDigest::new(JDK_JMOD_SET_SOURCE_IDENTITY_DOMAIN);
+    digest.push(release_bytes);
+    digest.push(&(jmods.len() as u64).to_le_bytes());
+    for jmod in jmods {
+        digest.push(jmod.relative_path.as_os_str().as_encoded_bytes());
+        digest.push(&jmod.bytes.to_le_bytes());
+        let modified = jmod.modified?.duration_since(std::time::UNIX_EPOCH).ok()?;
+        digest.push(&modified.as_secs().to_le_bytes());
+        digest.push(&modified.subsec_nanos().to_le_bytes());
+    }
+    Some(ArtifactSourceIdentity::from_digest(
+        digest.finish().to_string(),
+    ))
 }
 
 impl DependencyPackAdapter for JvmDependencyPackAdapter {
@@ -4384,6 +4463,206 @@ mod tests {
                 .iter()
                 .any(|diagnostic| { diagnostic.code == "artifact.metadata" })
         );
+    }
+
+    /// A second production over the same installed JDK must answer from the
+    /// catalog instead of reading the JMOD set again (#3429).
+    ///
+    /// Reading every JMOD of a real JDK is the whole cost of a
+    /// zero-configuration JDK pack, and the pack is identified by the release
+    /// digest plus each selected archive's path, length, and modification time.
+    /// The catalog is reopened between the two preparations, so only what the
+    /// first process wrote to disk can serve the second.
+    #[test]
+    fn jdk_jmod_set_source_identity_serves_a_second_production_without_reading() {
+        use crate::analyzer::semantic_model::{
+            CatalogOpenMode, CatalogOptions, DependencyPackPreparationStatus, SemanticPackCatalog,
+            prepare_dependency_semantic_packs,
+        };
+
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("jdk-21");
+        write_test_jdk_jmods(&home, &["java.sql.jmod"]);
+        let config = test_jdk_config(&home);
+        let project = TestProject::new(root.path(), Language::Java);
+        let limits = DependencyPackLimits::default();
+        let discovered = resolve_jvm_semantic_pack_dependencies(&config, &project, &limits, None);
+        assert!(discovered.complete, "{:#?}", discovered.diagnostics);
+        assert_eq!(discovered.dependencies.len(), 1);
+        assert_eq!(
+            discovered.dependencies[0].artifacts[0].kind,
+            ExternalArtifactKind::JdkJmodSet
+        );
+
+        let catalog_root = root.path().join("catalog");
+        let catalog = SemanticPackCatalog::open(
+            &catalog_root,
+            CatalogOpenMode::ReadWrite,
+            CatalogOptions::default(),
+        )
+        .unwrap();
+        let first = prepare_dependency_semantic_packs(
+            &catalog,
+            &JvmDependencyPackAdapter,
+            &discovered.dependencies,
+            &limits,
+            None,
+        );
+        assert!(first.complete, "{:#?}", first.diagnostics);
+        assert_eq!(first.profile.artifacts_read, 1);
+        assert_eq!(first.profile.generated_packs, 1);
+        assert_eq!(
+            first.packs[0].status,
+            DependencyPackPreparationStatus::Generated
+        );
+        drop(catalog);
+
+        // A second process: the same JDK, a freshly opened catalog handle, and
+        // no in-memory memory of the first production.
+        let catalog = SemanticPackCatalog::open(
+            &catalog_root,
+            CatalogOpenMode::ReadWrite,
+            CatalogOptions::default(),
+        )
+        .unwrap();
+        let discovered = resolve_jvm_semantic_pack_dependencies(&config, &project, &limits, None);
+        let second = prepare_dependency_semantic_packs(
+            &catalog,
+            &JvmDependencyPackAdapter,
+            &discovered.dependencies,
+            &limits,
+            None,
+        );
+        assert!(second.complete, "{:#?}", second.diagnostics);
+        assert_eq!(second.profile.artifacts_read, 0);
+        assert_eq!(second.profile.artifact_bytes_read, 0);
+        assert_eq!(second.profile.reused_packs, 1);
+        assert_eq!(second.profile.generated_packs, 0);
+        assert_eq!(
+            second.packs[0].status,
+            DependencyPackPreparationStatus::Reused
+        );
+        assert_eq!(first.packs[0].production, second.packs[0].production);
+        assert_eq!(first.evidence, second.evidence);
+    }
+
+    /// A JDK whose selected JMOD set changed is a different JDK: its packs are
+    /// read and produced, never served from the identity the old set was
+    /// learned under (#3429).
+    #[test]
+    fn changed_jdk_jmod_set_identity_is_not_served_from_the_catalog() {
+        use crate::analyzer::semantic_model::{
+            CatalogOpenMode, CatalogOptions, DependencyPackPreparationStatus, SemanticPackCatalog,
+            prepare_dependency_semantic_packs,
+        };
+
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("jdk-21");
+        write_test_jdk_jmods(&home, &["java.sql.jmod"]);
+        let config = test_jdk_config(&home);
+        let project = TestProject::new(root.path(), Language::Java);
+        let limits = DependencyPackLimits::default();
+        let catalog_root = root.path().join("catalog");
+        let catalog = SemanticPackCatalog::open(
+            &catalog_root,
+            CatalogOpenMode::ReadWrite,
+            CatalogOptions::default(),
+        )
+        .unwrap();
+        let discovered = resolve_jvm_semantic_pack_dependencies(&config, &project, &limits, None);
+        let first = prepare_dependency_semantic_packs(
+            &catalog,
+            &JvmDependencyPackAdapter,
+            &discovered.dependencies,
+            &limits,
+            None,
+        );
+        assert!(first.complete, "{:#?}", first.diagnostics);
+        assert_eq!(first.profile.generated_packs, 1);
+        drop(catalog);
+
+        // A module is added to the installed JDK. The listing, a length, and a
+        // modification time all change, so the recorded identity no longer
+        // describes this JDK.
+        write_test_jdk_jmods(&home, &["java.logging.jmod", "java.sql.jmod"]);
+        let catalog = SemanticPackCatalog::open(
+            &catalog_root,
+            CatalogOpenMode::ReadWrite,
+            CatalogOptions::default(),
+        )
+        .unwrap();
+        let discovered = resolve_jvm_semantic_pack_dependencies(&config, &project, &limits, None);
+        assert_eq!(discovered.dependencies.len(), 1);
+        let second = prepare_dependency_semantic_packs(
+            &catalog,
+            &JvmDependencyPackAdapter,
+            &discovered.dependencies,
+            &limits,
+            None,
+        );
+        assert_eq!(second.profile.artifacts_read, 1);
+        assert_eq!(second.profile.reused_packs, 0);
+        assert_eq!(second.profile.generated_packs, 1);
+        assert_eq!(
+            second.packs[0].status,
+            DependencyPackPreparationStatus::Generated
+        );
+        assert_ne!(
+            first.packs[0].production.key.input_digest(),
+            second.packs[0].production.key.input_digest()
+        );
+    }
+
+    fn test_jdk_config(home: &Path) -> JvmAnalyzerConfig {
+        use crate::analyzer::JvmStandardLibraryDiscoveryConfig;
+
+        JvmAnalyzerConfig {
+            dependency_discovery: crate::analyzer::JvmDependencyDiscoveryConfig {
+                mode: JvmDependencyDiscoveryMode::Disabled,
+                ..Default::default()
+            },
+            standard_library_discovery: JvmStandardLibraryDiscoveryConfig {
+                jdk_homes: vec![home.to_path_buf()],
+                discover_java_home: false,
+            },
+            ..JvmAnalyzerConfig::default()
+        }
+    }
+
+    /// An installed JDK fixture with one class-bearing `java.base` module and
+    /// one empty module for every name in `additional`.
+    fn write_test_jdk_jmods(home: &Path, additional: &[&str]) {
+        use crate::analyzer::jvm::jmod_artifact::test_module_info_class_bytes;
+
+        fs::create_dir_all(home.join("jmods")).unwrap();
+        fs::write(home.join("release"), "JAVA_VERSION=\"21.0.8\"\n").unwrap();
+        let class = test_class_file_bytes(&TestClassFile {
+            internal_name: "java/lang/Object",
+            super_internal_name: "java/lang/Object",
+            methods: &[],
+            private_nested: false,
+        });
+        write_zip_entries(
+            &home.join("jmods/java.base.jmod"),
+            &[
+                (
+                    "classes/module-info.class",
+                    &test_module_info_class_bytes(&["java/lang"]),
+                ),
+                ("classes/java/lang/Object.class", &class),
+            ],
+        );
+        for name in additional {
+            let module = name.strip_suffix(".jmod").unwrap();
+            let package = module.replace('.', "/");
+            write_zip_entries(
+                &home.join("jmods").join(name),
+                &[(
+                    "classes/module-info.class",
+                    &test_module_info_class_bytes(&[package.as_str()]),
+                )],
+            );
+        }
     }
 
     #[test]

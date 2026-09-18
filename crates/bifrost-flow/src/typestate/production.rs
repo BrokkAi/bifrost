@@ -1731,11 +1731,20 @@ fn project_modeled_call_effects(
         if let ResolvedConcurrencyEffect::TaskSpawn {
             callable,
             targets,
+            receiver,
             group,
             condition,
             timer,
         } = &effect
         {
+            // A spawn a model dispatches through a receiver names a method of
+            // a value the call already holds, not a callable value this
+            // procedure can recover a body for; the live solve binds that
+            // receiver itself, so the projection abstains rather than
+            // inventing a target (issue #3428).
+            if receiver.is_some() {
+                return Ok(());
+            }
             let recovered = crate::concurrency::source_callable_targets(procedure, *callable);
             if !matches!(recovered, ConcurrencyAnswer::Proven(ref recovered) if recovered == targets)
             {

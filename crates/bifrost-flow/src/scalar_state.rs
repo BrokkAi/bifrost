@@ -1,8 +1,9 @@
 //! Procedure-local finite scalar refinement over normalized semantic IR.
 //!
 //! The derivation deliberately consumes only semantic values, effects, guard
-//! facts, and CFG edges. It never reparses source text. The finite lattice and
-//! iterative worklist make loops stack safe and guarantee convergence.
+//! facts, and CFG edges. It never reparses source text. The iterative worklist
+//! makes loops stack safe, and explicit widening at a documented per-point
+//! join limit makes the integer lattice finite, so every procedure converges.
 
 #[cfg(test)]
 use crate::analyzer::semantic::MoveInvalidation;
@@ -357,7 +358,39 @@ impl ScalarFact {
             _ => Unknown,
         }
     }
+
+    /// Join `other` into `self` and give up an integer bound that still moves.
+    ///
+    /// Every other part of this lattice has finite height, so widening them
+    /// is the ordinary join. Only an integer interval can grow one value per
+    /// loop iteration, so a bound that the join expanded jumps to its machine
+    /// domain's bound, and a value whose domain has no finite bound becomes a
+    /// non-exact integer. Both outcomes are reached only through this
+    /// operation, which is what makes the derivation finite.
+    pub fn widen(self, other: Self) -> Self {
+        let joined = self.join(other);
+        let (Self::Integer(current), Self::Integer(joined)) = (self, joined) else {
+            return joined;
+        };
+        match current.widen(joined) {
+            ScalarIntegerWidening::Interval(widened) => Self::Integer(widened),
+            ScalarIntegerWidening::Unbounded | ScalarIntegerWidening::UnknownDomain => {
+                Self::NonExactInteger
+            }
+        }
+    }
 }
+
+/// How many times one program point may join an incoming predecessor state
+/// before its integer facts widen instead.
+///
+/// The mathematical integer domain has no finite bounds, so a counting loop
+/// would otherwise grow its interval by one value per iteration and never
+/// reach a fixed point. This is the documented per-point limit: a loop that
+/// settles within it keeps exact bounds, and a longer one widens and says so
+/// by losing the bound. It also caps a join of many distinct constants, such
+/// as a wide switch, at the same place.
+const POINT_JOIN_WIDENING_LIMIT: usize = 16;
 
 /// A complete procedure-local scalar solution. Point states describe values
 /// after the ordered effects at that point have executed.
@@ -455,6 +488,7 @@ impl ScalarStateDerivation {
         let mut queued = HashSet::default();
         let mut feasible_edges = HashSet::default();
         queued.insert(semantics.entry_point());
+        let mut joins = vec![0_usize; point_count];
         let mut updates = 0_usize;
         while let Some(point) = pending.pop_front() {
             queued.remove(&point);
@@ -503,7 +537,13 @@ impl ScalarStateDerivation {
                 {
                     successor[write.target.index()] = write.fact;
                 }
-                let changed = join_into(&mut incoming[edge.target_point.index()], &successor);
+                let target = edge.target_point.index();
+                joins[target] = joins[target].saturating_add(1);
+                let changed = if joins[target] > POINT_JOIN_WIDENING_LIMIT {
+                    widen_into(&mut incoming[target], &successor)
+                } else {
+                    join_into(&mut incoming[target], &successor)
+                };
                 if changed && queued.insert(edge.target_point) {
                     pending.push_back(edge.target_point);
                 }
@@ -892,6 +932,18 @@ fn intrinsic_fact(
 }
 
 fn join_into(slot: &mut Option<Box<[ScalarFact]>>, incoming: &[ScalarFact]) -> bool {
+    merge_into(slot, incoming, ScalarFact::join)
+}
+
+fn widen_into(slot: &mut Option<Box<[ScalarFact]>>, incoming: &[ScalarFact]) -> bool {
+    merge_into(slot, incoming, ScalarFact::widen)
+}
+
+fn merge_into(
+    slot: &mut Option<Box<[ScalarFact]>>,
+    incoming: &[ScalarFact],
+    step: fn(ScalarFact, ScalarFact) -> ScalarFact,
+) -> bool {
     let Some(current) = slot else {
         *slot = Some(incoming.to_vec().into_boxed_slice());
         return true;
@@ -899,9 +951,9 @@ fn join_into(slot: &mut Option<Box<[ScalarFact]>>, incoming: &[ScalarFact]) -> b
     assert_eq!(current.len(), incoming.len());
     let mut changed = false;
     for (current, incoming) in current.iter_mut().zip(incoming) {
-        let joined = current.join(*incoming);
-        changed |= joined != *current;
-        *current = joined;
+        let merged = step(*current, *incoming);
+        changed |= merged != *current;
+        *current = merged;
     }
     changed
 }
@@ -1133,6 +1185,26 @@ mod tests {
                 _project: project,
                 procedure,
             }
+        }
+
+        /// The scalar facts of every call argument, in call-site order.
+        ///
+        /// A Go index expression is evaluated into a temporary before the
+        /// memory location is built, so a call argument is the closest
+        /// stand-in for the value a concurrency consumer asks about.
+        fn call_argument_facts(&self) -> Vec<ScalarFact> {
+            let derivation = ScalarStateDerivation::derive(&self.procedure);
+            let semantics = self.procedure.semantics();
+            semantics
+                .call_sites()
+                .iter()
+                .flat_map(|call| {
+                    call.arguments
+                        .iter()
+                        .map(|argument| derivation.fact_at(call.point, argument.value))
+                        .collect::<Vec<_>>()
+                })
+                .collect()
         }
 
         fn field_base_facts(&self) -> Vec<ScalarFact> {
@@ -1771,5 +1843,125 @@ func run(out chan **item) int {{
                 "{body}: {semantics:#?}"
             );
         }
+    }
+
+    #[test]
+    fn widening_gives_up_an_integer_bound_that_still_moves() {
+        let domain = ScalarIntegerDomain::unsigned(8);
+        let settled = ScalarFact::Integer(ScalarIntegerInterval::new(
+            ScalarIntegerValue::unsigned(1),
+            ScalarIntegerValue::unsigned(4),
+            domain,
+        ));
+        // A join that stays inside the current bounds is not a growth signal.
+        assert_eq!(
+            settled.widen(ScalarFact::Integer(ScalarIntegerInterval::exact(
+                ScalarIntegerValue::unsigned(2),
+                domain
+            ))),
+            settled
+        );
+        // A finite domain has a bound to jump to.
+        assert_eq!(
+            settled.widen(ScalarFact::Integer(ScalarIntegerInterval::exact(
+                ScalarIntegerValue::unsigned(5),
+                domain
+            ))),
+            ScalarFact::Integer(ScalarIntegerInterval::new(
+                ScalarIntegerValue::unsigned(1),
+                ScalarIntegerValue::unsigned(255),
+                domain
+            ))
+        );
+        // The mathematical domain has none, so the value stops being exact.
+        let unbounded = ScalarFact::Integer(ScalarIntegerInterval::exact(
+            ScalarIntegerValue::unsigned(0),
+            ScalarIntegerDomain::Mathematical,
+        ));
+        assert_eq!(
+            unbounded.widen(exact_integer(1)),
+            ScalarFact::NonExactInteger
+        );
+        // Everything else in the lattice is the ordinary join.
+        assert_eq!(
+            ScalarFact::Nil.widen(ScalarFact::NonNil),
+            ScalarFact::MaybeNil
+        );
+        assert_eq!(
+            ScalarFact::Unreachable.widen(exact_integer(3)),
+            exact_integer(3)
+        );
+    }
+
+    #[test]
+    fn a_counted_loop_bounds_its_induction_variable() {
+        let fixture = Fixture::go(
+            r#"package sample
+func take(value int) {}
+func run() {
+    for index := 0; index < 3; index++ {
+        take(index)
+    }
+}
+"#,
+            "run",
+        );
+        assert_eq!(
+            fixture.call_argument_facts(),
+            vec![ScalarFact::Integer(ScalarIntegerInterval::new(
+                ScalarIntegerValue::unsigned(0),
+                ScalarIntegerValue::unsigned(2),
+                ScalarIntegerDomain::Mathematical,
+            ))],
+            "an ordered guard and a structured step bound the induction variable"
+        );
+    }
+
+    #[test]
+    fn a_loop_longer_than_the_join_limit_widens_its_induction_variable() {
+        let fixture = Fixture::go(
+            &format!(
+                r#"package sample
+func take(value int) {{}}
+func run() {{
+    for index := 0; index < {limit}; index++ {{
+        take(index)
+    }}
+}}
+"#,
+                limit = POINT_JOIN_WIDENING_LIMIT * 4,
+            ),
+            "run",
+        );
+        // Widening drops the bound, and the next step's offset over a value
+        // with no interval is unknown. The contrast with the counted loop
+        // above is what shows the limit, not the derivation, decided this.
+        assert_eq!(
+            fixture.call_argument_facts(),
+            vec![ScalarFact::Unknown],
+            "a loop past the join limit keeps no bound rather than iterating to one"
+        );
+    }
+
+    #[test]
+    fn an_unbounded_counting_loop_reaches_a_fixed_point() {
+        let fixture = Fixture::go(
+            r#"package sample
+func take(value int) {}
+func run() {
+    index := 0
+    for {
+        index++
+        take(index)
+    }
+}
+"#,
+            "run",
+        );
+        assert_eq!(
+            fixture.call_argument_facts(),
+            vec![ScalarFact::Unknown],
+            "a loop with no bound must terminate the derivation instead of growing"
+        );
     }
 }

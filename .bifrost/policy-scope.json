@@ -3,15 +3,18 @@
   "scopes": [
     {
       "path": "docs/fixtures/scan-tutorial",
-      "reason": "Intentional scan tutorial corpus: the published Scan a Codebase guide demonstrates these eval, pickle, and regex findings as expected positives."
+      "reason": "Intentional scan tutorial corpus: the published Scan a Codebase guide demonstrates these eval, pickle, and regex findings as expected positives.",
+      "exclude_roots": true
     },
     {
       "path": "tests/fixtures",
-      "reason": "Intentional smell corpus: these fixtures exist to trigger analyzer and policy behavior under test, so their findings are the expected positives, not defects."
+      "reason": "Intentional smell corpus: these fixtures exist to trigger analyzer and policy behavior under test, so their findings are the expected positives, not defects.",
+      "exclude_roots": true
     },
     {
       "path": "tests",
       "reason": "Test code is not performance-sensitive; the in-loop performance review prompts do not indicate defects here.",
+      "exclude_roots": true,
       "policy_categories": [
         "performance"
       ]
@@ -19,6 +22,7 @@
     {
       "path": "plugins/bifrost-agent/test",
       "reason": "Test code is not performance-sensitive; the in-loop performance review prompts do not indicate defects here.",
+      "exclude_roots": true,
       "policy_categories": [
         "performance"
       ]
@@ -26,17 +30,20 @@
     {
       "path": "plugins/bifrost-dsh/test",
       "reason": "Test code is not performance-sensitive; the in-loop performance review prompts do not indicate defects here.",
+      "exclude_roots": true,
       "policy_categories": [
         "performance"
       ]
     },
     {
       "path": "crates/bifrost-mcp/tests/fixtures/policy-cli",
-      "reason": "Intentional smell fixture: this MCP-owned policy CLI sample exists to trigger the dynamic-evaluation policy in the crate's contract test, so its finding is the expected positive, not a defect."
+      "reason": "Intentional smell fixture: this MCP-owned policy CLI sample exists to trigger the dynamic-evaluation policy in the crate's contract test, so its finding is the expected positive, not a defect.",
+      "exclude_roots": true
     },
     {
       "path": "crates/bifrost-mcp/tests",
       "reason": "Test code is not performance-sensitive; the in-loop performance review prompts do not indicate defects here.",
+      "exclude_roots": true,
       "policy_categories": [
         "performance"
       ]
@@ -44,6 +51,7 @@
     {
       "path": "crates/bifrost-lsp/tests",
       "reason": "Test code is not performance-sensitive; the in-loop performance review prompts do not indicate defects here.",
+      "exclude_roots": true,
       "policy_categories": [
         "performance"
       ]

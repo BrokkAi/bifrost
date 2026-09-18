@@ -29,6 +29,9 @@ pub(super) struct EndpointSetClosure {
     pub(super) parsed_documents: usize,
     pub(super) cache_hits: usize,
     pub(super) released_cache_bytes: usize,
+    /// Workspace-authored imports deferred at the built-in catalog boundary:
+    /// the references stay in the authored plan and close after activation.
+    pub(super) deferred: bool,
     selectors: HashMap<PolicySelectorPath, ResolvedPolicySelector>,
     origins: HashMap<PolicyDependencyPath, Vec<PolicySourceIdentity>>,
     import_ranges: HashMap<PolicySourceIdentity, (PolicySourceIdentity, std::ops::Range<usize>)>,
@@ -166,10 +169,30 @@ impl PolicyRegistry {
         if roots.is_empty() {
             return Ok(closure);
         }
-        let root = self
-            .workspace_root
-            .as_ref()
-            .ok_or(PolicyRegistryError::WorkspaceAccessUnavailable)?;
+        let Some(root) = self.workspace_root.as_ref() else {
+            if locators.is_deferred() {
+                // The built-in catalog boundary defers workspace-authored
+                // imports exactly like qualified locators: the reference stays
+                // in the authored plan and a host closes it once, after
+                // workspace activation.
+                closure.deferred = true;
+                return Ok(closure);
+            }
+            return Err(import_error(
+                &ImportFrame {
+                    reference: roots[0].1.clone(),
+                    referrer: Arc::new(parsed.clone()),
+                    kind: roots[0].0,
+                    depth: 1,
+                    exit: false,
+                },
+                "endpoint-set-import-requires-workspace",
+                format!(
+                    "endpoint-set `{}` is workspace-authored and cannot close before activation",
+                    roots[0].1.path
+                ),
+            ));
+        };
         let mut ids: HashSet<TaintEntryId> = all_entries(spec, flow)
             .into_iter()
             .map(|(_, id, _)| id.clone())

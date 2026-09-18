@@ -1250,15 +1250,32 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         node: Node<'tree>,
     ) -> Result<PointMetadata, TsLoweringError> {
         let anchor = source_anchor(node, 0).map_err(TsLoweringError::Invalid)?;
-        let ast_identity = self
-            .structural_node_index
-            .and_then(|index| index.identity(node));
+        let ast_identity = self.value_structural_identity(node);
         self.session.add_mapping_with_ast_identity(
             builder,
             anchor,
             SourceMappingKind::Exact,
             ast_identity,
         )
+    }
+
+    /// The structural fact that represents this value's own source
+    /// occurrence. Almost every admitted node is its own fact. A normalized
+    /// runtime keyed access is the exception: a subscript expression has no
+    /// subscript fact, so its load is represented by the base of its access
+    /// chain. Publishing that seed identity here keeps the identity on the
+    /// load itself, where local initialization preserves it, instead of
+    /// requiring the consumer to re-derive it from the container occurrence.
+    fn value_structural_identity(&self, node: Node<'tree>) -> Option<StructuralNodeIdentity> {
+        let index = self.structural_node_index?;
+        index.identity(node).or_else(|| {
+            brokk_bifrost_js_ts::syntax::runtime_keyed_access_seed(
+                node,
+                self.lexical_bindings,
+                self.prepared.source(),
+            )
+            .and_then(|seed| index.identity(seed))
+        })
     }
 
     fn parameter_mapping(

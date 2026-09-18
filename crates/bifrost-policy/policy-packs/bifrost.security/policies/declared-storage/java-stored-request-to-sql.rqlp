@@ -1,0 +1,48 @@
+; Declared-storage SQL flow, Java specialization.
+;
+; A request value (ServletRequest.getParameter) that the application
+; persists through its declared job store and later reads back must never
+; reach the SQL text of a JDBC Statement.execute(String) call. The
+; write-to-read edge is the workspace's reviewed store declaration, not an
+; observed database connection; the policy binds no flow without it. A
+; PreparedStatement with bound values keeps the value out of the SQL
+; structure and is the documented remediation.
+(policy
+  :schema-version 1
+  :id "bifrost.security.java.stored-request-to-sql"
+  :name "Stored request value reaches JDBC SQL (Java)"
+  :message "a request value stored in the declared job store reached Statement.execute(String) SQL text"
+  :severity error
+  :description "Reports servlet request values that cross the declared job-store persistence boundary and reach the SQL argument of the exact JDBC Statement.execute(String) overload. Selection is exact: the reviewed semantic-model identities of the request and statement APIs plus proven calls of the declared store, never same-named members of unrelated classes. The store, key, and instance contracts come from the reviewed endpoint-set document, whose absence fails activation rather than passing."
+  :help-uri "https://bifrost.brokk.ai/static-analysis-policies/#declared-storage"
+  :tags ["security" "java" "sql-injection" "cwe-89" "declared-storage"]
+  :analysis (analysis
+    :type taint
+    :mode may
+    :call-modeling (call-modeling :unmodeled require-model)
+    :sources (endpoint-set :entries [
+      (source :id servlet-request-parameter
+        :display-name "ServletRequest.getParameter(String)"
+        :categories [input.user-controlled io.external]
+        :selector (rql :schema-version 1
+          (language java
+            (call-sites-to :proof proven
+              (enclosing-decl
+                (inside-decl (class :name "ServletRequest") (method :name "getParameter"))))))
+        :bind return-value
+        :labels [attacker-controlled])])
+    :sinks (endpoint-set :entries [
+      (sink :id jdbc-statement-execute-sql
+        :display-name "Statement.execute(String) SQL"
+        :categories [sql.structure]
+        :selector (rql :schema-version 1
+          (language java
+            (call-sites-to :proof proven
+              (enclosing-decl
+                (inside-decl (class :name "Statement") (method :name "execute"))))))
+        :dangerous-operand (argument :index 0)
+        :accepts [attacker-controlled])])
+    :stores (endpoint-set :include-files [
+      (endpoint-set-file :path ".bifrost/endpoint-sets/stores/java-declared-store.rqlp")]))
+  :classification (classification
+    :fallback (classification-id :taxonomy "CWE" :id "89")))

@@ -752,6 +752,17 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
     assert!(report.contains("self-comparison"), "{report}");
     assert!(report.contains("SampleTest.java"), "{report}");
     assert!(report.contains("sample_spec.rb"), "{report}");
+    let assertion_contract = &test_assertion_smells["result"]["structuredContent"]["structured"];
+    assert_eq!(assertion_contract["schema_id"], "bifrost.quality.findings");
+    assert_eq!(assertion_contract["schema_version"], 1);
+    assert_eq!(assertion_contract["finding_kind"], "test_assertion");
+    assert!(assertion_contract["completion"]["input_complete"].is_boolean());
+    assert!(assertion_contract["findings"][0]["evidence"]["subject"]["symbol"].is_string());
+    assert!(assertion_contract["findings"][0]["evidence"]["source_sha256"].is_string());
+    assert_eq!(
+        assertion_contract["findings"][0]["evidence"]["location"]["status"],
+        "exact"
+    );
 
     let symbol_sources = round_trip(
         &mut stdin,
@@ -935,6 +946,18 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
     assert!(
         clone_report.contains("PeerClone.sameValue"),
         "{clone_report}"
+    );
+    let clone_contract = &clone_smells["result"]["structuredContent"]["structured"];
+    assert_eq!(clone_contract["finding_kind"], "structural_clone");
+    assert!(clone_contract["findings"][0]["primary"]["subject"]["symbol"].is_string());
+    assert!(clone_contract["findings"][0]["peer"]["subject"]["symbol"].is_string());
+    assert_eq!(
+        clone_contract["findings"][0]["primary"]["location"]["status"],
+        "exact"
+    );
+    assert_eq!(
+        clone_contract["findings"][0]["peer"]["location"]["status"],
+        "exact"
     );
 
     let secret_file = fixture_root.path().join("config.properties");
@@ -1794,11 +1817,32 @@ fn bifrost_mcp_lists_and_runs_built_in_policies() {
     );
     assert_eq!(packs[2]["id"], "bifrost.security");
     let security_policies = packs[2]["policies"].as_array().expect("security policies");
-    assert_eq!(security_policies.len(), 2);
+    // The pack carries the two JVM policies plus the declared-storage family:
+    // one stored-request-to-SQL policy and one store-requires-validation
+    // policy for each of the thirteen supported languages. Those 26 are
+    // opt-in, so a run activates them only when a policy-id selector names
+    // them, and they defer their workspace-authored endpoint-set imports, so
+    // the catalog records no resolved hash for them.
+    assert_eq!(security_policies.len(), 28);
+    let opt_in = security_policies
+        .iter()
+        .filter(|policy| policy["activation"] == "opt-in")
+        .collect::<Vec<_>>();
+    assert_eq!(opt_in.len(), 26);
+    assert!(
+        opt_in
+            .iter()
+            .all(|policy| policy["resolved_semantic_hash"].is_null())
+    );
     assert!(
         security_policies.iter().any(|policy| {
             policy["id"] == "bifrost.security.java.system-getenv-to-runtime-exec"
         })
+    );
+    assert!(
+        security_policies
+            .iter()
+            .any(|policy| policy["id"] == "bifrost.security.python.stored-request-to-sql")
     );
 
     let run = round_trip(
@@ -3761,7 +3805,7 @@ fn legacy_clients_never_see_a_result_type() {
 
 /// The tools whose `structuredContent` shapes are published as contracts.
 /// published tool answers with a shape that is not yet a declared contract.
-const OUTPUT_SCHEMA_TOOLS: [&str; 7] = [
+const OUTPUT_SCHEMA_TOOLS: [&str; 9] = [
     "blast_radius",
     "cyclomatic_complexity",
     "missing_tests",
@@ -3769,6 +3813,8 @@ const OUTPUT_SCHEMA_TOOLS: [&str; 7] = [
     "list_policies",
     "search_symbols",
     "get_definitions_by_location",
+    "report_structural_clone_smells",
+    "report_test_assertion_smells",
 ];
 
 #[test]

@@ -123,6 +123,12 @@ impl LspServer {
     /// Spawn the server with explicit `initialize` params (e.g. to exercise
     /// capability negotiation).
     pub fn start_with_params(root: &Path, initialize_params: Value) -> Self {
+        Self::start_with_params_and_result(root, initialize_params).0
+    }
+
+    /// Spawn the server, complete initialization, and retain the exact
+    /// initialize response for wire-contract assertions.
+    pub fn start_with_params_and_result(root: &Path, initialize_params: Value) -> (Self, Value) {
         let (mut command, cache_dir) = lsp_command(root);
         let mut child = command
             .stdin(Stdio::piped())
@@ -144,20 +150,21 @@ impl LspServer {
                 "params": initialize_params
             }),
         );
-        let _ = read_response_for_id(&mut reader, &mut stderr, 1);
+        let initialize_response = read_response_for_id(&mut reader, &mut stderr, 1);
         write_message(
             &mut stdin,
             json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}),
         );
 
-        Self {
+        let server = Self {
             child: Some(child),
             stdin: Some(stdin),
             reader: Some(reader),
             stderr: Some(stderr),
             next_id: 2,
             _cache_dir: Some(cache_dir),
-        }
+        };
+        (server, initialize_response)
     }
 
     pub fn child_id(&self) -> u32 {

@@ -440,10 +440,15 @@ function parseArgs(argv) {
   return options;
 }
 
-function changedPathsFromGit(base, head) {
-  const result = spawnSync("git", ["diff", "--name-only", "--diff-filter=ACMRD", base, head], {
-    encoding: "utf8",
-  });
+function changedPathsFromGit(diffArguments, cwd) {
+  const result = spawnSync(
+    "git",
+    ["diff", "--name-only", "--diff-filter=ACMRD", ...diffArguments],
+    {
+      cwd,
+      encoding: "utf8",
+    },
+  );
   if (result.status !== 0) {
     return { changedPaths: [], diffFailed: true };
   }
@@ -451,6 +456,14 @@ function changedPathsFromGit(base, head) {
     changedPaths: result.stdout.split(/\r?\n/u).filter(Boolean),
     diffFailed: false,
   };
+}
+
+export function changedPathsFromPullRequestGit(base, head, cwd) {
+  return changedPathsFromGit([`${base}...${head}`], cwd);
+}
+
+function changedPathsFromPushGit(base, head) {
+  return changedPathsFromGit([base, head]);
 }
 
 function writeOutputs(outputPath, decision) {
@@ -491,10 +504,13 @@ function main() {
   const options = parseArgs(process.argv.slice(2));
   let changedPaths = [];
   let diffFailed = false;
-  // Pull requests select their component matrix from the diff. For a push,
-  // --base is the prior commit (github.event.before).
-  if (options.event === "pull_request" || options.event === "push") {
-    ({ changedPaths, diffFailed } = changedPathsFromGit(options.base, options.head));
+  // Pull requests diff from the merge base so changes added only to the base
+  // branch do not select validation for a stale PR branch. Pushes compare the
+  // prior and current commits directly.
+  if (options.event === "pull_request") {
+    ({ changedPaths, diffFailed } = changedPathsFromPullRequestGit(options.base, options.head));
+  } else if (options.event === "push") {
+    ({ changedPaths, diffFailed } = changedPathsFromPushGit(options.base, options.head));
   }
   const decision = classifyChangeSet({
     eventName: options.event,

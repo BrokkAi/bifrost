@@ -17,6 +17,14 @@
 ; close satisfies both obligations; a bare trailing close leaves the
 ; exceptional obligation, because the close operation's own failure contract is
 ; not a proof that the resource was released.
+;
+; A language construct that releases its resource at its own exit is a close
+; operation on the receiver subject, so it joins the receiver close events
+; rather than getting an event of its own: Java `try (...)` lowers its implicit
+; close on both continuations of the statement, and Python `with` lowers its
+; implicit `__exit__` the same way. The structural kind is `resource_release`,
+; which is the statement itself, so the selector names the construct and the
+; lowering decides which value it closes.
 (policy
   :schema-version 1
   :id "bifrost.correctness.resource-lifecycle"
@@ -203,9 +211,11 @@
                       :schema-version 1
                       (union
                         (language java (call :callee (name "close")))
+                        (language java (resource_release))
                         (language javascript (call :callee (name "close")))
                         (language typescript (call :callee (name "close")))
                         (language python (call :callee (name "close")))
+                        (language python (resource_release))
                         (language rust (call :callee (name "close")))
                         (language kotlin (call :callee (name "close")))
                         (language scala (call :callee (name "close")))
@@ -223,9 +233,11 @@
                       :schema-version 1
                       (union
                         (language java (call :callee (name "close")))
+                        (language java (resource_release))
                         (language javascript (call :callee (name "close")))
                         (language typescript (call :callee (name "close")))
                         (language python (call :callee (name "close")))
+                        (language python (resource_release))
                         (language rust (call :callee (name "close")))
                         (language kotlin (call :callee (name "close")))
                         (language scala (call :callee (name "close")))

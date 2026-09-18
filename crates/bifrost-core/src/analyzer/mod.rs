@@ -24,7 +24,6 @@ pub mod prepared_syntax;
 pub mod project;
 pub mod query_batch;
 pub mod query_token;
-pub mod resolution_facts;
 pub mod rust_facts;
 pub mod semantic_diagnostics;
 pub mod source_content;
@@ -51,6 +50,3 @@ pub use model::{
     SemanticDiagnostic, SemanticDiagnosticDomain, SemanticDiagnosticIncompleteReason,
     SemanticDiagnosticOutcome, SemanticDiagnosticReport, SemanticDiagnosticReportStatus,
 };
-
-pub mod java_facts;
-pub mod source_facts;

@@ -115,7 +115,7 @@ export default defineConfig({
             { label: 'VS Code', slug: 'vscode' },
             { label: 'Cursor', slug: 'cursor' },
             { label: 'Zed', slug: 'zed-lsp' },
-            { label: 'Neovim', slug: 'neovim' },
+            { label: 'Neovim / Vim', slug: 'neovim' },
             { label: 'Helix', slug: 'helix' },
           ],
         },

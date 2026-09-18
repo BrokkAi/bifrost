@@ -193,11 +193,9 @@ pub fn write_policy_human<W: Write>(
     {
         write_suppression_review(&mut output, review)?;
     }
-    for review in report
-        .scope()
-        .iter()
-        .filter(|review| !review.applied() || review.result_omitted())
-    {
+    for review in report.scope().iter().filter(|review| {
+        !review.applied() || review.result_omitted() || review.entry().excludes_roots()
+    }) {
         write_scope_review(&mut output, review)?;
     }
     if let Some(review) = report.baseline() {
@@ -393,10 +391,20 @@ fn write_concise_report<W: Write>(
         )
         .map_err(map_io_error)?;
     }
-    let scoped = report
+    let excluded_roots = report
         .scope()
         .iter()
-        .filter(|review| review.applied())
+        .map(crate::PolicyScopeReview::excluded_root_files)
+        .sum::<u64>();
+    if excluded_roots > 0 {
+        writeln!(output, "  Root exclusion matches (scope/policy/file): {excluded_roots}. Dependencies remain visible.")
+            .map_err(map_io_error)?;
+    }
+    let scoped = report
+        .runs()
+        .iter()
+        .flat_map(PolicyRun::findings)
+        .filter(|finding| finding.scope().is_some())
         .count();
     if scoped > 0 {
         writeln!(
@@ -1176,6 +1184,14 @@ fn write_scope_review<W: Write>(
         yes_no(review.result_omitted()),
     )
     .map_err(map_io_error)?;
+    if review.entry().excludes_roots() {
+        writeln!(
+            output,
+            "  excluded analysis root files (policy/file pairs): {}",
+            review.excluded_root_files(),
+        )
+        .map_err(map_io_error)?;
+    }
     writeln!(
         output,
         "  scope reason: {}",
@@ -3973,6 +3989,7 @@ const fn location_relationship(value: PolicyLocationRelationship) -> &'static st
         PolicyLocationRelationship::GeneratedDeclaration => "generated_declaration",
         PolicyLocationRelationship::DeclaringScope => "declaring_scope",
         PolicyLocationRelationship::ActualOccurrence => "actual_occurrence",
+        PolicyLocationRelationship::StoreWrite => "store_write",
     }
 }
 

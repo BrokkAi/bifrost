@@ -2570,7 +2570,18 @@ fn apply_semantic_gate(
             evidence,
             ..
         } => {
-            let removed = retain_neutral_backed_values(&mut report.analysis, &points_to);
+            // The neutral gate can only confirm a value it materialized
+            // itself. An exact modeled external identity is proven by the
+            // declaration the overlay owns (for example a DOM `Element`
+            // declared by an activated standard-library pack), and the
+            // neutral lowerer holds no heap row for the external type, so
+            // retaining only neutral-backed candidates would drop the one
+            // identity the query has. This is the retention half of the same
+            // exemption the downgrade below already applies.
+            let exact_modeled_identity =
+                legacy_external_model_identity_is_precise(analyzer, &report.analysis);
+            let removed = !exact_modeled_identity
+                && retain_neutral_backed_values(&mut report.analysis, &points_to);
             report.candidates_truncated |= removed;
             report.candidates_truncated |= evidence.is_truncated();
             report.semantic_unsupported = evidence.unsupported_capability();
@@ -2582,7 +2593,7 @@ fn apply_semantic_gate(
             // non-precise.
             if !evidence.supports_precise()
                 && !evidence.legacy_provider_can_close()
-                && !legacy_external_model_identity_is_precise(analyzer, &report.analysis)
+                && !exact_modeled_identity
             {
                 neutral_incomplete(&mut report.analysis);
             }
@@ -2733,6 +2744,16 @@ fn retain_neutral_backed_values(
     analysis: &mut ReceiverQueryAnalysis,
     points_to: &SourcePointsToResult,
 ) -> bool {
+    // An explicit competing or truncated import boundary states its claim in
+    // the outcome itself and carries no candidate list, so the neutral heap has
+    // nothing to back and nothing to drop. Without this guard the empty list
+    // falls through to the `values.is_empty()` arm below and the proven
+    // boundary is rewritten as `Unknown`. This is the available-gate half of
+    // the exemption `apply_semantic_gate` already applies when the gate is
+    // unavailable.
+    if legacy_external_import_ambiguity(analysis) {
+        return false;
+    }
     let ReceiverQueryAnalysis::Values(outcome) = analysis else {
         return false;
     };

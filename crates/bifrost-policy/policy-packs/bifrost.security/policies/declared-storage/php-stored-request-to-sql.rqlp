@@ -1,0 +1,38 @@
+; Declared-storage SQL flow, PHP specialization.
+(policy
+  :schema-version 1
+  :id "bifrost.security.php.stored-request-to-sql"
+  :name "Stored request value reaches SQL (PHP)"
+  :message "a request value stored in the declared job store reached SQL text"
+  :severity error
+  :description "Reports request values that cross the declared job-store persistence boundary and reach mysqli SQL text. Selection is exact: proven calls of the declared functions only, never similarly named unrelated functions. The store, key, and instance contracts come from the reviewed endpoint-set document, whose absence fails activation rather than passing."
+  :help-uri "https://bifrost.brokk.ai/static-analysis-policies/#declared-storage"
+  :tags ["security" "php" "sql-injection" "cwe-89" "declared-storage"]
+  :analysis (analysis
+    :type taint
+    :mode may
+    :call-modeling (call-modeling :unmodeled require-model)
+    :sources (endpoint-set :entries [
+      (source :id request-param
+        :display-name "request parameter"
+        :categories [input.user-controlled io.external]
+        :selector (rql :schema-version 1
+          (language php
+            (call-sites-to :proof proven
+              (enclosing-decl (function :name "request_param")))))
+        :bind return-value
+        :labels [attacker-controlled])])
+    :sinks (endpoint-set :entries [
+      (sink :id mysqli-query
+        :display-name "mysqli query SQL"
+        :categories [sql.structure]
+        :selector (rql :schema-version 1
+          (language php
+            (call-sites-to :proof proven
+              (enclosing-decl (function :name "mysqli_query_text")))))
+        :dangerous-operand (argument :index 0)
+        :accepts [attacker-controlled])])
+    :stores (endpoint-set :include-files [
+      (endpoint-set-file :path ".bifrost/endpoint-sets/stores/php-declared-store.rqlp")]))
+  :classification (classification
+    :fallback (classification-id :taxonomy "CWE" :id "89")))

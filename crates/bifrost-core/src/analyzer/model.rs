@@ -1287,24 +1287,6 @@ impl StructuredTypeName {
         self.absolute
     }
 
-    pub fn estimated_retained_bytes(&self) -> usize {
-        self.path
-            .capacity()
-            .saturating_mul(std::mem::size_of::<String>())
-            .saturating_add(
-                self.lexical_scope
-                    .capacity()
-                    .saturating_mul(std::mem::size_of::<String>()),
-            )
-            .saturating_add(
-                self.path
-                    .iter()
-                    .chain(&self.lexical_scope)
-                    .map(String::capacity)
-                    .sum(),
-            )
-    }
-
     fn is_valid(&self) -> bool {
         let Some(component_count) = self.path.len().checked_add(self.lexical_scope.len()) else {
             return false;

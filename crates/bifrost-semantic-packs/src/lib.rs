@@ -372,12 +372,12 @@ const BIFROST_EMBEDDED_PACK_ENTRIES: &[EmbeddedSemanticPack<'static>] = &[
         GO_STDLIB_NET_URL_DECLARATION_SHARDS,
     ),
     EmbeddedSemanticPack::new(
-        "bifrost.go.stdlib.net-http@1.0.0",
+        "bifrost.go.stdlib.net-http@1.1.0",
         include_bytes!("../embedded/go-stdlib-net-http/manifest.json"),
         GO_STDLIB_NET_HTTP_SHARDS,
     ),
     EmbeddedSemanticPack::new(
-        "bifrost.go.stdlib.net-http-declarations@1.0.0",
+        "bifrost.go.stdlib.net-http-declarations@1.1.0",
         include_bytes!("../embedded/go-stdlib-net-http-declarations/manifest.json"),
         GO_STDLIB_NET_HTTP_DECLARATION_SHARDS,
     ),
@@ -537,8 +537,8 @@ mod tests {
         MemberKind, ProcedureSummaryMemberKey, SemanticModelActivationEvidence,
         SemanticModelActivationRequest, SemanticModelMatchDisposition, SemanticModelRuntimeLimits,
         SemanticModelRuntimeOutcome, SemanticPackSelectorQuery, SourceFormat, TypeIdentity,
-        TypeKind, TypeRef, acquire_active_semantic_models, compile_source, member_declaration_id,
-        prepare_compatible_installed_semantic_packs, type_declaration_id,
+        TypeKind, TypeRef, Visibility, acquire_active_semantic_models, compile_source,
+        member_declaration_id, prepare_compatible_installed_semantic_packs, type_declaration_id,
     };
     use brokk_bifrost_analysis::analyzer::usages::call_relations::CallRelationLimits;
     use brokk_bifrost_analysis::analyzer::usages::call_shape::call_shapes_in_file;
@@ -1811,9 +1811,10 @@ mod tests {
                     )
                 })
         }));
-        // The http.Handler interface forms keep a reviewed unsupported
-        // boundary: their callback is the dynamic type's ServeHTTP method,
-        // which the model does not resolve.
+        // The http.Handler interface forms spawn the handler's dynamic
+        // ServeHTTP method. The binder resolves the dynamic type from the
+        // handler argument's source and keeps the reviewed typed boundary
+        // when that type is not exact.
         for id in [
             "net-http.handle",
             "net-http.serve-mux.handle",
@@ -1824,8 +1825,12 @@ mod tests {
                 summary.id == id
                     && matches!(
                         summary.concurrency_effects.as_slice(),
-                        [CompiledConcurrencyEffect::Unsupported { protocol }]
-                            if protocol == "net/http.Handler"
+                        [CompiledConcurrencyEffect::TaskSpawn {
+                            callable,
+                            group: None,
+                            condition: None,
+                            timer: None,
+                        }] if callable == &CompiledSummaryInput::Parameter { ordinal: 1 }
                     )
             }));
         }
@@ -1845,7 +1850,7 @@ mod tests {
             .payload()
             .declaration_facts()
             .expect("the Go net/http declaration shard carries declaration facts");
-        assert_eq!(types.len(), 3);
+        assert_eq!(types.len(), 4);
         assert_eq!(members.len(), 7);
         assert!(relations.is_empty());
         assert!(types.iter().any(|fact| {
@@ -1853,6 +1858,52 @@ mod tests {
                 && fact.aliases == ["http"]
                 && fact.type_kind == TypeKind::Module
         }));
+        assert!(types.iter().any(|fact| {
+            fact.name == "net/http.HandlerFunc"
+                && fact.type_kind == TypeKind::Class
+                && fact.visibility == Visibility::Public
+        }));
+        for fact in types {
+            assert_eq!(
+                fact.id,
+                type_declaration_id(TypeIdentity {
+                    ecosystem: "go",
+                    name: &fact.name,
+                }),
+                "the authored net/http type ID uses the canonical Go identity"
+            );
+        }
+        for member in members {
+            let signature = member
+                .signature
+                .as_ref()
+                .unwrap_or_else(|| panic!("{} has a structured signature", member.name));
+            let parameter_types = signature
+                .parameters
+                .iter()
+                .map(|parameter| parameter.r#type.clone())
+                .collect::<Vec<_>>();
+            let parameter_variadics = signature
+                .parameters
+                .iter()
+                .map(|parameter| parameter.variadic)
+                .collect::<Vec<_>>();
+            let expected = member_declaration_id(MemberIdentity {
+                owner_id: &member.owner,
+                kind: member.member_kind,
+                is_static: member.is_static,
+                parameter_arity: parameter_types.len(),
+                name: &member.name,
+                generic_arity: signature.type_parameters.len(),
+                parameter_types: &parameter_types,
+                parameter_variadics: &parameter_variadics,
+                return_type: signature.returns.as_ref(),
+            });
+            assert_eq!(
+                member.id, expected,
+                "the authored net/http member ID uses the canonical Go identity"
+            );
+        }
         assert!(members.iter().any(|fact| {
             fact.name == "HandleFunc"
                 && fact

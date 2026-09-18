@@ -266,7 +266,7 @@ pub fn forward_reachability<G>(
 where
     G: DenseBidirectionalGraph,
 {
-    reachability(graph, start, Direction::Forward, request)
+    reachability(graph, start, Direction::Forward, &|_| false, request)
 }
 
 pub fn reverse_reachability<G>(
@@ -277,13 +277,34 @@ pub fn reverse_reachability<G>(
 where
     G: DenseBidirectionalGraph,
 {
-    reachability(graph, start, Direction::Reverse, request)
+    reachability(graph, start, Direction::Reverse, &|_| false, request)
+}
+
+/// Reachability in the forward direction where an `avoid`ed node is a barrier.
+///
+/// An avoided node is never entered and never leaves the membership: the walk
+/// neither claims the avoided node is reachable nor traverses through it, so a
+/// successor of an avoided node is reachable only on a path that does not pass
+/// the avoided node. An avoided `start` therefore yields empty membership,
+/// which is the answer the callers want from "can the walk reach anything
+/// without first passing a barrier at the start?".
+pub fn forward_reachability_avoiding<G>(
+    graph: &G,
+    start: G::Node,
+    avoid: impl Fn(G::Node) -> bool,
+    request: &mut CfgAlgorithmRequest<'_>,
+) -> Result<Reachability<G::Node>, CfgAlgorithmError<G::Node>>
+where
+    G: DenseBidirectionalGraph,
+{
+    reachability(graph, start, Direction::Forward, &avoid, request)
 }
 
 fn reachability<G>(
     graph: &G,
     start: G::Node,
     direction: Direction,
+    avoid: &impl Fn(G::Node) -> bool,
     request: &mut CfgAlgorithmRequest<'_>,
 ) -> Result<Reachability<G::Node>, CfgAlgorithmError<G::Node>>
 where
@@ -295,6 +316,13 @@ where
         .node_index(start)
         .ok_or(CfgAlgorithmError::InvalidNode(start))?;
     let mut membership = vec![false; graph.node_count()];
+    if avoid(start) {
+        return Ok(Reachability {
+            membership: membership.into_boxed_slice(),
+            work: request.budget.used().saturating_sub(started),
+            node: std::marker::PhantomData,
+        });
+    }
     membership[start_index] = true;
     request.visit_node()?;
     let mut stack = vec![start];
@@ -307,6 +335,7 @@ where
                 graph.successors(node).rev(),
                 &mut membership,
                 &mut stack,
+                avoid,
                 request,
             )?,
             Direction::Reverse => discover_adjacent(
@@ -314,6 +343,7 @@ where
                 graph.predecessors(node),
                 &mut membership,
                 &mut stack,
+                avoid,
                 request,
             )?,
         }
@@ -331,6 +361,7 @@ fn discover_adjacent<G>(
     adjacent: impl Iterator<Item = (G::Edge, G::Node)>,
     membership: &mut [bool],
     stack: &mut Vec<G::Node>,
+    avoid: &impl Fn(G::Node) -> bool,
     request: &mut CfgAlgorithmRequest<'_>,
 ) -> Result<(), CfgAlgorithmError<G::Node>>
 where
@@ -338,6 +369,9 @@ where
 {
     for (_, adjacent_node) in adjacent {
         request.visit_edge()?;
+        if avoid(adjacent_node) {
+            continue;
+        }
         let index = graph
             .node_index(adjacent_node)
             .ok_or(CfgAlgorithmError::InvalidNode(adjacent_node))?;
@@ -1628,6 +1662,55 @@ mod tests {
         cancellation: &'request CancellationToken,
     ) -> CfgAlgorithmRequest<'request> {
         CfgAlgorithmRequest::new(budget, cancellation)
+    }
+
+    #[test]
+    fn avoiding_reachability_treats_an_avoided_node_as_a_barrier() {
+        // 0 branches to 1 and 2; both reach the exit 3. Avoiding 2 still
+        // reaches 3 through 1, so the exit is reachable with the barrier.
+        let graph = TestGraph::new(4, &[(0, 1, 0), (1, 3, 0), (0, 2, 0), (2, 3, 0)]);
+        let cancellation = CancellationToken::default();
+        let mut budget = CfgAlgorithmBudget::uniform(100);
+        let reachable = forward_reachability_avoiding(
+            &graph,
+            0,
+            |node| node == 2,
+            &mut request(&mut budget, &cancellation),
+        )
+        .expect("avoiding forward reachability");
+        assert_eq!(reachable.iter(&graph).collect::<Vec<_>>(), vec![0, 1, 3]);
+        assert_eq!(
+            reachable.work(),
+            CfgAlgorithmWork {
+                node_visits: 3,
+                edge_visits: 3
+            }
+        );
+
+        // Avoiding the only path to the exit leaves the exit unreachable, and
+        // avoiding the start leaves the whole walk empty.
+        let graph = TestGraph::new(3, &[(0, 1, 0), (1, 2, 0)]);
+        let mut budget = CfgAlgorithmBudget::uniform(100);
+        let reachable = forward_reachability_avoiding(
+            &graph,
+            0,
+            |node| node == 1,
+            &mut request(&mut budget, &cancellation),
+        )
+        .expect("avoiding forward reachability");
+        assert_eq!(reachable.iter(&graph).collect::<Vec<_>>(), vec![0]);
+        assert!(!reachable.contains(&graph, 2));
+
+        let mut budget = CfgAlgorithmBudget::uniform(100);
+        let reachable = forward_reachability_avoiding(
+            &graph,
+            0,
+            |node| node == 0,
+            &mut request(&mut budget, &cancellation),
+        )
+        .expect("avoiding forward reachability");
+        assert_eq!(reachable.membership(), &[false, false, false]);
+        assert_eq!(reachable.work(), CfgAlgorithmWork::default());
     }
 
     #[test]

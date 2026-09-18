@@ -2548,21 +2548,26 @@ impl Drop for WorkspaceQueryScope {
 /// response (issue #3401).
 ///
 /// The marker fires exactly when the answer could have used the packs the
-/// session is still acquiring: the query's selected languages -- or the
-/// workspace's, when the query does not select -- must intersect the
-/// languages the pending acquisitions serve, or the snapshot must not know
-/// the warm's state at all (`WarmPending`, the request whose budget was
-/// already spent). The diagnostic's impact is `incomplete`, so the envelope's
-/// own completion derives `incomplete`: an answer produced without the packs
-/// it could have used is never reported as complete. After the diagnostic
-/// lands, the flow-status cap re-derives so no retained flow row presents a
-/// clean complete negative under it.
+/// session is still acquiring: the decoded plan may depend on semantic packs, and
+/// the query's selected languages -- or the workspace's, when the query does
+/// not select -- must intersect the languages the pending acquisitions serve.
+/// A `WarmPending` snapshot has the same dependency requirement because a query
+/// that cannot consume semantic packs also cannot gain rows when the warm's
+/// state is unknown. The diagnostic's impact is `incomplete`, so the
+/// envelope's own completion derives `incomplete`: an answer produced without
+/// the packs it could have used is never reported as complete. After the
+/// diagnostic lands, the flow-status cap re-derives so no retained flow row
+/// presents a clean complete negative under it.
 fn mark_pack_acquisition_pending(
     pack_activation: &SessionPackActivation,
+    query: &crate::rql::CodeQuery,
     query_languages: Option<&Value>,
     workspace_languages: &std::collections::BTreeSet<Language>,
     response: &mut crate::rql::CodeQueryResponse,
 ) {
+    if !query.may_use_semantic_packs() {
+        return;
+    }
     let message = match pack_activation {
         SessionPackActivation::Settled(_) => return,
         SessionPackActivation::AcquisitionPending(state) => {
@@ -2688,11 +2693,13 @@ mod pack_acquisition_pending_tests {
         pack_activation: &SessionPackActivation,
         query_languages: Option<&Value>,
         workspace_languages: &[Language],
+        query: &crate::rql::CodeQuery,
     ) -> crate::rql::CodeQueryResponse {
         let mut response =
             crate::rql::CodeQueryResponse::Results(crate::rql::CodeQueryResult::default());
         mark_pack_acquisition_pending(
             pack_activation,
+            query,
             query_languages,
             &workspace_languages.iter().copied().collect(),
             &mut response,
@@ -2700,8 +2707,94 @@ mod pack_acquisition_pending_tests {
         response
     }
 
+    fn parsed_query(query: serde_json::Value) -> crate::rql::CodeQuery {
+        crate::rql::CodeQuery::from_json(&query).expect("a valid pending-marker query")
+    }
+
+    fn pure_structural_query() -> crate::rql::CodeQuery {
+        parsed_query(json!({
+            "languages": ["java"],
+            "where": ["Gson.java"],
+            "match": { "kind": "class", "name": "Gson" }
+        }))
+    }
+
+    fn semantic_query() -> crate::rql::CodeQuery {
+        parsed_query(json!({
+            "languages": ["java"],
+            "where": ["Gson.java"],
+            "match": { "kind": "class", "name": "Gson" },
+            "steps": [{ "op": "procedure_of" }]
+        }))
+    }
+
+    fn nested_pure_query() -> crate::rql::CodeQuery {
+        parsed_query(json!({
+            "union": [
+                {
+                    "languages": ["java"],
+                    "where": ["Gson.java"],
+                    "match": { "kind": "class", "name": "Gson" },
+                    "steps": [{ "op": "file_of" }]
+                },
+                {
+                    "languages": ["java"],
+                    "where": ["Gson.java"],
+                    "match": { "kind": "class", "name": "Gson" },
+                    "steps": [{ "op": "file_of" }]
+                }
+            ]
+        }))
+    }
+
+    fn nested_semantic_query() -> crate::rql::CodeQuery {
+        parsed_query(json!({
+            "union": [
+                {
+                    "languages": ["java"],
+                    "where": ["Gson.java"],
+                    "match": { "kind": "class", "name": "Gson" },
+                    "steps": [{ "op": "procedure_of" }]
+                },
+                {
+                    "languages": ["java"],
+                    "where": ["Gson.java"],
+                    "match": { "kind": "class", "name": "Gson" },
+                    "steps": [{ "op": "procedure_of" }]
+                }
+            ]
+        }))
+    }
+
+    fn unscoped_enclosing_decl_query() -> crate::rql::CodeQuery {
+        parsed_query(json!({
+            "languages": ["java"],
+            "match": { "kind": "class", "name": "Gson" },
+            "steps": [{ "op": "enclosing_decl" }]
+        }))
+    }
+
+    fn nested_mixed_query() -> crate::rql::CodeQuery {
+        parsed_query(json!({
+            "union": [
+                {
+                    "languages": ["java"],
+                    "where": ["Gson.java"],
+                    "match": { "kind": "class", "name": "Gson" },
+                    "steps": [{ "op": "file_of" }]
+                },
+                {
+                    "languages": ["java"],
+                    "where": ["Gson.java"],
+                    "match": { "kind": "class", "name": "Gson" },
+                    "steps": [{ "op": "enclosing_decl" }, { "op": "file_of" }]
+                }
+            ]
+        }))
+    }
+
     #[test]
-    fn a_query_over_a_pending_language_carries_the_typed_pending_state() {
+    fn a_semantic_query_over_a_pending_language_carries_the_typed_pending_state() {
         let phase = SessionPackActivation::AcquisitionPending(pending_state(&[
             ("jvm", "jdk:25.0.4.1"),
             ("npm", "lodash"),
@@ -2710,6 +2803,7 @@ mod pack_acquisition_pending_tests {
             &phase,
             Some(&json!(["java"])),
             &[Language::Java, Language::JavaScript],
+            &semantic_query(),
         );
         let result = response.result().expect("results response");
         let diagnostic = result
@@ -2743,12 +2837,149 @@ mod pack_acquisition_pending_tests {
     }
 
     #[test]
-    fn a_query_outside_the_pending_languages_is_unmarked() {
+    fn model_dependent_near_misses_keep_pending_coverage() {
+        let queries = [
+            json!({"languages": ["java"], "match": {"kind": "class", "name": "External"}}),
+            json!({"languages": ["java"], "match": {"kind": "class", "name": "External"},
+                "steps": [{"op": "enclosing_decl"}]}),
+            json!({"languages": ["java"], "where": ["App.java"],
+                "match": {"kind": "call", "callee": {"name": "trim"}}}),
+            json!({"languages": ["java"], "where": ["App.java"],
+                "match": {"kind": "call", "receiver": {"name": "value"}}}),
+            json!({"languages": ["java"], "where": ["App.java"],
+                "match": {"kind": "class", "name": "App"},
+                "steps": [{"op": "enclosing_decl"}, {"op": "members"}]}),
+            json!({"union": [
+                {"languages": ["java"], "where": ["App.java"],
+                    "match": {"kind": "class", "name": "App"}},
+                {"languages": ["java"], "match": {"kind": "class", "name": "External"}}
+            ]}),
+        ];
+        let phase = SessionPackActivation::AcquisitionPending(pending_state(&[("jvm", "jdk")]));
+        for json in queries {
+            let query = parsed_query(json.clone());
+            let response = mark(&phase, Some(&json!(["java"])), &[Language::Java], &query);
+            assert!(
+                marked_codes(&response)
+                    .contains(&crate::rql::CodeQueryDiagnosticCode::SemanticPackAcquisitionPending),
+                "model-dependent query lost its coverage marker: {json}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_pure_structural_query_over_a_pending_language_is_unmarked() {
+        let phase = SessionPackActivation::AcquisitionPending(pending_state(&[("jvm", "jdk")]));
+        let response = mark(
+            &phase,
+            Some(&json!(["java"])),
+            &[Language::Java],
+            &pure_structural_query(),
+        );
+        assert!(marked_codes(&response).is_empty());
+    }
+
+    #[test]
+    fn file_scoped_callee_and_receiver_constraints_remain_conservative() {
+        let phase = SessionPackActivation::AcquisitionPending(pending_state(&[("jvm", "jdk")]));
+        for query in [
+            parsed_query(json!({
+                "languages": ["java"],
+                "where": ["Gson.java"],
+                "match": { "kind": "call", "callee": { "name": "trim" } }
+            })),
+            parsed_query(json!({
+                "languages": ["java"],
+                "where": ["Gson.java"],
+                "match": { "kind": "call", "receiver": { "name": "service" } }
+            })),
+        ] {
+            let response = mark(&phase, Some(&json!(["java"])), &[Language::Java], &query);
+            assert!(
+                marked_codes(&response)
+                    .contains(&crate::rql::CodeQueryDiagnosticCode::SemanticPackAcquisitionPending),
+                "a file-scoped role constraint remains conservatively pending"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unscoped_enclosing_decl_query_remains_pending() {
+        let phase = SessionPackActivation::AcquisitionPending(pending_state(&[("jvm", "jdk")]));
+        let response = mark(
+            &phase,
+            Some(&json!(["java"])),
+            &[Language::Java],
+            &unscoped_enclosing_decl_query(),
+        );
+        assert!(
+            marked_codes(&response)
+                .contains(&crate::rql::CodeQueryDiagnosticCode::SemanticPackAcquisitionPending)
+        );
+    }
+
+    #[test]
+    fn file_and_import_graph_steps_are_safe_for_scoped_declarations() {
+        let phase = SessionPackActivation::AcquisitionPending(pending_state(&[("jvm", "jdk")]));
+        let query = parsed_query(json!({
+            "languages": ["java"],
+            "where": ["Gson.java"],
+            "match": { "kind": "class", "name": "Gson" },
+            "steps": [
+                { "op": "file_of" },
+                { "op": "imports_of" },
+                { "op": "importers_of" }
+            ]
+        }));
+        let response = mark(&phase, Some(&json!(["java"])), &[Language::Java], &query);
+        assert!(marked_codes(&response).is_empty());
+    }
+
+    #[test]
+    fn disallowed_steps_remain_pending() {
+        let phase = SessionPackActivation::AcquisitionPending(pending_state(&[("jvm", "jdk")]));
+        for step in [
+            json!({ "op": "enclosing_decl" }),
+            json!({ "op": "procedure_of" }),
+        ] {
+            let query = parsed_query(json!({
+                "languages": ["java"],
+                "where": ["Gson.java"],
+                "match": { "kind": "class", "name": "Gson" },
+                "steps": [step]
+            }));
+            let response = mark(&phase, Some(&json!(["java"])), &[Language::Java], &query);
+            assert!(
+                marked_codes(&response)
+                    .contains(&crate::rql::CodeQueryDiagnosticCode::SemanticPackAcquisitionPending),
+                "non-structural step remains conservatively pending"
+            );
+        }
+    }
+
+    #[test]
+    fn a_mixed_nested_query_marks_when_one_branch_is_disallowed() {
+        let phase = SessionPackActivation::AcquisitionPending(pending_state(&[("jvm", "jdk")]));
+        let response = mark(
+            &phase,
+            Some(&json!(["java"])),
+            &[Language::Java],
+            &nested_mixed_query(),
+        );
+        assert!(
+            marked_codes(&response)
+                .contains(&crate::rql::CodeQueryDiagnosticCode::SemanticPackAcquisitionPending)
+        );
+    }
+
+    #[test]
+    fn a_semantic_query_outside_the_pending_languages_is_unmarked() {
         let phase = SessionPackActivation::AcquisitionPending(pending_state(&[("jvm", "jdk:25")]));
         let response = mark(
             &phase,
             Some(&json!(["rust"])),
             &[Language::Java, Language::Rust],
+            &semantic_query(),
         );
         assert!(
             !marked_codes(&response)
@@ -2758,14 +2989,19 @@ mod pack_acquisition_pending_tests {
 
         // The same holds for an unfiltered query on a workspace with no
         // pending language.
-        let response = mark(&phase, None, &[Language::Rust]);
+        let response = mark(&phase, None, &[Language::Rust], &semantic_query());
         assert!(marked_codes(&response).is_empty());
     }
 
     #[test]
-    fn an_unfiltered_query_marks_when_the_workspace_uses_a_pending_language() {
+    fn an_unfiltered_semantic_query_marks_when_the_workspace_uses_a_pending_language() {
         let phase = SessionPackActivation::AcquisitionPending(pending_state(&[("npm", "lodash")]));
-        let response = mark(&phase, None, &[Language::JavaScript, Language::Rust]);
+        let response = mark(
+            &phase,
+            None,
+            &[Language::JavaScript, Language::Rust],
+            &semantic_query(),
+        );
         assert!(
             marked_codes(&response)
                 .contains(&crate::rql::CodeQueryDiagnosticCode::SemanticPackAcquisitionPending)
@@ -2773,17 +3009,53 @@ mod pack_acquisition_pending_tests {
     }
 
     #[test]
-    fn a_warm_the_request_could_not_wait_for_marks_any_answer() {
+    fn nested_pure_structural_branches_do_not_mark() {
+        let phase = SessionPackActivation::AcquisitionPending(pending_state(&[("jvm", "jdk")]));
+        let response = mark(
+            &phase,
+            Some(&json!(["java"])),
+            &[Language::Java],
+            &nested_pure_query(),
+        );
+        assert!(marked_codes(&response).is_empty());
+    }
+
+    #[test]
+    fn a_nested_semantic_branch_carries_the_typed_pending_state() {
+        let phase = SessionPackActivation::AcquisitionPending(pending_state(&[("jvm", "jdk")]));
+        let response = mark(
+            &phase,
+            Some(&json!(["java"])),
+            &[Language::Java],
+            &nested_semantic_query(),
+        );
+        assert!(
+            marked_codes(&response)
+                .contains(&crate::rql::CodeQueryDiagnosticCode::SemanticPackAcquisitionPending)
+        );
+    }
+
+    #[test]
+    fn a_warm_the_request_could_not_wait_for_marks_a_semantic_query() {
         let response = mark(
             &SessionPackActivation::WarmPending,
             Some(&json!(["rust"])),
             &[Language::Rust],
+            &semantic_query(),
         );
         assert!(
             marked_codes(&response)
                 .contains(&crate::rql::CodeQueryDiagnosticCode::SemanticPackAcquisitionPending),
             "an answer whose pack state is unknown is never reported as complete"
         );
+
+        let pure = mark(
+            &SessionPackActivation::WarmPending,
+            Some(&json!(["rust"])),
+            &[Language::Rust],
+            &pure_structural_query(),
+        );
+        assert!(marked_codes(&pure).is_empty());
     }
 
     #[test]
@@ -2792,11 +3064,17 @@ mod pack_acquisition_pending_tests {
             &SessionPackActivation::Settled(None),
             Some(&json!(["java"])),
             &[Language::Java],
+            &semantic_query(),
         );
         assert!(marked_codes(&settled_none).is_empty());
 
         let settled = SessionPackActivation::Settled(Some(pending_state(&[])));
-        let response = mark(&settled, Some(&json!(["java"])), &[Language::Java]);
+        let response = mark(
+            &settled,
+            Some(&json!(["java"])),
+            &[Language::Java],
+            &semantic_query(),
+        );
         assert!(marked_codes(&response).is_empty());
     }
 }
@@ -4396,6 +4674,7 @@ impl SearchToolsService {
             );
         mark_pack_acquisition_pending(
             &snapshot.pack_activation,
+            &query,
             query_languages.as_ref(),
             &snapshot.analyzer().languages(),
             &mut response,
@@ -8258,6 +8537,34 @@ mod watcher_startup_tests {
         // stage is still parked. The query returning at all, rather than
         // blocking behind the parked production, is the #3372 half of the
         // contract; the diagnostic it carries is the #3401 half.
+        let source_query = json!({
+            "schema_version": 1,
+            "languages": ["javascript"],
+            "where": ["app.js"],
+            "match": {"kind": "function", "name": "missing"},
+        });
+        let prepared_source = service
+            .prepare_query_code(source_query, None)
+            .expect("prepare source-only query during acquisition");
+        let source_output = service
+            .execute_prepared_query_code(prepared_source, None)
+            .expect("execute source-only query during acquisition");
+        let ToolOutput::Structured {
+            structured: source_result,
+            ..
+        } = source_output
+        else {
+            panic!("query_code should return structured output");
+        };
+        assert!(
+            source_result["diagnostics"]
+                .as_array()
+                .is_none_or(|diagnostics| diagnostics.iter().all(|diagnostic| {
+                    diagnostic["code"] != "semantic_pack_acquisition_pending"
+                })),
+            "file-scoped declaration coverage does not depend on pending packs: {source_result:#}"
+        );
+
         let prepared = service
             .prepare_query_code(query(), None)
             .expect("prepare query against the interim activation");

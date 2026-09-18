@@ -305,9 +305,14 @@ pub(crate) trait LanguageSupport: Send + Sync {
     /// Returning a *different* owner than `owner` is how a module binding
     /// publishes its module's identity rather than the local name a file
     /// happened to give it.
+    ///
+    /// `member` is the callee's own member name. An owner that is a shared
+    /// mutable object publishes an identity for one member at a time, because
+    /// the file may have replaced exactly that member (#3427).
     fn single_segment_external_owner(
         &self,
         _owner: &str,
+        _member: &str,
         _site: &ExternalCalleeSite<'_>,
     ) -> Option<String> {
         None
@@ -895,6 +900,21 @@ pub(crate) struct ExternalCalleeSite<'a> {
     pub(crate) source: &'a str,
     pub(crate) tree: &'a tree_sitter::Tree,
     pub(crate) callee_start_byte: usize,
+    /// File-wide evidence shared by every callee site classified in this file.
+    pub(crate) file_evidence: &'a ExternalCalleeFileEvidence,
+}
+
+/// The file-wide proofs [`LanguageSupport::single_segment_external_owner`]
+/// reuses across one file's callee sites.
+///
+/// An owner rule can need evidence that walks the whole file: JavaScript must
+/// prove the file writes nothing to the member it is about to publish (#3427).
+/// Classification runs once per unresolved callee, so a file with many external
+/// member calls would otherwise rewalk itself once per call. One value is built
+/// per file and handed to each of its sites.
+#[derive(Default)]
+pub(crate) struct ExternalCalleeFileEvidence {
+    pub(crate) js_ts_module_member_writes: js_ts::JsTsModuleMemberWriteMemo,
 }
 
 /// Extra candidate files for one query target, split by how the query's budgets treat them.

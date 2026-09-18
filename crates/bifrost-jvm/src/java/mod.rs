@@ -12,9 +12,3 @@ pub mod imports;
 pub mod resolution;
 pub mod structural;
 pub mod test_detection;
-
-#[cfg(test)]
-mod coordinated_source_tests;
-#[cfg(test)]
-mod source_properties;
-mod source_types;

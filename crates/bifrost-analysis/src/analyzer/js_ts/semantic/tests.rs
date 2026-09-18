@@ -1709,13 +1709,12 @@ fn runtime_keyed_store_gaps_are_not_read_discharges() {
         assert_eq!(stores, 2);
     }
 }
-/// #3352: the runtime oracle joins a keyed read to its structural seed
-/// through the `ast_identity` of the load result's source mapping. Only
-/// `member_expression` nodes are structural facts, so the mapping anchored at
-/// the query's candidate anchor must be the one carrying that identity: the
-/// terminal load for a dot read, and the container load for a subscript read.
-/// Local `const` initializers must preserve this exactly as return positions
-/// do.
+/// #3352/#3373: the runtime oracle joins a keyed read to its structural seed
+/// through the `ast_identity` of the load result's source mapping. The
+/// mapping anchored at the query's candidate anchor must be the one carrying
+/// that identity: the terminal load itself for a dot read, and the load of
+/// the base of its access chain for a subscript read. Local `const`
+/// initializers must preserve this exactly as return positions do.
 #[test]
 fn const_initializer_runtime_loads_keep_the_structural_identity_the_oracle_joins_on() {
     let source = "function read() {\
@@ -1735,7 +1734,10 @@ fn const_initializer_runtime_loads_keep_the_structural_identity_the_oracle_joins
         let mut identity_anchors: Vec<&str> = Vec::new();
         for point in &procedure.points {
             for event in &point.events {
-                let SemanticEffect::MemoryLoad { result, .. } = event.effect else {
+                let SemanticEffect::MemoryLoad {
+                    location, result, ..
+                } = event.effect
+                else {
                     continue;
                 };
                 let value = &procedure.values[result.index()];
@@ -1760,8 +1762,25 @@ fn const_initializer_runtime_loads_keep_the_structural_identity_the_oracle_joins
                     identity_anchors.push(anchored);
                 } else {
                     // Subscript terminals anchor spans that are not structural
-                    // facts; the oracle must never depend on their identity.
-                    assert!(mapping.ast_identity.is_none());
+                    // facts, so they carry the seed identity of the base of
+                    // their access chain instead. The oracle reads that
+                    // identity directly from the load.
+                    let base = match &procedure.memory_locations[location.index()].kind {
+                        crate::analyzer::semantic::MemoryLocationKind::Field { base, .. }
+                        | crate::analyzer::semantic::MemoryLocationKind::Property {
+                            base, ..
+                        }
+                        | crate::analyzer::semantic::MemoryLocationKind::Index { base, .. } => {
+                            *base
+                        }
+                        kind => panic!("const-held runtime load has non-memory kind: {kind:?}"),
+                    };
+                    let base_mapping =
+                        &procedure.source_mappings[procedure.values[base.index()].source.index()];
+                    assert_eq!(
+                        mapping.ast_identity, base_mapping.ast_identity,
+                        "const-held runtime subscript `{anchored}` must keep the seed identity of its container"
+                    );
                 }
             }
         }
@@ -1771,5 +1790,148 @@ fn const_initializer_runtime_loads_keep_the_structural_identity_the_oracle_joins
                 "expected an identity-bearing load anchored at `{expected}`, got {identity_anchors:?}"
             );
         }
+    }
+}
+
+#[test]
+fn runtime_keyed_subscript_loads_retain_the_ast_derived_seed_identity() {
+    let source = "function probe() { const token = process.env['CONFIG_TOKEN']; const index = process.argv[7]; }";
+    for procedures in [
+        lower_typescript_source(source),
+        lower_javascript_parts(source),
+    ] {
+        let mut checked = 0;
+        for procedure in &procedures {
+            for point in &procedure.points {
+                for event in &point.events {
+                    let SemanticEffect::MemoryLoad {
+                        location, result, ..
+                    } = event.effect
+                    else {
+                        continue;
+                    };
+                    let base = match &procedure.memory_locations[location.index()].kind {
+                        crate::analyzer::semantic::MemoryLocationKind::Property { base, key }
+                            if key == "CONFIG_TOKEN" =>
+                        {
+                            *base
+                        }
+                        crate::analyzer::semantic::MemoryLocationKind::Index {
+                            base,
+                            constant_index: Some(7),
+                            ..
+                        } => *base,
+                        _ => continue,
+                    };
+                    let load_mapping =
+                        &procedure.source_mappings[procedure.values[result.index()].source.index()];
+                    let container_mapping =
+                        &procedure.source_mappings[procedure.values[base.index()].source.index()];
+                    let load_identity = load_mapping
+                        .ast_identity
+                        .expect("a runtime subscript load keeps its structural seed identity");
+                    assert_eq!(
+                        Some(load_identity),
+                        container_mapping.ast_identity,
+                        "the subscript load is represented by its container field"
+                    );
+                    let container_span = container_mapping.locator.anchor().span();
+                    let container_text = &source
+                        [container_span.start_byte() as usize..container_span.end_byte() as usize];
+                    assert!(
+                        matches!(container_text, "process.env" | "process.argv"),
+                        "unexpected container field `{container_text}`"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert_eq!(
+            checked, 2,
+            "both runtime subscript loads must carry identity"
+        );
+    }
+}
+
+#[test]
+fn ordinary_subscript_values_do_not_borrow_a_runtime_seed_identity() {
+    let source = "function probe(items) { return items[7]; }";
+    for procedures in [
+        lower_typescript_source(source),
+        lower_javascript_parts(source),
+    ] {
+        let mut checked = 0;
+        for procedure in &procedures {
+            for point in &procedure.points {
+                for event in &point.events {
+                    let SemanticEffect::MemoryLoad { result, .. } = event.effect else {
+                        continue;
+                    };
+                    let mapping =
+                        &procedure.source_mappings[procedure.values[result.index()].source.index()];
+                    let span = mapping.locator.anchor().span();
+                    if &source[span.start_byte() as usize..span.end_byte() as usize] != "items[7]" {
+                        continue;
+                    }
+                    assert!(
+                        mapping.ast_identity.is_none(),
+                        "a non-runtime subscript must not borrow a structural seed identity"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert_eq!(
+            checked, 1,
+            "the ordinary subscript load must remain unseeded"
+        );
+    }
+}
+
+#[test]
+fn computed_runtime_container_loads_resolve_to_the_binding_their_chain_starts_from() {
+    let source = "function probe() { const token = process['env']['CONFIG_TOKEN']; }";
+    for procedures in [
+        lower_typescript_source(source),
+        lower_javascript_parts(source),
+    ] {
+        let mut found = false;
+        for procedure in &procedures {
+            for point in &procedure.points {
+                for event in &point.events {
+                    let SemanticEffect::MemoryLoad { result, .. } = event.effect else {
+                        continue;
+                    };
+                    let mapping =
+                        &procedure.source_mappings[procedure.values[result.index()].source.index()];
+                    let span = mapping.locator.anchor().span();
+                    if &source[span.start_byte() as usize..span.end_byte() as usize]
+                        != "process['env']['CONFIG_TOKEN']"
+                    {
+                        continue;
+                    }
+                    let identity = mapping.ast_identity.expect(
+                        "a computed runtime container still resolves to a structural binding",
+                    );
+                    let root = procedure
+                        .values
+                        .iter()
+                        .map(|value| &procedure.source_mappings[value.source.index()])
+                        .find(|candidate| {
+                            let span = candidate.locator.anchor().span();
+                            &source[span.start_byte() as usize..span.end_byte() as usize]
+                                == "process"
+                        })
+                        .expect("the runtime root binding has a value");
+                    assert_eq!(
+                        Some(identity),
+                        root.ast_identity,
+                        "a computed chain is represented by the binding it starts from"
+                    );
+                    found = true;
+                }
+            }
+        }
+        assert!(found, "the computed runtime container load must be lowered");
     }
 }

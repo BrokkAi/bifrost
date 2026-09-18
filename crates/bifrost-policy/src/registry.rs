@@ -750,6 +750,7 @@ impl PolicyRegistry {
                         &candidate_dependencies,
                         &match_inputs.manifests,
                         self.composition_limits()?,
+                        imports.deferred,
                     )?;
                     imports
                         .attach_origins(&mut composed.spec, &mut composed.endpoint_dependencies)?;

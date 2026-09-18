@@ -3,7 +3,14 @@
 //! Brokk-compatible defaults, dedupes symmetric findings, and renders the
 //! same markdown table shape as brokk-core MCP.
 
-use super::{ReportLines, append_ambiguous_path_notes, resolve_project_files, sanitize_table_cell};
+use super::{
+    resolve_project_files,
+    structured_quality::{
+        MAX_QUALITY_FINDINGS, QualityEvidenceCache, QualityFinding, QualityFindingKind,
+        StructuralCloneQualityFinding, StructuralCloneQualityMetrics, StructuredQualityFindings,
+        parameters, reasons, render_quality_findings,
+    },
+};
 use crate::analyzer::{CloneSmell, CloneSmellWeights, IAnalyzer};
 use crate::path_utils::AmbiguousPathInput;
 use serde::{Deserialize, Serialize};
@@ -28,12 +35,13 @@ pub struct ReportStructuralCloneSmellsParams {
     pub max_findings: i32,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct ReportStructuralCloneSmellsResult {
     pub report: String,
     pub truncated: bool,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub ambiguous_paths: Vec<AmbiguousPathInput>,
+    pub structured: StructuredQualityFindings,
 }
 
 pub fn report_structural_clone_smells(
@@ -46,11 +54,12 @@ pub fn report_structural_clone_smells(
     } else {
         defaults.min_similarity_percent
     };
-    let findings_cap = if params.max_findings > 0 {
+    let requested_findings_cap = if params.max_findings > 0 {
         params.max_findings as usize
     } else {
         DEFAULT_MAX_FINDINGS as usize
     };
+    let findings_cap = requested_findings_cap.min(MAX_QUALITY_FINDINGS);
     let weights = CloneSmellWeights {
         min_normalized_tokens: if params.min_normalized_tokens > 0 {
             params.min_normalized_tokens
@@ -77,7 +86,6 @@ pub fn report_structural_clone_smells(
 
     let resolved = resolve_project_files(analyzer, params.file_paths);
     let findings = analyzer.find_structural_clone_smells_for_files(&resolved.files, weights);
-    let mut truncated = resolved.input_truncated;
     let ambiguous_paths = resolved.ambiguous_paths.clone();
     let mut deduped: BTreeMap<String, CloneSmell> = BTreeMap::new();
     for finding in findings {
@@ -103,56 +111,66 @@ pub fn report_structural_clone_smells(
         .filter(|finding| finding.score >= threshold)
         .collect();
     filtered.sort_by(structural_clone_smell_cmp);
-    if filtered.is_empty() {
-        return ReportStructuralCloneSmellsResult {
-            report: format!("No structural clone smells met minScore {threshold}."),
-            truncated,
-            ambiguous_paths,
-        };
-    }
-
     let shown = findings_cap.min(filtered.len());
-    let rows_truncated = filtered.len() > shown;
-    truncated |= rows_truncated;
-
-    let mut lines = ReportLines::with_capacity(shown + 8);
-    lines.line("## Structural clone smells");
-    lines.blank();
-    lines.line(format!("- Min score: {threshold}"));
-    lines.line(format!("- Findings shown: {shown} of {}", filtered.len()));
-    lines.line(format!(
-        "- Weights: minTokens={}, shingleSize={}, minShared={}, astThreshold={}",
-        weights.min_normalized_tokens,
-        weights.shingle_size,
-        weights.min_shared_shingles,
-        weights.ast_similarity_percent
-    ));
-    append_ambiguous_path_notes(&mut lines, &ambiguous_paths);
-    lines.blank();
-    lines.line("| Score | Tokens | Symbol | Peer Symbol | Reasons | Excerpt |");
-    lines.line("|------:|-------:|--------|-------------|---------|---------|");
-    for finding in filtered.into_iter().take(shown) {
-        lines.line(format!(
-            "| {} | {} | `{}` ({}) | `{}` ({}) | `{}` | `{}` |",
-            finding.score,
-            finding.normalized_token_count,
-            sanitize_table_cell(&finding.enclosing_fq_name),
-            sanitize_table_cell(&finding.file.to_string()),
-            sanitize_table_cell(&finding.peer_enclosing_fq_name),
-            sanitize_table_cell(&finding.peer_file.to_string()),
-            sanitize_table_cell(&finding.reasons.join(", ")),
-            sanitize_table_cell(&finding.excerpt),
-        ));
-    }
-    if rows_truncated {
-        lines.blank();
-        lines.line("- Note: output truncated; increase maxFindings to see more.");
-    }
+    let mut cache = QualityEvidenceCache::new();
+    let structured_findings = filtered
+        .iter()
+        .take(shown)
+        .map(|finding| {
+            QualityFinding::StructuralClone(StructuralCloneQualityFinding {
+                reasons: reasons(&finding.reasons),
+                metrics: StructuralCloneQualityMetrics {
+                    score: finding.score,
+                    normalized_token_count: finding.normalized_token_count,
+                },
+                primary: cache.evidence(
+                    analyzer,
+                    &finding.file,
+                    &finding.enclosing_fq_name,
+                    None,
+                    finding.excerpt.clone(),
+                ),
+                peer: cache.evidence(
+                    analyzer,
+                    &finding.peer_file,
+                    &finding.peer_enclosing_fq_name,
+                    None,
+                    finding.peer_excerpt.clone(),
+                ),
+            })
+        })
+        .collect();
+    let structured = StructuredQualityFindings::new(
+        QualityFindingKind::StructuralClone,
+        parameters(
+            threshold,
+            &[
+                ("minTokens", weights.min_normalized_tokens),
+                ("shingleSize", weights.shingle_size),
+                ("minShared", weights.min_shared_shingles),
+                ("astThreshold", weights.ast_similarity_percent),
+            ],
+        ),
+        structured_findings,
+        !resolved.input_truncated
+            && resolved.skipped_inputs == 0
+            && resolved.ambiguous_paths.is_empty(),
+        true,
+        requested_findings_cap,
+        filtered.len(),
+    );
+    let report = render_quality_findings(
+        &structured,
+        &ambiguous_paths,
+        format!("No structural clone smells met minScore {threshold}"),
+    );
+    let truncated = !structured.completion.complete();
 
     ReportStructuralCloneSmellsResult {
-        report: lines.build(),
+        report,
         truncated,
         ambiguous_paths,
+        structured,
     }
 }
 

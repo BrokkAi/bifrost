@@ -939,12 +939,16 @@ struct CleanupRegion<'tree> {
 #[derive(Debug, Clone, Copy)]
 enum CleanupBody<'tree> {
     Statement(Node<'tree>),
+    /// A `with` statement runs the implicit `__exit__` of every context
+    /// manager it entered at the construct's own exit, so the region carries
+    /// the statement whose clause names those context managers.
+    WithStatement(Node<'tree>),
 }
 
 impl<'tree> CleanupBody<'tree> {
     const fn source_node(self) -> Node<'tree> {
         match self {
-            Self::Statement(node) => node,
+            Self::Statement(node) | Self::WithStatement(node) => node,
         }
     }
 }
@@ -3833,34 +3837,6 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 let object = required_field(node, "object")?;
                 let attribute = required_field(node, "attribute")?;
                 let proven = self.proven_instance_attribute(node, object, attribute);
-                if !proven {
-                    // Two independent claims, published as two gaps.
-                    //
-                    // The missing abort edge is an implicit-exception gap like
-                    // every other one this adapter publishes, and like the
-                    // JavaScript and C# adapters' member-access gaps, so it
-                    // carries the same `Point` subject. When no handler or
-                    // cleanup body runs user code, the missing edge can only
-                    // remove paths from a may analysis, and the shared
-                    // discharge closes it (#1952). A `Value` subject asserted
-                    // more than that and left the gap permanently open, which
-                    // is why no Python procedure that read an attribute could
-                    // ever complete a value-flow snapshot (#2495).
-                    //
-                    // The value-level claim -- that a descriptor or special
-                    // method may produce this value -- keeps its own `Value`
-                    // subject below, and is discharged only when the same value
-                    // is a call's callee whose target the plan resolved.
-                    self.implicit_exception_gap(builder, entry, node)?;
-                    self.add_gap(
-                        builder,
-                        entry,
-                        SemanticGapSubject::Value(result),
-                        SemanticCapability::Calls,
-                        SemanticGapKind::Unknown,
-                        "descriptor or special-method invocation requires type refinement",
-                    )?;
-                }
                 let Some(member) = self.memory_member_locator(attribute)? else {
                     self.add_gap(
                         builder,
@@ -3870,60 +3846,72 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         SemanticGapKind::Unknown,
                         "Python attribute name is not a structured identifier",
                     )?;
+                    let continuation = if proven {
+                        next
+                    } else {
+                        let claims = self
+                            .unresolved_member_read_claims(builder, node, result, scope, stack)?;
+                        self.edge(builder, claims, next)?;
+                        EdgeTarget::normal(claims)
+                    };
                     return self.schedule_expressions(
                         builder,
                         entry,
                         &[object],
-                        next,
+                        continuation,
                         scope,
                         stack,
                     );
                 };
-                let access = self.point(builder, node, Vec::new())?;
+                let claims = if proven {
+                    None
+                } else {
+                    Some(self.unresolved_member_read_claims(builder, node, result, scope, stack)?)
+                };
+                let load = self.point(builder, node, Vec::new())?;
+                let reached_load = match claims {
+                    Some(claims) => {
+                        self.edge(builder, claims, EdgeTarget::normal(load))?;
+                        EdgeTarget::normal(claims)
+                    }
+                    None => EdgeTarget::normal(load),
+                };
                 let base = self.expression_value(builder, object, expression_value_kind(object))?;
                 let location = self.session.add_memory_location(
                     builder,
-                    access,
+                    load,
                     MemoryLocationKind::Field { base, member },
                 )?;
                 self.append_effect(
                     builder,
-                    access,
+                    load,
                     SemanticEffect::MemoryLoad {
                         kind: MemoryAccessKind::Field,
                         location,
                         result,
                     },
                 )?;
-                self.edge(builder, access, next)?;
-                self.schedule_expressions(
-                    builder,
-                    entry,
-                    &[object],
-                    EdgeTarget::normal(access),
-                    scope,
-                    stack,
-                )
+                self.edge(builder, load, next)?;
+                self.schedule_expressions(builder, entry, &[object], reached_load, scope, stack)
             }
             "subscript" => {
                 let value = required_field(node, "value")?;
                 let subscript = required_field(node, "subscript")?;
                 let proven = self.proven_sequence_index_read(node, value, subscript);
-                if !proven {
-                    // The same split as the attribute arm above: the abort edge
-                    // is a `Point`-subject implicit-exception gap, and the
-                    // value-level special-method claim keeps its `Value` subject.
-                    self.implicit_exception_gap(builder, entry, node)?;
-                    self.add_gap(
-                        builder,
-                        entry,
-                        SemanticGapSubject::Value(result),
-                        SemanticCapability::Calls,
-                        SemanticGapKind::Unknown,
-                        "descriptor or special-method invocation requires type refinement",
-                    )?;
-                }
+                // The same two claims as the attribute arm above.
+                let claims = if proven {
+                    None
+                } else {
+                    Some(self.unresolved_member_read_claims(builder, node, result, scope, stack)?)
+                };
                 let access = self.point(builder, node, Vec::new())?;
+                let reached_access = match claims {
+                    Some(claims) => {
+                        self.edge(builder, claims, EdgeTarget::normal(access))?;
+                        EdgeTarget::normal(claims)
+                    }
+                    None => EdgeTarget::normal(access),
+                };
                 let base = self.expression_value(builder, value, expression_value_kind(value))?;
                 let index = self.constant_index_value(builder, subscript)?;
                 let location = self.session.add_memory_location(
@@ -3953,7 +3941,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     builder,
                     entry,
                     &[value, subscript],
-                    EdgeTarget::normal(access),
+                    reached_access,
                     scope,
                     stack,
                 )
@@ -3984,9 +3972,6 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 self.sequence_literal_expression(builder, node, entry, next, scope, stack)
             }
             "binary_operator" | "unary_operator" | "not_operator" => {
-                if operation_can_throw_implicitly(node) {
-                    self.implicit_exception_gap(builder, entry, node)?;
-                }
                 if may_invoke_user_code(node) {
                     self.add_gap(
                         builder,
@@ -3999,6 +3984,52 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 }
                 let children = runtime_expression_children(node);
                 let terminal = self.point(builder, node, Vec::new())?;
+                if operation_can_throw_implicitly(node) {
+                    self.implicit_abort_route(builder, node, terminal, scope, stack)?;
+                }
+                let operands = children
+                    .iter()
+                    .map(|child| {
+                        self.expression_value(builder, *child, expression_value_kind(*child))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                self.session
+                    .append_language_defined_value_flows(builder, terminal, operands, result)?;
+                self.edge(builder, terminal, next)?;
+                self.schedule_expressions(
+                    builder,
+                    entry,
+                    &children,
+                    EdgeTarget::normal(terminal),
+                    scope,
+                    stack,
+                )
+            }
+            "interpolation" | "format_expression" | "concatenated_string" | "string" => {
+                if may_invoke_user_code(node) {
+                    self.add_gap(
+                        builder,
+                        entry,
+                        SemanticGapSubject::Point,
+                        SemanticCapability::Calls,
+                        SemanticGapKind::Unknown,
+                        "operator, conversion, formatting, or unpacking calls require type refinement",
+                    )?;
+                }
+                // A formatted string derives its value from every interpolated
+                // expression, an interpolation from the expression it renders,
+                // and a concatenated string from every literal part. The
+                // rendering itself (__format__, conversion, the format spec)
+                // stays unrefined behind the gap above, but the operands flow
+                // into the result the way they do for `a + b`.
+                let children = runtime_expression_children(node);
+                let terminal = self.point(builder, node, Vec::new())?;
+                // The abort leaves the point that performs the conversion, so
+                // the operands this node formats are already evaluated on the
+                // abort path.
+                if operation_can_throw_implicitly(node) {
+                    self.implicit_abort_route(builder, node, terminal, scope, stack)?;
+                }
                 let operands = children
                     .iter()
                     .map(|child| {
@@ -4023,14 +4054,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             | "keyword_argument"
             | "list_splat"
             | "dictionary_splat"
-            | "parenthesized_list_splat"
-            | "interpolation"
-            | "format_expression"
-            | "concatenated_string"
-            | "string" => {
-                if operation_can_throw_implicitly(node) {
-                    self.implicit_exception_gap(builder, entry, node)?;
-                }
+            | "parenthesized_list_splat" => {
                 if may_invoke_user_code(node) {
                     self.add_gap(
                         builder,
@@ -4042,6 +4066,17 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     )?;
                 }
                 let children = runtime_expression_children(node);
+                // The abort leaves the point that performs the conversion, so
+                // the operands this node unpacks or formats are already
+                // evaluated on the abort path.
+                let next = if operation_can_throw_implicitly(node) {
+                    let terminal = self.point(builder, node, Vec::new())?;
+                    self.implicit_abort_route(builder, node, terminal, scope, stack)?;
+                    self.edge(builder, terminal, next)?;
+                    EdgeTarget::normal(terminal)
+                } else {
+                    next
+                };
                 self.schedule_expressions(builder, entry, &children, next, scope, stack)
             }
             kind if is_runtime_leaf(kind) => self.edge(builder, entry, next),
@@ -4143,7 +4178,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             Some(boundary)
         };
         if operation_can_throw_implicitly(node) && !suppresses_implicit_exception {
-            self.implicit_exception_gap(builder, boundary, node)?;
+            self.implicit_abort_route(builder, node, boundary, scope, stack)?;
         }
         if let Some(completion) = completion {
             self.edge(builder, completion, next)?;
@@ -4181,7 +4216,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         }
 
         let operation = self.point(builder, node, Vec::new())?;
-        self.implicit_exception_gap(builder, operation, node)?;
+        self.implicit_abort_route(builder, node, operation, scope, stack)?;
         self.add_gap(
             builder,
             operation,
@@ -4190,8 +4225,21 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             SemanticGapKind::Unknown,
             "augmented-assignment operator dispatch requires type refinement",
         )?;
+        // `x += y` stores a value that derives from the current target and the
+        // operand, whatever the refined operator semantics turn out to be:
+        // `__iadd__` mutates the target with the operand, `__add__` produces a
+        // new value from both. The result stays language-defined unknown, but
+        // both operands flow into it the way they do for `x = x + y`.
+        let target_value = self.expression_value(builder, target, expression_value_kind(target))?;
+        let rhs_value = self.expression_value(builder, rhs, expression_value_kind(rhs))?;
         let result =
             self.unknown_target_value(builder, node, PYTHON_UNKNOWN_AUGMENTED_ASSIGNMENT)?;
+        self.session.append_language_defined_value_flows(
+            builder,
+            operation,
+            [target_value, rhs_value],
+            result,
+        )?;
         let store = self.point(builder, target, Vec::new())?;
         if self.proven_tuple_mutation(target) {
             self.tuple_mutation_failure(builder, store, scope, stack)?;
@@ -4274,7 +4322,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     let unpack_point = self.point(builder, target, Vec::new())?;
                     self.edge(builder, previous, EdgeTarget::normal(unpack_point))?;
                     if may_fail {
-                        self.implicit_exception_gap(builder, unpack_point, target)?;
+                        self.implicit_abort_route(builder, target, unpack_point, scope, stack)?;
                     }
                     if !outputs.is_empty() {
                         let base = match source {
@@ -4358,7 +4406,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                                 required_field(target, "attribute")?,
                             ) =>
                         {
-                            self.implicit_exception_gap(builder, target_point, target)?;
+                            self.implicit_abort_route(builder, target, target_point, scope, stack)?;
                         }
                         "subscript"
                             if !self.proven_list_index(
@@ -4367,7 +4415,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                                 required_field(target, "subscript")?,
                             ) =>
                         {
-                            self.implicit_exception_gap(builder, target_point, target)?;
+                            self.implicit_abort_route(builder, target, target_point, scope, stack)?;
                         }
                         _ => {}
                     }
@@ -6017,61 +6065,235 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         builder: &mut ProcedureCfgBuilder,
         node: Node<'tree>,
         entry: ProgramPointId,
-        _next: EdgeTarget,
+        next: EdgeTarget,
         scope: ScopeFrameId,
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), PythonLoweringError> {
-        let clause = named_children(node)
-            .into_iter()
-            .find(|child| child.kind() == "with_clause")
-            .ok_or_else(|| missing_field(node, "with clause"))?;
-        let values = named_children(clause)
-            .into_iter()
-            .filter(|child| child.kind() == "with_item")
-            .map(context_manager_expression)
-            .collect::<Result<Vec<_>, _>>()?;
-        let boundary = self.point(builder, clause, Vec::new())?;
-        for (capability, detail) in [
-            (
-                SemanticCapability::ResourceManagement,
-                "context-manager enter/exit ordering and suppression are not lowered",
-            ),
-            (
-                SemanticCapability::Calls,
-                "context-manager protocol operations are not represented as call sites",
-            ),
-            (
-                SemanticCapability::ExceptionalControlFlow,
-                "context acquisition, enter, exit, and suppression failures are not lowered",
-            ),
-        ] {
-            self.add_gap(
-                builder,
-                boundary,
-                SemanticGapSubject::Point,
-                capability,
-                SemanticGapKind::Unsupported,
-                detail,
-            )?;
-        }
-        if has_direct_token(node, "async") {
-            self.add_gap(
-                builder,
-                boundary,
-                SemanticGapSubject::Point,
-                SemanticCapability::AsyncSuspendResume,
-                SemanticGapKind::Unsupported,
-                "async context-manager enter/exit suspension is not lowered",
-            )?;
+        let body = required_field(node, "body")?;
+        let items = with_items(node)?;
+        let region = CleanupRegionId::new(
+            u32::try_from(self.cleanups.len())
+                .map_err(|_| PythonLoweringError::Invalid("too many cleanup regions".into()))?,
+        );
+        self.cleanups.push(CleanupRegion {
+            id: region,
+            body: CleanupBody::WithStatement(node),
+            outer_scope: scope,
+        });
+        let body_scope = builder.push_scope(Some(scope), ScopeBinding::Cleanup { region });
+
+        // The exit point resumes the statement's own continuation, so the
+        // implicit exits always run before anything that follows the `with`.
+        let after = self.point(builder, node, Vec::new())?;
+        self.edge(builder, after, next)?;
+        let normal_route = builder.normal_cleanup_completion(region, after);
+        let body_exit = self.point(builder, body, Vec::new())?;
+        self.route(builder, body_exit, &normal_route, stack)?;
+
+        // `with EXPR as NAME` binds the context manager the acquisition
+        // produced, so the body's uses and explicit closes reach the same
+        // value the construct entered and will exit.
+        let body_entry = self.point(builder, node, Vec::new())?;
+        let mut contexts = Vec::with_capacity(items.len());
+        for item in &items {
+            let (context, binder) = with_item_parts(*item)?;
+            if let Some(binder) = binder {
+                let value =
+                    self.expression_value(builder, context, expression_value_kind(context))?;
+                self.append_target_assignment(builder, body_entry, *item, binder, value)?;
+            }
+            contexts.push(context);
         }
         self.schedule_expressions(
             builder,
             entry,
-            &values,
-            EdgeTarget::normal(boundary),
+            &contexts,
+            EdgeTarget::normal(body_entry),
             scope,
             stack,
-        )
+        )?;
+        stack.push(Work::Statement {
+            node: body,
+            entry: body_entry,
+            next: EdgeTarget::normal(body_exit),
+            scope: body_scope,
+        });
+        Ok(())
+    }
+
+    /// Lower the implicit `__exit__` of a `with` statement.
+    ///
+    /// Python exits the context managers the statement entered at the
+    /// construct's own exit, in reverse declaration order, on both the normal
+    /// and the exceptional continuation of the guarded body. Each exit is a
+    /// real close operation on the context manager value the construct
+    /// acquired, so the typestate engine binds it to the tracked subject
+    /// identity instead of to the spelled binding.
+    ///
+    /// Every exit site is anchored at the `with` statement, which is the
+    /// source fact the resource-lifecycle selector names for the construct,
+    /// and each publishes the operation's own normal and exceptional
+    /// continuations. An exit that raises still released its context manager,
+    /// so its exceptional continuation enters the *next* exit in the chain,
+    /// and only the last exit propagates from the enclosing scope: an earlier
+    /// failure cannot skip a later release, and this region never runs twice.
+    fn lower_implicit_context_manager_exits(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        step: CleanupSpecialization<CleanupRegion<'tree>>,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), PythonLoweringError> {
+        assert_eq!(
+            node.kind(),
+            "with_statement",
+            "only a with statement declares a context manager list"
+        );
+        let mut contexts = with_items(node)?
+            .into_iter()
+            .map(|item| with_item_parts(item).map(|(context, _)| context))
+            .collect::<Result<Vec<_>, _>>()?;
+        // Python exits in reverse declaration order.
+        contexts.reverse();
+        if contexts.is_empty() {
+            // Only an error-recovered clause has no context manager at all;
+            // the grammar requires at least one item. Keep the construct
+            // reachable and report the gap instead of inventing an exit.
+            self.add_gap(
+                builder,
+                step.entry,
+                SemanticGapSubject::Point,
+                SemanticCapability::ResourceManagement,
+                SemanticGapKind::Unsupported,
+                "a malformed with clause declares no context manager, so its implicit exit is not represented",
+            )?;
+            self.edge(builder, step.entry, step.next)?;
+            return Ok(());
+        }
+        // The cleanup entry is the first exit Python performs, so reusing it
+        // keeps one point per exit without adding a relay.
+        let mut invokes = Vec::with_capacity(contexts.len());
+        for index in 0..contexts.len() {
+            invokes.push(if index == 0 {
+                step.entry
+            } else {
+                self.point(builder, node, Vec::new())?
+            });
+        }
+        let last = contexts.len() - 1;
+        let mut continuations = Vec::with_capacity(contexts.len());
+        for (index, context) in contexts.into_iter().enumerate() {
+            let invoke = invokes[index];
+            let normal = self.point(builder, node, Vec::new())?;
+            let exceptional = self.point(builder, node, Vec::new())?;
+            let receiver =
+                self.expression_value(builder, context, expression_value_kind(context))?;
+            let value_metadata = self.value_mapping(builder, context)?;
+            let callee = self.session.add_value_with_metadata(
+                builder,
+                value_metadata,
+                SemanticValueKind::Callable,
+            )?;
+            let thrown = self.session.add_value_with_metadata(
+                builder,
+                value_metadata,
+                SemanticValueKind::Exception,
+            )?;
+            let metadata = self.metadata(invoke)?;
+            self.append_effect(
+                builder,
+                invoke,
+                SemanticEffect::CallableReference {
+                    result: callee,
+                    callable: CallableValue {
+                        kind: CallableReferenceKind::BoundMethod,
+                        targets: CallableTargetResolution::Unknown,
+                        target_evidence: metadata.evidence,
+                        bound_receiver: Some(receiver),
+                        environment: None,
+                    },
+                },
+            )?;
+            let call_site = self.session.add_call_site(
+                builder,
+                CallSiteScaffold {
+                    point: invoke,
+                    callee,
+                    receiver: Some(receiver),
+                    arguments: Box::new([]),
+                    normal_results: Box::new([]),
+                    result: None,
+                    thrown: Some(thrown),
+                    declared_targets: CallableTargetResolution::Unknown,
+                    normal_continuation: normal,
+                    exceptional_continuation: exceptional,
+                },
+            )?;
+            self.resolution_gaps(
+                builder,
+                invoke,
+                callee,
+                call_site,
+                &CallableTargetResolution::Unknown,
+            )?;
+            if has_direct_token(node, "async") {
+                // `async with` awaits `__aenter__`/`__aexit__`; the suspension
+                // of this synthesized exit is not lowered, but the release it
+                // performs is still the construct's own exit, so the gap stays
+                // scoped to this call instead of opening the resource value.
+                self.add_gap(
+                    builder,
+                    invoke,
+                    SemanticGapSubject::CallSite(call_site),
+                    SemanticCapability::AsyncSuspendResume,
+                    SemanticGapKind::Unsupported,
+                    "async context-manager exit suspension is not lowered",
+                )?;
+            }
+            self.edge(builder, invoke, EdgeTarget::normal(normal))?;
+            self.edge(
+                builder,
+                invoke,
+                EdgeTarget {
+                    point: exceptional,
+                    kind: ControlEdgeKind::Exceptional,
+                },
+            )?;
+            continuations.push((normal, exceptional, index == last));
+        }
+        for (index, (normal, exceptional, is_last)) in continuations.iter().copied().enumerate() {
+            let next = invokes
+                .get(index + 1)
+                .copied()
+                .map(EdgeTarget::normal)
+                .unwrap_or(step.next);
+            self.edge(builder, normal, next)?;
+            if is_last {
+                self.abrupt(
+                    builder,
+                    exceptional,
+                    step.region.outer_scope,
+                    CompletionKind::Throw,
+                    None,
+                    stack,
+                )?;
+            } else {
+                // The remaining exits run as part of the same unwinding, so the
+                // edge that resumes the chain stays exceptional. Publishing it
+                // as a normal edge would lose the in-flight completion here and
+                // let a later exit's own class stand in for the class this hop
+                // arrived with.
+                self.edge(
+                    builder,
+                    exceptional,
+                    EdgeTarget {
+                        point: invokes[index + 1],
+                        kind: ControlEdgeKind::Exceptional,
+                    },
+                )?;
+            }
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -6459,20 +6681,110 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         self.edge(builder, entry, next)
     }
 
-    fn implicit_exception_gap(
+    /// Lower the abort edge of a Python runtime operation that can raise
+    /// implicitly.
+    ///
+    /// Python raises from ordinary evaluation -- an attribute or subscript
+    /// read, an operator, a literal construction, or an unpacking boundary --
+    /// and the raise transfers into the enclosing structured completion route
+    /// exactly like an explicit `raise` or a call's exceptional continuation.
+    /// `route` threads the abort through every enclosing cleanup region, a
+    /// `with` statement's implicit `__exit__` chain among them, to the handler
+    /// dispatcher, or to the exceptional exit when this procedure has no
+    /// matching handler. The modeled edge is why an adapter-published
+    /// implicit-exception gap is no longer needed here: the route, not a
+    /// discharge, answers whether the abort can carry a store.
+    ///
+    /// The edge leaves `operation`, the point that carries the operation's own
+    /// effect, so every value its operands established is already live on the
+    /// abort path. The failing operation's exception object is a fresh value
+    /// this adapter does not type, and the value-level effects the operation
+    /// may still perform -- descriptor invocation, operator dispatch -- stay
+    /// covered by the `Value`-subject claim the caller publishes beside it.
+    fn implicit_abort_route(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
-        point: ProgramPointId,
         node: Node<'tree>,
+        operation: ProgramPointId,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), PythonLoweringError> {
+        let Some(route) =
+            builder.resolve_completion(scope, &CompletionRequest::new(CompletionKind::Throw, None))
+        else {
+            return Err(PythonLoweringError::Invalid(
+                "implicit abort has no matching structured continuation".into(),
+            ));
+        };
+        let abort = self.point(builder, node, Vec::new())?;
+        if let Some(binder) = self
+            .catch_binders
+            .get(&route.destination().target())
+            .copied()
+        {
+            let thrown = self.value(builder, abort, SemanticValueKind::Exception)?;
+            self.append_effect(
+                builder,
+                abort,
+                SemanticEffect::ValueFlow {
+                    kind: ValueFlowKind::Local,
+                    source: thrown,
+                    target: binder,
+                },
+            )?;
+        }
+        self.edge(
+            builder,
+            operation,
+            EdgeTarget {
+                point: abort,
+                kind: ControlEdgeKind::Exceptional,
+            },
+        )?;
+        self.route(builder, abort, &route, stack)
+    }
+
+    /// Publish the two claims an unresolved attribute or subscript read makes.
+    ///
+    /// The abort edge is a lowered route into the enclosing completion, so a
+    /// `with` statement's implicit `__exit__` chain and a `finally` body run on
+    /// it exactly as they do for a call's exceptional continuation. Publishing
+    /// only a `Point`-subject implicit-exception gap instead left the abort
+    /// unmodeled, and the shared discharge then opened every traced value in a
+    /// procedure whose abort paths run user code: any `with` body that read an
+    /// attribute reported the resource it manages as leaked (#3410).
+    ///
+    /// A read that abandons control never performs its load, so the claims get
+    /// a point of their own ahead of the read's load point. Sharing one point
+    /// between the claims and the `MemoryLoad` effect would give the load an
+    /// abandoning successor, and the flow graph publishes a point's
+    /// observations on every outgoing edge: the same read would be reported
+    /// twice, once for the normal continuation and once for the abandon
+    /// (#3410).
+    ///
+    /// The value-level claim -- that a descriptor or special method may
+    /// produce this value -- keeps its own `Value` subject, and is discharged
+    /// only when the same value is a call's callee whose target the plan
+    /// resolved.
+    fn unresolved_member_read_claims(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        result: ValueId,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<ProgramPointId, PythonLoweringError> {
+        let claims = self.point(builder, node, Vec::new())?;
+        self.implicit_abort_route(builder, node, claims, scope, stack)?;
         self.add_gap(
             builder,
-            point,
-            SemanticGapSubject::Point,
-            SemanticCapability::ExceptionalControlFlow,
-            SemanticGapKind::Unsupported,
-            implicit_exception_detail(node),
-        )
+            claims,
+            SemanticGapSubject::Value(result),
+            SemanticCapability::Calls,
+            SemanticGapKind::Unknown,
+            "descriptor or special-method invocation requires type refinement",
+        )?;
+        Ok(claims)
     }
 
     fn unhandled_control_syntax(
@@ -6652,20 +6964,26 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             |region| region.id,
             |region| region.body.source_node(),
         )? {
-            let CleanupBody::Statement(body) = step.region.body;
-            let statement_next = if step.next.kind == ControlEdgeKind::Normal {
-                step.next
-            } else {
-                let relay = self.point(builder, body, Vec::new())?;
-                self.edge(builder, relay, step.next)?;
-                EdgeTarget::normal(relay)
-            };
-            stack.push(Work::Statement {
-                node: body,
-                entry: step.entry,
-                next: statement_next,
-                scope: step.region.outer_scope,
-            });
+            match step.region.body {
+                CleanupBody::Statement(body) => {
+                    let statement_next = if step.next.kind == ControlEdgeKind::Normal {
+                        step.next
+                    } else {
+                        let relay = self.point(builder, body, Vec::new())?;
+                        self.edge(builder, relay, step.next)?;
+                        EdgeTarget::normal(relay)
+                    };
+                    stack.push(Work::Statement {
+                        node: body,
+                        entry: step.entry,
+                        next: statement_next,
+                        scope: step.region.outer_scope,
+                    });
+                }
+                CleanupBody::WithStatement(node) => {
+                    self.lower_implicit_context_manager_exits(builder, node, step, stack)?;
+                }
+            }
         }
         self.edge(builder, from, plan.target())
     }
@@ -6831,15 +7149,7 @@ fn precise_except_shape<'tree>(clause: Node<'tree>) -> Option<(Node<'tree>, Node
         let type_node = named_children(*value)
             .into_iter()
             .find(|child| child.id() != alias.id())?;
-        let binder = if alias.kind() == "as_pattern_target" {
-            let alias_children = named_children(alias);
-            let [binder] = alias_children.as_slice() else {
-                return None;
-            };
-            *binder
-        } else {
-            alias
-        };
+        let binder = as_pattern_binder(alias)?;
         (type_node, binder)
     } else {
         let alias = clause.child_by_field_name("alias")?;
@@ -6848,17 +7158,58 @@ fn precise_except_shape<'tree>(clause: Node<'tree>) -> Option<(Node<'tree>, Node
     (type_node.kind() == "identifier" && alias.kind() == "identifier").then_some((type_node, alias))
 }
 
-fn context_manager_expression(item: Node<'_>) -> Result<Node<'_>, PythonLoweringError> {
+/// The `as_pattern` binder of an `as` target, unwrapped to the bound name.
+///
+/// A pattern target wraps its single binding, so matching on the wrapper's
+/// named children keeps the answer structural instead of reading source text.
+fn as_pattern_binder(alias: Node<'_>) -> Option<Node<'_>> {
+    if alias.kind() != "as_pattern_target" {
+        return Some(alias);
+    }
+    let children = named_children(alias);
+    let [binder] = children.as_slice() else {
+        return None;
+    };
+    Some(*binder)
+}
+
+/// The context manager items of a `with` statement, in declaration order.
+fn with_items(node: Node<'_>) -> Result<Vec<Node<'_>>, PythonLoweringError> {
+    assert_eq!(
+        node.kind(),
+        "with_statement",
+        "only a with statement declares a context manager list"
+    );
+    let clause = named_children(node)
+        .into_iter()
+        .find(|child| child.kind() == "with_clause")
+        .ok_or_else(|| missing_field(node, "with clause"))?;
+    Ok(named_children(clause)
+        .into_iter()
+        .filter(|child| child.kind() == "with_item")
+        .collect())
+}
+
+/// The evaluated context manager and the optional `as` binder of one item.
+fn with_item_parts<'tree>(
+    item: Node<'tree>,
+) -> Result<(Node<'tree>, Option<Node<'tree>>), PythonLoweringError> {
+    assert_eq!(
+        item.kind(),
+        "with_item",
+        "only a with item declares a context manager and its optional binder"
+    );
     let value = required_field(item, "value")?;
     if value.kind() != "as_pattern" {
-        return Ok(value);
+        return Ok((value, None));
     }
 
     let alias = value.child_by_field_name("alias");
-    named_children(value)
+    let context = named_children(value)
         .into_iter()
         .find(|child| alias.is_none_or(|alias| alias.id() != child.id()))
-        .ok_or_else(|| missing_field(value, "context expression"))
+        .ok_or_else(|| missing_field(value, "context expression"))?;
+    Ok((context, alias.and_then(as_pattern_binder)))
 }
 
 fn python_binding_name_node<'tree>(
@@ -7490,18 +7841,6 @@ fn missing_field(node: Node<'_>, field: &str) -> PythonLoweringError {
     ))
 }
 
-fn implicit_exception_detail(node: Node<'_>) -> &'static str {
-    match node.kind() {
-        "attribute" => {
-            "attribute lookup, descriptor execution, and missing-attribute failures are not lowered"
-        }
-        "subscript" => {
-            "subscription special-method, key, index, and bounds failures are not lowered"
-        }
-        _ => "implicit exceptions from Python runtime operations are not lowered",
-    }
-}
-
 fn operation_can_throw_implicitly(node: Node<'_>) -> bool {
     matches!(
         node.kind(),
@@ -7769,18 +8108,33 @@ mod tests {
     }
 
     #[test]
-    fn python_attribute_gaps_do_not_claim_non_rejoining_provenance() {
+    fn python_attribute_read_lowers_its_implicit_abort_edge() {
         let parts = lower_fixture_named("def read(value):\n    return value.field\n", Some("read"));
-        let gap = parts
+        let access = parts
             .gaps
             .iter()
             .find(|gap| {
-                gap.capability == SemanticCapability::ExceptionalControlFlow
+                gap.capability == SemanticCapability::Calls
                     && gap.detail.as_ref()
-                        == "attribute lookup, descriptor execution, and missing-attribute failures are not lowered"
+                        == "descriptor or special-method invocation requires type refinement"
             })
-            .expect("the Python attribute publishes its implicit-exception gap");
-        assert_eq!(gap.discharge, SemanticGapDischarge::None);
+            .expect("the Python attribute keeps its value-level descriptor claim")
+            .point;
+        assert!(
+            parts.control_edges.iter().any(|edge| {
+                edge.source_point == access && edge.kind == ControlEdgeKind::Exceptional
+            }),
+            "the attribute read must lower its implicit abort edge: {:?}",
+            parts.control_edges
+        );
+        assert!(
+            !parts.gaps.iter().any(|gap| {
+                gap.capability == SemanticCapability::ExceptionalControlFlow
+                    && gap.subject == SemanticGapSubject::Point
+            }),
+            "a lowered abort edge must not also declare the abort unmodeled: {:?}",
+            parts.gaps
+        );
     }
 
     #[test]

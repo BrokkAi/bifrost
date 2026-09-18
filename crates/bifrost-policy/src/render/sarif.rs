@@ -1129,6 +1129,8 @@ struct SarifRunProperties<'a> {
     policy_runs: SarifPolicyRuns<'a>,
     #[serde(rename = "bifrost.suppressionReviews")]
     suppressions: &'a [PolicySuppressionReview],
+    #[serde(rename = "bifrost.scopeReviews")]
+    scope: &'a [crate::PolicyScopeReview],
     #[serde(
         rename = "bifrost.diffBaseline",
         skip_serializing_if = "Option::is_none"
@@ -1163,6 +1165,7 @@ impl<'a> SarifRunProperties<'a> {
             evaluation: report.evaluation(),
             policy_runs: SarifPolicyRuns(report.runs()),
             suppressions: report.suppressions(),
+            scope: report.scope(),
             diff_baseline: report.diff(),
             pack_activation: report.packs(),
             baseline: report.baseline(),
@@ -1295,6 +1298,7 @@ fn relationship_label(related: &RelatedPolicyLocation) -> &'static str {
         PolicyLocationRelationship::GeneratedDeclaration => "generated declaration",
         PolicyLocationRelationship::DeclaringScope => "declaring scope",
         PolicyLocationRelationship::ActualOccurrence => "actual occurrence",
+        PolicyLocationRelationship::StoreWrite => "store write",
     }
 }
 

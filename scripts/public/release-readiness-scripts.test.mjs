@@ -7,6 +7,7 @@
 
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -534,6 +535,10 @@ function completeBundle(dir, { crates = releaseCrateCount, wheels = 10, vsix = 1
   for (let index = 0; index < sidecars; index += 1) {
     fs.writeFileSync(path.join(bundle, `archive-${index}.sha256`), "");
   }
+  const installer = "bifrost-semantic-pack-v0.11.5-x86_64-unknown-linux-gnu.tar.gz";
+  fs.writeFileSync(path.join(bundle, installer), "installer fixture");
+  const installerDigest = createHash("sha256").update("installer fixture").digest("hex");
+  fs.writeFileSync(path.join(bundle, `${installer}.sha256`), `${installerDigest}  ${installer}\n`);
   if (notices) {
     fs.writeFileSync(path.join(bundle, "THIRD_PARTY_LICENSES.html"), "");
   }

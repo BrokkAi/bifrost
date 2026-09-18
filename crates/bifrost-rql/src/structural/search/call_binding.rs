@@ -675,6 +675,41 @@ fn authored_selector_proof_for_external_target(
     authored_summary_selector_proof(analyzer, key)
 }
 
+/// Select the authored claim for the #3406 closed shape: the reviewed complete
+/// summary was consumed at dispatch, so the answer is already resolved and
+/// exhaustive with no residual arm. The selector still names the authored
+/// claim that closed the target set, exactly like the residual-arm path; only
+/// the point at which it was consumed differs.
+fn closed_model_selector_proof_for_external_target(
+    analyzer: &dyn IAnalyzer,
+    answer: &DispatchSiteAnswer,
+    key: &ModeledProcedureKey,
+) -> Option<CallBindingSelectorProof> {
+    if answer.outcome != "resolved"
+        || !answer.coverage.is_exhaustive()
+        || answer.call_site_count != 1
+        || !answer.unnamed_boundaries.is_empty()
+    {
+        return None;
+    }
+    let [arm] = answer.arms.as_slice() else {
+        return None;
+    };
+    if arm.proof != "proven" || arm.completeness != "complete" {
+        return None;
+    }
+    let target = arm.unmaterialized_target.as_ref()?;
+    if target.language().semantic_pack_label() != key.language
+        || target.owner_fqn() != key.owner
+        || target.member() != key.member
+        || target.has_receiver() != key.has_receiver
+        || target.arity() != key.parameter_count
+    {
+        return None;
+    }
+    authored_summary_selector_proof(analyzer, key)
+}
+
 fn authored_summary_selector_proof(
     analyzer: &dyn IAnalyzer,
     key: &ModeledProcedureKey,
@@ -1180,7 +1215,10 @@ pub(super) fn call_binding_expansions(
                     Some(target) => {
                         authored_selector_proof_for_source_target(analyzer, answer, target, key)
                     }
-                    None => authored_selector_proof_for_external_target(analyzer, answer, key),
+                    None => authored_selector_proof_for_external_target(analyzer, answer, key)
+                        .or_else(|| {
+                            closed_model_selector_proof_for_external_target(analyzer, answer, key)
+                        }),
                 }
             })
             .unwrap_or_else(CallBindingSelectorProof::unavailable)

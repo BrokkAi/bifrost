@@ -2052,7 +2052,7 @@ OPTIONS:
     --suppressions-file PATH
                            Load accepted findings from this workspace-relative JSON file
                            (default: .bifrost/suppressions.json)
-    --scope-file PATH      Load accepted directory scopes from this workspace-relative JSON file
+    --scope-file PATH      Load directory acceptance and root exclusions from a workspace-relative JSON file
                            (default: .bifrost/policy-scope.json)
     --baseline-file PATH   Load bulk-accepted finding identities from this workspace-relative
                            JSON file (default: .bifrost/baseline.json)

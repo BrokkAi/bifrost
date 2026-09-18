@@ -3198,6 +3198,64 @@ pub fn allocation_binds_by_reference_at_offset(
     }
 }
 
+/// Whether the Go allocation at `offset` boxes a reference payload when it is
+/// bound into an interface wrapper: a pointer object or a channel keeps the
+/// caller's reference inside the wrapper, while an inline value and a slice or
+/// map header copy a descriptor the wrapper carries no reference identity for.
+///
+/// This is the interface-wrapper rule of the channel transport
+/// (`expression_supports_channel_payload_copy`), stated for an allocation so an
+/// interface-typed parameter transports exactly the payload a
+/// `chan interface{}` element transports. A shape this classification cannot
+/// resolve stays unknown, so the wrapper stays unnamed.
+pub fn allocation_boxes_reference_payload_at_offset(
+    file: &ProjectFile,
+    source: &str,
+    offset: usize,
+) -> Option<bool> {
+    let tree = parse_tree_for_language(file, Language::Go, source)?;
+    let node = tree
+        .root_node()
+        .named_descendant_for_byte_range(offset, offset)?;
+    let allocation = go_allocation_expression_at_offset(node, offset)?;
+    if allocation.has_error() || allocation.is_missing() {
+        return None;
+    }
+    match allocation.kind() {
+        // An address names the object the wrapper holds.
+        "unary_expression" => allocation
+            .child_by_field_name("operator")
+            .filter(|operator| go_node_text(*operator, source) == "&")
+            .map(|_| true),
+        "call_expression" => go_allocation_call_boxes_reference_payload(allocation, source),
+        // A composite literal is a value or a slice, map, or array descriptor.
+        // Only its addressed form names an object the wrapper holds by
+        // reference, which is what `go_composite_literal_is_addressed` proves.
+        "composite_literal" => Some(go_composite_literal_is_addressed(allocation)),
+        _ => None,
+    }
+}
+
+/// The interface-wrapper classification of one Go allocation call. `new`
+/// allocates the object its result points at, a channel is itself a reference,
+/// and a slice or map result is a header whose backing storage the wrapper does
+/// not name. A named allocation type stays unknown rather than guessed.
+fn go_allocation_call_boxes_reference_payload(node: Node<'_>, source: &str) -> Option<bool> {
+    let function = node.child_by_field_name("function")?;
+    match go_node_text(function, source) {
+        "new" => Some(true),
+        "make" => {
+            let arguments = node.child_by_field_name("arguments")?;
+            match arguments.named_child(0)?.kind() {
+                "channel_type" => Some(true),
+                "slice_type" | "map_type" => Some(false),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Prove the storage mode of one exact Go callable result declaration.
 ///
 /// The declaration range comes from the analyzer, while the result ordinal and
@@ -3292,6 +3350,141 @@ pub fn parameter_preserves_backing_at_span(
         .map(|mode| matches!(mode, GoParameterBindingMode::BackingDescriptor))
 }
 
+/// Whether an exact Go callable parameter's declared type is an interface that
+/// boxes one reference payload rather than copying the referenced object.
+///
+/// Go copies an interface argument, but the copy still holds the caller's
+/// object inside the wrapper, so a compatible assertion on the formal recovers
+/// that object. `Some(true)` means the declaration is available and the
+/// formal's type is an interface; `Some(false)` means the declaration is
+/// available and the formal is not an interface type. `None` means the type
+/// shape is unavailable or ambiguous, so nothing may be transported.
+pub fn parameter_boxes_reference_payload_at_span(
+    file: &ProjectFile,
+    source: &str,
+    start: usize,
+    end: usize,
+    ordinal: usize,
+) -> Option<bool> {
+    if language_for_file(file) != Language::Go || start >= end || end > source.len() {
+        return None;
+    }
+    let tree = parse_tree_for_language(file, Language::Go, source)?;
+    let root = tree.root_node();
+    if root.has_error() {
+        return None;
+    }
+    let callable = go_callable_at_span(root, start, end)?;
+    let type_node = go_parameter_type_node_at_ordinal(callable, ordinal)?;
+    if type_node.is_missing() || type_node.has_error() {
+        return None;
+    }
+    go_type_boxes_reference_payload(root, type_node, source, &mut HashSet::default())
+}
+
+/// Classify one Go type node as an interface whose wrapper boxes a reference
+/// payload. A named type resolves through its one direct same-file
+/// declaration, so a chain of local aliases-of-aliases still reaches its
+/// underlying shape; a cycle, an alias that names another package, and any
+/// unavailable declaration stay unknown.
+fn go_type_boxes_reference_payload(
+    root: Node<'_>,
+    type_node: Node<'_>,
+    source: &str,
+    visited: &mut HashSet<usize>,
+) -> Option<bool> {
+    if !visited.insert(type_node.id()) {
+        return None;
+    }
+    let type_node = go_unwrap_parenthesized_type(type_node)?;
+    match type_node.kind() {
+        // An empty interface and a method-bearing interface both box one
+        // reference payload; the shape of the wrapper does not change what it
+        // carries.
+        "interface_type" => Some(true),
+        "type_identifier" | "identifier" => {
+            let name = go_node_text(type_node, source);
+            if name.is_empty() {
+                return None;
+            }
+            // `any` is the predeclared alias for the empty interface. A local
+            // declaration of that name shadows it, so the name alone is no
+            // longer an interface.
+            if name == "any" && go_same_file_named_type_declaration(root, name, source).is_none() {
+                return Some(true);
+            }
+            let declaration = go_same_file_named_type_declaration(root, name, source)?;
+            let underlying = declaration.child_by_field_name("type")?;
+            if underlying.is_missing() || underlying.has_error() {
+                return None;
+            }
+            go_type_boxes_reference_payload(root, underlying, source, visited)
+        }
+        // A package-qualified or generic name needs cross-package or
+        // type-argument resolution; the local AST alone cannot prove whether
+        // the named type is an interface.
+        "qualified_type" | "generic_type" => None,
+        // Every other declaration shape names a concrete type that copies a
+        // value or storage directly; none boxes a reference payload.
+        _ => Some(false),
+    }
+}
+
+/// Unwrap the parenthesized spellings of one type expression. Parentheses are
+/// a spelling rather than a shape, so the underlying type node answers for it.
+fn go_unwrap_parenthesized_type(mut type_node: Node<'_>) -> Option<Node<'_>> {
+    while type_node.kind() == "parenthesized_type" {
+        type_node = type_node.named_child(0)?;
+    }
+    (!type_node.is_missing()).then_some(type_node)
+}
+
+/// Find the one same-file direct type declaration that names `name`.
+///
+/// A second declaration, an alias, a generic declaration, and a declaration
+/// that is not at package scope are all unavailable, so the caller keeps the
+/// question open rather than guessing one shape.
+fn go_same_file_named_type_declaration<'tree>(
+    root: Node<'tree>,
+    name: &str,
+    source: &str,
+) -> Option<Node<'tree>> {
+    if name.is_empty() {
+        return None;
+    }
+    let mut stack = vec![root];
+    let mut matches = Vec::new();
+    while let Some(node) = stack.pop() {
+        if matches!(node.kind(), "type_spec" | "type_alias")
+            && node
+                .parent()
+                .is_some_and(|parent| parent.kind() == "type_declaration")
+            && node
+                .child_by_field_name("name")
+                .is_some_and(|declared| go_node_text(declared, source) == name)
+        {
+            matches.push(node);
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    let [declaration] = matches.as_slice() else {
+        return None;
+    };
+    if declaration.kind() == "type_alias"
+        || declaration
+            .parent()
+            .and_then(|parent| parent.parent())
+            .is_none_or(|scope| scope.kind() != "source_file")
+        || declaration.child_by_field_name("type_parameters").is_some()
+        || declaration.has_error()
+        || declaration.is_missing()
+    {
+        return None;
+    }
+    Some(*declaration)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GoParameterBindingMode {
     Reference,
@@ -3314,17 +3507,7 @@ fn go_parameter_binding_mode_at_span(
     if root.has_error() {
         return None;
     }
-    let callable = root.named_descendant_for_byte_range(start, end)?;
-    if callable.start_byte() != start
-        || callable.end_byte() != end
-        || !matches!(
-            callable.kind(),
-            "function_declaration" | "method_declaration" | "func_literal"
-        )
-        || callable.is_missing()
-    {
-        return None;
-    }
+    let callable = go_callable_at_span(root, start, end)?;
     let type_node = go_parameter_type_node_at_ordinal(callable, ordinal)?;
     if type_node.is_missing() || type_node.has_error() {
         return None;
@@ -3348,6 +3531,21 @@ fn go_parameter_binding_mode_at_span(
         }
         _ => None,
     }
+}
+
+/// The exact callable declaration or literal at a source span, when the span
+/// bounds one whole node. Anonymous function literals are callables too, and a
+/// name-based lookup cannot locate or tell them apart.
+fn go_callable_at_span(root: Node<'_>, start: usize, end: usize) -> Option<Node<'_>> {
+    let callable = root.named_descendant_for_byte_range(start, end)?;
+    (callable.start_byte() == start
+        && callable.end_byte() == end
+        && matches!(
+            callable.kind(),
+            "function_declaration" | "method_declaration" | "func_literal"
+        )
+        && !callable.is_missing())
+    .then_some(callable)
 }
 
 /// Whether one exact indexed Go callable parameter is proven to be a
@@ -3607,36 +3805,7 @@ fn go_named_type_binding_mode(
         Some(true) | None => return None,
         Some(false) => {}
     }
-    let mut stack = vec![root];
-    let mut matches = Vec::new();
-    while let Some(node) = stack.pop() {
-        if matches!(node.kind(), "type_spec" | "type_alias")
-            && node
-                .parent()
-                .is_some_and(|parent| parent.kind() == "type_declaration")
-            && node
-                .child_by_field_name("name")
-                .is_some_and(|declared| go_node_text(declared, source) == name)
-        {
-            matches.push(node);
-        }
-        let mut cursor = node.walk();
-        stack.extend(node.named_children(&mut cursor));
-    }
-    let [declaration] = matches.as_slice() else {
-        return None;
-    };
-    if declaration.kind() == "type_alias"
-        || declaration
-            .parent()
-            .and_then(|parent| parent.parent())
-            .is_none_or(|scope| scope.kind() != "source_file")
-        || declaration.child_by_field_name("type_parameters").is_some()
-        || declaration.has_error()
-        || declaration.is_missing()
-    {
-        return None;
-    }
+    let declaration = go_same_file_named_type_declaration(root, name, source)?;
     let type_node = declaration.child_by_field_name("type")?;
     if type_node.has_error() || type_node.is_missing() {
         return None;

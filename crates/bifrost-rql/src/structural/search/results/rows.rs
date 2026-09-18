@@ -472,6 +472,7 @@ mod value_domain {
         "object_property",
         "computed_property",
         "concurrent_spawn",
+        "resource_release",
         "spread_element",
         "return",
         "throw",

@@ -6526,13 +6526,11 @@ void raii_caller() {
     }
 
     #[test]
-    fn python_mixed_return_gaps_retain_only_matched_normal_reason() {
+    fn python_mixed_return_gaps_retain_only_the_matched_normal_reason() {
+        const SOURCE: &str = "async def target(value):\n    result = value\n    return result\n";
         let fixture = AnalyzerFixture::new_for_language(
             crate::analyzer::Language::Python,
-            &[(
-                "mixed_return_gaps.py",
-                "async def target(value):\n    result = value\n    return result\n",
-            )],
+            &[("mixed_return_gaps.py", SOURCE)],
         );
         let file = ProjectFile::new(fixture.project_root(), "mixed_return_gaps.py");
         let cancellation = CancellationToken::default();
@@ -6553,10 +6551,12 @@ void raii_caller() {
             .and_then(|procedure| artifact.procedure_handle(procedure.id()))
             .expect("target procedure");
         let semantics = target.semantics();
-        // The exit profile discharges implicit-abort gaps when no abort path
-        // runs user code (#1952); the expected reasons below apply the same
-        // rule. The raw gap set still retains the exceptional-flow gap, which
-        // the direct assertions on `all_gaps` pin.
+        // An ordinary Python operation's implicit abort is a lowered route
+        // into the enclosing structured completion, not a published
+        // exceptional-flow gap, so the procedure's only return-affecting gap
+        // is the subject-wide async-suspension gap. The exit profile
+        // discharges implicit-abort gaps when no abort path runs user code
+        // (#1952); the expected reasons below apply the same rule.
         let abort_user_code =
             crate::analyzer::semantic::workspace_oracle::abort_paths_run_user_code(semantics);
         let all_gaps = semantics
@@ -6564,6 +6564,42 @@ void raii_caller() {
             .iter()
             .filter(|gap| gap.impacts.contains(SemanticGapImpact::ReturnTransfer))
             .collect::<Vec<_>>();
+        assert!(
+            all_gaps.iter().all(|gap| {
+                !(gap.capability == SemanticCapability::ExceptionalControlFlow
+                    && gap.kind == SemanticGapKind::Unsupported)
+            }),
+            "the assignment's implicit abort must be a modeled exceptional \
+             edge rather than an unsupported exceptional-flow gap: {all_gaps:#?}"
+        );
+        // The store lowers its implicit abort from the statement's own
+        // boundary point, so the abort edge leaves the point whose source
+        // mapping anchors at the whole assignment statement rather than the
+        // point that carries the `Assignment` effect.
+        let statement_anchor = SOURCE
+            .find("result = value")
+            .expect("the fixture names the assignment statement");
+        let assignment_abort = semantics
+            .cfg()
+            .edges()
+            .iter()
+            .find(|edge| {
+                edge.kind == ControlEdgeKind::Exceptional
+                    && semantics.point(edge.source_point).is_some_and(|point| {
+                        semantics
+                            .source_mapping(point.source)
+                            .is_some_and(|mapping| {
+                                mapping.locator.anchor().span().start_byte() as usize
+                                    == statement_anchor
+                            })
+                    })
+            })
+            .expect("the assignment's implicit abort is a modeled exceptional edge");
+        assert_ne!(
+            assignment_abort.target_point,
+            semantics.exceptional_exit_point(),
+            "the assignment's abort routes into the structured completion"
+        );
         let return_gaps = all_gaps
             .iter()
             .copied()
@@ -6581,12 +6617,10 @@ void raii_caller() {
             }),
             "async lowering must retain its suspension gap: {return_gaps:#?}"
         );
-        assert!(
-            all_gaps.iter().any(|gap| {
-                gap.capability == SemanticCapability::ExceptionalControlFlow
-                    && gap.kind == SemanticGapKind::Unsupported
-            }),
-            "assignment must retain its exceptional-flow gap: {all_gaps:#?}"
+        assert_eq!(
+            return_gaps.len(),
+            1,
+            "the async-suspension gap is the only return-affecting gap left: {return_gaps:#?}"
         );
         let aggregate_reason = return_gaps
             .iter()
@@ -6636,21 +6670,16 @@ void raii_caller() {
             profile.aggregate_return_affecting_gap_reason(),
             Some(aggregate_reason.as_str())
         );
+        assert_eq!(matched_reason, aggregate_reason);
         assert_eq!(
             profile.matched_return_affecting_gap_reason(),
-            Some(matched_reason.as_str())
+            Some(matched_reason.as_str()),
+            "the matched reason falls back to the aggregate because the two \
+             gap sets now coincide"
         );
-        // The profile charges the matched reason only when it differs from the
-        // aggregate; after the implicit-abort discharge (#1952) the two can
-        // coincide.
-        let expected_text_bytes =
-            aggregate_reason
-                .len()
-                .saturating_add(if matched_reason == aggregate_reason {
-                    0
-                } else {
-                    matched_reason.len()
-                });
+        // The profile charges the matched reason only when it names a distinct
+        // gap set, which it no longer does here.
+        let expected_text_bytes = aggregate_reason.len();
         assert_eq!(outcome.work().owned_text_bytes, expected_text_bytes);
         assert_eq!(budget.used(), outcome.work());
 

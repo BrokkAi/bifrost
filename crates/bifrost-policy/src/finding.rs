@@ -2216,6 +2216,8 @@ pub enum PolicyLocationRelationship {
     GenerationSite,
     /// One declaration that site materialized, located at its naming argument.
     GeneratedDeclaration,
+    /// The declared persistence-store write a store-fed finding crossed.
+    StoreWrite,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

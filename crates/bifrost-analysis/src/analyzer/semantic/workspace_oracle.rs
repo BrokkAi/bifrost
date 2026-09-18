@@ -62,6 +62,7 @@ use super::{DispatchHints, OracleLimits};
 pub struct WorkspaceSemanticOracle<'a> {
     workspace: &'a WorkspaceAnalyzer,
     runtime_reads: runtime_values::RuntimeReadCache,
+    runtime_write_footprints: runtime_values::WorkspaceRuntimeWriteFootprintCache,
     limits: OracleLimits,
     hierarchy_expansion: DispatchHierarchyExpansion,
     active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
@@ -132,6 +133,7 @@ impl<'a> WorkspaceSemanticOracle<'a> {
         Self {
             workspace,
             runtime_reads: runtime_values::runtime_read_cache(),
+            runtime_write_footprints: runtime_values::workspace_runtime_write_footprint_cache(),
             limits,
             hierarchy_expansion,
             active_semantic_model_snapshot,

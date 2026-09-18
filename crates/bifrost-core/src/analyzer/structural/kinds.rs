@@ -71,6 +71,7 @@ normalized_kinds! {
     // expression-ish kinds (kept flat; see ExecPlan decision log)
     Call => "call": "Match call expressions for functions, methods, or constructors.",
     ConcurrentSpawn => "concurrent_spawn": "Match a structured operation that starts a callable in a distinct concurrent task.",
+    ResourceRelease => "resource_release": "Match a language construct that releases a resource at its own exit, such as a Java try-with-resources statement or a Python with statement.",
     Assignment => "assignment": "Match an assignment expression or statement.",
     FieldAccess => "field_access": "Match member or field access.",
     Identifier => "identifier": "Match an identifier reference.",
@@ -114,9 +115,9 @@ impl NormalizedKind {
             }
             ForLoop | WhileLoop => Some(Loop),
             Declaration | Call | ConcurrentSpawn | Assignment | FieldAccess | Identifier
-            | Literal | Return | Throw | Catch | If | Loop | Decorator | Block | JsxElement
-            | JsxAttribute | JsxSpreadAttribute | ObjectProperty | ComputedProperty
-            | SpreadElement => None,
+            | Literal | ResourceRelease | Return | Throw | Catch | If | Loop | Decorator
+            | Block | JsxElement | JsxAttribute | JsxSpreadAttribute | ObjectProperty
+            | ComputedProperty | SpreadElement => None,
         }
     }
 

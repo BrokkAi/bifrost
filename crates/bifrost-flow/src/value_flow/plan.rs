@@ -1364,6 +1364,13 @@ enum SummaryProofRequirement {
 enum SummaryInputBinding {
     Carrier(ValueFlowCarrierId),
     VacuousConstant,
+    /// The call names a live value for this port, but the plan retains no
+    /// carrier for it. No caller fact can enter through the port, and no fact
+    /// the transfer would produce at it can be observed, so the transfer is
+    /// vacuous over this plan's carriers rather than a missing-model gap
+    /// (#3406). Distinct from `Unbound`, where the port has no value at all
+    /// and the model genuinely does not describe this call.
+    CarrierlessValue,
     Unbound,
 }
 
@@ -1686,14 +1693,14 @@ struct ObservationKey {
     phase: ValueFlowObservationPhase,
 }
 
-/// Immutable reverse lookup tables derived from the canonical local rule
-/// array. The values are rule-array positions rather than cloned rules, so
-/// every lookup retains the plan's one authoritative rule representation.
+/// Immutable point lookup tables derived from the canonical local rule array.
+/// The values are rule-array positions in canonical forward order rather than
+/// cloned rules, so every lookup retains the plan's one authoritative rule
+/// representation; the backward accessor reverses a bucket only while reading.
 #[derive(Debug, Clone, Default)]
-struct LocalRuleReverseIndex {
-    /// Every local rule at a point in reverse event order. A backward
-    /// preimage may change carriers, so a target-only bucket is insufficient
-    /// for chained same-point rules.
+struct LocalRulePointIndex {
+    /// Every local rule at a point. A backward preimage may change carriers,
+    /// so a target-only bucket is insufficient for chained same-point rules.
     by_point: HashMap<ProgramPointHandle, Box<[usize]>>,
 }
 
@@ -1711,7 +1718,7 @@ struct ObservationIndex {
     by_point_phase: HashMap<ObservationKey, Box<[usize]>>,
 }
 
-impl LocalRuleReverseIndex {
+impl LocalRulePointIndex {
     fn retained_heap_bytes(&self) -> usize {
         reverse_index_heap_bytes(&self.by_point)
     }
@@ -1779,7 +1786,7 @@ pub struct ValueFlowPlan {
     /// Derived lookup only; canonical rule identity remains `local_rules`.
     /// This field is intentionally absent from `PartialEq`, `Hash`, and
     /// propagation compatibility; `retained_bytes` still charges its storage.
-    local_rule_reverse_index: LocalRuleReverseIndex,
+    local_rule_point_index: LocalRulePointIndex,
     call_rules: Box<[CallFlowRule]>,
     /// Derived lookup only; canonical rule identity remains `call_rules`.
     /// This field is intentionally absent from `PartialEq`, `Hash`, and
@@ -2519,7 +2526,7 @@ impl ValueFlowPlan {
             })
             .collect::<Result<Vec<_>, ValueFlowPlanError>>()?;
 
-        let local_rule_reverse_index = build_local_rule_reverse_index(&local_rules);
+        let local_rule_point_index = build_local_rule_point_index(&local_rules);
         let call_rule_reverse_index = build_call_rule_reverse_index(&call_rules);
         let source_index = build_observation_index(&bound_sources, |source| ObservationKey {
             point: source.spec.point().clone(),
@@ -2540,7 +2547,7 @@ impl ValueFlowPlan {
             carrier_keys: carrier_keys.into_boxed_slice(),
             carrier_ids,
             local_rules: local_rules.into_boxed_slice(),
-            local_rule_reverse_index,
+            local_rule_point_index,
             call_rules: call_rules.into_boxed_slice(),
             call_rule_reverse_index,
             fallback_profiles: fallback_profiles.into_boxed_slice(),
@@ -2711,7 +2718,7 @@ impl ValueFlowPlan {
             )
             .saturating_add(size_of_val(self.local_rules.as_ref()))
             .saturating_add(local_rule_heap)
-            .saturating_add(self.local_rule_reverse_index.retained_heap_bytes())
+            .saturating_add(self.local_rule_point_index.retained_heap_bytes())
             .saturating_add(size_of_val(self.call_rules.as_ref()))
             .saturating_add(call_rule_heap)
             .saturating_add(self.call_rule_reverse_index.retained_heap_bytes())
@@ -2914,7 +2921,7 @@ impl ValueFlowPlan {
             &carrier_components,
         )
         .into_boxed_slice();
-        self.local_rule_reverse_index = build_local_rule_reverse_index(&local_rules);
+        self.local_rule_point_index = build_local_rule_point_index(&local_rules);
         self.local_rules = local_rules.into_boxed_slice();
         Ok(self)
     }
@@ -3199,7 +3206,7 @@ impl ValueFlowPlan {
             &carrier_ids,
             &carrier_components,
         );
-        let local_rule_reverse_index = build_local_rule_reverse_index(&local_rules);
+        let local_rule_point_index = build_local_rule_point_index(&local_rules);
         let call_rule_reverse_index = build_call_rule_reverse_index(&call_rules);
         let source_index = build_observation_index(&bound_sources, |source| ObservationKey {
             point: source.spec.point().clone(),
@@ -3219,7 +3226,7 @@ impl ValueFlowPlan {
             carrier_keys: carrier_keys.into_boxed_slice(),
             carrier_ids,
             local_rules: local_rules.into_boxed_slice(),
-            local_rule_reverse_index,
+            local_rule_point_index,
             call_rules: call_rules.into_boxed_slice(),
             call_rule_reverse_index,
             fallback_profiles: fallback_profiles.into_boxed_slice(),
@@ -3364,7 +3371,7 @@ impl ValueFlowPlan {
             &carrier_ids,
             &carrier_components,
         );
-        let local_rule_reverse_index = build_local_rule_reverse_index(&local_rules);
+        let local_rule_point_index = build_local_rule_point_index(&local_rules);
         let call_rule_reverse_index = build_call_rule_reverse_index(&call_rules);
         let source_index = build_observation_index(&sources, |source| ObservationKey {
             point: source.spec.point().clone(),
@@ -3384,7 +3391,7 @@ impl ValueFlowPlan {
             carrier_keys: carrier_keys.into_boxed_slice(),
             carrier_ids,
             local_rules: local_rules.into_boxed_slice(),
-            local_rule_reverse_index,
+            local_rule_point_index,
             call_rules: call_rules.into_boxed_slice(),
             call_rule_reverse_index,
             fallback_profiles: fallback_profiles.into_boxed_slice(),
@@ -4049,10 +4056,17 @@ impl ValueFlowPlan {
             };
             evidence_ok
                 && match self.summary_input_binding(call, transfer.input()) {
-                    SummaryInputBinding::Carrier(_) => self
-                        .summary_port_carrier(call, transfer.exit().port())
-                        .is_some(),
-                    SummaryInputBinding::VacuousConstant => true,
+                    SummaryInputBinding::Carrier(_) => {
+                        self.summary_port_carrier(call, transfer.exit().port())
+                            .is_some()
+                            // A live exit value without a carrier makes the
+                            // transfer's output unobservable over this plan's
+                            // carriers, which is vacuous rather than a
+                            // missing-model gap (#3406).
+                            || self.summary_port_value(call, transfer.exit().port()).is_some()
+                    }
+                    SummaryInputBinding::VacuousConstant
+                    | SummaryInputBinding::CarrierlessValue => true,
                     SummaryInputBinding::Unbound => false,
                 }
         })
@@ -4482,6 +4496,18 @@ impl ValueFlowPlan {
                 .ok()
                 .map(|index| self.summary_location_bindings[index].carrier);
         }
+        let value = self.summary_port_value(call, port)?;
+        self.carrier_id(&ValueFlowCarrier::Value(value))
+    }
+
+    /// The call's live value for one summary port, whether or not the plan
+    /// retains a carrier for it. `None` means the port names no value at this
+    /// call at all, so a model port that references it is genuinely unbound.
+    fn summary_port_value(
+        &self,
+        call: &CallSiteHandle,
+        port: &SummaryPort,
+    ) -> Option<crate::analyzer::semantic::ValueHandle> {
         let row = call.procedure().semantics().call_site(call.id())?;
         let value = match port {
             SummaryPort::Receiver => row.receiver?,
@@ -4491,8 +4517,7 @@ impl ValueFlowPlan {
             SummaryPort::ExceptionalReturn => row.thrown?,
             SummaryPort::Capture(_) | SummaryPort::Heap(_) => return None,
         };
-        let value = call.procedure().value_handle(value)?;
-        self.carrier_id(&ValueFlowCarrier::Value(value))
+        call.procedure().value_handle(value)
     }
 
     fn summary_input_binding(
@@ -4516,6 +4541,8 @@ impl ValueFlowPlan {
         };
         if carrierless_summary_input_is_vacuous(port, value_kind) {
             SummaryInputBinding::VacuousConstant
+        } else if self.summary_port_value(call, port).is_some() {
+            SummaryInputBinding::CarrierlessValue
         } else {
             SummaryInputBinding::Unbound
         }
@@ -4705,7 +4732,14 @@ impl ValueFlowPlan {
                 SummaryInputBinding::VacuousConstant => {
                     complete &= summary_evidence_is_proven_complete(transfer.evidence());
                 }
-                SummaryInputBinding::Unbound => complete = false,
+                // A live value without a carrier cannot receive a fact through
+                // this transfer either, so it is incomplete for this plan just
+                // like a genuinely unbound port. `model_is_fully_bindable`
+                // distinguishes the two; the solve only needs the shared
+                // incomplete answer.
+                SummaryInputBinding::CarrierlessValue | SummaryInputBinding::Unbound => {
+                    complete = false
+                }
             }
         }
 
@@ -4906,9 +4940,13 @@ impl ValueFlowPlan {
         point: &ProgramPointHandle,
     ) -> impl Iterator<Item = &LocalFlowRule> {
         let feasible = !self.point_is_infeasible(point);
-        self.local_rules
-            .iter()
-            .filter(move |rule| feasible && &rule.point == point)
+        self.local_rule_point_index
+            .by_point
+            .get(point)
+            .into_iter()
+            .flatten()
+            .filter(move |_| feasible)
+            .map(move |index| &self.local_rules[*index])
     }
 
     pub(crate) fn edge_kills(
@@ -4964,11 +5002,12 @@ impl ValueFlowPlan {
         point: &ProgramPointHandle,
     ) -> impl Iterator<Item = LocalRuleView> {
         let feasible = !self.point_is_infeasible(point);
-        self.local_rule_reverse_index
+        self.local_rule_point_index
             .by_point
             .get(point)
             .into_iter()
             .flatten()
+            .rev()
             .filter(move |_| feasible)
             .map(move |index| {
                 let rule = &self.local_rules[*index];
@@ -5157,6 +5196,182 @@ mod tests {
         let mut trace = HashTrace::default();
         plan.propagation_semantics_hash(&mut trace);
         trace.0
+    }
+
+    #[test]
+    fn local_rule_point_index_matches_filtered_reference_and_preserves_order() {
+        let project = InlineTestProject::with_language(Language::Go)
+            .file(
+                "flow.go",
+                "package fixture\nfunc run(input string) string {\n    output := input\n    return output\n}\n",
+            )
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let cancellation = CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let artifact = workspace
+            .materialize_program_semantics(
+                &project.file("flow.go"),
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .expect("fixture semantics materialize")
+            .available_value()
+            .cloned()
+            .expect("fixture semantics remain available");
+        let root = artifact
+            .procedures()
+            .iter()
+            .find(|procedure| {
+                procedure
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|segment| segment.name())
+                    == Some("run")
+            })
+            .and_then(|procedure| artifact.procedure_handle(procedure.id()))
+            .expect("fixture declares run");
+        let mut budget = SemanticBudget::default();
+        let snapshot_outcome = workspace
+            .semantic_oracle_provider()
+            .procedure_relations(
+                &root,
+                &OracleCallContext::empty(),
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .expect("fixture value-flow snapshot materializes");
+        let status = SemanticInputStatus::from_outcome(&snapshot_outcome);
+        let snapshot = snapshot_outcome
+            .available_value()
+            .cloned()
+            .expect("fixture value-flow snapshot remains available");
+        let mut plan = ValueFlowPlan::try_new(
+            root.clone(),
+            vec![ValueFlowInput::new(snapshot, status)],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("fixture value-flow plan");
+
+        let mut points = Vec::new();
+        for rule in &plan.local_rules {
+            if !points.contains(&rule.point) {
+                points.push(rule.point.clone());
+            }
+        }
+        assert!(points.len() >= 2, "fixture has rules at multiple points");
+
+        let mut rules = plan.local_rules.to_vec();
+        for (ordinal, rule) in rules.iter_mut().enumerate() {
+            rule.point = points[ordinal % points.len()].clone();
+            rule.event_index = u32::try_from(ordinal / points.len())
+                .expect("fixture relation count fits an event index");
+        }
+        rules.sort_by(compare_local_rules);
+        plan.local_rules = rules.into_boxed_slice();
+        plan.local_rule_point_index = build_local_rule_point_index(&plan.local_rules);
+
+        let expected_by_point = points
+            .iter()
+            .map(|point| {
+                let expected_rules = plan
+                    .local_rules
+                    .iter()
+                    .filter(|rule| &rule.point == point)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let expected_views = expected_rules
+                    .iter()
+                    .map(|rule| LocalRuleView {
+                        event_index: rule.event_index,
+                        source: rule.source,
+                        target: rule.target,
+                        kind: rule.kind,
+                        transfer: rule.transfer,
+                        complete: matches!(rule.proof, ProofStatus::Proven)
+                            && matches!(rule.completeness, EvidenceCompleteness::Complete),
+                        policy_local: rule.policy_local,
+                        strong_update: rule.strong_update,
+                    })
+                    .collect::<Vec<_>>();
+                (point.clone(), expected_rules, expected_views)
+            })
+            .collect::<Vec<_>>();
+
+        for (point, expected_rules, expected_views) in &expected_by_point {
+            let expected = plan
+                .local_rules
+                .iter()
+                .enumerate()
+                .filter(|(_, rule)| &rule.point == point)
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            let indexed = plan
+                .local_rule_point_index
+                .by_point
+                .get(point)
+                .map(|positions| positions.as_ref())
+                .unwrap_or_default();
+            assert_eq!(indexed, expected.as_slice(), "index positions differ");
+
+            let forward_rules = plan.local_rules_at(point).cloned().collect::<Vec<_>>();
+            assert_eq!(forward_rules, *expected_rules, "forward rules differ");
+
+            let mut reverse_views = expected_views.clone();
+            reverse_views.reverse();
+            assert_eq!(
+                plan.local_rule_views(point).collect::<Vec<_>>(),
+                *expected_views,
+                "forward views differ"
+            );
+            assert_eq!(
+                plan.local_rule_views_reverse_at(point).collect::<Vec<_>>(),
+                reverse_views,
+                "reverse views differ"
+            );
+        }
+
+        plan.infeasible_points =
+            Box::new([(root.clone(), vec![points[1].id()].into_boxed_slice())]);
+        assert_eq!(
+            plan.local_rule_views(&points[0]).collect::<Vec<_>>(),
+            expected_by_point[0].2
+        );
+        assert!(
+            plan.local_rule_views(&points[1]).next().is_none(),
+            "infeasible point suppresses forward rules"
+        );
+        assert_eq!(
+            plan.local_rule_views_reverse_at(&points[0])
+                .collect::<Vec<_>>(),
+            expected_by_point[0]
+                .2
+                .iter()
+                .copied()
+                .rev()
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            plan.local_rule_views_reverse_at(&points[1])
+                .next()
+                .is_none(),
+            "infeasible point suppresses reverse rules"
+        );
+
+        plan.local_rules = Box::default();
+        plan.local_rule_point_index = build_local_rule_point_index(&plan.local_rules);
+        assert!(
+            plan.local_rule_views(&points[0]).next().is_none(),
+            "empty local-rule array yields no forward rules"
+        );
+        assert!(
+            plan.local_rule_views_reverse_at(&points[0])
+                .next()
+                .is_none(),
+            "empty local-rule array yields no reverse rules"
+        );
     }
 
     #[test]
@@ -6889,22 +7104,19 @@ fn merge_call_rule_completeness(
     }
 }
 
-fn build_local_rule_reverse_index(rules: &[LocalFlowRule]) -> LocalRuleReverseIndex {
+fn build_local_rule_point_index(rules: &[LocalFlowRule]) -> LocalRulePointIndex {
     let mut by_point = HashMap::<ProgramPointHandle, Vec<usize>>::default();
     for (index, rule) in rules.iter().enumerate() {
         by_point.entry(rule.point.clone()).or_default().push(index);
     }
-    // `rules` is canonicalized in forward event order. Reverse each point so
-    // a backward client sees the exact preimage order at a point, including
-    // strong updates followed by weak rules at the same target.
+    // `rules` is canonicalized in forward event order. Keep each bucket in
+    // that order; the backward accessor reverses it while reading so strong
+    // updates are still followed by weak rules at the same target.
     let by_point = by_point
         .into_iter()
-        .map(|(point, mut positions)| {
-            positions.reverse();
-            (point, positions.into_boxed_slice())
-        })
+        .map(|(point, positions)| (point, positions.into_boxed_slice()))
         .collect();
-    LocalRuleReverseIndex { by_point }
+    LocalRulePointIndex { by_point }
 }
 
 fn build_call_rule_reverse_index(rules: &[CallFlowRule]) -> CallRuleReverseIndex {

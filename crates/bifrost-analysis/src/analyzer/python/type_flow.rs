@@ -25,10 +25,10 @@ use super::PythonAnalyzer;
 use super::lexical_scope::python_lexical_scope_inventory_bounded;
 use crate::analyzer::lexical_definitions::{PythonMethodBinding, formal_parameter_slots_for_owner};
 use crate::analyzer::semantic::type_flow::{
-    CallGuardOutcome, ClassHierarchy, ClassIdentity, ClassSeed, DynamicFieldWrite,
-    ExternalClassCache, MemberAccessKind, MemberAccessQuery, MemberDeclaration, MemberLookup,
-    MemberLookupHit, NarrowingVerdict, NormalReturnTypeConstraint, TypeFlowAdapter, UnknownReason,
-    analyzer_range_for_span, class_seed_from_lookup_types, external_class_identity,
+    CallGuardOutcome, ClassBodyMemberBinding, ClassHierarchy, ClassIdentity, ClassSeed,
+    DynamicFieldWrite, ExternalClassCache, MemberAccessKind, MemberAccessQuery, MemberDeclaration,
+    MemberLookup, MemberLookupHit, NarrowingVerdict, NormalReturnTypeConstraint, TypeFlowAdapter,
+    UnknownReason, analyzer_range_for_span, class_seed_from_lookup_types, external_class_identity,
     external_member_lookup, file_for_locator, source_span_for_node,
     validate_prepared_syntax_for_procedure,
 };
@@ -2013,11 +2013,13 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
         // Keep cached class sets in step with program-point refinement,
         // guard remainders, scoped writes, open builtin call results, the
         // class-object remainder a declared or imported class reference
-        // seeds, and the classes a guard's true arm now proves about a
-        // remainder.
+        // seeds, the classes a guard's true arm now proves about a
+        // remainder, the arm-proven classes that now reach the guard's
+        // reconvergence instead of ending there, and the class-body binding
+        // a member name resolves to.
         AdapterSemanticsVersion::hash_bytes(
             "python-type-flow",
-            b"python-type-flow-unmodeled-guards-scoped-dynamic-writes-subscripted-annotation-outer-class-class-object-reference-imports-unmodeled-predicate-type-is-guard-exact-binding-replacement-stable-receiver-entry-implicit-tuples-closed-native-members-sequence-initializers-module-binding-reuse-comprehension-scope-closed-sequence-loads-implicit-none-returns-returned-sequence-loads-v47",
+            b"python-type-flow-unmodeled-guards-scoped-dynamic-writes-subscripted-annotation-outer-class-class-object-reference-imports-unmodeled-predicate-type-is-guard-exact-binding-replacement-stable-receiver-entry-implicit-tuples-closed-native-members-sequence-initializers-module-binding-reuse-comprehension-scope-closed-sequence-loads-implicit-none-returns-returned-sequence-loads-arm-proven-classes-reach-joins-class-body-member-binding-v49",
         )
         .expect("adapter name is non-empty")
     }
@@ -2787,44 +2789,54 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
         }
     }
 
-    fn field_slot_is_complete(
+    fn class_body_member_binding(
         &self,
         workspace: &WorkspaceAnalyzer,
         class: &ClassIdentity,
         member: &str,
-    ) -> bool {
+    ) -> ClassBodyMemberBinding {
         let ClassIdentity::Workspace(unit) = class else {
-            return false;
+            return ClassBodyMemberBinding::Unclassified;
         };
         let python = python_analyzer(workspace);
         let file = unit.source();
         let Some(prepared) = current_indexed_prepared(python, file) else {
-            return false;
+            return ClassBodyMemberBinding::Unclassified;
         };
         let Some(class) = class_node_for_unit(python, &prepared, unit) else {
-            return false;
+            return ClassBodyMemberBinding::Unclassified;
         };
+        // A class decorator can return a different class, so this body does
+        // not state what any member of the runtime class binds.
         if class
             .parent()
             .is_some_and(|parent| parent.kind() == "decorated_definition")
         {
-            return false;
+            return ClassBodyMemberBinding::Unclassified;
         }
         let Some(body) = class.child_by_field_name("body") else {
-            return false;
+            return ClassBodyMemberBinding::Unclassified;
         };
+        let mut binding = ClassBodyMemberBinding::Unbound;
         let mut cursor = body.walk();
         for child in body.named_children(&mut cursor) {
             if assignment_name(child, prepared.source()) == Some(member) {
-                return false;
+                return ClassBodyMemberBinding::Unclassified;
             }
-            if matches!(child.kind(), "function_definition" | "decorated_definition")
-                && definition_name(child, prepared.source()) == Some(member)
-            {
-                return false;
+            if definition_name(child, prepared.source()) == Some(member) {
+                match child.kind() {
+                    // A plain `def` binds the function the member lookup
+                    // already names. Reading it through an instance yields
+                    // that method, not a stored attribute value.
+                    "function_definition" => binding = ClassBodyMemberBinding::Procedure,
+                    // A decorator returns an arbitrary object, and a
+                    // descriptor such as `property` runs user code on read.
+                    "decorated_definition" => return ClassBodyMemberBinding::Unclassified,
+                    _ => {}
+                }
             }
         }
-        true
+        binding
     }
 
     fn truthiness_is_pure(&self, workspace: &WorkspaceAnalyzer, class: &ClassIdentity) -> bool {
@@ -2874,7 +2886,13 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
                 let owner_hierarchy = self.class_hierarchy(workspace, owner);
                 !owner_hierarchy.unresolved_base
                     && !owner_hierarchy.dynamic_attributes
-                    && self.field_slot_is_complete(workspace, owner, member)
+                    // Any class-level binding, including a plain method,
+                    // makes the read go through the class rather than plain
+                    // instance storage.
+                    && matches!(
+                        self.class_body_member_binding(workspace, owner, member),
+                        ClassBodyMemberBinding::Unbound
+                    )
             })
     }
 

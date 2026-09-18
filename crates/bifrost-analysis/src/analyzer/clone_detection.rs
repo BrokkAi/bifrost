@@ -288,7 +288,6 @@ pub(crate) fn compact_clone_excerpt(raw: &str) -> String {
         .take(6)
         .collect::<Vec<_>>()
         .join(" ")
-        .replace('|', "\\|")
 }
 
 pub(crate) fn build_clone_reason(token_similarity: i32, refined_similarity: i32) -> String {

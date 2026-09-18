@@ -1,7 +1,7 @@
 {
   "schema_version": 2,
   "id": "bifrost.security",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "name": "Bifrost security",
   "description": "High-precision security policies backed by exact structural identity and value-flow evidence.",
   "policies": [
@@ -43,6 +43,513 @@
       ],
       "severity_rationale": "Attacker-controlled command text can execute unintended operating-system commands with the application's privileges.",
       "remediation": "Avoid passing untrusted text to Runtime.exec. Use a fixed executable and validate arguments against an allowlist."
+    },
+    {
+      "path": "policies/declared-storage/c-stored-request-to-sql.rqlp",
+      "id": "bifrost.security.c.stored-request-to-sql",
+      "authored_hash": "c286d4e92032a2e34c5778fc8d395b2d06ac16c77ee695bf0efaad49fd85437c",
+      "resolved_semantic_hash": null,
+      "category": "security",
+      "supported_languages": [
+        "c"
+      ],
+      "required_capabilities": [
+        "taint",
+        "exact-call-target",
+        "actual-to-formal-binding",
+        "declared-store-boundary",
+        "endpoint-set-imports"
+      ],
+      "severity_rationale": "A request value persisted through the declared store and read back into SQL text can change the executed statement and compromise application data.",
+      "remediation": "Pass untrusted values through the driver's parameter-binding contract instead of adding them to the SQL text.",
+      "activation": "opt-in"
+    },
+    {
+      "path": "policies/declared-storage/c-store-requires-validation.rqlp",
+      "id": "bifrost.security.c.store-requires-validation",
+      "authored_hash": "42a369670f0ff0346b159394021af9d7296646ee1331ece21348158f68c2fe40",
+      "resolved_semantic_hash": null,
+      "category": "security",
+      "supported_languages": [
+        "c"
+      ],
+      "required_capabilities": [
+        "flow",
+        "exact-call-target",
+        "actual-to-formal-binding",
+        "endpoint-set-imports"
+      ],
+      "severity_rationale": "A request value stored without the validator the workspace requires bypasses the application's own reviewed storage invariant.",
+      "remediation": "Pass request-derived values through the configured validator before storing them, or narrow the reviewed configuration if the obligation does not apply.",
+      "activation": "opt-in"
+    },
+    {
+      "path": "policies/declared-storage/cpp-stored-request-to-sql.rqlp",
+      "id": "bifrost.security.cpp.stored-request-to-sql",
+      "authored_hash": "977a175308bd8a4a491afe293b53a8a993f0fe8eef403ca64baf2503d7463715",
+      "resolved_semantic_hash": null,
+      "category": "security",
+      "supported_languages": [
+        "cpp"
+      ],
+      "required_capabilities": [
+        "taint",
+        "exact-call-target",
+        "actual-to-formal-binding",
+        "declared-store-boundary",
+        "endpoint-set-imports"
+      ],
+      "severity_rationale": "A request value persisted through the declared store and read back into SQL text can change the executed statement and compromise application data.",
+      "remediation": "Pass untrusted values through the driver's parameter-binding contract instead of adding them to the SQL text.",
+      "activation": "opt-in"
+    },
+    {
+      "path": "policies/declared-storage/cpp-store-requires-validation.rqlp",
+      "id": "bifrost.security.cpp.store-requires-validation",
+      "authored_hash": "32611b93b850993ec9888f2233b24dbd5e82ac90d85289b718018d830e08ef95",
+      "resolved_semantic_hash": null,
+      "category": "security",
+      "supported_languages": [
+        "cpp"
+      ],
+      "required_capabilities": [
+        "flow",
+        "exact-call-target",
+        "actual-to-formal-binding",
+        "endpoint-set-imports"
+      ],
+      "severity_rationale": "A request value stored without the validator the workspace requires bypasses the application's own reviewed storage invariant.",
+      "remediation": "Pass request-derived values through the configured validator before storing them, or narrow the reviewed configuration if the obligation does not apply.",
+      "activation": "opt-in"
+    },
+    {
+      "path": "policies/declared-storage/csharp-stored-request-to-sql.rqlp",
+      "id": "bifrost.security.csharp.stored-request-to-sql",
+      "authored_hash": "85a82e21bef171c72a1bba916f2e01a206e5b876e0510d6a4ec8c520c01426ed",
+      "resolved_semantic_hash": null,
+      "category": "security",
+      "supported_languages": [
+        "csharp"
+      ],
+      "required_capabilities": [
+        "taint",
+        "exact-call-target",
+        "actual-to-formal-binding",
+        "declared-store-boundary",
+        "endpoint-set-imports"
+      ],
+      "severity_rationale": "A request value persisted through the declared store and read back into SQL text can change the executed statement and compromise application data.",
+      "remediation": "Pass untrusted values through the driver's parameter-binding contract instead of adding them to the SQL text.",
+      "activation": "opt-in"
+    },
+    {
+      "path": "policies/declared-storage/csharp-store-requires-validation.rqlp",
+      "id": "bifrost.security.csharp.store-requires-validation",
+      "authored_hash": "d2cfb27f840e874d2513f1d1d8526c6ae79c017194f847694e041b0fbafe6916",
+      "resolved_semantic_hash": null,
+      "category": "security",
+      "supported_languages": [
+        "csharp"
+      ],
+      "required_capabilities": [
+        "flow",
+        "exact-call-target",
+        "actual-to-formal-binding",
+        "endpoint-set-imports"
+      ],
+      "severity_rationale": "A request value stored without the validator the workspace requires bypasses the application's own reviewed storage invariant.",
+      "remediation": "Pass request-derived values through the configured validator before storing them, or narrow the reviewed configuration if the obligation does not apply.",
+      "activation": "opt-in"
+    },
+    {
+      "path": "policies/declared-storage/go-stored-request-to-sql.rqlp",
+      "id": "bifrost.security.go.stored-request-to-sql",
+      "authored_hash": "533bfc83c7362778c3dd2948c662fa1e6d105c119976021996f82ee954e5c600",
+      "resolved_semantic_hash": null,
+      "category": "security",
+      "supported_languages": [
+        "go"
+      ],
+      "required_capabilities": [
+        "taint",
+        "exact-call-target",
+        "actual-to-formal-binding",
+        "declared-store-boundary",
+        "endpoint-set-imports"
+      ],
+      "severity_rationale": "A request value persisted through the declared store and read back into SQL text can change the executed statement and compromise application data.",
+      "remediation": "Pass untrusted values through the driver's parameter-binding contract instead of adding them to the SQL text.",
+      "activation": "opt-in"
+    },
+    {
+      "path": "policies/declared-storage/go-store-requires-validation.rqlp",
+      "id": "bifrost.security.go.store-requires-validation",
+      "authored_hash": "a768363a29c77009a220dd2f50dcbd0c98d171ec2ea0d60e03a0e8d63732b2fe",
+      "resolved_semantic_hash": null,
+      "category": "security",
+      "supported_languages": [
+        "go"
+      ],
+      "required_capabilities": [
+        "flow",
+        "exact-call-target",
+        "actual-to-formal-binding",
+        "endpoint-set-imports"
+      ],
+      "severity_rationale": "A request value stored without the validator the workspace requires bypasses the application's own reviewed storage invariant.",
+      "remediation": "Pass request-derived values through the configured validator before storing them, or narrow the reviewed configuration if the obligation does not apply.",
+      "activation": "opt-in"
+    },
+    {
+      "path": "policies/declared-storage/java-stored-request-to-sql.rqlp",
+      "id": "bifrost.security.java.stored-request-to-sql",
+      "authored_hash": "6eb131d0820bcc5b1334222eba6caf7b8ac71fc49642a622bf6c994f17895985",
+      "resolved_semantic_hash": null,
+      "category": "security",
+      "supported_languages": [
+        "java"
+      ],
+      "required_capabilities": [
+        "taint",
+        "exact-call-target",
+        "actual-to-formal-binding",
+        "declared-store-boundary",
+        "endpoint-set-imports"
+      ],
+      "severity_rationale": "A request value persisted through the declared store and read back into SQL text can change the executed statement and compromise application data.",
+      "remediation": "Pass untrusted values through the driver's parameter-binding contract instead of adding them to the SQL text.",
+      "activation": "opt-in"
+    },
+    {
+      "path": "policies/declared-storage/java-store-requires-validation.rqlp",
+      "id": "bifrost.security.java.store-requires-validation",
+      "authored_hash": "b42faaaff9edb0e9e3cbcb65692563dbd188379da522136d2e0304cd641213eb",
+      "resolved_semantic_hash": null,
+      "category": "security",
+      "supported_languages": [
+        "java"
+      ],
+      "required_capabilities": [
+        "flow",
+        "exact-call-target",
+        "actual-to-formal-binding",
+        "endpoint-set-imports"
+      ],
+      "severity_rationale": "A request value stored without the validator the workspace requires bypasses the application's own reviewed storage invariant.",
+      "remediation": "Pass request-derived values through the configured validator before storing them, or narrow the reviewed configuration if the obligation does not apply.",
+      "activation": "opt-in"
+    },
+    {
+      "path": "policies/declared-storage/javascript-stored-request-to-sql.rqlp",
+      "id": "bifrost.security.javascript.stored-request-to-sql",
+      "authored_hash": "e4d3400e5a5caa3ca1406c41628a4305ef944ad1915a85a7c6de640acfddffdd",
+      "resolved_semantic_hash": null,
+      "category": "security",
+      "supported_languages": [
+        "javascript"
+      ],
+      "required_capabilities": [
+        "taint",
+        "exact-call-target",
+        "actual-to-formal-binding",
+        "declared-store-boundary",
+        "endpoint-set-imports"
+      ],
+      "severity_rationale": "A request value persisted through the declared store and read back into SQL text can change the executed statement and compromise application data.",
+      "remediation": "Pass untrusted values through the driver's parameter-binding contract instead of adding them to the SQL text.",
+      "activation": "opt-in"
+    },
+    {
+      "path": "policies/declared-storage/javascript-store-requires-validation.rqlp",
+      "id": "bifrost.security.javascript.store-requires-validation",
+      "authored_hash": "775b8afe54e27e2b2e915bfa12c8c136b99d9a9dcdc9a0171f26155d0fc241c8",
+      "resolved_semantic_hash": null,
+      "category": "security",
+      "supported_languages": [
+        "javascript"
+      ],
+      "required_capabilities": [
+        "flow",
+        "exact-call-target",
+        "actual-to-formal-binding",
+        "endpoint-set-imports"
+      ],
+      "severity_rationale": "A request value stored without the validator the workspace requires bypasses the application's own reviewed storage invariant.",
+      "remediation": "Pass request-derived values through the configured validator before storing them, or narrow the reviewed configuration if the obligation does not apply.",
+      "activation": "opt-in"
+    },
+    {
+      "path": "policies/declared-storage/kotlin-stored-request-to-sql.rqlp",
+      "id": "bifrost.security.kotlin.stored-request-to-sql",
+      "authored_hash": "85ce41cda68fe035dad514d89220185b0c1f64890535d4e12d859e03afa7357c",
+      "resolved_semantic_hash": null,
+      "category": "security",
+      "supported_languages": [
+        "kotlin"
+      ],
+      "required_capabilities": [
+        "taint",
+        "exact-call-target",
+        "actual-to-formal-binding",
+        "declared-store-boundary",
+        "endpoint-set-imports"
+      ],
+      "severity_rationale": "A request value persisted through the declared store and read back into SQL text can change the executed statement and compromise application data.",
+      "remediation": "Pass untrusted values through the driver's parameter-binding contract instead of adding them to the SQL text.",
+      "activation": "opt-in"
+    },
+    {
+      "path": "policies/declared-storage/kotlin-store-requires-validation.rqlp",
+      "id": "bifrost.security.kotlin.store-requires-validation",
+      "authored_hash": "f897db6e958a74512a3161a2803679bdfa9cb7ec7b66ae9529cfa4298153a618",
+      "resolved_semantic_hash": null,
+      "category": "security",
+      "supported_languages": [
+        "kotlin"
+      ],
+      "required_capabilities": [
+        "flow",
+        "exact-call-target",
+        "actual-to-formal-binding",
+        "endpoint-set-imports"
+      ],
+      "severity_rationale": "A request value stored without the validator the workspace requires bypasses the application's own reviewed storage invariant.",
+      "remediation": "Pass request-derived values through the configured validator before storing them, or narrow the reviewed configuration if the obligation does not apply.",
+      "activation": "opt-in"
+    },
+    {
+      "path": "policies/declared-storage/php-stored-request-to-sql.rqlp",
+      "id": "bifrost.security.php.stored-request-to-sql",
+      "authored_hash": "1f808587f7eb33ec37ee6904ff9d5533d4175e24642c8749dd58d8ec11e50927",
+      "resolved_semantic_hash": null,
+      "category": "security",
+      "supported_languages": [
+        "php"
+      ],
+      "required_capabilities": [
+        "taint",
+        "exact-call-target",
+        "actual-to-formal-binding",
+        "declared-store-boundary",
+        "endpoint-set-imports"
+      ],
+      "severity_rationale": "A request value persisted through the declared store and read back into SQL text can change the executed statement and compromise application data.",
+      "remediation": "Pass untrusted values through the driver's parameter-binding contract instead of adding them to the SQL text.",
+      "activation": "opt-in"
+    },
+    {
+      "path": "policies/declared-storage/php-store-requires-validation.rqlp",
+      "id": "bifrost.security.php.store-requires-validation",
+      "authored_hash": "ffa1029dd6b1ce77378047e5fafaa4e777dfa32411dcaeae52f075ce17e390e9",
+      "resolved_semantic_hash": null,
+      "category": "security",
+      "supported_languages": [
+        "php"
+      ],
+      "required_capabilities": [
+        "flow",
+        "exact-call-target",
+        "actual-to-formal-binding",
+        "endpoint-set-imports"
+      ],
+      "severity_rationale": "A request value stored without the validator the workspace requires bypasses the application's own reviewed storage invariant.",
+      "remediation": "Pass request-derived values through the configured validator before storing them, or narrow the reviewed configuration if the obligation does not apply.",
+      "activation": "opt-in"
+    },
+    {
+      "path": "policies/declared-storage/python-stored-request-to-sql.rqlp",
+      "id": "bifrost.security.python.stored-request-to-sql",
+      "authored_hash": "b17a2fef926b5dd30c0f1e26618a9b2d0f8858b16b8bc396b3a0797be43b8572",
+      "resolved_semantic_hash": null,
+      "category": "security",
+      "supported_languages": [
+        "python"
+      ],
+      "required_capabilities": [
+        "taint",
+        "exact-call-target",
+        "actual-to-formal-binding",
+        "declared-store-boundary",
+        "endpoint-set-imports"
+      ],
+      "severity_rationale": "A request value persisted through the declared store and read back into SQL text can change the executed statement and compromise application data.",
+      "remediation": "Pass untrusted values through the driver's parameter-binding contract instead of adding them to the SQL text.",
+      "activation": "opt-in"
+    },
+    {
+      "path": "policies/declared-storage/python-store-requires-validation.rqlp",
+      "id": "bifrost.security.python.store-requires-validation",
+      "authored_hash": "bce539224954757ab05f45d4afdddda96f9b4968d81d710407e18c998635e974",
+      "resolved_semantic_hash": null,
+      "category": "security",
+      "supported_languages": [
+        "python"
+      ],
+      "required_capabilities": [
+        "flow",
+        "exact-call-target",
+        "actual-to-formal-binding",
+        "endpoint-set-imports"
+      ],
+      "severity_rationale": "A request value stored without the validator the workspace requires bypasses the application's own reviewed storage invariant.",
+      "remediation": "Pass request-derived values through the configured validator before storing them, or narrow the reviewed configuration if the obligation does not apply.",
+      "activation": "opt-in"
+    },
+    {
+      "path": "policies/declared-storage/ruby-stored-request-to-sql.rqlp",
+      "id": "bifrost.security.ruby.stored-request-to-sql",
+      "authored_hash": "4962b2137d27e6f0fc1aa3d7138b65132864fe5b6d2109d90cbc1bb1d003ba02",
+      "resolved_semantic_hash": null,
+      "category": "security",
+      "supported_languages": [
+        "ruby"
+      ],
+      "required_capabilities": [
+        "taint",
+        "exact-call-target",
+        "actual-to-formal-binding",
+        "declared-store-boundary",
+        "endpoint-set-imports"
+      ],
+      "severity_rationale": "A request value persisted through the declared store and read back into SQL text can change the executed statement and compromise application data.",
+      "remediation": "Pass untrusted values through the driver's parameter-binding contract instead of adding them to the SQL text.",
+      "activation": "opt-in"
+    },
+    {
+      "path": "policies/declared-storage/ruby-store-requires-validation.rqlp",
+      "id": "bifrost.security.ruby.store-requires-validation",
+      "authored_hash": "e06cf9385efd6893eff133e1e53e4ee734353e20bc0fce33906b800b952ceea1",
+      "resolved_semantic_hash": null,
+      "category": "security",
+      "supported_languages": [
+        "ruby"
+      ],
+      "required_capabilities": [
+        "flow",
+        "exact-call-target",
+        "actual-to-formal-binding",
+        "endpoint-set-imports"
+      ],
+      "severity_rationale": "A request value stored without the validator the workspace requires bypasses the application's own reviewed storage invariant.",
+      "remediation": "Pass request-derived values through the configured validator before storing them, or narrow the reviewed configuration if the obligation does not apply.",
+      "activation": "opt-in"
+    },
+    {
+      "path": "policies/declared-storage/rust-stored-request-to-sql.rqlp",
+      "id": "bifrost.security.rust.stored-request-to-sql",
+      "authored_hash": "8816b7080d97b02cc47f110d23ada1e817bc165487a6c56f29321cc5963d5c78",
+      "resolved_semantic_hash": null,
+      "category": "security",
+      "supported_languages": [
+        "rust"
+      ],
+      "required_capabilities": [
+        "taint",
+        "exact-call-target",
+        "actual-to-formal-binding",
+        "declared-store-boundary",
+        "endpoint-set-imports"
+      ],
+      "severity_rationale": "A request value persisted through the declared store and read back into SQL text can change the executed statement and compromise application data.",
+      "remediation": "Pass untrusted values through the driver's parameter-binding contract instead of adding them to the SQL text.",
+      "activation": "opt-in"
+    },
+    {
+      "path": "policies/declared-storage/rust-store-requires-validation.rqlp",
+      "id": "bifrost.security.rust.store-requires-validation",
+      "authored_hash": "2fdb10af8360284dcd19ddc4ae73011f11d08e735f2ccb3a7f93dc14c808d91a",
+      "resolved_semantic_hash": null,
+      "category": "security",
+      "supported_languages": [
+        "rust"
+      ],
+      "required_capabilities": [
+        "flow",
+        "exact-call-target",
+        "actual-to-formal-binding",
+        "endpoint-set-imports"
+      ],
+      "severity_rationale": "A request value stored without the validator the workspace requires bypasses the application's own reviewed storage invariant.",
+      "remediation": "Pass request-derived values through the configured validator before storing them, or narrow the reviewed configuration if the obligation does not apply.",
+      "activation": "opt-in"
+    },
+    {
+      "path": "policies/declared-storage/scala-stored-request-to-sql.rqlp",
+      "id": "bifrost.security.scala.stored-request-to-sql",
+      "authored_hash": "d2ab845883799e753ec247a33b0c0095cfa8076ea70caf86787f49d44e0bdc35",
+      "resolved_semantic_hash": null,
+      "category": "security",
+      "supported_languages": [
+        "scala"
+      ],
+      "required_capabilities": [
+        "taint",
+        "exact-call-target",
+        "actual-to-formal-binding",
+        "declared-store-boundary",
+        "endpoint-set-imports"
+      ],
+      "severity_rationale": "A request value persisted through the declared store and read back into SQL text can change the executed statement and compromise application data.",
+      "remediation": "Pass untrusted values through the driver's parameter-binding contract instead of adding them to the SQL text.",
+      "activation": "opt-in"
+    },
+    {
+      "path": "policies/declared-storage/scala-store-requires-validation.rqlp",
+      "id": "bifrost.security.scala.store-requires-validation",
+      "authored_hash": "8b2f4c177adcb9e10537d4f3d4272fe5c6528b76d942dc2dfbd8f240d098e61e",
+      "resolved_semantic_hash": null,
+      "category": "security",
+      "supported_languages": [
+        "scala"
+      ],
+      "required_capabilities": [
+        "flow",
+        "exact-call-target",
+        "actual-to-formal-binding",
+        "endpoint-set-imports"
+      ],
+      "severity_rationale": "A request value stored without the validator the workspace requires bypasses the application's own reviewed storage invariant.",
+      "remediation": "Pass request-derived values through the configured validator before storing them, or narrow the reviewed configuration if the obligation does not apply.",
+      "activation": "opt-in"
+    },
+    {
+      "path": "policies/declared-storage/typescript-stored-request-to-sql.rqlp",
+      "id": "bifrost.security.typescript.stored-request-to-sql",
+      "authored_hash": "70c618b0fd2b385314176e134a73cb68c378b1010b1147fdb898249123118b9b",
+      "resolved_semantic_hash": null,
+      "category": "security",
+      "supported_languages": [
+        "typescript"
+      ],
+      "required_capabilities": [
+        "taint",
+        "exact-call-target",
+        "actual-to-formal-binding",
+        "declared-store-boundary",
+        "endpoint-set-imports"
+      ],
+      "severity_rationale": "A request value persisted through the declared store and read back into SQL text can change the executed statement and compromise application data.",
+      "remediation": "Pass untrusted values through the driver's parameter-binding contract instead of adding them to the SQL text.",
+      "activation": "opt-in"
+    },
+    {
+      "path": "policies/declared-storage/typescript-store-requires-validation.rqlp",
+      "id": "bifrost.security.typescript.store-requires-validation",
+      "authored_hash": "3b40938621aab7b234702813d6bb20a4e4b2d70c01b67b538fa17fc5ddf67829",
+      "resolved_semantic_hash": null,
+      "category": "security",
+      "supported_languages": [
+        "typescript"
+      ],
+      "required_capabilities": [
+        "flow",
+        "exact-call-target",
+        "actual-to-formal-binding",
+        "endpoint-set-imports"
+      ],
+      "severity_rationale": "A request value stored without the validator the workspace requires bypasses the application's own reviewed storage invariant.",
+      "remediation": "Pass request-derived values through the configured validator before storing them, or narrow the reviewed configuration if the obligation does not apply.",
+      "activation": "opt-in"
     }
   ]
 }

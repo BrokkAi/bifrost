@@ -139,6 +139,162 @@ const SECURITY_POLICY_SOURCES: &[(&str, &str)] = &[
             "../policy-packs/bifrost.security/policies/jvm/system-getenv-to-runtime-exec.rqlp"
         ),
     ),
+    (
+        "policies/declared-storage/c-stored-request-to-sql.rqlp",
+        include_str!(
+            "../policy-packs/bifrost.security/policies/declared-storage/c-stored-request-to-sql.rqlp"
+        ),
+    ),
+    (
+        "policies/declared-storage/c-store-requires-validation.rqlp",
+        include_str!(
+            "../policy-packs/bifrost.security/policies/declared-storage/c-store-requires-validation.rqlp"
+        ),
+    ),
+    (
+        "policies/declared-storage/cpp-stored-request-to-sql.rqlp",
+        include_str!(
+            "../policy-packs/bifrost.security/policies/declared-storage/cpp-stored-request-to-sql.rqlp"
+        ),
+    ),
+    (
+        "policies/declared-storage/cpp-store-requires-validation.rqlp",
+        include_str!(
+            "../policy-packs/bifrost.security/policies/declared-storage/cpp-store-requires-validation.rqlp"
+        ),
+    ),
+    (
+        "policies/declared-storage/csharp-stored-request-to-sql.rqlp",
+        include_str!(
+            "../policy-packs/bifrost.security/policies/declared-storage/csharp-stored-request-to-sql.rqlp"
+        ),
+    ),
+    (
+        "policies/declared-storage/csharp-store-requires-validation.rqlp",
+        include_str!(
+            "../policy-packs/bifrost.security/policies/declared-storage/csharp-store-requires-validation.rqlp"
+        ),
+    ),
+    (
+        "policies/declared-storage/go-stored-request-to-sql.rqlp",
+        include_str!(
+            "../policy-packs/bifrost.security/policies/declared-storage/go-stored-request-to-sql.rqlp"
+        ),
+    ),
+    (
+        "policies/declared-storage/go-store-requires-validation.rqlp",
+        include_str!(
+            "../policy-packs/bifrost.security/policies/declared-storage/go-store-requires-validation.rqlp"
+        ),
+    ),
+    (
+        "policies/declared-storage/java-stored-request-to-sql.rqlp",
+        include_str!(
+            "../policy-packs/bifrost.security/policies/declared-storage/java-stored-request-to-sql.rqlp"
+        ),
+    ),
+    (
+        "policies/declared-storage/java-store-requires-validation.rqlp",
+        include_str!(
+            "../policy-packs/bifrost.security/policies/declared-storage/java-store-requires-validation.rqlp"
+        ),
+    ),
+    (
+        "policies/declared-storage/javascript-stored-request-to-sql.rqlp",
+        include_str!(
+            "../policy-packs/bifrost.security/policies/declared-storage/javascript-stored-request-to-sql.rqlp"
+        ),
+    ),
+    (
+        "policies/declared-storage/javascript-store-requires-validation.rqlp",
+        include_str!(
+            "../policy-packs/bifrost.security/policies/declared-storage/javascript-store-requires-validation.rqlp"
+        ),
+    ),
+    (
+        "policies/declared-storage/kotlin-stored-request-to-sql.rqlp",
+        include_str!(
+            "../policy-packs/bifrost.security/policies/declared-storage/kotlin-stored-request-to-sql.rqlp"
+        ),
+    ),
+    (
+        "policies/declared-storage/kotlin-store-requires-validation.rqlp",
+        include_str!(
+            "../policy-packs/bifrost.security/policies/declared-storage/kotlin-store-requires-validation.rqlp"
+        ),
+    ),
+    (
+        "policies/declared-storage/php-stored-request-to-sql.rqlp",
+        include_str!(
+            "../policy-packs/bifrost.security/policies/declared-storage/php-stored-request-to-sql.rqlp"
+        ),
+    ),
+    (
+        "policies/declared-storage/php-store-requires-validation.rqlp",
+        include_str!(
+            "../policy-packs/bifrost.security/policies/declared-storage/php-store-requires-validation.rqlp"
+        ),
+    ),
+    (
+        "policies/declared-storage/python-stored-request-to-sql.rqlp",
+        include_str!(
+            "../policy-packs/bifrost.security/policies/declared-storage/python-stored-request-to-sql.rqlp"
+        ),
+    ),
+    (
+        "policies/declared-storage/python-store-requires-validation.rqlp",
+        include_str!(
+            "../policy-packs/bifrost.security/policies/declared-storage/python-store-requires-validation.rqlp"
+        ),
+    ),
+    (
+        "policies/declared-storage/ruby-stored-request-to-sql.rqlp",
+        include_str!(
+            "../policy-packs/bifrost.security/policies/declared-storage/ruby-stored-request-to-sql.rqlp"
+        ),
+    ),
+    (
+        "policies/declared-storage/ruby-store-requires-validation.rqlp",
+        include_str!(
+            "../policy-packs/bifrost.security/policies/declared-storage/ruby-store-requires-validation.rqlp"
+        ),
+    ),
+    (
+        "policies/declared-storage/rust-stored-request-to-sql.rqlp",
+        include_str!(
+            "../policy-packs/bifrost.security/policies/declared-storage/rust-stored-request-to-sql.rqlp"
+        ),
+    ),
+    (
+        "policies/declared-storage/rust-store-requires-validation.rqlp",
+        include_str!(
+            "../policy-packs/bifrost.security/policies/declared-storage/rust-store-requires-validation.rqlp"
+        ),
+    ),
+    (
+        "policies/declared-storage/scala-stored-request-to-sql.rqlp",
+        include_str!(
+            "../policy-packs/bifrost.security/policies/declared-storage/scala-stored-request-to-sql.rqlp"
+        ),
+    ),
+    (
+        "policies/declared-storage/scala-store-requires-validation.rqlp",
+        include_str!(
+            "../policy-packs/bifrost.security/policies/declared-storage/scala-store-requires-validation.rqlp"
+        ),
+    ),
+    (
+        "policies/declared-storage/typescript-stored-request-to-sql.rqlp",
+        include_str!(
+            "../policy-packs/bifrost.security/policies/declared-storage/typescript-stored-request-to-sql.rqlp"
+        ),
+    ),
+    (
+        "policies/declared-storage/typescript-store-requires-validation.rqlp",
+        include_str!(
+            "../policy-packs/bifrost.security/policies/declared-storage/typescript-store-requires-validation.rqlp"
+        ),
+    ),
 ];
 
 const EFFECTS_POLICY_SOURCES: &[(&str, &str)] = &[
@@ -198,6 +354,20 @@ pub struct BuiltInPolicyCatalogManifest {
     pub packs: Vec<BuiltInPolicyPackManifest>,
 }
 
+/// How a shipped policy joins a run. `Default` policies join every pack and
+/// category selection; an `OptIn` policy runs only when a policy-id selector
+/// names it, because its meaning depends on reviewed workspace configuration
+/// a default run cannot assume.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum PolicyActivation {
+    #[default]
+    Default,
+    OptIn,
+}
+
 /// One built-in policy entry under the schema-v2 identity contract.
 ///
 /// `authored_hash` is always present: it is the deterministic identity of the
@@ -220,6 +390,8 @@ pub struct BuiltInPolicyManifestEntry {
     pub required_capabilities: Vec<String>,
     pub severity_rationale: String,
     pub remediation: String,
+    #[serde(default)]
+    pub activation: PolicyActivation,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -662,6 +834,13 @@ impl BuiltInPolicyCatalog {
                 .into_iter()
                 .all(|(dimension, value)| dimension.is_empty() || dimension.contains(value))
             })
+            // An opt-in policy runs only when a policy-id selector names it:
+            // its meaning depends on reviewed workspace configuration, and a
+            // pack- or category-wide selection must not activate it silently.
+            .filter(|(_, entry)| {
+                entry.activation != PolicyActivation::OptIn
+                    || selection.policy_ids.contains(&entry.id)
+            })
             .map(|(pack, entry)| SelectedBuiltInPolicy {
                 manifest: entry,
                 source: self.source_by_policy_id[entry.id.as_str()].as_str(),
@@ -718,10 +897,14 @@ fn resolved_identity(
 }
 
 /// Whether an analyzer-free registration failed only because a qualified
-/// locator needs an active model. Every other failure is an authoring defect.
+/// locator needs an active model or a workspace-authored endpoint-set import
+/// needs the workspace. Every other failure is an authoring defect.
 fn is_deferred_rejection(error: &PolicyRegistryError) -> bool {
     match error {
         PolicyRegistryError::Source(source) => is_qualified_locator_code(source.diagnostic.code),
+        PolicyRegistryError::EndpointSetImport { error, .. } => {
+            error.diagnostic.code == "endpoint-set-import-requires-workspace"
+        }
         _ => false,
     }
 }
@@ -923,7 +1106,7 @@ mod tests {
                 .expect("security pack")
                 .policies
                 .len(),
-            2
+            28
         );
         let effects = catalog
             .pack_manifest(EFFECTS_PACK_ID)

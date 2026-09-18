@@ -9,13 +9,15 @@ use super::java_artifact::{
     JavaClassSurfaceOutcome, class_surface, class_surface_facts, zip_directory_status_with_limits,
 };
 use crate::CancellationToken;
+use crate::analyzer::install_on_dedicated_build_pool;
 use crate::analyzer::semantic_model::{
     ArtifactProducerLimits, ArtifactProduction, ArtifactProductionRequest, AuthoredPayload,
     AuthoredSemanticModelPack, AuthoredShard, BoundedProducerDiagnostics, Completeness,
-    ExactArtifact, ExternalArtifactKind, ExternalArtifactPackProducer, MemberFact, Producer,
-    ProducerDiagnostic, ProducerDiagnosticSeverity, TypeFact, Visibility,
+    ExactArtifact, ExactSourceEntry, ExternalArtifactKind, ExternalArtifactPackProducer,
+    MemberFact, Producer, ProducerDiagnostic, ProducerDiagnosticSeverity, TypeFact, Visibility,
 };
 use crate::hash::{HashMap, HashSet};
+use rayon::prelude::*;
 use std::collections::BTreeMap;
 use std::io::{Cursor, Read};
 use zip::ZipArchive;
@@ -115,187 +117,103 @@ impl JdkJmodSetPackProducer {
             );
         }
 
-        let mut diagnostics = BoundedProducerDiagnostics::new(limits);
-        let mut modules = BTreeMap::<String, ModuleFacts>::new();
-        let mut remaining_records = limits.max_records;
-        let mut record_limit_hit = false;
+        // The per-module archive read and class-table walk are the whole cost
+        // of this producer, so they run on the process's parallelism. A module
+        // that demands more of the artifact's record budget than the artifact
+        // can spare is a different production from its own-budget counterpart,
+        // and that case falls back to the single pass below.
+        let loaded = match self.load_jmod_modules(artifact, limits, cancellation) {
+            Some(loaded) => loaded,
+            None => return cancelled_production(limits),
+        };
+        if loaded_demands_shared_budget(&loaded, limits) {
+            return self.produce_single_pass(request, limits, cancellation, artifact);
+        }
+        self.assemble_loaded(request, artifact, limits, loaded, false)
+    }
 
+    /// Read and parse every module archive of the source set on the process's
+    /// parallelism.
+    ///
+    /// One worker reads and parses one module under a record budget of its own.
+    /// Whether the result can be assembled into the bytes a single pass would
+    /// have produced is [`loaded_demands_shared_budget`]'s question.
+    ///
+    /// `None` means the production was cancelled.
+    fn load_jmod_modules(
+        &self,
+        artifact: &ExactArtifact,
+        limits: &ArtifactProducerLimits,
+        cancellation: Option<&CancellationToken>,
+    ) -> Option<Vec<LoadedJmod>> {
+        install_on_dedicated_build_pool(|| {
+            artifact
+                .source_entries()
+                .par_iter()
+                .map(|source_entry| {
+                    let mut budget = RecordBudget::new(limits);
+                    load_jmod_entry(source_entry, limits, cancellation, &mut budget)
+                })
+                .collect::<Vec<_>>()
+        })
+        .into_iter()
+        .collect()
+    }
+
+    /// Produce with one record budget shared by every module of the artifact.
+    ///
+    /// Reading each module under a budget of its own cannot produce the bytes
+    /// of a single pass once the artifact's shared budget is reached, because
+    /// reaching it inside one module also stops the parse of every later
+    /// module. That is rare: the default budget is several times what a real
+    /// JDK demands. Exactness wins over the parallelism, so the producer
+    /// repeats the read this way whenever the shared budget can bind.
+    fn produce_single_pass(
+        &self,
+        request: &ArtifactProductionRequest,
+        limits: &ArtifactProducerLimits,
+        cancellation: Option<&CancellationToken>,
+        artifact: &ExactArtifact,
+    ) -> ArtifactProduction {
+        let mut budget = RecordBudget::new(limits);
+        let mut loaded = Vec::with_capacity(artifact.source_entries().len());
         for source_entry in artifact.source_entries() {
             if cancellation.is_some_and(CancellationToken::is_cancelled) {
                 return cancelled_production(limits);
             }
-            let relative_path = source_entry.relative_path();
-            let Some(module) = jmod_module_name(relative_path, &mut diagnostics) else {
+            let Some(entry) = load_jmod_entry(source_entry, limits, cancellation, &mut budget)
+            else {
+                return cancelled_production(limits);
+            };
+            loaded.push(entry);
+        }
+        self.assemble_loaded(request, artifact, limits, loaded, budget.exhausted)
+    }
+
+    /// Insert every loaded module and finish the pack.
+    ///
+    /// The modules are assembled in source-entry order. That is what decides
+    /// which of two disagreeing declarations is retained, and in which order
+    /// the diagnostics that report them arrive.
+    fn assemble_loaded(
+        &self,
+        request: &ArtifactProductionRequest,
+        artifact: &ExactArtifact,
+        limits: &ArtifactProducerLimits,
+        loaded: Vec<LoadedJmod>,
+        record_limit_hit: bool,
+    ) -> ArtifactProduction {
+        let mut diagnostics = BoundedProducerDiagnostics::new(limits);
+        let mut modules = BTreeMap::<String, ModuleFacts>::new();
+        for entry in loaded {
+            diagnostics.absorb(entry.read_diagnostics);
+            let Some(module) = entry.module else {
                 continue;
             };
-            let module_facts = modules.entry(module.clone()).or_default();
-            let bytes = source_entry.bytes();
-            if zip_directory_status_with_limits(
-                bytes,
-                MAX_JMOD_ARCHIVE_ENTRIES,
-                MAX_JMOD_CENTRAL_DIRECTORY_BYTES,
-            ) == super::java_artifact::ZipDirectoryStatus::Exceeded
-            {
-                diagnostics.error(
-                    "limit.archive_directory",
-                    Some(relative_path.to_owned()),
-                    "JDK JMOD central directory exceeds bounded entry or byte limits",
-                );
-                continue;
-            }
-            let mut archive = match ZipArchive::new(Cursor::new(bytes)) {
-                Ok(archive) => archive,
-                Err(_) => {
-                    diagnostics.error(
-                        "jdk.jmod.invalid",
-                        Some(relative_path.to_owned()),
-                        "JDK JMOD is not a readable ZIP archive",
-                    );
-                    continue;
-                }
-            };
-            let entry_limit = archive.len().min(MAX_JMOD_ARCHIVE_ENTRIES);
-            if archive.len() > MAX_JMOD_ARCHIVE_ENTRIES {
-                diagnostics.warning(
-                    "limit.archive_entries",
-                    Some(relative_path.to_owned()),
-                    format!(
-                        "producer inspected at most {MAX_JMOD_ARCHIVE_ENTRIES} JMOD archive entries"
-                    ),
-                );
-            }
-            let mut total_class_bytes = 0u64;
-            let mut class_entries = Vec::new();
-            let mut module_info = None;
-            for index in 0..entry_limit {
-                if cancellation.is_some_and(CancellationToken::is_cancelled) {
-                    return cancelled_production(limits);
-                }
-                let Ok(mut entry) = archive.by_index(index) else {
-                    diagnostics.warning(
-                        "jdk.jmod.entry",
-                        Some(relative_path.to_owned()),
-                        format!("could not read JMOD entry at index {index}"),
-                    );
-                    continue;
-                };
-                let entry_name = entry.name().to_owned();
-                if entry_name == "classes/module-info.class" {
-                    let mut bytes = Vec::new();
-                    if entry
-                        .by_ref()
-                        .take(MAX_JMOD_CLASS_ENTRY_BYTES.saturating_add(1))
-                        .read_to_end(&mut bytes)
-                        .is_err()
-                        || bytes.len() as u64 > MAX_JMOD_CLASS_ENTRY_BYTES
-                    {
-                        diagnostics.error(
-                            "jdk.jmod.module_info",
-                            Some(format!("{relative_path}:{entry_name}")),
-                            "could not read bounded module-info.class bytes",
-                        );
-                    } else {
-                        module_info = Some(bytes);
-                    }
-                    continue;
-                }
-                let class_entry =
-                    match jmod_class_entry(&entry_name, &mut diagnostics, relative_path) {
-                        Some(entry) => entry,
-                        None => continue,
-                    };
-                let next_total = total_class_bytes.saturating_add(entry.size());
-                if entry.size() > MAX_JMOD_CLASS_ENTRY_BYTES
-                    || next_total > MAX_JMOD_TOTAL_CLASS_BYTES
-                {
-                    diagnostics.warning(
-                        "limit.archive_bytes",
-                        Some(format!("{relative_path}:{class_entry}")),
-                        "JMOD class entry exceeded the bounded extraction budget",
-                    );
-                    continue;
-                }
-                total_class_bytes = next_total;
-                let mut class_bytes = Vec::with_capacity(entry.size() as usize);
-                if entry
-                    .by_ref()
-                    .take(MAX_JMOD_CLASS_ENTRY_BYTES.saturating_add(1))
-                    .read_to_end(&mut class_bytes)
-                    .is_err()
-                    || class_bytes.len() as u64 > MAX_JMOD_CLASS_ENTRY_BYTES
-                {
-                    diagnostics.warning(
-                        "jdk.jmod.entry_read",
-                        Some(format!("{relative_path}:{class_entry}")),
-                        "could not read bounded JMOD class entry bytes",
-                    );
-                    continue;
-                }
-                class_entries.push((class_entry, class_bytes));
-            }
-            class_entries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
-            let exported_packages = match module_info
-                .as_deref()
-                .and_then(|bytes| parse_module_exports(bytes).ok())
-            {
-                Some(packages) => packages,
-                None => {
-                    diagnostics.error(
-                        "jdk.jmod.module_info",
-                        Some(relative_path.to_owned()),
-                        "JDK JMOD is missing a structurally valid module-info.class descriptor",
-                    );
-                    continue;
-                }
-            };
-            let mut surfaces = Vec::new();
-            for (class_entry, class_bytes) in class_entries {
-                let surface = match class_surface(
-                    relative_path,
-                    &class_entry,
-                    &class_bytes,
-                    limits.max_signature_depth,
-                    &mut remaining_records,
-                    &mut record_limit_hit,
-                    &mut diagnostics,
-                ) {
-                    JavaClassSurfaceOutcome::Declared(surface) => surface,
-                    JavaClassSurfaceOutcome::Excluded | JavaClassSurfaceOutcome::Skipped => {
-                        continue;
-                    }
-                    JavaClassSurfaceOutcome::Invalid => {
-                        diagnostics.warning(
-                            "java.class.invalid",
-                            Some(format!("{relative_path}:{class_entry}")),
-                            "JMOD class entry did not contain supported bounded metadata",
-                        );
-                        continue;
-                    }
-                };
-                surfaces.push(surface);
-            }
-            let visibility_by_name = surfaces
-                .iter()
-                .map(|surface| (surface.name.clone(), surface.visibility))
-                .collect::<HashMap<_, _>>();
-            for mut surface in surfaces {
-                let mut effective = surface.visibility;
-                let mut enclosing = surface.name.as_str();
-                while let Some((owner, _)) = enclosing.rsplit_once('.') {
-                    if let Some(owner_visibility) = visibility_by_name.get(owner) {
-                        effective = restrict_visibility(effective, *owner_visibility);
-                    }
-                    enclosing = owner;
-                }
-                if !matches!(effective, Visibility::Public | Visibility::Protected)
-                    || !exported_packages.contains(&surface.package_name)
-                {
-                    continue;
-                }
-                surface.visibility = effective;
-                let (types, members) =
-                    class_surface_facts(surface, limits.max_records, &mut diagnostics);
-                module_facts.insert(types, members, &mut diagnostics);
+            let module_facts = modules.entry(module).or_default();
+            for surface in entry.surfaces {
+                diagnostics.absorb(surface.diagnostics);
+                module_facts.insert(surface.types, surface.members, &mut diagnostics);
             }
         }
 
@@ -417,6 +335,305 @@ impl JdkJmodSetPackProducer {
             suppressed_diagnostics,
         }
     }
+}
+
+/// One module archive after its classes have been read and parsed.
+///
+/// The parse is done but the facts are not inserted yet: insertion order is an
+/// artifact-level decision, so the assembly inserts them once every module has
+/// been read.
+struct LoadedJmod {
+    /// The module the source entry names, or `None` when the producer rejected
+    /// the entry as a module archive and reported that itself.
+    module: Option<String>,
+    /// What reading the archive and parsing its class surfaces reported, in the
+    /// order a single pass reports it.
+    read_diagnostics: Vec<ProducerDiagnostic>,
+    /// One entry per retained class surface, in class-entry order.
+    surfaces: Vec<LoadedJmodSurface>,
+    /// Declaration records the parse took from its budget.
+    records_used: usize,
+    /// Whether the parse stopped because its budget was empty.
+    record_limit_hit: bool,
+}
+
+/// The facts of one retained class surface, and what producing them reported.
+struct LoadedJmodSurface {
+    types: Vec<TypeFact>,
+    members: Vec<MemberFact>,
+    diagnostics: Vec<ProducerDiagnostic>,
+}
+
+/// The declaration-record budget the parse spends.
+///
+/// One budget is spent across an artifact's modules, so an artifact that
+/// demands more records than the limit retains exactly the records a single
+/// pass in source-entry order would have retained.
+struct RecordBudget {
+    remaining: usize,
+    exhausted: bool,
+}
+
+impl RecordBudget {
+    fn new(limits: &ArtifactProducerLimits) -> Self {
+        Self {
+            remaining: limits.max_records,
+            exhausted: false,
+        }
+    }
+}
+
+/// Whether these modules can only be assembled into the bytes of a single pass
+/// that shares one record budget across the whole artifact.
+///
+/// Every module was parsed under a budget of its own, and the two agree unless
+/// the shared budget would have run out: inside the module whose demand
+/// exceeds what the single pass would still have had, or at any later module,
+/// which the single pass would have stopped at. A module that demanded more
+/// than a whole budget reports that itself.
+fn loaded_demands_shared_budget(loaded: &[LoadedJmod], limits: &ArtifactProducerLimits) -> bool {
+    let mut consumed = 0usize;
+    loaded.iter().any(|entry| {
+        consumed += entry.records_used;
+        entry.record_limit_hit || consumed > limits.max_records
+    })
+}
+
+/// A loaded module that contributes diagnostics and no retained class surface.
+///
+/// The source entry did not name a module archive, the archive could not be
+/// read, or it carries no module descriptor. In every case the module
+/// contributes nothing to the pack, and a declaration record it never produced
+/// is never charged to the budget.
+fn loaded_without_surfaces(
+    module: Option<String>,
+    mut diagnostics: BoundedProducerDiagnostics,
+    records_before: usize,
+    budget: &RecordBudget,
+) -> LoadedJmod {
+    LoadedJmod {
+        module,
+        read_diagnostics: diagnostics.take_retained(),
+        surfaces: Vec::new(),
+        records_used: records_before - budget.remaining,
+        record_limit_hit: budget.exhausted,
+    }
+}
+
+/// Read one module archive and parse every class surface it declares.
+///
+/// The caller supplies the record budget the parse spends from: the parallel
+/// load gives each module a budget of its own and the single pass shares one
+/// across the artifact. `None` means the production was cancelled.
+fn load_jmod_entry(
+    source_entry: &ExactSourceEntry,
+    limits: &ArtifactProducerLimits,
+    cancellation: Option<&CancellationToken>,
+    budget: &mut RecordBudget,
+) -> Option<LoadedJmod> {
+    let records_before = budget.remaining;
+    let mut diagnostics = BoundedProducerDiagnostics::unbounded(limits);
+    let relative_path = source_entry.relative_path();
+    let Some(module) = jmod_module_name(relative_path, &mut diagnostics) else {
+        return Some(loaded_without_surfaces(
+            None,
+            diagnostics,
+            records_before,
+            budget,
+        ));
+    };
+    let bytes = source_entry.bytes();
+    if zip_directory_status_with_limits(
+        bytes,
+        MAX_JMOD_ARCHIVE_ENTRIES,
+        MAX_JMOD_CENTRAL_DIRECTORY_BYTES,
+    ) == super::java_artifact::ZipDirectoryStatus::Exceeded
+    {
+        diagnostics.error(
+            "limit.archive_directory",
+            Some(relative_path.to_owned()),
+            "JDK JMOD central directory exceeds bounded entry or byte limits",
+        );
+        return Some(loaded_without_surfaces(
+            Some(module),
+            diagnostics,
+            records_before,
+            budget,
+        ));
+    }
+    let mut archive = match ZipArchive::new(Cursor::new(bytes)) {
+        Ok(archive) => archive,
+        Err(_) => {
+            diagnostics.error(
+                "jdk.jmod.invalid",
+                Some(relative_path.to_owned()),
+                "JDK JMOD is not a readable ZIP archive",
+            );
+            return Some(loaded_without_surfaces(
+                Some(module),
+                diagnostics,
+                records_before,
+                budget,
+            ));
+        }
+    };
+    let entry_limit = archive.len().min(MAX_JMOD_ARCHIVE_ENTRIES);
+    if archive.len() > MAX_JMOD_ARCHIVE_ENTRIES {
+        diagnostics.warning(
+            "limit.archive_entries",
+            Some(relative_path.to_owned()),
+            format!("producer inspected at most {MAX_JMOD_ARCHIVE_ENTRIES} JMOD archive entries"),
+        );
+    }
+    let mut total_class_bytes = 0u64;
+    let mut class_entries = Vec::new();
+    let mut module_info = None;
+    for index in 0..entry_limit {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return None;
+        }
+        let Ok(mut entry) = archive.by_index(index) else {
+            diagnostics.warning(
+                "jdk.jmod.entry",
+                Some(relative_path.to_owned()),
+                format!("could not read JMOD entry at index {index}"),
+            );
+            continue;
+        };
+        let entry_name = entry.name().to_owned();
+        if entry_name == "classes/module-info.class" {
+            let mut bytes = Vec::new();
+            if entry
+                .by_ref()
+                .take(MAX_JMOD_CLASS_ENTRY_BYTES.saturating_add(1))
+                .read_to_end(&mut bytes)
+                .is_err()
+                || bytes.len() as u64 > MAX_JMOD_CLASS_ENTRY_BYTES
+            {
+                diagnostics.error(
+                    "jdk.jmod.module_info",
+                    Some(format!("{relative_path}:{entry_name}")),
+                    "could not read bounded module-info.class bytes",
+                );
+            } else {
+                module_info = Some(bytes);
+            }
+            continue;
+        }
+        let class_entry = match jmod_class_entry(&entry_name, &mut diagnostics, relative_path) {
+            Some(entry) => entry,
+            None => continue,
+        };
+        let next_total = total_class_bytes.saturating_add(entry.size());
+        if entry.size() > MAX_JMOD_CLASS_ENTRY_BYTES || next_total > MAX_JMOD_TOTAL_CLASS_BYTES {
+            diagnostics.warning(
+                "limit.archive_bytes",
+                Some(format!("{relative_path}:{class_entry}")),
+                "JMOD class entry exceeded the bounded extraction budget",
+            );
+            continue;
+        }
+        total_class_bytes = next_total;
+        let mut class_bytes = Vec::with_capacity(entry.size() as usize);
+        if entry
+            .by_ref()
+            .take(MAX_JMOD_CLASS_ENTRY_BYTES.saturating_add(1))
+            .read_to_end(&mut class_bytes)
+            .is_err()
+            || class_bytes.len() as u64 > MAX_JMOD_CLASS_ENTRY_BYTES
+        {
+            diagnostics.warning(
+                "jdk.jmod.entry_read",
+                Some(format!("{relative_path}:{class_entry}")),
+                "could not read bounded JMOD class entry bytes",
+            );
+            continue;
+        }
+        class_entries.push((class_entry, class_bytes));
+    }
+    class_entries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    let exported_packages = match module_info
+        .as_deref()
+        .and_then(|bytes| parse_module_exports(bytes).ok())
+    {
+        Some(packages) => packages,
+        None => {
+            diagnostics.error(
+                "jdk.jmod.module_info",
+                Some(relative_path.to_owned()),
+                "JDK JMOD is missing a structurally valid module-info.class descriptor",
+            );
+            return Some(loaded_without_surfaces(
+                Some(module),
+                diagnostics,
+                records_before,
+                budget,
+            ));
+        }
+    };
+    // The surfaces are parsed here but their facts are handed to the caller,
+    // which inserts them in source-entry order.
+    let read_diagnostics = diagnostics.take_retained();
+    let mut surfaces = Vec::new();
+    let mut parsed = Vec::new();
+    for (class_entry, class_bytes) in class_entries {
+        let surface = match class_surface(
+            relative_path,
+            &class_entry,
+            &class_bytes,
+            limits.max_signature_depth,
+            &mut budget.remaining,
+            &mut budget.exhausted,
+            &mut diagnostics,
+        ) {
+            JavaClassSurfaceOutcome::Declared(surface) => surface,
+            JavaClassSurfaceOutcome::Excluded | JavaClassSurfaceOutcome::Skipped => continue,
+            JavaClassSurfaceOutcome::Invalid => {
+                diagnostics.warning(
+                    "java.class.invalid",
+                    Some(format!("{relative_path}:{class_entry}")),
+                    "JMOD class entry did not contain supported bounded metadata",
+                );
+                continue;
+            }
+        };
+        parsed.push(surface);
+    }
+    let visibility_by_name = parsed
+        .iter()
+        .map(|surface| (surface.name.clone(), surface.visibility))
+        .collect::<HashMap<_, _>>();
+    for mut surface in parsed {
+        let mut effective = surface.visibility;
+        let mut enclosing = surface.name.as_str();
+        while let Some((owner, _)) = enclosing.rsplit_once('.') {
+            if let Some(owner_visibility) = visibility_by_name.get(owner) {
+                effective = restrict_visibility(effective, *owner_visibility);
+            }
+            enclosing = owner;
+        }
+        if !matches!(effective, Visibility::Public | Visibility::Protected)
+            || !exported_packages.contains(&surface.package_name)
+        {
+            continue;
+        }
+        surface.visibility = effective;
+        let (types, members) = class_surface_facts(surface, limits.max_records, &mut diagnostics);
+        surfaces.push(LoadedJmodSurface {
+            types,
+            members,
+            diagnostics: diagnostics.take_retained(),
+        });
+    }
+    // Every diagnostic this entry reported has to reach the assembly.
+    debug_assert!(diagnostics.is_empty());
+    Some(LoadedJmod {
+        module: Some(module),
+        read_diagnostics,
+        surfaces,
+        records_used: records_before - budget.remaining,
+        record_limit_hit: budget.exhausted,
+    })
 }
 
 fn restrict_visibility(declared: Visibility, enclosing: Visibility) -> Visibility {
@@ -1101,6 +1318,107 @@ mod tests {
         };
         assert_eq!(path, "jmods/java.base.jmod");
         assert_eq!(symbol, "classes/java/lang/Object.class");
+    }
+
+    /// The per-module parallel read must assemble exactly the bytes of the
+    /// single shared-budget pass, at every record budget where the two can
+    /// disagree.
+    ///
+    /// The single pass is the definition of what this producer produces; the
+    /// record budget is the only artifact-wide state the parse touches, so the
+    /// budgets around what this fixture demands are where a per-module budget
+    /// could retain a declaration the shared budget would have dropped.
+    #[test]
+    fn parallel_module_reads_reproduce_the_single_pass_pack_at_every_budget() {
+        let root = tempfile::tempdir().unwrap();
+        let jmods = root.path().join("jmods");
+        fs::create_dir(&jmods).unwrap();
+        write_jmod(
+            &jmods.join("java.base.jmod"),
+            &[
+                (
+                    "classes/java/lang/Object.class",
+                    sample_class("java/lang/Object"),
+                ),
+                (
+                    "classes/java/lang/String.class",
+                    sample_class("java/lang/String"),
+                ),
+            ],
+        );
+        write_jmod(
+            &jmods.join("java.logging.jmod"),
+            &[(
+                "classes/java/util/logging/Logger.class",
+                sample_class("java/util/logging/Logger"),
+            )],
+        );
+        write_jmod(
+            &jmods.join("java.sql.jmod"),
+            &[(
+                "classes/java/sql/Driver.class",
+                sample_class("java/sql/Driver"),
+            )],
+        );
+        let artifact = read_exact_source_set(
+            root.path(),
+            &[
+                PathBuf::from("jmods/java.base.jmod"),
+                PathBuf::from("jmods/java.logging.jmod"),
+                PathBuf::from("jmods/java.sql.jmod"),
+            ],
+            16,
+            8,
+            &ArtifactProducerLimits::default(),
+        )
+        .unwrap();
+
+        for max_records in [ArtifactProducerLimits::default().max_records, 4, 3, 2, 1] {
+            let limits = ArtifactProducerLimits {
+                max_records,
+                ..ArtifactProducerLimits::default()
+            };
+            let parallel = JdkJmodSetPackProducer.produce_loaded_artifact(
+                &request(root.path()),
+                &limits,
+                None,
+                &artifact,
+            );
+            let single = JdkJmodSetPackProducer.produce_single_pass(
+                &request(root.path()),
+                &limits,
+                None,
+                &artifact,
+            );
+            assert_eq!(
+                parallel.completeness, single.completeness,
+                "max_records={max_records}"
+            );
+            assert_eq!(
+                parallel.diagnostics, single.diagnostics,
+                "max_records={max_records}"
+            );
+            let parallel = parallel.pack.expect("parallel pass must emit a pack");
+            let single = single.pack.expect("single pass must emit a pack");
+            assert_eq!(
+                compile_pack(&parallel, &CompilerOptions::default()).unwrap(),
+                compile_pack(&single, &CompilerOptions::default()).unwrap(),
+                "max_records={max_records}"
+            );
+        }
+    }
+
+    fn sample_class(internal_name: &str) -> Vec<u8> {
+        test_class_file_bytes(&TestClassFile {
+            internal_name,
+            super_internal_name: "java/lang/Object",
+            methods: &[TestClassMethod {
+                name: "value",
+                descriptor: "()Ljava/lang/String;",
+                is_static: false,
+            }],
+            private_nested: false,
+        })
     }
 
     fn request(path: &Path) -> ArtifactProductionRequest {

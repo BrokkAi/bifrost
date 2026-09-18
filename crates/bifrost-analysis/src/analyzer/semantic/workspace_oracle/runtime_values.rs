@@ -168,7 +168,7 @@ use crate::analyzer::semantic::{
     SemanticCapability, SemanticEffect, SemanticGap, SemanticGapSubject, SemanticOutcome,
     SemanticProviderError, SemanticRequest, SemanticWork,
 };
-use crate::analyzer::{Language, parser_language_for_dialect};
+use crate::analyzer::{Language, LanguageDialect, parser_language_for_dialect};
 
 impl WorkspaceSemanticOracle<'_> {
     /// Bind a structured source candidate to its exact executable load.
@@ -358,6 +358,32 @@ use brokk_bifrost_js_ts::syntax::{
 
 pub(super) type RuntimeReadCache = CompleteValueCache<ProcedureHandle, RuntimeKeyedReadResult>;
 
+/// The runtime initialization and mutation footprint of every other
+/// JavaScript or TypeScript module in the workspace.
+///
+/// The reviewed runtime model states that a keyed read observes pristine input
+/// until a write. This is the workspace-derived half of that claim: the
+/// modules that the analyzer can read and parse, and the runtime-root writes
+/// they spell. It is deliberately not an authoring claim, because a pack
+/// cannot describe the mutations of a particular workspace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum WorkspaceRuntimeWriteFootprint {
+    /// Every other module reads, parses, and spells no runtime-root write.
+    Closed,
+    /// Another module spells a write to `process`, `globalThis`, or `global`
+    /// that reaches the runtime container.
+    RuntimeRootWrite,
+    /// Another module's source or syntax could not be inspected completely.
+    CoverageLimited,
+}
+
+pub(super) type WorkspaceRuntimeWriteFootprintCache =
+    CompleteValueCache<ProjectFile, WorkspaceRuntimeWriteFootprint>;
+
+pub(super) fn workspace_runtime_write_footprint_cache() -> WorkspaceRuntimeWriteFootprintCache {
+    CompleteValueCache::new(1024 * 1024, |_, _| 256)
+}
+
 pub(super) fn runtime_read_cache() -> RuntimeReadCache {
     CompleteValueCache::new(
         8 * 1024 * 1024,
@@ -408,6 +434,121 @@ pub(super) fn runtime_read_cache() -> RuntimeReadCache {
 }
 
 impl WorkspaceSemanticOracle<'_> {
+    /// Inspect every other JavaScript or TypeScript module once per captured
+    /// oracle for the runtime-root writes the pristine-input model names.
+    ///
+    /// The scan is bounded by the request budget: a module the budget cannot
+    /// cover keeps the answer incomplete rather than clean. Results are cached
+    /// per current module, because one keyed-read request evaluates every
+    /// procedure of that module.
+    fn workspace_runtime_write_footprint(
+        &self,
+        current: &ProjectFile,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<(WorkspaceRuntimeWriteFootprint, SemanticWork), SemanticProviderError> {
+        let (acquisition, _) = self
+            .runtime_write_footprints
+            .acquire(current, request.cancellation);
+        let permit = match acquisition {
+            CompleteValueAcquisition::Cached { value } => {
+                let work = SemanticWork {
+                    nested_entries: 1,
+                    ..SemanticWork::default()
+                };
+                if request.budget.charge(work).is_err() {
+                    return Ok((WorkspaceRuntimeWriteFootprint::CoverageLimited, work));
+                }
+                return Ok((*value, work));
+            }
+            CompleteValueAcquisition::Leader { permit } => permit,
+            CompleteValueAcquisition::Cancelled | CompleteValueAcquisition::Rejected => {
+                return Ok((
+                    WorkspaceRuntimeWriteFootprint::CoverageLimited,
+                    SemanticWork::default(),
+                ));
+            }
+        };
+        let (footprint, work) = self.scan_workspace_runtime_writes(current, request)?;
+        if footprint != WorkspaceRuntimeWriteFootprint::CoverageLimited {
+            permit.publish_complete(Arc::new(footprint));
+        }
+        Ok((footprint, work))
+    }
+
+    fn scan_workspace_runtime_writes(
+        &self,
+        current: &ProjectFile,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<(WorkspaceRuntimeWriteFootprint, SemanticWork), SemanticProviderError> {
+        let mut footprint = WorkspaceRuntimeWriteFootprint::Closed;
+        let mut work = SemanticWork::default();
+        let project = self.workspace.analyzer().project();
+        let files = project
+            .all_files_shared()
+            .map_err(|error| SemanticProviderError::internal(error.to_string()))?;
+        let mut parser = tree_sitter::Parser::new();
+        for file in files.iter() {
+            if file == current
+                || !matches!(file.language(), Language::JavaScript | Language::TypeScript)
+            {
+                continue;
+            }
+            if request.cancellation.is_cancelled() {
+                return Ok((WorkspaceRuntimeWriteFootprint::CoverageLimited, work));
+            }
+            let max_bytes = request.budget.remaining().source_bytes;
+            let snapshot = project
+                .read_source_snapshot_limited(file, max_bytes)
+                .map_err(|error| SemanticProviderError::internal(error.to_string()))?;
+            let Some(snapshot) = snapshot else {
+                return Ok((WorkspaceRuntimeWriteFootprint::CoverageLimited, work));
+            };
+            let source = snapshot.source().to_owned();
+            let file_work = SemanticWork {
+                source_bytes: source.len(),
+                ..SemanticWork::default()
+            };
+            work = work.conservative_add(file_work);
+            if request.budget.charge(file_work).is_err() {
+                return Ok((WorkspaceRuntimeWriteFootprint::CoverageLimited, work));
+            }
+            let dialect = LanguageDialect::for_path(file.language(), file.rel_path());
+            let Some(grammar) = parser_language_for_dialect(dialect) else {
+                return Ok((WorkspaceRuntimeWriteFootprint::CoverageLimited, work));
+            };
+            parser
+                .set_language(&grammar)
+                .map_err(|error| SemanticProviderError::internal(error.to_string()))?;
+            let mut input = |offset: usize, _| &source.as_bytes()[offset..];
+            let Some(tree) = parser.parse_with_options(&mut input, None, None) else {
+                return Ok((WorkspaceRuntimeWriteFootprint::CoverageLimited, work));
+            };
+            if tree.root_node().has_error() {
+                return Ok((WorkspaceRuntimeWriteFootprint::CoverageLimited, work));
+            }
+            let facts = extract_js_ts_runtime_reads(
+                tree.root_node(),
+                &source,
+                request.budget.remaining().nested_entries,
+            );
+            let fact_work = SemanticWork {
+                nested_entries: facts
+                    .visited_nodes
+                    .saturating_add(facts.reads.len())
+                    .saturating_add(facts.writes.len()),
+                ..SemanticWork::default()
+            };
+            work = work.conservative_add(fact_work);
+            if request.budget.charge(fact_work).is_err() || !facts.complete {
+                return Ok((WorkspaceRuntimeWriteFootprint::CoverageLimited, work));
+            }
+            if facts.writes.iter().any(runtime_root_write) {
+                footprint = WorkspaceRuntimeWriteFootprint::RuntimeRootWrite;
+            }
+        }
+        Ok((footprint, work))
+    }
+
     /// Ordinary semantic consumers pay no parse cost when the captured model
     /// snapshot has no runtime-value contracts to apply.
     pub(crate) fn runtime_refinements_for_procedure(
@@ -519,12 +660,6 @@ impl WorkspaceSemanticOracle<'_> {
     ) -> Result<SemanticOutcome<RuntimeKeyedReadResult>, SemanticProviderError> {
         let mut result = RuntimeKeyedReadResult::default();
         let max_bytes = request.budget.remaining().source_bytes;
-        // The initial effect proof closes one source module. A profile assertion
-        // cannot discharge writes in sibling modules that have not been inspected.
-        // The footprint check runs after extraction so shaped reads in a wider
-        // workspace keep their typed incomplete rows instead of vanishing into
-        // a clean zero.
-        let single_file_footprint = self.workspace.project_file_count() == 1;
         let Some((file, source)) =
             exact_source_for_procedure(self.workspace, procedure, max_bytes)?
         else {
@@ -548,6 +683,25 @@ impl WorkspaceSemanticOracle<'_> {
                 work,
             });
         }
+        // The runtime initialization footprint spans the whole workspace, not
+        // only the module that spells the read. Every other JavaScript or
+        // TypeScript module is inspected for the runtime-root writes that the
+        // reviewed `pristine-input-until-write` model names; an unreadable or
+        // unparseable sibling keeps the answer incomplete instead of clean.
+        let (footprint, footprint_work) = self.workspace_runtime_write_footprint(&file, request)?;
+        work = work.conservative_add(footprint_work);
+        // A footprint that is not closed still reports the read's own typed
+        // limitation. The extraction below keeps every candidate so a query
+        // anchored on this read sees the boundary instead of an empty answer.
+        let footprint_limitation = match footprint {
+            WorkspaceRuntimeWriteFootprint::Closed => None,
+            WorkspaceRuntimeWriteFootprint::RuntimeRootWrite => {
+                Some(RuntimeReadLimitation::MutationIncomplete)
+            }
+            WorkspaceRuntimeWriteFootprint::CoverageLimited => {
+                Some(RuntimeReadLimitation::CoverageLimited)
+            }
+        };
         let grammar = parser_language_for_dialect(procedure.artifact().key().language())
             .ok_or_else(|| SemanticProviderError::internal("runtime-read dialect has no parser"))?;
         let mut parser = tree_sitter::Parser::new();
@@ -609,38 +763,6 @@ impl WorkspaceSemanticOracle<'_> {
             result
                 .limitations
                 .push(RuntimeReadLimitation::CoverageLimited);
-        }
-        if !single_file_footprint {
-            for read in &facts.reads {
-                if loads_at_range(procedure, read.range).is_empty() {
-                    continue;
-                }
-                // The key identity is intentionally left uninterpreted on
-                // this path: the read keeps its anchor so the limitation
-                // below attaches to it, but no endpoint can publish.
-                result.candidates.push(RuntimeKeyedReadCandidate {
-                    anchor: read.candidate_anchor,
-                    global: read.root_name.clone(),
-                    container: read.container.clone(),
-                    key: None,
-                    excluded: false,
-                });
-            }
-            result
-                .limitations
-                .push(RuntimeReadLimitation::MutationIncomplete);
-            result.limitations.sort_by_key(|limit| limit.label());
-            result.limitations.dedup();
-            if request.cancellation.is_cancelled() {
-                return Ok(SemanticOutcome::Cancelled {
-                    partial: Some(result),
-                    work,
-                });
-            }
-            return Ok(SemanticOutcome::Unproven {
-                partial: result,
-                work,
-            });
         }
         for read in &facts.reads {
             let loads = loads_at_range(procedure, read.range);
@@ -713,6 +835,9 @@ impl WorkspaceSemanticOracle<'_> {
         }
         // Every runtime-shaped read in the closed footprint needs a modeled
         // effect contract. An unmodeled sibling may mutate the selected root.
+        if let Some(limitation) = footprint_limitation {
+            result.limitations.push(limitation);
+        }
         if !result.limitations.is_empty() {
             result.endpoints.clear();
         }
@@ -740,6 +865,16 @@ impl WorkspaceSemanticOracle<'_> {
 
 fn same_byte_span(left: Range, right: Range) -> bool {
     left.start_byte == right.start_byte && left.end_byte == right.end_byte
+}
+
+/// Whether one extracted write reaches the Node runtime container.
+///
+/// `root_name` is the canonical global root the extractor proved for the write
+/// site: direct `process` writes and the reflective `globalThis.process` or
+/// `global.process` routes all arrive as `process`, and a lexically bound
+/// `process` is never reported as one.
+fn runtime_root_write(write: &brokk_bifrost_js_ts::syntax::JsTsRuntimeWrite) -> bool {
+    write.root_name == "process"
 }
 
 use crate::analyzer::semantic_model::{
@@ -964,17 +1099,15 @@ impl WorkspaceSemanticOracle<'_> {
                 .push(RuntimeReadLimitation::AmbiguousOwner);
             return Ok(());
         }
-        // Resolve the identity of the same AST-derived structural seed used
-        // by the query. Both string and numeric subscripts use their container
-        // field as that seed; the endpoint still owns the full load below.
-        let identity_observation = if same_byte_span(read.candidate_anchor, read.container_range) {
-            container
-        } else {
-            &load.0
-        };
+        // The load's own result mapping carries the structural identity of the
+        // AST-derived seed the query addresses. A dot-member read is its own
+        // field access; a subscript read is represented by the base of its
+        // access chain, and the lowerer publishes that seed identity on the
+        // subscript load. A mapping without one stays a typed materialization
+        // boundary instead of being re-derived from the container occurrence.
         let identity_row = procedure
             .semantics()
-            .value(identity_observation.value().id())
+            .value(load.0.value().id())
             .expect("validated runtime identity observation");
         let identity_mapping = procedure
             .semantics()

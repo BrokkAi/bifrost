@@ -1690,7 +1690,9 @@ fn validate_resolved_taint(
     if authored.mode != resolved.mode || authored.call_modeling != resolved.call_modeling {
         return invalid("resolved taint mode/call modeling differs from the authored policy");
     }
-    if resolved.sources.is_empty() || resolved.sinks.is_empty() {
+    if resolved.sources.is_empty() && authored.sources.include_files.is_empty()
+        || resolved.sinks.is_empty() && authored.sinks.include_files.is_empty()
+    {
         return invalid("resolved taint policy requires non-empty source and sink sets");
     }
     if contains_duplicates(

@@ -420,5 +420,6 @@ pub(super) const fn relationship_label(relationship: PolicyLocationRelationship)
         PolicyLocationRelationship::DeclaringScope => "declaring_scope_row",
         PolicyLocationRelationship::GenerationSite => "generation_site_row",
         PolicyLocationRelationship::GeneratedDeclaration => "generated_declaration_row",
+        PolicyLocationRelationship::StoreWrite => "store_write_row",
     }
 }

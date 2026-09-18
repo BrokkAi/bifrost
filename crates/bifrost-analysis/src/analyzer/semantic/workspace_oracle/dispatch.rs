@@ -587,7 +587,10 @@ impl<'a> WorkspaceSemanticOracle<'a> {
         let PreparedCallDispatch { lookup } = prepared;
         debug_assert!(lookup.work.scanned_files <= 1);
         debug_assert!(
-            lookup.status.is_none() || !lookup.targets.is_empty() || !lookup.boundaries.is_empty(),
+            lookup.status.is_none()
+                || !lookup.targets.is_empty()
+                || !lookup.boundaries.is_empty()
+                || lookup.adjudicated_non_callable,
             "every completed dispatch status must retain a target or typed boundary"
         );
         let dispatch_work = low_level_dispatch_work(lookup.work);
@@ -1357,6 +1360,51 @@ impl<'a> WorkspaceSemanticOracle<'a> {
 
         let resolver_proven_external_static =
             resolver_proven_external_static_boundary(lookup.status, &candidates, &boundaries);
+        // #3406: a require-bound or namespace-bound JS/TS member call whose
+        // exact resolver proved the external member closes its residual
+        // dynamic-dispatch arm when the activated models carry one complete,
+        // override-covering procedure summary for that exact member and no
+        // workspace source can replace the member value first. The reviewed
+        // summary then also supplies the call's complete transfer set, so the
+        // external boundary stops stating the body as unobserved. A call
+        // without such a summary, or with a visible member write or
+        // module-object escape, keeps the arm and stays honestly open.
+        let js_ts_modeled_member_shape =
+            js_ts_proven_external_member_boundary(call_language, &candidates, &boundaries)
+                .filter(|target| active_covering_complete_summary(self, target));
+        let js_ts_member_mutation_free = js_ts_modeled_member_shape.map(|target| {
+            js_ts_module_member_mutation_free(
+                self.workspace.analyzer(),
+                target,
+                request.cancellation,
+            )
+        });
+        let js_ts_modeled_member_closure =
+            match (js_ts_modeled_member_shape, js_ts_member_mutation_free) {
+                (Some(target), Some(true)) => Some(target.clone()),
+                _ => None,
+            };
+        // When the reviewed summary is active but a member write or a
+        // module-object escape may replace the member, the plan-level authored
+        // closure must not close the residual arm over the write: the call may
+        // not dispatch to the modeled member at all. Refuse the workspace half
+        // the same way an unenumerated hierarchy refuses it (#2371), so the
+        // run stays typed inconclusive instead of asserting a precision the
+        // authored claim does not cover.
+        let js_ts_member_mutation_unproven =
+            js_ts_modeled_member_shape.is_some() && js_ts_modeled_member_closure.is_none();
+        if let Some(target) = &js_ts_modeled_member_closure {
+            for boundary in &mut boundaries {
+                if boundary.unmaterialized_external_target() == Some(target) {
+                    boundary.completeness = EvidenceCompleteness::Complete;
+                }
+            }
+        }
+        if js_ts_member_mutation_unproven {
+            boundaries.push(js_ts_member_mutation_unproven_boundary());
+            materialization_quality =
+                merge_dispatch_quality(materialization_quality, DispatchQuality::Truncated);
+        }
         let call_dispatch_gap = (!anonymous_receiver_refined && !hint_refinement_complete)
             .then_some(call_dispatch_gap)
             .flatten()
@@ -1389,6 +1437,12 @@ impl<'a> WorkspaceSemanticOracle<'a> {
                         resolver_proven_external_static,
                         gap,
                     )
+                    && !(js_ts_modeled_member_closure.is_some()
+                        && gap.capability == SemanticCapability::DynamicDispatch
+                        && matches!(
+                            gap.kind,
+                            SemanticGapKind::Unknown | SemanticGapKind::Unproven
+                        ))
             });
         let gap_exceeded = call_dispatch_gap
             .and_then(|gap| gap.budget)
@@ -1510,13 +1564,24 @@ impl<'a> WorkspaceSemanticOracle<'a> {
             || boundaries
                 .iter()
                 .any(|boundary| boundary.kind == DispatchBoundaryKind::Truncated);
+        // A call expression the resolver proved is not an applicable call at
+        // all -- a Go conversion to a type an activated model publishes --
+        // has no callee. Its empty target set is a complete answer, not an
+        // unreached one, so it reports exhaustive coverage with no arm.
+        let resolver_proved_no_callee = lookup.adjudicated_non_callable
+            && !dispatch_truncated
+            && !cancelled
+            && candidates.is_empty()
+            && boundaries.is_empty();
         let coverage = if dispatch_truncated {
             CandidateCoverage::Truncated
         } else if cancelled {
             CandidateCoverage::Open
-        } else if anonymous_receiver_refined
+        } else if resolver_proved_no_callee
+            || anonymous_receiver_refined
             || resolver_proven_external_static
             || hint_refinement_complete
+            || js_ts_modeled_member_closure.is_some()
         {
             CandidateCoverage::Exhaustive
         } else {
@@ -1528,6 +1593,9 @@ impl<'a> WorkspaceSemanticOracle<'a> {
                 "workspace dispatch produced invalid relation provenance: {error}"
             ))
         })?;
+        if resolver_proved_no_callee {
+            result.mark_resolver_proved_no_callee();
+        }
         if workspace_hierarchy_unenumerated
             && ordinary_dispatch_is_only_unresolved_or_heuristic_external
             && !displaceable_heuristic_external_boundaries.is_empty()
@@ -1566,7 +1634,21 @@ impl<'a> WorkspaceSemanticOracle<'a> {
                 Ok(result) => result,
                 Err(outcome) => return Ok(*outcome),
             };
-        let status_quality = if anonymous_receiver_refined || resolver_proven_external_static {
+        let status_quality = if anonymous_receiver_refined
+            || resolver_proven_external_static
+            || js_ts_modeled_member_closure.is_some()
+            || resolver_proved_no_callee
+        {
+            // The modeled-member closure answers the same target-set question
+            // the receiverless static closure answers: the exact resolver
+            // proved the external member and the reviewed complete summary
+            // closes its behavior, so the boundary is a resolved external
+            // arm, not an unknown external root (#3406).
+            //
+            // A conversion the resolver adjudicated as not applicable names
+            // no callee at all: the empty target set is the complete answer,
+            // so the low-level `NoDefinition` status cannot degrade it to an
+            // unknown outcome (#3428).
             DispatchQuality::Complete
         } else {
             dispatch_quality_for_status(lookup.status, lookup.boundary)
@@ -1934,6 +2016,29 @@ fn workspace_hierarchy_unenumerated_boundary(
             "workspace implementors of the external member are not proven enumerated".into(),
         ),
         completeness: EvidenceCompleteness::Partial(completeness.into()),
+        provenance: Box::new([]),
+    }
+}
+
+/// #3406: the arm a modeled JS/TS member call keeps when the reviewed summary
+/// is active but a workspace member write or module-object escape means the
+/// member value may have been replaced before the call runs. The authored
+/// `covers_overrides` claim describes implementations of the external member,
+/// not a different value written over it, so the workspace half refuses the
+/// closure with the same typed shape an unenumerated hierarchy uses (#2371).
+fn js_ts_member_mutation_unproven_boundary() -> DispatchBoundary {
+    DispatchBoundary {
+        kind: DispatchBoundaryKind::Truncated,
+        external_callee_identity: None,
+        exact_external_target: None,
+        unmaterialized_external_target: None,
+        proof: ProofStatus::Unproven(
+            "workspace mutation of the external member is not proven absent".into(),
+        ),
+        completeness: EvidenceCompleteness::Partial(
+            "a member write or module-object escape may replace the external member before the call runs"
+                .into(),
+        ),
         provenance: Box::new([]),
     }
 }
@@ -3279,6 +3384,130 @@ fn external_flow_claims_agree(
         && left.locations == right.locations
         && left.transfers == right.transfers
         && left.effects == right.effects
+}
+
+/// Whether the activated models select one complete procedure summary for the
+/// exact member `target`, with the override claim a receiver-bearing target
+/// needs before the summary can close its whole target set (#3406).
+///
+/// The selection rule is the one the policy route's summary binding applies
+/// (`select_unmaterialized_flow_summary`): a unique match, or a conflict set
+/// whose candidates all make the same flow-observable claims. The completeness
+/// and `covers_overrides` checks are the ones `authored_target_closure`
+/// applies to the same target, so the dispatch discharge below and the
+/// plan-level closure never disagree about which summary was consumed.
+fn active_covering_complete_summary(
+    oracle: &WorkspaceSemanticOracle<'_>,
+    target: &UnmaterializedExternalTarget,
+) -> bool {
+    let Some(active) = oracle.active_semantic_models() else {
+        return false;
+    };
+    let claims_cover = |record: &CompiledProcedureSummary| {
+        record.completeness == Completeness::Complete
+            && (!target.has_receiver() || record.covers_overrides)
+    };
+    let matched = active.procedure_summaries_for_member(ProcedureSummaryMemberKey::new(
+        target.language().semantic_pack_label(),
+        target.owner_fqn(),
+        target.member(),
+        target.has_receiver(),
+        target.arity(),
+    ));
+    match matched.disposition {
+        SemanticModelMatchDisposition::Unique => {
+            matches!(matched.records.as_slice(), [selected] if claims_cover(selected.record))
+        }
+        SemanticModelMatchDisposition::Conflict => {
+            let Some((first, rest)) = matched.records.split_first() else {
+                return false;
+            };
+            !rest.is_empty()
+                && claims_cover(first.record)
+                && rest.iter().all(|other| {
+                    claims_cover(other.record)
+                        && external_flow_claims_agree(other.record, first.record)
+                })
+        }
+        SemanticModelMatchDisposition::Empty => false,
+    }
+}
+
+/// The one boundary shape the JS/TS modeled-member discharge answers: the
+/// exact resolver proved a receiver-bound external member (no workspace
+/// candidate at all) and named it through one proven external boundary
+/// (#3406).
+fn js_ts_proven_external_member_boundary<'a>(
+    call_language: SemanticLanguage,
+    candidates: &[DispatchCandidate],
+    boundaries: &'a [DispatchBoundary],
+) -> Option<&'a UnmaterializedExternalTarget> {
+    if !matches!(
+        call_language.language(),
+        Language::JavaScript | Language::TypeScript
+    ) || !candidates.is_empty()
+    {
+        return None;
+    }
+    let [boundary] = boundaries else {
+        return None;
+    };
+    if !matches!(boundary.kind, DispatchBoundaryKind::External(Some(_)))
+        || !matches!(boundary.proof, ProofStatus::Proven)
+    {
+        return None;
+    }
+    boundary
+        .unmaterialized_external_target()
+        .filter(|target| target.has_receiver())
+}
+
+/// Whether no workspace source can replace the member value a require or
+/// namespace binding reads from `target`'s module before the call runs
+/// (#3406).
+///
+/// The require-bound receiver resolution proves the receiver *is* the shared
+/// module object, but JavaScript permits replacing an own member of that
+/// object (`cp.execSync = fake`), and the member-minting route deliberately
+/// leaves that question open. A reviewed complete summary closes the residual
+/// dynamic-dispatch arm only while the member value at the call can still be
+/// the module's own, so every JavaScript and TypeScript file in the workspace
+/// is scanned for member writes and module-object escapes before the arm is
+/// discharged. The scan runs once per discharged call and only after the
+/// cheaper summary check has already selected the closure.
+fn js_ts_module_member_mutation_free(
+    analyzer: &dyn IAnalyzer,
+    target: &UnmaterializedExternalTarget,
+    cancellation: &CancellationToken,
+) -> bool {
+    let Ok(files) = analyzer.project().all_files_shared() else {
+        return false;
+    };
+    for file in files.iter() {
+        if cancellation.is_cancelled() {
+            return false;
+        }
+        let language = crate::analyzer::common::language_for_file(file);
+        if !matches!(language, Language::JavaScript | Language::TypeScript) {
+            continue;
+        }
+        let Ok(source) = file.read_to_string() else {
+            return false;
+        };
+        let Some(tree) = brokk_bifrost_js_ts::syntax::parse_js_ts_tree(file, &source, language)
+        else {
+            return false;
+        };
+        if !brokk_bifrost_js_ts::syntax::module_member_is_mutation_free(
+            tree.root_node(),
+            &source,
+            target.owner_fqn(),
+            target.member(),
+        ) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Whether a low-level external boundary is only a syntax-derived placeholder
@@ -7889,6 +8118,11 @@ export function shadowed(raw) {
                     "path.join(a, b)".to_owned(),
                     Some(("path".to_owned(), "join".to_owned(), 2, true))
                 ),
+                // The module body executes the file-scope `const crypto =
+                // require('crypto')`, so its call site is collected like the
+                // call sites inside the function bodies (#3374). A bare
+                // global callee has no owner to decide at all.
+                ("require('crypto')".to_owned(), None),
             ]
         );
     }
@@ -7951,6 +8185,11 @@ export function local(opts: { parse(raw: string): unknown }, raw: string): unkno
                     "path.join(a, b)".to_owned(),
                     Some(("path".to_owned(), "join".to_owned(), 2, true))
                 ),
+                // The module body executes the file-scope `const crypto =
+                // require('crypto')`, so its call site is collected like the
+                // call sites inside the function bodies (#3374). A bare
+                // global callee has no owner to decide at all.
+                ("require('crypto')".to_owned(), None),
             ]
         );
     }

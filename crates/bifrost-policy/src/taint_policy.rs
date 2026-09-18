@@ -712,6 +712,7 @@ impl ProductionTaintPolicyEvaluator {
                             .collect();
                     }
                 }
+                let store_write_evidence = seeding.write_evidence_by_read(&batches);
                 for (batch_index, batch) in batches.into_iter().enumerate() {
                     let seeds = seeding.seeds[batch_index]
                         .iter()
@@ -758,6 +759,7 @@ impl ProductionTaintPolicyEvaluator {
                         &mut retained_analyses,
                         batch_planning_elapsed,
                         icfg_active_semantic_model_snapshot.clone(),
+                        &store_write_evidence,
                     ) else {
                         if store_fed_uncertain {
                             for internal_id in batch.policy_ids() {
@@ -1987,11 +1989,15 @@ impl<'a> TaintPolicyCompiler<'a> {
                 self.selectors
                     .materialized_artifacts()
                     .flat_map(|artifact| {
-                        artifact.procedures().iter().map(|procedure| {
-                            artifact
-                                .procedure_handle(procedure.id())
-                                .expect("a live artifact owns each retained procedure")
-                        })
+                        artifact
+                            .procedures()
+                            .iter()
+                            .filter(|procedure| !procedure.properties().is_synthetic)
+                            .map(|procedure| {
+                                artifact
+                                    .procedure_handle(procedure.id())
+                                    .expect("a live artifact owns each retained procedure")
+                            })
                     }),
             )
             .collect::<Vec<_>>();
@@ -4535,6 +4541,12 @@ struct StoreReadSeed {
     classes: TaintClassSet,
     contributors: BTreeSet<ResolvedEndpointIdentity>,
     crossings: Vec<StoreCrossingProvenance>,
+    /// The write call sites that fed this read's channel, and the origin sites
+    /// whose values those writes persisted, so a store-fed finding can name the
+    /// write-to-read edge it crossed instead of presenting the read as an
+    /// unexplained origin.
+    write_sites: BTreeSet<brokk_bifrost_analysis::analyzer::semantic::SemanticLocator>,
+    write_origin_sites: BTreeSet<brokk_bifrost_analysis::analyzer::semantic::SemanticLocator>,
 }
 
 #[derive(Clone, PartialEq)]
@@ -4559,12 +4571,50 @@ struct ObservedStoreWrite {
     channel: TaintStoreChannel,
 }
 
+/// The write-side evidence of one seeded store read: the write call sites that
+/// fed the read's channel, and the origin sites whose values those writes
+/// persisted. Keyed by the read's own origin event key so the projection can
+/// attach it to a store-fed origin.
+type StoreWriteEvidenceByRead = HashMap<
+    ValueFlowEventKey,
+    (
+        BTreeSet<brokk_bifrost_analysis::analyzer::semantic::SemanticLocator>,
+        BTreeSet<brokk_bifrost_analysis::analyzer::semantic::SemanticLocator>,
+    ),
+>;
+
 impl StoreSeeding {
     fn empty(batches: usize) -> Self {
         Self {
             seeds: vec![Vec::new(); batches],
             uncertain: false,
         }
+    }
+
+    /// Collect the write-side evidence of every seeded read by its origin key.
+    fn write_evidence_by_read(&self, batches: &[TaintBatch]) -> StoreWriteEvidenceByRead {
+        let mut evidence = HashMap::new();
+        for (batch_index, seeds) in self.seeds.iter().enumerate() {
+            let batch = &batches[batch_index];
+            for seed in seeds {
+                let Some(read) = batch
+                    .analysis()
+                    .store_reads()
+                    .iter()
+                    .find(|read| read.source() == seed.source)
+                else {
+                    continue;
+                };
+                let Some(spec) = batch.analysis().value_flow().source(read.source()) else {
+                    continue;
+                };
+                evidence.insert(
+                    spec.key().clone(),
+                    (seed.write_sites.clone(), seed.write_origin_sites.clone()),
+                );
+            }
+        }
+        evidence
     }
 }
 
@@ -4617,6 +4667,16 @@ fn seed_store_channels(
         .iter()
         .map(|batch| vec![Vec::<ObservedStoreWrite>::new(); batch.analysis().store_writes().len()])
         .collect::<Vec<_>>();
+    let mut write_sites = batches
+        .iter()
+        .map(|batch| {
+            vec![
+                BTreeSet::<brokk_bifrost_analysis::analyzer::semantic::SemanticLocator>::new();
+                batch.analysis().store_writes().len()
+            ]
+        })
+        .collect::<Vec<_>>();
+    let mut write_origin_sites = write_sites.clone();
     // Per batch, the compiled metadata's origin-event-to-endpoint rows, for
     // attributing an observed write back to the policy sources that fed it.
     let batch_origin_endpoints = batches
@@ -4731,8 +4791,10 @@ fn seed_store_channels(
                     write_classes[index][write_index] = merged;
                     changed = true;
                 }
+                write_sites[index][write_index].insert(finding.key().sink().site().clone());
                 for origin in finding.origins().evidence() {
                     let key = origin.origin().value_flow_key();
+                    write_origin_sites[index][write_index].insert(key.site().clone());
                     for (policy_id, event, endpoint) in &batch_origin_endpoints[index] {
                         if *event != key {
                             continue;
@@ -4783,6 +4845,8 @@ fn seed_store_channels(
                 let mut classes = read_batch.analysis().universe().empty_set();
                 let mut contributors = BTreeSet::new();
                 let mut crossings = Vec::new();
+                let mut read_write_sites = BTreeSet::new();
+                let mut read_write_origin_sites = BTreeSet::new();
                 let read_event = read_batch
                     .analysis()
                     .value_flow()
@@ -4834,6 +4898,9 @@ fn seed_store_channels(
                                 }
                             }
                         }
+                        read_write_sites.extend(write_sites[write_index][position].iter().cloned());
+                        read_write_origin_sites
+                            .extend(write_origin_sites[write_index][position].iter().cloned());
                     }
                 }
                 if !classes.is_empty() {
@@ -4860,6 +4927,8 @@ fn seed_store_channels(
                         classes,
                         contributors,
                         crossings,
+                        write_sites: read_write_sites,
+                        write_origin_sites: read_write_origin_sites,
                     });
                 }
             }
@@ -4891,6 +4960,7 @@ fn solve_and_project_batch(
     retained_analyses: &mut Vec<Arc<ProductionTaintAnalysisResult>>,
     batch_planning_elapsed: Duration,
     active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
+    store_write_evidence: &StoreWriteEvidenceByRead,
 ) -> Result<(), TaintBatchError> {
     // Each batch solves its own regions and reconstructs evidence only for its
     // own findings, so give it a fresh solve and witness budget instead of the
@@ -5048,6 +5118,7 @@ fn solve_and_project_batch(
             store_seeds,
             budget,
             &mut dropped_for_missing_origins,
+            store_write_evidence,
         )?;
         let payload = payloads
             .get_mut(&plan.policy_id)
@@ -5445,6 +5516,7 @@ fn project_policy_findings(
     store_seeds: &[StoreReadSeed],
     budget: &PolicyBudget,
     dropped_for_missing_origins: &mut usize,
+    store_write_evidence: &StoreWriteEvidenceByRead,
 ) -> Result<Vec<TaintProjectedFinding>, String> {
     // The projection authority validates each envelope against the *effective*
     // report limits, which are the policy's own report options capped by the
@@ -5702,6 +5774,7 @@ fn project_policy_findings(
                 witness_limits,
                 budget,
                 report.authored_arm_closures(),
+                store_write_evidence,
             )?;
             let witness_refs_truncated = projected_report.witnesses_truncated;
             pairs.push(TaintPairProjection {
@@ -5897,6 +5970,7 @@ fn project_taint_report(
     witness_limits: EffectiveWitnessLimits,
     budget: &PolicyBudget,
     authored_arm_closures: &[brokk_bifrost_flow::value_flow::AuthoredArmClosure],
+    store_write_evidence: &StoreWriteEvidenceByRead,
 ) -> Result<(ProjectedFindingReport, Vec<WitnessId>), String> {
     let certainty = if proven {
         FindingCertainty::Definite
@@ -5984,6 +6058,39 @@ fn project_taint_report(
             )
             .map_err(|error| error.to_string())?,
         );
+    }
+    // A store-fed origin carries the write-to-read edge it crossed: the write
+    // call sites that fed its channel, and the origin sites whose values those
+    // writes persisted. The read stays the origin; these name what fed it.
+    for origin in &group.origins {
+        let Some((write_sites, write_origin_sites)) =
+            store_write_evidence.get(origin.origin().value_flow_key())
+        else {
+            continue;
+        };
+        for (relationship, sites) in [
+            (PolicyLocationRelationship::StoreWrite, write_sites),
+            (PolicyLocationRelationship::Origin, write_origin_sites),
+        ] {
+            for site in sites {
+                let location = super::semantic_identity::policy_location(workspace, site)?;
+                if &location == primary
+                    || related
+                        .iter()
+                        .any(|item: &RelatedPolicyLocation| item.location() == &location)
+                {
+                    continue;
+                }
+                if related.len() >= related_limit {
+                    omitted_related = omitted_related.saturating_add(1);
+                    continue;
+                }
+                related.push(
+                    RelatedPolicyLocation::try_new(relationship, location, Vec::new())
+                        .map_err(|error| error.to_string())?,
+                );
+            }
+        }
     }
     Ok((
         ProjectedFindingReport {

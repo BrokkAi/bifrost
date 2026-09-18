@@ -269,6 +269,7 @@ jobs:
           assets="$RUNNER_TEMP/release-assets.txt"
           jq -r '.files[] |
             select((.path | test("^bifrost-v.*\\.(tar\\.gz|zip)(\\.sha256)?$")) or
+                   (.path | test("^bifrost-semantic-pack-v.*-x86_64-unknown-linux-gnu\\.tar\\.gz(\\.sha256)?$")) or
                    (.path | test("^bifrost-semantic-packs-.*\\.(tar\\.gz|json)(\\.sha256)?$")) or
                    (.path | test("^(bifrost-agent-.*\\.tar\\.gz|brokk-bifrost-agent-.*\\.tgz|bifrost-vscode-.*\\.vsix)$"))) |
             "qualification/" + .path' qualification/release-qualification.json > "$assets"

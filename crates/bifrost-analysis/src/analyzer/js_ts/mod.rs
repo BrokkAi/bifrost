@@ -51,17 +51,18 @@ use crate::analyzer::{
     ProjectFile, QueryScope, Range, TypescriptAnalyzer, resolve_analyzer,
 };
 use crate::analyzer::{CodeUnit, Language, SummaryFileProjection};
-use crate::hash::HashSet;
+use crate::hash::{HashMap, HashSet};
 use crate::text_utils::compute_line_starts;
 use brokk_bifrost_core::analyzer::usages::model::ImportKind;
 use brokk_bifrost_js_ts::imports::js_ts_module_identity;
 use brokk_bifrost_js_ts::model::module_code_unit;
 use brokk_bifrost_js_ts::syntax::{
-    JsTsLexicalBindingIndex, compute_import_binder as compute_js_ts_import_binder,
-    js_ts_declaration_name, js_ts_variable_declarator_binding_scope,
+    JsTsImportBinder, JsTsLexicalBindingIndex, JsTsModuleMemberWrites,
+    compute_import_binder as compute_js_ts_import_binder, js_ts_declaration_name,
+    js_ts_variable_declarator_binding_scope,
 };
 use std::path::{Component, Path};
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock, Mutex};
 
 pub(crate) fn is_typescript_declaration_path(path: &Path) -> bool {
     let declaration_extension = path
@@ -519,6 +520,46 @@ pub(crate) fn synthesize_summary_module(
 
 static JS_TS_USAGE_STRATEGY: JsTsExportUsageGraphStrategy = JsTsExportUsageGraphStrategy::new();
 
+/// One file's module-member write evidence, keyed by module specifier (#3427).
+///
+/// `module_member_writes` walks the whole file, and owner classification asks
+/// for it once per unresolved external callee. A file typically binds one or
+/// two module objects, so memoizing by specifier turns a per-callee file walk
+/// back into one walk per module.
+#[derive(Default)]
+pub(crate) struct JsTsModuleMemberWriteMemo {
+    by_module: Mutex<HashMap<String, Arc<JsTsModuleMemberWrites>>>,
+}
+
+impl JsTsModuleMemberWriteMemo {
+    /// This file's writes to `module`'s members, collected on first use.
+    ///
+    /// One memo belongs to one file, so `root`, `source`, `lexical` and
+    /// `imports` must describe that file at every call; the module specifier is
+    /// the only thing that varies.
+    pub(crate) fn writes(
+        &self,
+        root: tree_sitter::Node<'_>,
+        source: &str,
+        module: &str,
+        lexical: &JsTsLexicalBindingIndex,
+        imports: &JsTsImportBinder,
+    ) -> Arc<JsTsModuleMemberWrites> {
+        let mut by_module = self
+            .by_module
+            .lock()
+            .expect("module member write memo mutex poisoned");
+        if let Some(writes) = by_module.get(module) {
+            return Arc::clone(writes);
+        }
+        let writes = Arc::new(JsTsModuleMemberWrites::collect_with(
+            root, source, module, lexical, imports,
+        ));
+        by_module.insert(module.to_owned(), Arc::clone(&writes));
+        writes
+    }
+}
+
 /// The canonical owner a single-segment JS/TS external callee publishes, or
 /// `None` when the owner names no external identity at all (#2598).
 ///
@@ -531,9 +572,14 @@ static JS_TS_USAGE_STRATEGY: JsTsExportUsageGraphStrategy = JsTsExportUsageGraph
 ///     CommonJS module-object binding *is* the module, so the specifier is the
 ///     owner and `import p from 'path'` keys identically to
 ///     `import path from 'path'`. The specifier is read in its canonical
-///     spelling, so `node:path` and `path` are one owner (#2609). A named
-///     import binds a member *of* the module, and that member is itself the
-///     owner: `import { Buffer } from 'buffer'` makes `Buffer.from` owner
+///     spelling, so `node:path` and `path` are one owner (#2609). Such a
+///     binding names a shared mutable object, so the identity is published
+///     only while this file proves it writes nothing to `member`: after
+///     `cp.execSync = f`, `cp[key] = f`, `Object.assign(cp, ...)` or
+///     `delete cp.execSync` the value read at the callee is no longer the
+///     module's own and no external identity is published for it (#3427). A
+///     named import binds a member *of* the module, and that member is itself
+///     the owner: `import { Buffer } from 'buffer'` makes `Buffer.from` owner
 ///     `Buffer`, never `buffer`;
 ///   * bound by an import whose specifier is relative or absolute -- refused.
 ///     That specifier addresses a workspace file, so a call through it that did
@@ -553,6 +599,7 @@ static JS_TS_USAGE_STRATEGY: JsTsExportUsageGraphStrategy = JsTsExportUsageGraph
 /// question answers both cases from the file in hand.
 fn js_ts_single_segment_external_owner(
     owner: &str,
+    member: &str,
     site: &ExternalCalleeSite<'_>,
 ) -> Option<String> {
     let binder = compute_js_ts_import_binder(site.source, site.tree);
@@ -572,7 +619,27 @@ fn js_ts_single_segment_external_owner(
     let module = js_ts_module_identity(&binding.module_specifier)?;
     match binding.kind {
         ImportKind::Default | ImportKind::Namespace | ImportKind::CommonJsRequire => {
-            Some(module.specifier.to_owned())
+            // #3427: the binding is the shared module object, so the member
+            // this callee reads is the module's own only while the file writes
+            // nothing to it. The same #3406 proof the summary closure uses
+            // answers that, and refusing here keeps every consumer of the exact
+            // external member -- call bindings, the resolution surface, the
+            // usage scans -- from asserting an exactness the module replaced.
+            let lexical = binder
+                .lexical_bindings()
+                .expect("a computed import binder carries its lexical binding index");
+            site.file_evidence
+                .js_ts_module_member_writes
+                .writes(
+                    site.tree.root_node(),
+                    site.source,
+                    module.specifier,
+                    lexical,
+                    &binder,
+                )
+                .mutation(member)
+                .is_none()
+                .then(|| module.specifier.to_owned())
         }
         ImportKind::Named => Some(owner.to_owned()),
         // A glob binds no single name, so it cannot be what bound this owner.
@@ -683,9 +750,10 @@ impl LanguageSupport for JavascriptSupport {
     fn single_segment_external_owner(
         &self,
         owner: &str,
+        member: &str,
         site: &ExternalCalleeSite<'_>,
     ) -> Option<String> {
-        js_ts_single_segment_external_owner(owner, site)
+        js_ts_single_segment_external_owner(owner, member, site)
     }
 
     fn structural_spec(&self) -> &'static dyn crate::analyzer::structural::StructuralSpec {
@@ -814,9 +882,10 @@ impl LanguageSupport for TypescriptSupport {
     fn single_segment_external_owner(
         &self,
         owner: &str,
+        member: &str,
         site: &ExternalCalleeSite<'_>,
     ) -> Option<String> {
-        js_ts_single_segment_external_owner(owner, site)
+        js_ts_single_segment_external_owner(owner, member, site)
     }
 
     fn structural_spec(&self) -> &'static dyn crate::analyzer::structural::StructuralSpec {

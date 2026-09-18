@@ -3,7 +3,9 @@
 use std::sync::Arc;
 
 use crate::analyzer::common::language_for_file;
-use crate::analyzer::languages::{ExternalCalleeSite, language_support};
+use crate::analyzer::languages::{
+    ExternalCalleeFileEvidence, ExternalCalleeSite, language_support,
+};
 use crate::analyzer::lexical_definitions::{
     FormalParameterLayout, PythonMethodBinding, formal_parameter_slots,
 };
@@ -15,7 +17,8 @@ use crate::analyzer::usages::call_shape::call_shapes_in_file;
 use crate::analyzer::usages::get_definition::{
     CallApplicationKind, CallSiteSyntax, CallSyntaxKind, CallTargetLookupOutcome,
     DefinitionLookupOutcome, DefinitionLookupRequest, DefinitionLookupStatus, ExactCallReference,
-    ExactCallReferenceGap, ExactExternalCallProof, IMPORT_BINDINGS_TRUNCATED_DIAGNOSTIC,
+    ExactCallReferenceGap, ExactExternalCallProof,
+    GO_MODELED_PACKAGE_CALL_NOT_APPLICABLE_DIAGNOSTIC_KIND, IMPORT_BINDINGS_TRUNCATED_DIAGNOSTIC,
     LOCAL_VARIABLE_REFERENCE_DIAGNOSTIC_KIND, PARTIAL_IMPORT_BOUNDARY_DIAGNOSTIC,
     PARTIAL_IMPORT_UNRESOLVED_DIAGNOSTIC, call_reference_ranges_in_tree,
     call_reference_requires_point_lookup, call_site_syntax_for_reference,
@@ -140,6 +143,13 @@ pub(crate) struct CallDispatchLookup {
     /// The exact resolver proved that a no-definition answer is intentional
     /// (for example a local binder), rather than failing to reach a target.
     pub(crate) adjudicated_no_target: bool,
+    /// The exact resolver proved this call expression is not an applicable
+    /// call at all: its callee names a declaration an activated Go model
+    /// publishes, and positive declaration facts rule out a callable with
+    /// this argument list. In Go that is a conversion to a modeled type
+    /// (`http.HandlerFunc(f)`), so the call expression has no callee and
+    /// dispatch is a complete empty target set, not an unreached one.
+    pub(crate) adjudicated_non_callable: bool,
     /// Receiver-application evidence produced by the same exact language
     /// resolution that populated the dispatch boundaries.
     pub(crate) call_application: CallApplicationKind,
@@ -175,6 +185,9 @@ pub(crate) struct CallDispatchSession {
     exact_source: Arc<str>,
     language: Language,
     parse: CallDispatchParse,
+    /// Shared with the parse, and for the same reason: the file-wide owner
+    /// proofs classification needs are the same for every call in this window.
+    file_evidence: ExternalCalleeFileEvidence,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -666,6 +679,14 @@ fn project_incoming_call_hit(
     let Some(syntax) =
         syntax_cache.syntax_for_range(analyzer, &hit.file, hit.start_offset, hit.end_offset)
     else {
+        // A hit inside the target itself that has no call syntax is the
+        // target's own declaration name, which is not a call candidate at
+        // all: every function declaration produces exactly this hit, and
+        // counting it as an unresolved candidate would fail every strict
+        // incoming scan over a resolvable call.
+        if caller == *target {
+            return Err(IncomingCallOmission::KeywordLabel);
+        }
         return Err(
             if syntax_cache.range_is_keyword_label(
                 analyzer,
@@ -836,6 +857,7 @@ impl CallDispatchSession {
             source: &self.exact_source,
             tree,
             callee_start_byte: callee_range.start_byte,
+            file_evidence: &self.file_evidence,
         };
         apply_call_target_outcome(
             &mut lookup,
@@ -858,6 +880,7 @@ impl CallRelationService {
             file,
             exact_source,
             parse: CallDispatchParse::Uninitialized,
+            file_evidence: ExternalCalleeFileEvidence::default(),
         }
     }
 
@@ -987,6 +1010,9 @@ impl CallRelationService {
             &references,
             cancellation,
         );
+        // One memo for the whole file: every site below classifies its callee
+        // against the same tree and source.
+        let file_evidence = ExternalCalleeFileEvidence::default();
         for ((index, callee_range), (_, outcome)) in resolvable.iter().zip(batch.resolved) {
             let mut lookup = CallDispatchLookup {
                 cancelled: batch.cancelled,
@@ -1000,6 +1026,7 @@ impl CallRelationService {
                 source: &exact_source,
                 tree: &tree,
                 callee_start_byte: callee_range.start_byte,
+                file_evidence: &file_evidence,
             };
             apply_call_target_outcome(
                 &mut lookup,
@@ -1793,6 +1820,15 @@ fn apply_dispatch_outcome_with_flags(
         || diagnostics
             .iter()
             .any(|diagnostic| is_adjudicated_answer_diagnostic_kind(&diagnostic.kind));
+    lookup.adjudicated_non_callable |= diagnostics.iter().any(|diagnostic| {
+        diagnostic.kind == GO_MODELED_PACKAGE_CALL_NOT_APPLICABLE_DIAGNOSTIC_KIND
+    });
+    if lookup.adjudicated_non_callable {
+        debug_assert!(
+            definitions.is_empty(),
+            "a non-callable package member answer never retains a definition"
+        );
+    }
     lookup.status = Some(status);
     lookup.diagnostics.extend(
         diagnostics
@@ -1889,6 +1925,14 @@ fn apply_dispatch_outcome_with_flags(
         // selector such as `missing.Open` therefore has no package-binding
         // proof: its dotted spelling alone must not mint an exact external
         // identity or turn an applicable modeled member into a clean miss.
+        //
+        // An adjudicated non-callable model member is the one Go no-definition
+        // answer with no unresolved arm to retain: `http.HandlerFunc(f)` is a
+        // conversion, so the call expression names no callee at all and its
+        // empty target set is complete by the same facts that ruled the
+        // function out.
+        DefinitionLookupStatus::NoDefinition
+            if language == Language::Go && lookup.adjudicated_non_callable => {}
         DefinitionLookupStatus::NoDefinition if language == Language::Go => lookup
             .boundaries
             .push(CallDispatchBoundaryKind::Unresolved(status)),
@@ -2012,7 +2056,7 @@ fn canonical_external_callee(
     }
     // Without the call site's own file evidence there is nothing to decide a
     // single-segment owner on, and guessing one is exactly what #2598 forbids.
-    let canonical_owner = support.single_segment_external_owner(&owner, site?)?;
+    let canonical_owner = support.single_segment_external_owner(&owner, &member, site?)?;
     Some(format!(
         "{canonical_owner}{}{member}",
         support.qualified_call_separator()

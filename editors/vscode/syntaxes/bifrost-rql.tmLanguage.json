@@ -74,7 +74,7 @@
     },
     {
       "name": "entity.name.type.kind.bifrost-rql",
-      "match": "\\b(?:assignment|block|boolean_literal|call|callable|catch|class|collection_literal|concurrent_spawn|constructor|computed_property|declaration|decorator|field_access|for_loop|function|identifier|if|import|jsx_attribute|jsx_element|jsx_spread_attribute|lambda|literal|loop|method|module|null_literal|numeric_literal|object_property|parameter|return|string_literal|spread_element|throw|while_loop)\\b"
+      "match": "\\b(?:assignment|block|boolean_literal|call|callable|catch|class|collection_literal|concurrent_spawn|constructor|computed_property|declaration|decorator|field_access|for_loop|function|identifier|if|import|jsx_attribute|jsx_element|jsx_spread_attribute|lambda|literal|loop|method|module|null_literal|numeric_literal|object_property|parameter|resource_release|return|string_literal|spread_element|throw|while_loop)\\b"
     },
     {
       "name": "support.function.predicate.bifrost-rql",

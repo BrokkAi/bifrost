@@ -57,9 +57,10 @@ use brokk_bifrost_rql::structural::search::{
     UnitRowIdentities, UnitRowIdentityCandidate, UnitRowItem, UnitRowItemProvenance,
     UnitRowItemRef, UnitRowItemRefValue, UnitRowItemTerminal, UnitRowProvenance,
     UnitRowProvenanceRef, execute_code_query_detailed_eager_index,
+    execute_code_query_detailed_eager_index_in_scope,
     execute_code_query_detailed_eager_index_with_row_family_session_in_scope,
     execute_code_query_detailed_eager_index_without_targets_with_row_family_session_in_scope,
-    execute_code_query_detailed_eager_index_workspace, execute_code_query_unit,
+    execute_code_query_detailed_eager_index_workspace_in_scope, execute_code_query_unit,
 };
 use brokk_bifrost_rql::structural::{BoundaryStatus, PrecedenceTier};
 use brokk_bifrost_rql::structural::{
@@ -525,12 +526,44 @@ impl PolicyEvaluator for DefaultPolicyEvaluator<'_> {
         context: &PolicyEvaluationContext<'_>,
         budget: &mut PolicyBudget,
     ) -> Result<PolicyRun, PolicyRunError> {
+        self.evaluate_with_optional_scope(policy, context, budget, None)
+    }
+}
+
+impl DefaultPolicyEvaluator<'_> {
+    /// Evaluate one policy over an explicit seed scope.
+    ///
+    /// Scoped policy runs intentionally do not use incremental units or the
+    /// subject-query batch: both cache whole-workspace questions. The scope is
+    /// applied only to the policy's subject/binding query; assertion row-family
+    /// and dependency queries retain their existing full-workspace behavior.
+    pub(crate) fn evaluate_in_scope(
+        &self,
+        policy: &LoadedPolicy,
+        context: &PolicyEvaluationContext<'_>,
+        budget: &mut PolicyBudget,
+        execution_scope: CodeQueryExecutionScope<'_>,
+    ) -> Result<PolicyRun, PolicyRunError> {
+        self.evaluate_with_optional_scope(policy, context, budget, Some(execution_scope))
+    }
+
+    fn evaluate_with_optional_scope(
+        &self,
+        policy: &LoadedPolicy,
+        context: &PolicyEvaluationContext<'_>,
+        budget: &mut PolicyBudget,
+        execution_scope: Option<CodeQueryExecutionScope<'_>>,
+    ) -> Result<PolicyRun, PolicyRunError> {
         let host_budget = *budget;
+        if execution_scope.is_some() && !policy_supports_execution_scope(policy) {
+            return unsupported_scoped_policy_run(policy, &host_budget);
+        }
         // Every family accounts for itself. The families that are sliced record
         // their own attempt, whether or not it widened; the rest state here
         // that they were evaluated whole rather than being absent from the
         // review.
-        if let Some(incremental) = context.incremental
+        if execution_scope.is_none()
+            && let Some(incremental) = context.incremental
             && !evaluates_by_unit(&policy.definition().analysis)
         {
             incremental.record_run(PolicyIncrementalRun::whole_family(
@@ -538,14 +571,20 @@ impl PolicyEvaluator for DefaultPolicyEvaluator<'_> {
             ));
         }
         match &policy.definition().analysis {
-            PolicyAnalysis::Match { .. } => evaluate_match_policy(policy, context, &host_budget),
+            PolicyAnalysis::Match { .. } => {
+                evaluate_match_policy(policy, context, &host_budget, execution_scope)
+            }
             PolicyAnalysis::Assertion { spec } => evaluate_assertion_policy(
                 policy,
                 spec,
                 context,
                 &host_budget,
                 self.active_semantic_model_snapshot.clone(),
-                self.subject_batch,
+                execution_scope
+                    .is_none()
+                    .then_some(self.subject_batch)
+                    .flatten(),
+                execution_scope,
             ),
             // Flow executes the production taint pipeline over the same
             // resolved model with one internal label (#2436); only the run's
@@ -616,6 +655,65 @@ impl PolicyEvaluator for DefaultPolicyEvaluator<'_> {
             }
         }
     }
+}
+
+/// Whether the policy's authored seed queries can honor an explicit execution
+/// scope. This is intentionally narrower than whole-query support: only the
+/// Match selector and Assertion subject or binding queries are narrowed.
+pub(crate) fn policy_supports_execution_scope(policy: &LoadedPolicy) -> bool {
+    match &policy.definition().analysis {
+        PolicyAnalysis::Match { .. } => policy
+            .resolved_selectors()
+            .iter()
+            .find(|selector| selector.path.as_str() == MATCH_SELECTOR_PATH)
+            .and_then(|selector| selector.as_query().map(|(_, query)| query))
+            .is_some_and(query_supports_execution_scope),
+        PolicyAnalysis::Assertion { spec } => match &spec.relational {
+            Some(plan) => plan.bindings.iter().all(|binding| {
+                let super::definition::RowBindingSource::Query(_) = &binding.source;
+                let path = super::definition::relational_binding_selector_path(&binding.name);
+                policy
+                    .resolved_selectors()
+                    .iter()
+                    .find(|selector| selector.path.as_str() == path)
+                    .and_then(|selector| selector.as_query().map(|(_, query)| query))
+                    .is_some_and(query_supports_execution_scope)
+            }),
+            None => policy
+                .resolved_selectors()
+                .iter()
+                .find(|selector| selector.path.as_str() == ASSERTION_SUBJECT_SELECTOR_PATH)
+                .and_then(|selector| selector.as_query().map(|(_, query)| query))
+                .is_some_and(query_supports_execution_scope),
+        },
+        PolicyAnalysis::Taint { .. }
+        | PolicyAnalysis::Flow { .. }
+        | PolicyAnalysis::Typestate { .. } => false,
+    }
+}
+
+fn query_supports_execution_scope(query: &CodeQuery) -> bool {
+    query_plan_source_supports_execution_scope(&query.plan.source)
+}
+
+fn query_plan_source_supports_execution_scope(source: &CodeQueryPlanSource) -> bool {
+    let mut pending = vec![source];
+    while let Some(source) = pending.pop() {
+        match source {
+            CodeQueryPlanSource::ConfigurationFacts(_) => return false,
+            CodeQueryPlanSource::Set { branches, .. } => {
+                pending.extend(branches.iter().map(|branch| &branch.source));
+            }
+            CodeQueryPlanSource::Seed(_)
+            | CodeQueryPlanSource::Occurrences(_)
+            | CodeQueryPlanSource::Scopes(_)
+            | CodeQueryPlanSource::Bindings(_)
+            | CodeQueryPlanSource::Paths(_)
+            | CodeQueryPlanSource::GenerationSites(_)
+            | CodeQueryPlanSource::Exports(_) => {}
+        }
+    }
+    true
 }
 
 impl DefaultPolicyEvaluator<'_> {
@@ -741,16 +839,35 @@ fn evaluate_match_policy(
     policy: &LoadedPolicy,
     context: &PolicyEvaluationContext<'_>,
     budget: &PolicyBudget,
+    execution_scope: Option<CodeQueryExecutionScope<'_>>,
 ) -> Result<PolicyRun, PolicyRunError> {
     // An evaluation that holds an incremental context has units to reuse and a
     // workspace to verify them against; one that does not executes exactly as
     // it always has. The two paths meet again at `assemble_match_run`, over
     // the same rendered rows.
-    let evaluated = match context.incremental {
-        Some(incremental) => evaluate_match_policy_by_unit(policy, incremental, context, budget),
-        None => {
-            evaluate_match_policy_candidates(policy, context.analyzer, budget, context.cancellation)
-        }
+    let evaluated = match execution_scope {
+        Some(execution_scope) => match match_policy_query(policy) {
+            Ok(query) => evaluate_match_query_candidates_in_scope(
+                &policy.definition().metadata.id,
+                context.analyzer,
+                query,
+                budget,
+                context.cancellation,
+                execution_scope,
+            ),
+            Err(refusal) => refusal.into_run(budget),
+        },
+        None => match context.incremental {
+            Some(incremental) => {
+                evaluate_match_policy_by_unit(policy, incremental, context, budget)
+            }
+            None => evaluate_match_policy_candidates(
+                policy,
+                context.analyzer,
+                budget,
+                context.cancellation,
+            ),
+        },
     };
     assemble_match_run(
         policy,
@@ -1363,6 +1480,23 @@ fn unsupported_policy_run(
         diagnostics,
         !retain_diagnostic,
         work_report(CodeQueryExecutionWork::default(), 0, 0),
+        budget,
+    )
+}
+
+fn unsupported_scoped_policy_run(
+    policy: &LoadedPolicy,
+    budget: &PolicyBudget,
+) -> Result<PolicyRun, PolicyRunError> {
+    unsupported_policy_run(
+        policy,
+        policy.definition().analysis.analysis_type(),
+        PolicyCapability::QueryDomain {
+            domain: "execution_scope".to_owned(),
+            capability: Some("seed_scope".to_owned()),
+            reason: "query_source_not_scope_aware".to_owned(),
+        },
+        "explicit execution scope is supported only for Match and Assertion seed queries whose sources honor scope; this policy has an unsupported source or analysis family",
         budget,
     )
 }
@@ -2699,9 +2833,27 @@ fn executable_match_query(
 fn evaluate_match_query_candidates(
     policy_id: &PolicyId,
     analyzer: &dyn IAnalyzer,
+    query: &CodeQuery,
+    budget: &PolicyBudget,
+    cancellation: Option<&CancellationToken>,
+) -> EvaluatedMatchPolicy {
+    evaluate_match_query_candidates_in_scope(
+        policy_id,
+        analyzer,
+        query,
+        budget,
+        cancellation,
+        CodeQueryExecutionScope::whole_workspace(),
+    )
+}
+
+fn evaluate_match_query_candidates_in_scope(
+    policy_id: &PolicyId,
+    analyzer: &dyn IAnalyzer,
     query: &brokk_bifrost_rql::structural::CodeQuery,
     budget: &PolicyBudget,
     cancellation: Option<&CancellationToken>,
+    execution_scope: CodeQueryExecutionScope<'_>,
 ) -> EvaluatedMatchPolicy {
     let executable = match executable_match_query(query, budget) {
         Ok(executable) => executable,
@@ -2711,11 +2863,12 @@ fn evaluate_match_query_candidates(
     // index reuse is guaranteed: build the snapshot index on first use
     // instead of letting Auto's first-request deferral scan the workspace
     // once per policy.
-    let detailed = execute_code_query_detailed_eager_index(
+    let detailed = execute_code_query_detailed_eager_index_in_scope(
         analyzer,
         &executable,
         budget.query_limits(),
         cancellation,
+        execution_scope,
     );
     adapt_match_execution(
         policy_id,

@@ -8,11 +8,11 @@ use brokk_bifrost_core::complete_value_cache::{CompleteValueAcquisition, Complet
 #[cfg(test)]
 use crate::analyzer::semantic::MemberAccessKind;
 use crate::analyzer::semantic::{
-    ClassAtom, ClassIdentity, ClassSeed, DynamicFieldWrite, IcfgProviderBehaviorIdentity,
-    LengthDelimitedDigest, MemberAccessQuery, MemoryLocationKind, ProcedureHandle, SemanticBudget,
-    SemanticBudgetExceeded, SemanticEffect, SemanticIrVersion, SemanticRequest, SemanticValueKind,
-    SourcePosition, SourceSpan, StableDigest, TypeFlowAdapter, UnknownReason, ValueFlowKind,
-    WorkspaceMountId, WorkspaceRelativePath,
+    ClassAtom, ClassBodyMemberBinding, ClassIdentity, ClassSeed, DynamicFieldWrite,
+    IcfgProviderBehaviorIdentity, LengthDelimitedDigest, MemberAccessQuery, MemoryLocationKind,
+    ProcedureHandle, SemanticBudget, SemanticBudgetExceeded, SemanticEffect, SemanticIrVersion,
+    SemanticRequest, SemanticValueKind, SourcePosition, SourceSpan, StableDigest, TypeFlowAdapter,
+    UnknownReason, ValueFlowKind, WorkspaceMountId, WorkspaceRelativePath,
 };
 use crate::analyzer::semantic_model::ActiveSemanticModelSnapshot;
 use crate::analyzer::store::StoreError;
@@ -282,7 +282,7 @@ impl FieldStoreSurvey {
 
 impl FieldSlotIndex {
     // Bump when the language-neutral field-slot algorithm changes.
-    const ALGORITHM_VERSION: u32 = 20;
+    const ALGORITHM_VERSION: u32 = 21;
     // Bump only when the persisted row encoding changes.
     const REPRESENTATION_VERSION: u32 = 2;
 
@@ -784,6 +784,7 @@ impl FieldSlotIndex {
                     .any(|write| related.iter().any(|class| write.affects(class)))
                 || collected.foreign_members.contains(member.as_ref())
                 || collected.dynamic_members.contains(member.as_ref());
+            let mut declared_procedure = false;
             for owner in &related {
                 if cancellation.is_cancelled() {
                     return Err(TypeFlowPlanError::Cancelled);
@@ -795,15 +796,29 @@ impl FieldSlotIndex {
                     || owner_hierarchy.descendants.is_none()
                     || owner_hierarchy.unresolved_base
                     || owner_hierarchy.dynamic_attributes
-                    || !adapter.field_slot_is_complete(workspace, owner, &member)
                 {
                     incomplete = true;
+                }
+                match adapter.class_body_member_binding(workspace, owner, &member) {
+                    ClassBodyMemberBinding::Unbound => {}
+                    ClassBodyMemberBinding::Procedure => declared_procedure = true,
+                    ClassBodyMemberBinding::Unclassified => incomplete = true,
                 }
                 if let Some(stored) = collected.stores.get(&(owner.clone(), member.clone())) {
                     atoms.extend(stored.iter().cloned());
                 }
             }
             dedup_atoms(&mut atoms);
+            // A declared method is not an instance-attribute value: reading it
+            // yields that method, and `member_lookup` already names the
+            // declaration. Only a store that can shadow it puts a second,
+            // unclassified alternative in the same slot. With no such store
+            // there is no instance-attribute slot to summarize, and inventing
+            // an open one publishes a remainder on every receiver that reads
+            // one of its own methods.
+            if declared_procedure && !atoms.is_empty() {
+                incomplete = true;
+            }
             if incomplete {
                 let site = collected
                     .loads
@@ -2469,13 +2484,14 @@ mod tests {
             self.inner.class_hierarchy(workspace, class)
         }
 
-        fn field_slot_is_complete(
+        fn class_body_member_binding(
             &self,
             workspace: &WorkspaceAnalyzer,
             class: &ClassIdentity,
             member: &str,
-        ) -> bool {
-            self.inner.field_slot_is_complete(workspace, class, member)
+        ) -> ClassBodyMemberBinding {
+            self.inner
+                .class_body_member_binding(workspace, class, member)
         }
 
         fn dynamic_field_writes(

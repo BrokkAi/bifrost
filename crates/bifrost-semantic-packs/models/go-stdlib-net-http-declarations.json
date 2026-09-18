@@ -1,13 +1,13 @@
 {
   "schema_version": 2,
   "pack_id": "bifrost.go.stdlib.net-http-declarations",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "producer": { "name": "bifrost", "version": "0.11.3" },
   "language": "go",
   "ecosystem": "go",
   "compatibility": { "bifrost": ">=0.11.3, <1.0.0", "toolchains": [] },
   "provenance": {
-    "source": "https://go.dev/src/net/http/server.go (http.Handle, http.HandleFunc, http.Serve, http.ListenAndServe, http.NewServeMux, http.ServeMux.Handle, http.ServeMux.HandleFunc, http.Handler, http.ServeMux)",
+    "source": "https://go.dev/src/net/http/server.go (http.Handle, http.HandleFunc, http.Serve, http.ListenAndServe, http.NewServeMux, http.ServeMux.Handle, http.ServeMux.HandleFunc, http.Handler, http.ServeMux, http.HandlerFunc)",
     "revision": "go1.26.0"
   },
   "license": "BSD-3-Clause",
@@ -21,7 +21,7 @@
         "kind": "declaration_facts",
         "types": [
           {
-            "id": "type.b6eedc642c6132236bae5425a063fd44b150a8ea8555340b10ef1d3082dffe9a",
+            "id": "type.b99de246c17e589368907e55dac75ea8887ae4a75829fb0eb4d25e7f05f77238",
             "name": "net/http",
             "type_kind": "module",
             "visibility": "package",
@@ -37,7 +37,7 @@
             "locator": { "kind": "artifact", "path": "src/net/http/server.go", "symbol": "net/http" }
           },
           {
-            "id": "type.93777606d63fbb9dc04087a876b5408f323d632fb8ff469033fa91b384dfd9cc",
+            "id": "type.c8f51b9a2125d81abbd78dcfad74f00ebc60931a657e2c8585ea7ac84f4f5ebf",
             "name": "net/http.Handler",
             "type_kind": "interface",
             "visibility": "public",
@@ -53,7 +53,7 @@
             "locator": { "kind": "artifact", "path": "src/net/http/server.go", "symbol": "net/http.Handler" }
           },
           {
-            "id": "type.4c393b735855228a04f3c05bd17a970f4301acda0f7c16507fe4453daa72660b",
+            "id": "type.fca5d790b7cc69fabd7f6b60f004b588a25a992e07fded17a7622c32189e7c17",
             "name": "net/http.ServeMux",
             "type_kind": "struct",
             "visibility": "public",
@@ -67,12 +67,28 @@
             "aliases": [],
             "extension_surfaces": [],
             "locator": { "kind": "artifact", "path": "src/net/http/server.go", "symbol": "net/http.ServeMux" }
+          },
+          {
+            "id": "type.509421c0392cedf0918bc8ca56ed6703705ab12a7f0907a9b0c9a878e8e0b3ea",
+            "name": "net/http.HandlerFunc",
+            "type_kind": "class",
+            "visibility": "public",
+            "is_abstract": false,
+            "is_sealed": false,
+            "has_explicit_type_terms": false,
+            "type_parameters": [],
+            "type_parameter_constraints": [],
+            "embedded_types": [],
+            "hierarchy": [],
+            "aliases": [],
+            "extension_surfaces": [],
+            "locator": { "kind": "artifact", "path": "src/net/http/server.go", "symbol": "net/http.HandlerFunc" }
           }
         ],
         "members": [
           {
-            "id": "member.9af6dc214e864d397e406b8857431d9aefac5766686e6d4d95adb3a67c494f10",
-            "owner": "type.b6eedc642c6132236bae5425a063fd44b150a8ea8555340b10ef1d3082dffe9a",
+            "id": "member.9d53dc08528d41134c2f340de8b8918edd03dac8370ca096f1833911bb1c6de9",
+            "owner": "type.b99de246c17e589368907e55dac75ea8887ae4a75829fb0eb4d25e7f05f77238",
             "name": "NewServeMux",
             "member_kind": "function",
             "visibility": "public",
@@ -82,14 +98,14 @@
             "signature": {
               "type_parameters": [],
               "parameters": [],
-              "returns": { "kind": "pointer", "element": { "kind": "declared", "id": "type.4c393b735855228a04f3c05bd17a970f4301acda0f7c16507fe4453daa72660b", "arguments": [], "nullable": false } }
+              "returns": { "kind": "pointer", "element": { "kind": "declared", "id": "type.fca5d790b7cc69fabd7f6b60f004b588a25a992e07fded17a7622c32189e7c17", "arguments": [], "nullable": false } }
             },
             "aliases": [],
             "locator": { "kind": "artifact", "path": "src/net/http/server.go", "symbol": "net/http.NewServeMux" }
           },
           {
-            "id": "member.f7c17b594b5859f3dbea72f9e2190c4603ea8d4baadebf6f898bbdc08ef3a7a3",
-            "owner": "type.b6eedc642c6132236bae5425a063fd44b150a8ea8555340b10ef1d3082dffe9a",
+            "id": "member.072b96ba5069bc5998cb919fc7fd9e92ecddf34ae7e9cc10681f3c59123f84da",
+            "owner": "type.b99de246c17e589368907e55dac75ea8887ae4a75829fb0eb4d25e7f05f77238",
             "name": "HandleFunc",
             "member_kind": "function",
             "visibility": "public",
@@ -107,8 +123,8 @@
             "locator": { "kind": "artifact", "path": "src/net/http/server.go", "symbol": "net/http.HandleFunc" }
           },
           {
-            "id": "member.a8b0914462fd948fbe3642097fe5e048c3614c50ec5556ad0dab49ea13ff3dfa",
-            "owner": "type.b6eedc642c6132236bae5425a063fd44b150a8ea8555340b10ef1d3082dffe9a",
+            "id": "member.0f243fae8d056b35e471a233c456f7cfead880a1a0ce33568b256a1195ea63c0",
+            "owner": "type.b99de246c17e589368907e55dac75ea8887ae4a75829fb0eb4d25e7f05f77238",
             "name": "Handle",
             "member_kind": "function",
             "visibility": "public",
@@ -126,8 +142,8 @@
             "locator": { "kind": "artifact", "path": "src/net/http/server.go", "symbol": "net/http.Handle" }
           },
           {
-            "id": "member.394649d2d0cefee027325c02c6cab04ae0035f4c17fabbbe8b193a0b5beed09a",
-            "owner": "type.b6eedc642c6132236bae5425a063fd44b150a8ea8555340b10ef1d3082dffe9a",
+            "id": "member.1e530cd26a68a082861f871cbead91d8acb6bf6bef0bd4fed33e6b91b5b6a213",
+            "owner": "type.b99de246c17e589368907e55dac75ea8887ae4a75829fb0eb4d25e7f05f77238",
             "name": "Serve",
             "member_kind": "function",
             "visibility": "public",
@@ -146,8 +162,8 @@
             "locator": { "kind": "artifact", "path": "src/net/http/server.go", "symbol": "net/http.Serve" }
           },
           {
-            "id": "member.55c4eccff19fc50b68ff06dabf0c12527a27850d0e6a43f7793bab40e04f2124",
-            "owner": "type.b6eedc642c6132236bae5425a063fd44b150a8ea8555340b10ef1d3082dffe9a",
+            "id": "member.2a51bd42705b25c065968b189ce035a728638755a38dcfcebcd61c6b6a09afab",
+            "owner": "type.b99de246c17e589368907e55dac75ea8887ae4a75829fb0eb4d25e7f05f77238",
             "name": "ListenAndServe",
             "member_kind": "function",
             "visibility": "public",
@@ -166,8 +182,8 @@
             "locator": { "kind": "artifact", "path": "src/net/http/server.go", "symbol": "net/http.ListenAndServe" }
           },
           {
-            "id": "member.54c86563d13dead12ac400f2e7ddf30b55152059bfd39bebf7b8cdc659b95768",
-            "owner": "type.4c393b735855228a04f3c05bd17a970f4301acda0f7c16507fe4453daa72660b",
+            "id": "member.5a635450899ab0299a066f79ff594a35816eeb98b6fbb23128c69bcfafb9971e",
+            "owner": "type.fca5d790b7cc69fabd7f6b60f004b588a25a992e07fded17a7622c32189e7c17",
             "name": "HandleFunc",
             "member_kind": "method",
             "visibility": "public",
@@ -186,8 +202,8 @@
             "locator": { "kind": "artifact", "path": "src/net/http/server.go", "symbol": "net/http.ServeMux.HandleFunc" }
           },
           {
-            "id": "member.b9bc67c1cc6e6c9efce3e637210d2e5357fa90a6c70ebe2ec348b658f5b11ffc",
-            "owner": "type.4c393b735855228a04f3c05bd17a970f4301acda0f7c16507fe4453daa72660b",
+            "id": "member.8288e41021708201a573ce5b85917d04ae354dc9ec8d1a6003498444da20419d",
+            "owner": "type.fca5d790b7cc69fabd7f6b60f004b588a25a992e07fded17a7622c32189e7c17",
             "name": "Handle",
             "member_kind": "method",
             "visibility": "public",

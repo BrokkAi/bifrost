@@ -3,7 +3,7 @@
 
 use super::{ReportLines, sanitize_table_cell};
 use crate::analyzer::test_paths;
-use crate::analyzer::{IAnalyzer, Language};
+use crate::analyzer::{IAnalyzer, Language, parser_language_for_path};
 use crate::gitblob::resolve_default_branch_ref;
 use crate::path_utils::normalize_pattern;
 use git2::{FileMode, ObjectType, Oid, Repository, Sort, TreeWalkMode, TreeWalkResult};
@@ -13,6 +13,7 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
+use tree_sitter::{Node, Parser};
 
 const DEFAULT_SECRET_MAX_FINDINGS: i32 = 100;
 const DEFAULT_SECRET_MAX_COMMITS: i32 = 2000;
@@ -54,6 +55,8 @@ pub struct ReportSecretLikeCodeParams {
 pub struct ReportSecretLikeCodeResult {
     pub report: String,
     pub truncated: bool,
+    pub findings: Vec<SecretFinding>,
+    pub diagnostics: Vec<SecretScanDiagnostic>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
@@ -70,6 +73,28 @@ pub enum SecretLocation {
     Both,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+pub struct SecretRedactionSpan {
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub start_line: usize,
+    pub start_column: usize,
+    pub end_line: usize,
+    pub end_column: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+pub enum SecretScanDiagnosticKind {
+    UnsupportedAssignmentSyntax,
+    UnparseableAssignmentSyntax,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+pub struct SecretScanDiagnostic {
+    pub path: String,
+    pub kind: SecretScanDiagnosticKind,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct SecretKey {
     path: String,
@@ -77,6 +102,7 @@ struct SecretKey {
     rule: String,
     confidence: SecretConfidence,
     sample: String,
+    redaction_span: SecretRedactionSpan,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -89,6 +115,7 @@ pub struct SecretFinding {
     pub first_seen_commit: String,
     pub last_seen_commit: String,
     pub sample: String,
+    pub redaction_span: SecretRedactionSpan,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,6 +128,7 @@ struct SecretScanReport {
     missing_entries_skipped: usize,
     non_text_entries_skipped: usize,
     findings: Vec<SecretFinding>,
+    diagnostics: Vec<SecretScanDiagnostic>,
 }
 
 struct GitContext {
@@ -112,6 +140,7 @@ struct GitContext {
 #[derive(Debug, Clone)]
 struct BlobScanResult {
     keys: HashSet<SecretKey>,
+    diagnostics: Vec<SecretScanDiagnostic>,
     blobs_scanned: usize,
     missing_entries_skipped: usize,
     non_text_entries_skipped: usize,
@@ -120,6 +149,7 @@ struct BlobScanResult {
 #[derive(Debug, Clone, Default)]
 struct CurrentScanResult {
     keys: HashSet<SecretKey>,
+    diagnostics: Vec<SecretScanDiagnostic>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -130,6 +160,13 @@ struct HistoryScanAccumulator {
     blobs_scanned: usize,
     missing_entries_skipped: usize,
     non_text_entries_skipped: usize,
+    diagnostics: HashSet<SecretScanDiagnostic>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct TextScanResult {
+    keys: HashSet<SecretKey>,
+    diagnostics: Vec<SecretScanDiagnostic>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -159,68 +196,35 @@ struct SecretRule {
 
 #[derive(Debug, Clone)]
 struct CredentialKeyword {
-    pattern_fragment: &'static str,
     signal_substrings: &'static [&'static str],
 }
 
 static CREDENTIAL_KEYWORDS: &[CredentialKeyword] = &[
     CredentialKeyword {
-        pattern_fragment: "password",
         signal_substrings: &["password"],
     },
     CredentialKeyword {
-        pattern_fragment: "passwd",
         signal_substrings: &["passwd"],
     },
     CredentialKeyword {
-        pattern_fragment: "secret",
         signal_substrings: &["secret"],
     },
     CredentialKeyword {
-        pattern_fragment: "token",
         signal_substrings: &["token"],
     },
     CredentialKeyword {
-        pattern_fragment: "api[_-]?key",
         signal_substrings: &["apikey", "api_key", "api-key"],
     },
     CredentialKeyword {
-        pattern_fragment: "client[_-]?secret",
         signal_substrings: &["clientsecret", "client_secret", "client-secret"],
     },
     CredentialKeyword {
-        pattern_fragment: "private[_-]?key",
         signal_substrings: &["privatekey", "private_key", "private-key"],
     },
     CredentialKeyword {
-        pattern_fragment: "access[_-]?key",
         signal_substrings: &["accesskey", "access_key", "access-key"],
     },
 ];
-
-static CREDENTIAL_NAME_PATTERN_FRAGMENT: LazyLock<String> = LazyLock::new(|| {
-    CREDENTIAL_KEYWORDS
-        .iter()
-        .map(|k| k.pattern_fragment)
-        .collect::<Vec<_>>()
-        .join("|")
-});
-
-static ASSIGNMENT_SECRET_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(&format!(
-        "(?i)([A-Za-z0-9_.-]*(?:{})[A-Za-z0-9_.-]*)\\s*[:=]\\s*['\"]?([^'\"\\s,;#}}]+)",
-        *CREDENTIAL_NAME_PATTERN_FRAGMENT
-    ))
-    .expect("valid assignment secret regex")
-});
-
-static LOW_CONFIDENCE_SECRET_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(&format!(
-        "(?i)([A-Za-z0-9_.-]*(?:{})[A-Za-z0-9_.-]*)\\s*[:=]\\s*['\"]?([^'\"\\s,;#}}]{{4,11}})",
-        *CREDENTIAL_NAME_PATTERN_FRAGMENT
-    ))
-    .expect("valid low-confidence secret regex")
-});
 
 static HIGH_CONFIDENCE_RULES: LazyLock<Vec<SecretRule>> = LazyLock::new(|| {
     vec![
@@ -303,13 +307,18 @@ pub fn report_secret_like_code(
             return ReportSecretLikeCodeResult {
                 report: "Secret-like code scan requires a JGit-backed repository.".to_string(),
                 truncated: false,
+                findings: Vec::new(),
+                diagnostics: Vec::new(),
             };
         }
     };
 
+    let findings = report.findings.iter().take(findings_cap).cloned().collect();
     ReportSecretLikeCodeResult {
         truncated: report.findings.len() > findings_cap,
         report: format_secret_scan_report(&report, findings_cap),
+        findings,
+        diagnostics: report.diagnostics.clone(),
     }
 }
 
@@ -324,6 +333,7 @@ fn scan_repository(
     let history = scan_history(ctx, commit_cap, include_low_confidence);
 
     let mut accumulator = SecretScanAccumulator::default();
+    let mut diagnostics = current.diagnostics.into_iter().collect::<HashSet<_>>();
     for key in current.keys {
         accumulator.add(key, SecretLocation::Current, "", "", -1);
     }
@@ -340,11 +350,14 @@ fn scan_repository(
             );
         }
     }
+    diagnostics.extend(history.diagnostics);
 
     let mut findings = accumulator.findings();
     findings.retain(|finding| include_history_only || finding.location != SecretLocation::History);
     findings.sort_by(secret_finding_cmp);
 
+    let mut diagnostics = diagnostics.into_iter().collect::<Vec<_>>();
+    diagnostics.sort();
     SecretScanReport {
         repository: ctx.repo_root.display().to_string(),
         default_ref_display_name: ref_info.display_name,
@@ -354,6 +367,7 @@ fn scan_repository(
         missing_entries_skipped: history.missing_entries_skipped,
         non_text_entries_skipped: history.non_text_entries_skipped,
         findings,
+        diagnostics,
     }
 }
 
@@ -387,6 +401,7 @@ fn scan_default_ref(
     include_low_confidence: bool,
 ) -> CurrentScanResult {
     let mut keys = HashSet::new();
+    let mut diagnostics = Vec::new();
     let obj = match ctx.repo.revparse_single(ref_name) {
         Ok(obj) => obj,
         Err(_) => return CurrentScanResult::default(),
@@ -418,10 +433,11 @@ fn scan_default_ref(
             let result =
                 scan_blob_content(&ctx.repo, entry.id(), &project_path, include_low_confidence);
             keys.extend(result.keys);
+            diagnostics.extend(result.diagnostics);
         }
         TreeWalkResult::Ok
     });
-    CurrentScanResult { keys }
+    CurrentScanResult { keys, diagnostics }
 }
 
 fn scan_history(
@@ -488,6 +504,7 @@ fn scan_history(
                     oid,
                     BlobScanResult {
                         keys: rebase_path(&scanned.keys, "__cache__"),
+                        diagnostics: scanned.diagnostics.clone(),
                         blobs_scanned: scanned.blobs_scanned,
                         missing_entries_skipped: scanned.missing_entries_skipped,
                         non_text_entries_skipped: scanned.non_text_entries_skipped,
@@ -506,6 +523,12 @@ fn scan_history(
             accumulator.blobs_scanned += stats.blobs_scanned;
             accumulator.missing_entries_skipped += stats.missing_entries_skipped;
             accumulator.non_text_entries_skipped += stats.non_text_entries_skipped;
+            accumulator
+                .diagnostics
+                .extend(stats.diagnostics.iter().cloned().map(|mut diagnostic| {
+                    diagnostic.path = project_path.clone();
+                    diagnostic
+                }));
             TreeWalkResult::Ok
         });
     }
@@ -522,6 +545,7 @@ fn scan_blob_content(
     let Ok(blob) = repo.find_blob(oid) else {
         return BlobScanResult {
             keys: HashSet::new(),
+            diagnostics: Vec::new(),
             blobs_scanned: 0,
             missing_entries_skipped: 1,
             non_text_entries_skipped: 0,
@@ -530,6 +554,7 @@ fn scan_blob_content(
     if blob.size() > MAX_BLOB_BYTES {
         return BlobScanResult {
             keys: HashSet::new(),
+            diagnostics: Vec::new(),
             blobs_scanned: 0,
             missing_entries_skipped: 0,
             non_text_entries_skipped: 1,
@@ -538,6 +563,7 @@ fn scan_blob_content(
     let Ok(text) = std::str::from_utf8(blob.content()) else {
         return BlobScanResult {
             keys: HashSet::new(),
+            diagnostics: Vec::new(),
             blobs_scanned: 0,
             missing_entries_skipped: 0,
             non_text_entries_skipped: 1,
@@ -546,22 +572,35 @@ fn scan_blob_content(
     if is_binary_text(text) {
         return BlobScanResult {
             keys: HashSet::new(),
+            diagnostics: Vec::new(),
             blobs_scanned: 0,
             missing_entries_skipped: 0,
             non_text_entries_skipped: 1,
         };
     }
+    let scanned = scan_text_detailed(path, text, include_low_confidence);
     BlobScanResult {
-        keys: scan_text(path, text, include_low_confidence),
+        keys: scanned.keys,
+        diagnostics: scanned.diagnostics,
         blobs_scanned: 1,
         missing_entries_skipped: 0,
         non_text_entries_skipped: 0,
     }
 }
 
+#[cfg(test)]
 fn scan_text(path: &str, text: &str, include_low_confidence: bool) -> HashSet<SecretKey> {
-    let mut findings = HashSet::new();
-    for (idx, line) in text.lines().enumerate() {
+    scan_text_detailed(path, text, include_low_confidence).keys
+}
+
+fn scan_text_detailed(path: &str, text: &str, include_low_confidence: bool) -> TextScanResult {
+    let mut result = TextScanResult::default();
+    let mut line_start = 0;
+    for (idx, line_with_ending) in text.split_inclusive('\n').enumerate() {
+        let line = line_with_ending
+            .strip_suffix('\n')
+            .unwrap_or(line_with_ending);
+        let line = line.strip_suffix('\r').unwrap_or(line);
         let line_number = idx + 1;
         for rule in HIGH_CONFIDENCE_RULES.iter() {
             if !rule
@@ -579,71 +618,267 @@ fn scan_text(path: &str, text: &str, include_low_confidence: bool) -> HashSet<Se
                 if is_placeholder(value) {
                     continue;
                 }
-                findings.insert(SecretKey {
+                let start = line_start + matched.start();
+                let end = line_start + matched.end();
+                result.keys.insert(SecretKey {
                     path: path.to_string(),
                     line: line_number,
                     rule: rule.name.to_string(),
                     confidence: rule.confidence,
                     sample: redacted_line(line, value, matched.start(), matched.end()),
+                    redaction_span: redaction_span(text, start, end),
                 });
             }
         }
-
-        let lower_line = line.to_lowercase();
-        if has_credential_keyword(&lower_line) {
-            add_assignment_findings(
-                &mut findings,
-                path,
-                line_number,
-                line,
-                &ASSIGNMENT_SECRET_PATTERN,
-                SecretConfidence::Medium,
-            );
-            if include_low_confidence {
-                add_assignment_findings(
-                    &mut findings,
-                    path,
-                    line_number,
-                    line,
-                    &LOW_CONFIDENCE_SECRET_PATTERN,
-                    SecretConfidence::Low,
-                );
-            }
-        }
+        line_start += line_with_ending.len();
     }
-    findings
+    add_structural_assignment_findings(&mut result, path, text, include_low_confidence);
+    result
 }
 
-fn add_assignment_findings(
-    findings: &mut HashSet<SecretKey>,
+fn add_structural_assignment_findings(
+    result: &mut TextScanResult,
     path: &str,
-    line_number: usize,
-    line: &str,
-    pattern: &Regex,
-    confidence: SecretConfidence,
+    text: &str,
+    include_low_confidence: bool,
 ) {
-    for captures in pattern.captures_iter(line) {
-        let Some(whole) = captures.get(0) else {
+    if !has_credential_keyword(&text.to_lowercase()) {
+        return;
+    }
+    let path_obj = Path::new(path);
+    let language = language_for_path(path);
+    let grammar = parser_language_for_path(language, path_obj).or_else(|| {
+        match path_obj
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "yaml" | "yml" => Some(tree_sitter_yaml::LANGUAGE.into()),
+            "json" => Some(tree_sitter_json::LANGUAGE.into()),
+            "properties" => Some(tree_sitter_properties::LANGUAGE.into()),
+            _ => None,
+        }
+    });
+    let Some(grammar) = grammar else {
+        result.diagnostics.push(SecretScanDiagnostic {
+            path: path.to_string(),
+            kind: SecretScanDiagnosticKind::UnsupportedAssignmentSyntax,
+        });
+        return;
+    };
+    let mut parser = Parser::new();
+    if parser.set_language(&grammar).is_err() {
+        result.diagnostics.push(SecretScanDiagnostic {
+            path: path.to_string(),
+            kind: SecretScanDiagnosticKind::UnsupportedAssignmentSyntax,
+        });
+        return;
+    }
+    let Some(tree) = parser.parse(text, None) else {
+        result.diagnostics.push(SecretScanDiagnostic {
+            path: path.to_string(),
+            kind: SecretScanDiagnosticKind::UnparseableAssignmentSyntax,
+        });
+        return;
+    };
+    if tree.root_node().has_error() {
+        result.diagnostics.push(SecretScanDiagnostic {
+            path: path.to_string(),
+            kind: SecretScanDiagnosticKind::UnparseableAssignmentSyntax,
+        });
+    }
+
+    let mut pending = vec![tree.root_node()];
+    while let Some(node) = pending.pop() {
+        let mut cursor = node.walk();
+        pending.extend(node.named_children(&mut cursor));
+        let Some((name, value)) = assignment_parts(node) else {
             continue;
         };
-        let Some(value_match) = captures.get(2) else {
+        let Ok(name_text) = name.utf8_text(text.as_bytes()) else {
             continue;
         };
-        let value = value_match.as_str();
-        if !is_plausible_assignment_secret(value, confidence) {
+        if !has_credential_keyword(&name_text.to_lowercase()) {
             continue;
         }
-        findings.insert(SecretKey {
+        let Some(literal) = literal_value_node(value) else {
+            continue;
+        };
+        if literal.start_position().row != literal.end_position().row
+            || contains_descendant_kind(literal, "escape_sequence")
+        {
+            continue;
+        }
+        let Some((start, end)) = literal_content_range(literal, text) else {
+            continue;
+        };
+        let value_text = &text[start..end];
+        let confidence = if value_text.chars().count() >= 12 {
+            SecretConfidence::Medium
+        } else if include_low_confidence {
+            SecretConfidence::Low
+        } else {
+            continue;
+        };
+        if !is_plausible_assignment_secret(value_text, confidence) {
+            continue;
+        }
+        let span = redaction_span(text, start, end);
+        result.keys.insert(SecretKey {
             path: path.to_string(),
-            line: line_number,
+            line: span.start_line,
             rule: if confidence == SecretConfidence::Low {
                 "Credential-like name".to_string()
             } else {
                 "Credential assignment".to_string()
             },
             confidence,
-            sample: redacted_line(line, value, whole.start(), whole.end()),
+            sample: redact_assignment_excerpt(text, node, start, end),
+            redaction_span: span,
         });
+    }
+}
+
+fn assignment_parts(node: Node<'_>) -> Option<(Node<'_>, Node<'_>)> {
+    match node.kind() {
+        "assignment_expression" | "assignment" | "short_var_declaration" => Some((
+            node.child_by_field_name("left")?,
+            node.child_by_field_name("right")?,
+        )),
+        "variable_declarator" | "var_spec" => Some((
+            node.child_by_field_name("name")?,
+            node.child_by_field_name("value")?,
+        )),
+        "let_declaration" => Some((
+            node.child_by_field_name("pattern")?,
+            node.child_by_field_name("value")?,
+        )),
+        "const_item" | "static_item" => Some((
+            node.child_by_field_name("name")?,
+            node.child_by_field_name("value")?,
+        )),
+        "pair" | "block_mapping_pair" | "flow_pair" => Some((
+            node.child_by_field_name("key")?,
+            node.child_by_field_name("value")?,
+        )),
+        "property" => {
+            let mut cursor = node.walk();
+            let mut children = node.named_children(&mut cursor);
+            Some((children.next()?, children.next()?))
+        }
+        _ => None,
+    }
+}
+
+fn literal_value_node(mut node: Node<'_>) -> Option<Node<'_>> {
+    loop {
+        if matches!(
+            node.kind(),
+            "string_literal"
+                | "string"
+                | "template_string"
+                | "interpreted_string_literal"
+                | "raw_string_literal"
+                | "double_quote_scalar"
+                | "single_quote_scalar"
+                | "plain_scalar"
+                | "block_scalar"
+                | "value"
+        ) {
+            if node.kind() == "template_string"
+                && (0..node.named_child_count())
+                    .filter_map(|index| node.named_child(index))
+                    .any(|child| child.kind() == "template_substitution")
+            {
+                return None;
+            }
+            return Some(node);
+        }
+        if !matches!(
+            node.kind(),
+            "flow_node" | "block_node" | "equals_value_clause" | "parenthesized_expression"
+        ) || node.named_child_count() != 1
+        {
+            return None;
+        }
+        node = node.named_child(0)?;
+    }
+}
+
+fn literal_content_range(node: Node<'_>, text: &str) -> Option<(usize, usize)> {
+    let mut start = node.start_byte();
+    let mut end = node.end_byte();
+    let bytes = text.as_bytes().get(start..end)?;
+    if matches!(
+        node.kind(),
+        "string_literal"
+            | "string"
+            | "template_string"
+            | "double_quote_scalar"
+            | "single_quote_scalar"
+    ) && bytes.len() >= 2
+        && matches!(
+            (bytes[0], bytes[bytes.len() - 1]),
+            (b'\'', b'\'') | (b'"', b'"') | (b'`', b'`')
+        )
+    {
+        start += 1;
+        end -= 1;
+    }
+    (start < end).then_some((start, end))
+}
+
+fn contains_descendant_kind(node: Node<'_>, kind: &str) -> bool {
+    let mut pending = vec![node];
+    while let Some(current) = pending.pop() {
+        if current != node && current.kind() == kind {
+            return true;
+        }
+        let mut cursor = current.walk();
+        pending.extend(current.named_children(&mut cursor));
+    }
+    false
+}
+
+fn redaction_span(text: &str, start: usize, end: usize) -> SecretRedactionSpan {
+    let start_point = point_for_offset(text, start);
+    let end_point = point_for_offset(text, end);
+    SecretRedactionSpan {
+        start_byte: start,
+        end_byte: end,
+        start_line: start_point.0,
+        start_column: start_point.1,
+        end_line: end_point.0,
+        end_column: end_point.1,
+    }
+}
+
+fn point_for_offset(text: &str, offset: usize) -> (usize, usize) {
+    let prefix = &text[..offset.min(text.len())];
+    let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
+    let column = prefix
+        .rsplit_once('\n')
+        .map_or(prefix.len(), |(_, tail)| tail.len())
+        + 1;
+    (line, column)
+}
+
+fn redact_assignment_excerpt(text: &str, assignment: Node<'_>, start: usize, end: usize) -> String {
+    let excerpt_start = assignment.start_byte();
+    let excerpt_end = assignment.end_byte().min(text.len());
+    let mut excerpt = text[excerpt_start..excerpt_end].to_string();
+    let relative_start = start - excerpt_start;
+    let relative_end = end - excerpt_start;
+    excerpt.replace_range(
+        relative_start..relative_end,
+        &redact_secret(&text[start..end]),
+    );
+    if excerpt.len() > MAX_EXCERPT_CHARS {
+        format!("{}...", &excerpt[..MAX_EXCERPT_CHARS - 3])
+    } else {
+        excerpt.trim().to_string()
     }
 }
 
@@ -775,6 +1010,7 @@ fn rebase_path(keys: &HashSet<SecretKey>, path: &str) -> HashSet<SecretKey> {
             rule: key.rule.clone(),
             confidence: key.confidence,
             sample: key.sample.clone(),
+            redaction_span: key.redaction_span.clone(),
         })
         .collect()
 }
@@ -852,6 +1088,7 @@ impl MutableSecretFinding {
             first_seen_commit: self.first_seen_commit,
             last_seen_commit: self.last_seen_commit,
             sample: self.key.sample,
+            redaction_span: self.key.redaction_span,
         }
     }
 }
@@ -901,6 +1138,13 @@ fn confidence_label(confidence: SecretConfidence) -> &'static str {
     }
 }
 
+fn diagnostic_label(kind: SecretScanDiagnosticKind) -> &'static str {
+    match kind {
+        SecretScanDiagnosticKind::UnsupportedAssignmentSyntax => "unsupported assignment syntax",
+        SecretScanDiagnosticKind::UnparseableAssignmentSyntax => "unparseable assignment syntax",
+    }
+}
+
 fn format_secret_scan_report(report: &SecretScanReport, max_findings: usize) -> String {
     let shown = report
         .findings
@@ -935,6 +1179,10 @@ fn format_secret_scan_report(report: &SecretScanReport, max_findings: usize) -> 
         report.non_text_entries_skipped
     ));
     lines.line(format!(
+        "- Assignment syntax diagnostics: {}",
+        report.diagnostics.len()
+    ));
+    lines.line(format!(
         "- Findings shown: {} of {}{}",
         shown.len(),
         report.findings.len(),
@@ -942,8 +1190,27 @@ fn format_secret_scan_report(report: &SecretScanReport, max_findings: usize) -> 
     ));
     lines.blank();
 
+    if !report.diagnostics.is_empty() {
+        lines.line("### Incomplete assignment classification");
+        lines.blank();
+        for diagnostic in &report.diagnostics {
+            lines.line(format!(
+                "- `{}`: {}",
+                sanitize_table_cell(&diagnostic.path),
+                diagnostic_label(diagnostic.kind)
+            ));
+        }
+        lines.blank();
+    }
+
     if shown.is_empty() {
-        lines.line("No secret-like code found.");
+        if report.diagnostics.is_empty() {
+            lines.line("No secret-like code found.");
+        } else {
+            lines.line(
+                "No secret-like findings retained; assignment classification was incomplete.",
+            );
+        }
         return lines.build();
     }
 
@@ -1099,13 +1366,64 @@ mod tests {
     }
 
     #[test]
+    fn matcher_ignores_nonliteral_credential_assignments() {
+        let java = "this.promptTokensDetails = builder.promptTokensDetails;";
+        let typescript = "tokenizeBody = makeEditBlockBodyTokenizer(parser, state);";
+
+        assert!(scan_text("Usage.java", java, false).is_empty());
+        assert!(scan_text("fenced-edit-block.ts", typescript, false).is_empty());
+    }
+
+    #[test]
+    fn matcher_reports_structured_redaction_spans_without_values() {
+        let text = "const clientSecret = \"qQ9xV7pL2mN8rT4sZ6wY\";";
+        let finding = scan_text("config.ts", text, false)
+            .into_iter()
+            .find(|finding| finding.rule == "Credential assignment")
+            .unwrap();
+
+        assert_eq!(
+            &text[finding.redaction_span.start_byte..finding.redaction_span.end_byte],
+            "qQ9xV7pL2mN8rT4sZ6wY"
+        );
+        assert_eq!(finding.redaction_span.start_line, 1);
+        assert!(!finding.sample.contains("qQ9xV7pL2mN8rT4sZ6wY"));
+    }
+
+    #[test]
+    fn matcher_treats_escaped_and_multiline_literals_as_near_misses() {
+        let escaped = r#"const apiKey = "qQ9xV7pL2mN8rT4s\\\"Z6wY";"#;
+        let multiline = "const accessToken = `qQ9xV7pL2mN8rT4s\nZ6wY`;";
+
+        assert!(scan_text("config.ts", escaped, false).is_empty());
+        assert!(scan_text("config.ts", multiline, false).is_empty());
+    }
+
+    #[test]
+    fn unsupported_assignment_syntax_is_diagnostic() {
+        let result = scan_text_detailed(
+            "config.unknown",
+            "client_secret = qQ9xV7pL2mN8rT4sZ6wY",
+            false,
+        );
+
+        assert!(result.keys.is_empty());
+        assert_eq!(
+            result.diagnostics,
+            vec![SecretScanDiagnostic {
+                path: "config.unknown".to_string(),
+                kind: SecretScanDiagnosticKind::UnsupportedAssignmentSyntax,
+            }]
+        );
+    }
+
+    #[test]
     fn matcher_detects_credential_assignment_keyword_variants() {
-        let text = r#"
-        apiKey = "qQ9xV7pL2mN8rT4sZ6wY"
-        api_key = "aB9xV7pL2mN8rT4sZ6wY"
-        api-key = "zZ9xV7pL2mN8rT4sZ6wY"
-        access_key = "mM9xV7pL2mN8rT4sZ6wY"
-        "#;
+        let text = r#"apiKey: "qQ9xV7pL2mN8rT4sZ6wY"
+api_key: "aB9xV7pL2mN8rT4sZ6wY"
+api-key: "zZ9xV7pL2mN8rT4sZ6wY"
+access_key: "mM9xV7pL2mN8rT4sZ6wY"
+"#;
 
         let findings = scan_text("config.yml", text, false);
         assert_eq!(
@@ -1119,20 +1437,22 @@ mod tests {
 
     #[test]
     fn matcher_ignores_placeholders_and_low_confidence_unless_requested() {
-        let text = r#"
-        password = "changeme"
-        api_key = "test"
-        token = "abcd123"
-        "#;
+        let text = r#"password: "changeme"
+api_key: "test"
+token: "abcd123"
+"#;
 
         let normal_findings = scan_text("config.yml", text, false);
         let low_findings = scan_text("config.yml", text, true);
 
         assert!(normal_findings.is_empty(), "{normal_findings:?}");
-        assert!(
+        assert_eq!(
             low_findings
                 .iter()
-                .any(|f| f.rule == "Credential-like name")
+                .filter(|f| f.rule == "Credential-like name")
+                .count(),
+            1,
+            "{low_findings:?}"
         );
     }
 
@@ -1177,6 +1497,9 @@ mod tests {
                 .report
                 .contains("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")
         );
+        assert!(!result.findings.is_empty());
+        let serialized = serde_json::to_string(&result).unwrap();
+        assert!(!serialized.contains("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"));
     }
 
     #[test]

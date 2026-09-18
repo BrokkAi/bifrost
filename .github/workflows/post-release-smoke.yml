@@ -94,6 +94,8 @@ jobs:
             "bifrost-agent-${RELEASE_TAG}.tar.gz" \
             "brokk-bifrost-agent-${RELEASE_VERSION}.tgz" \
             "bifrost-vscode-${RELEASE_TAG}.vsix" \
+            "bifrost-semantic-pack-${RELEASE_TAG}-x86_64-unknown-linux-gnu.tar.gz" \
+            "bifrost-semantic-pack-${RELEASE_TAG}-x86_64-unknown-linux-gnu.tar.gz.sha256" \
             "bifrost-semantic-packs-${RELEASE_TAG}.tar.gz" \
             "bifrost-semantic-packs-${RELEASE_TAG}.tar.gz.sha256"; do
             test -s "$asset_dir/$required"

@@ -2761,6 +2761,53 @@ impl CodeQuery {
         }
     }
 
+    /// Conservatively classify whether pending models can affect this query.
+    /// Only source-scoped seeds and file/import traversal are independent of
+    /// model activation. Other operations retain pending coverage until their
+    /// dependency contract proves otherwise.
+    pub fn may_use_semantic_packs(&self) -> bool {
+        let mut plans = vec![&self.plan];
+        while let Some(plan) = plans.pop() {
+            if plan.steps.iter().any(|step| {
+                !matches!(
+                    step,
+                    QueryStep::FileOf | QueryStep::ImportsOf | QueryStep::ImportersOf
+                )
+            }) {
+                return true;
+            }
+            match &plan.source {
+                CodeQueryPlanSource::Set { branches, .. } => plans.extend(branches),
+                CodeQueryPlanSource::Seed(seed) => {
+                    // Unscoped declaration queries can include model overlays.
+                    if seed.where_globs.is_empty() {
+                        return true;
+                    }
+                    let mut patterns = vec![&seed.root];
+                    patterns.extend(seed.inside.iter());
+                    patterns.extend(seed.inside_decl.iter());
+                    patterns.extend(seed.not_inside.iter());
+                    while let Some(pattern) = patterns.pop() {
+                        // Role constraints may resolve call/receiver identity.
+                        if pattern.has_role_constraints()
+                            || pattern.kinds.is_empty()
+                            || pattern
+                                .kinds
+                                .iter()
+                                .any(|kind| !kind.satisfies(NormalizedKind::Declaration))
+                        {
+                            return true;
+                        }
+                        patterns.extend(pattern.has.as_deref());
+                        patterns.extend(pattern.not_has.as_deref());
+                    }
+                }
+                _ => return true,
+            }
+        }
+        false
+    }
+
     /// Validate the semantic pipeline independently of its JSON/RQL origin.
     /// Embedders may construct this public IR directly, so execution cannot
     /// rely solely on decoder validation.

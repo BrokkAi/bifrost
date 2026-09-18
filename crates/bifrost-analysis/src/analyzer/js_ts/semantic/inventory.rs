@@ -215,6 +215,11 @@ pub(super) fn enumerate_procedures<'tree>(
             .collect::<Vec<_>>();
         for (child, field) in children.into_iter().rev() {
             let (child_parent, child_path) = match procedure_context {
+                // A file-scope declaration is a sibling of the module body
+                // frame, so it keeps the file scope as its lexical parent and
+                // declaration path while the body frame executes only the
+                // statements around it (#3374).
+                Some(_) if is_file_scope_declaration(child) => (lexical_parent, outer_path),
                 Some((procedure, procedure_path))
                     if callable_field_belongs_to_procedure(node.kind(), field) =>
                 {
@@ -281,6 +286,13 @@ fn populate_lexical_capture_specs<'tree>(
         }
         try_walk_named_tree_preorder(spec.body, true, |node| {
             charge_js_ts_inventory_prepass(inventory, cancellation)?;
+            // A file-scope declaration is a sibling of the module body frame,
+            // so the frame owns no binding for it: a nested procedure that
+            // names it reads the file scope, not a capture of the body
+            // (#3374).
+            if is_file_scope_declaration(node) {
+                return Ok(WalkControl::SkipChildren);
+            }
             if is_js_ts_nested_execution_boundary(node, spec.body) {
                 if matches!(
                     node.kind(),

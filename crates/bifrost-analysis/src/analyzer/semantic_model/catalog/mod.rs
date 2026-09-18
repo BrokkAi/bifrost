@@ -19,7 +19,8 @@ use super::validate::is_canonical_relative_path;
 use super::{
     ActivationSelector, ArtifactEncoding, CompiledPackManifest, CompiledSemanticModelPack,
     CompiledShard, CompiledShardDescriptor, Completeness, DecodeLimits, NameSelector, PayloadKind,
-    decode_manifest, decode_validated_shard_for_manifest, validate_manifest_inventory,
+    SEMANTIC_MODEL_SCHEMA_VERSION, decode_manifest, decode_validated_shard_for_manifest,
+    validate_manifest_inventory,
 };
 use crate::analyzer::canonical_hash::{CanonicalHasher, is_lower_sha256, lower_hex_string};
 use crate::analyzer::store::{
@@ -1778,6 +1779,127 @@ impl SemanticPackCatalog {
             },
             install,
         })
+    }
+
+    /// Record that `key` can be found again from a read-free source identity.
+    ///
+    /// The identity is derived by the ecosystem adapter from cheap filesystem
+    /// metadata rather than artifact bytes (see
+    /// `dependency_source_identity`), so a later process can ask for this
+    /// production before it reads anything. The recorded row only names the
+    /// production; [`Self::generated_production_by_source_identity`] still
+    /// resolves it through the fully verified key path, and the row disappears
+    /// with the production it names.
+    ///
+    /// The row is keyed by the current `GENERATED_PRODUCTION_CACHE_VERSION`, so
+    /// a catalog shared by binaries at different cache epochs keeps one mapping
+    /// per epoch instead of letting the newest one hide the mapping a running
+    /// binary learned.
+    pub fn install_generated_source_identity(
+        &self,
+        source_identity: &str,
+        key: &GeneratedProductionKey,
+    ) -> Result<(), CatalogError> {
+        self.require_writable()?;
+        if !is_lower_sha256(source_identity) {
+            return Err(CatalogError::Integrity(
+                "generated source identity must be a lowercase SHA-256 digest".to_owned(),
+            ));
+        }
+        let connection = self
+            .connection
+            .lock()
+            .expect("semantic-pack catalog connection mutex poisoned");
+        let inserted = connection
+            .execute(
+                "INSERT OR REPLACE INTO catalog_generated_source_identities(
+                   source_identity, producer_name, producer_version, schema_version,
+                   generated_cache_version, production_digest, created_at
+                 )
+                 SELECT ?1, ?2, ?3, ?4, ?5, gp.production_digest, ?6
+                 FROM catalog_generated_productions AS gp
+                 WHERE gp.production_digest = ?7
+                   AND gp.producer_name = ?2
+                   AND gp.producer_version = ?3
+                   AND gp.schema_version = ?4",
+                params![
+                    source_identity,
+                    key.producer_name(),
+                    key.producer_version(),
+                    key.schema_version(),
+                    GENERATED_PRODUCTION_CACHE_VERSION,
+                    crate::cache_db::now_unix_seconds(),
+                    key.production_digest(),
+                ],
+            )
+            .map_err(|error| CatalogError::sqlite("install generated source identity", error))?;
+        if inserted != 1 {
+            return Err(CatalogError::Integrity(format!(
+                "generated production {} is not installed, so its source identity cannot be recorded",
+                key.production_digest()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Look up the generated production a read-free source identity was learned
+    /// under, without reading or hashing the artifacts that identity describes.
+    ///
+    /// The row only names a candidate input digest. The returned production
+    /// comes from [`Self::generated_production`], which re-validates the key,
+    /// the manifest, and every shard row, so a partially deleted or quarantined
+    /// production reads as a miss here. Callers treat that miss, and any error,
+    /// as "read the artifacts and use the exact path instead".
+    pub fn generated_production_by_source_identity(
+        &self,
+        source_identity: &str,
+        producer: &super::Producer,
+    ) -> Result<Option<GeneratedProduction>, CatalogError> {
+        let connection = self
+            .connection
+            .lock()
+            .expect("semantic-pack catalog connection mutex poisoned");
+        let row = connection
+            .query_row(
+                "SELECT gp.production_digest, gp.input_digest
+                 FROM catalog_generated_source_identities AS ident
+                 JOIN catalog_generated_productions AS gp
+                   ON gp.production_digest = ident.production_digest
+                 WHERE ident.source_identity = ?1
+                   AND ident.producer_name = ?2
+                   AND ident.producer_version = ?3
+                   AND ident.schema_version = ?4
+                   AND ident.generated_cache_version = ?5
+                   AND gp.producer_name = ident.producer_name
+                   AND gp.producer_version = ident.producer_version
+                   AND gp.schema_version = ident.schema_version",
+                params![
+                    source_identity,
+                    &producer.name,
+                    &producer.version,
+                    SEMANTIC_MODEL_SCHEMA_VERSION,
+                    GENERATED_PRODUCTION_CACHE_VERSION,
+                ],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|error| CatalogError::sqlite("lookup generated source identity", error))?;
+        drop(connection);
+        let Some((production_digest, input_digest)) = row else {
+            return Ok(None);
+        };
+        let key = GeneratedProductionKey::new(
+            input_digest,
+            &producer.name,
+            &producer.version,
+            SEMANTIC_MODEL_SCHEMA_VERSION,
+        )?;
+        debug_assert_eq!(
+            key.production_digest(),
+            production_digest,
+            "a source-identity row must name the production its stored key derives"
+        );
+        self.generated_production(&key)
     }
 
     /// Look up the cached generated pack for `key`.
@@ -4026,6 +4148,14 @@ impl SemanticPackCatalog {
         } else {
             Err(CatalogError::ReadOnly)
         }
+    }
+
+    /// Whether this catalog handle may write catalog rows.
+    ///
+    /// Optional accelerator work asks first, so a read-only catalog does not
+    /// report a failure for work it was never able to do.
+    pub fn is_writable(&self) -> bool {
+        self.mode == CatalogOpenMode::ReadWrite
     }
 }
 

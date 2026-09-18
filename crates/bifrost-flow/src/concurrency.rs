@@ -515,6 +515,12 @@ pub enum ResolvedConcurrencyEffect {
     TaskSpawn {
         callable: ValueId,
         targets: Vec<ProcedureHandle>,
+        /// The caller-frame value the spawned task's receiver formal binds to,
+        /// when the spawn dispatches through a reviewed model to a method of a
+        /// value the call already names (`net/http.Handler` registration,
+        /// issue #3428). The callable of a method-value spawn carries its own
+        /// receiver through the closure environment and leaves this `None`.
+        receiver: Option<ValueId>,
         group: Option<ResolvedConcurrencySubject>,
         condition: ResolvedTaskSpawnCondition,
         /// The timer object the spawn call returns, when the spawned
@@ -903,6 +909,22 @@ pub trait ConcurrencyProvider {
         None
     }
 
+    /// Whether boxing this allocation's value into an interface wrapper carries
+    /// a reference payload the wrapper keeps, rather than a value or descriptor
+    /// it copies.
+    ///
+    /// `Some(true)` names a pointed-to object or a channel, exactly the
+    /// payloads an interface channel element transports. `Some(false)` proves
+    /// an inline value or a slice or map header, whose endpoint stays unknown.
+    /// Missing metadata stays unknown.
+    fn allocation_boxes_reference_payload(
+        &self,
+        _procedure: &ProcedureHandle,
+        _allocation: AllocationId,
+    ) -> Option<bool> {
+        None
+    }
+
     /// Whether this exact fresh allocation remains confined to the task that
     /// executes its procedure through every procedure exit. A positive answer
     /// requires a complete publication inventory; ordinary allocation
@@ -976,6 +998,22 @@ pub trait ConcurrencyProvider {
     /// and unavailable metadata must return false.
     fn parameter_preserves_backing(&self, _procedure: &ProcedureHandle, _ordinal: u32) -> bool {
         false
+    }
+
+    /// Whether this callee's parameter declaration is an interface type, so
+    /// binding it boxes one reference argument.
+    ///
+    /// Go copies an interface argument, but the copy still carries the
+    /// caller's object inside the wrapper: a compatible assertion on the
+    /// formal recovers that object. `Some(true)` names that wrapper;
+    /// `Some(false)` proves the formal is not an interface; `None` means the
+    /// declaration is unavailable or ambiguous, so nothing crosses.
+    fn parameter_boxes_reference_payload(
+        &self,
+        _procedure: &ProcedureHandle,
+        _ordinal: u32,
+    ) -> Option<bool> {
+        None
     }
 
     /// Exact type evidence that this parameter cannot carry a mutable object
@@ -1288,6 +1326,13 @@ struct SubtestSpawn {
     receiver: ValueId,
     /// The spawn effect's group subject, for canonical receiver matching.
     group: ResolvedConcurrencySubject,
+    /// The proven `Parallel` call points of this target's callback (issue
+    /// #3407), in the callback procedure. Empty for every other kind. Every
+    /// path from the callback's entry to an exit crosses all of them, so a
+    /// callback access that every path from it to an exit still crosses a
+    /// point lies in the pre-`Parallel` prefix that runs while the spawning
+    /// test is blocked inside `Run`.
+    parallel_points: Vec<ProgramPointId>,
 }
 
 /// Which reviewed subtest event spawned a task (issue #3383).
@@ -1758,7 +1803,88 @@ struct OmittedRecursiveCall {
 struct IndexAliasDomain {
     base: CanonicalConcurrencyLocation,
     identity: IndexedLocationIdentity,
-    constant_index: Option<u128>,
+    /// The element range this access can select, when a bounded proof decided
+    /// one. `None` is an undecided index and keeps the element open.
+    index: Option<IndexRange>,
+}
+
+/// The inclusive element-index range one indexed access can select.
+///
+/// A literal index, an exact scalar snapshot carried across an invocation
+/// chain, and the procedure's bounded scalar derivation all produce one of
+/// these, so the overlap gate names an element the same way whichever proof
+/// supplied it. Naming one element needs a single value; rejecting a conflict
+/// needs only two ranges that do not meet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct IndexRange {
+    lowest: ScalarIntegerValue,
+    highest: ScalarIntegerValue,
+}
+
+impl IndexRange {
+    fn exact(value: ScalarIntegerValue) -> Self {
+        Self {
+            lowest: value,
+            highest: value,
+        }
+    }
+
+    fn from_interval(interval: ScalarIntegerInterval) -> Self {
+        Self {
+            lowest: interval.lower(),
+            highest: interval.upper(),
+        }
+    }
+
+    /// The one element this range selects, when it selects exactly one.
+    fn selected_element(self) -> Option<ScalarIntegerValue> {
+        (self.lowest == self.highest).then_some(self.lowest)
+    }
+
+    fn is_disjoint(self, other: Self) -> bool {
+        self.highest < other.lowest || other.highest < self.lowest
+    }
+
+    /// Intersect two proofs about one access's index.
+    ///
+    /// Both sides describe the same runtime value at the same point, so they
+    /// must meet. An empty intersection would mean one of the producers is
+    /// unsound rather than that the access selects no element, so it fails
+    /// here instead of narrowing a location out of existence.
+    fn narrow(self, other: Self) -> Self {
+        assert!(
+            !self.is_disjoint(other),
+            "index proofs of one access agree: {self:?} and {other:?}"
+        );
+        Self {
+            lowest: self.lowest.max(other.lowest),
+            highest: self.highest.min(other.highest),
+        }
+    }
+}
+
+/// Name one proven element inside a composed location identity.
+///
+/// A non-negative element renders exactly as the producer's literal index
+/// does, so an access the scalar domain decided and an access the producer
+/// already knew name one location.
+fn element_index_selector(element: ScalarIntegerValue) -> String {
+    if element.negative() {
+        format!("-{}", element.magnitude())
+    } else {
+        element.magnitude().to_string()
+    }
+}
+
+/// The storage selector for one proven element, when it fits the selector's
+/// signed representation.
+fn element_index_constant(element: ScalarIntegerValue) -> Option<i128> {
+    let magnitude = i128::try_from(element.magnitude()).ok()?;
+    Some(if element.negative() {
+        -magnitude
+    } else {
+        magnitude
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4806,6 +4932,7 @@ fn solve_concurrent_access_conflicts(
                     ResolvedConcurrencyEffect::TaskSpawn {
                         callable,
                         targets,
+                        receiver,
                         group,
                         condition,
                         timer,
@@ -4826,6 +4953,7 @@ fn solve_concurrent_access_conflicts(
                             conditional,
                             timer.clone(),
                             None,
+                            *receiver,
                         ))
                     }
                     ResolvedConcurrencyEffect::OnceDo {
@@ -4838,6 +4966,7 @@ fn solve_concurrent_access_conflicts(
                         false,
                         *callable,
                         Some(once.clone()),
+                        None,
                         None,
                         None,
                         None,
@@ -4859,6 +4988,7 @@ fn solve_concurrent_access_conflicts(
                             group: group.clone(),
                             cleanup: false,
                         }),
+                        None,
                     )),
                     ResolvedConcurrencyEffect::SubtestCleanup {
                         callable,
@@ -4877,6 +5007,7 @@ fn solve_concurrent_access_conflicts(
                             group: group.clone(),
                             cleanup: true,
                         }),
+                        None,
                     )),
                     _ => None,
                 })
@@ -4922,7 +5053,17 @@ fn solve_concurrent_access_conflicts(
             report.reasons.extend(target_reasons);
             let (direct_targets, synchronous_targets) = if detached {
                 (
-                    Some((targets, None, true, call.callee, None, None, None, None)),
+                    Some((
+                        targets,
+                        None,
+                        true,
+                        call.callee,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )),
                     Vec::new(),
                 )
             } else {
@@ -4938,19 +5079,23 @@ fn solve_concurrent_access_conflicts(
                 conditional,
                 timer,
                 subtest_template,
+                receiver,
             ) in direct_targets.into_iter().chain(modeled_spawns)
             {
                 // A subtest classification is a property of the callback set,
                 // so it runs once per spawning call, before the per-target
                 // loop. An unknown callback keeps its typed boundary; a
                 // budget failure stops the solve like any other exhaustion.
-                let subtest = match subtest_template.as_ref() {
+                let subtest: Option<Vec<SubtestSpawn>> = match subtest_template.as_ref() {
                     Some(template) => {
-                        let kind = if template.cleanup {
-                            SubtestSpawnKind::Cleanup
+                        let (kind, parallel_points) = if template.cleanup {
+                            (SubtestSpawnKind::Cleanup, vec![Vec::new(); targets.len()])
                         } else {
                             match classify_subtest_callback(&targets, provider, request) {
-                                Ok(parallel) => SubtestSpawnKind::Run(parallel),
+                                Ok(classification) => (
+                                    SubtestSpawnKind::Run(classification.parallelism),
+                                    classification.parallel_points,
+                                ),
                                 Err(SubtestClassifyError::Budget(reason)) => {
                                     report.reasons.push(reason);
                                     report.reasons.sort();
@@ -4968,15 +5113,23 @@ fn solve_concurrent_access_conflicts(
                                 ),
                             );
                         }
-                        Some(SubtestSpawn {
-                            kind,
-                            receiver: template.receiver,
-                            group: template.group.clone(),
-                        })
+                        // Each callback target carries its own `Parallel`
+                        // points: separate targets have separate procedures.
+                        Some(
+                            parallel_points
+                                .into_iter()
+                                .map(|parallel_points| SubtestSpawn {
+                                    kind,
+                                    receiver: template.receiver,
+                                    group: template.group.clone(),
+                                    parallel_points,
+                                })
+                                .collect(),
+                        )
                     }
                     None => None,
                 };
-                for target in targets {
+                for (target_index, target) in targets.into_iter().enumerate() {
                     spawned_any_task = true;
                     match invocations.repeats_spawn_edge(
                         context.invocation,
@@ -5027,8 +5180,13 @@ fn solve_concurrent_access_conflicts(
                             return Ok(report);
                         }
                     };
+                    // A modeled spawn that dispatches through a receiver
+                    // names a method, not a callable value: the caller's
+                    // value is that method's receiver, and naming it here
+                    // would make the callable trace read the handler as the
+                    // task's own entry value.
                     invocations.entries[target_context.invocation.0 as usize].callable =
-                        Some(invoked_callable);
+                        receiver.is_none().then_some(invoked_callable);
                     let conditional_spawn = match conditional.as_ref() {
                         Some((guard, true_edges)) => {
                             match conditional_spawn_false_edges(
@@ -5059,7 +5217,7 @@ fn solve_concurrent_access_conflicts(
                         timer: timer.clone(),
                         timer_context: timer.as_ref().map(|_| context.clone()),
                         timer_cancellation: None,
-                        subtest: subtest.clone(),
+                        subtest: subtest.as_ref().map(|spawns| spawns[target_index].clone()),
                         completion: None,
                         repetition: invocations.entries[target_context.invocation.0 as usize]
                             .repetition,
@@ -5080,6 +5238,21 @@ fn solve_concurrent_access_conflicts(
                             target_context.invocation,
                             &target,
                             true,
+                            provider,
+                            request,
+                        )?;
+                    } else if let Some(receiver) = receiver {
+                        bind_modeled_receiver_input(
+                            &mut synchronization_subjects,
+                            &mut callable_values,
+                            &invocations,
+                            &tasks,
+                            &context,
+                            call,
+                            child,
+                            target_context.invocation,
+                            &target,
+                            receiver,
                             provider,
                             request,
                         )?;
@@ -5257,6 +5430,8 @@ fn solve_concurrent_access_conflicts(
     // task-local object as a write to the caller's.
     let sync_map_payload_transports =
         sync_map_payload_transports(&mut synchronization_subjects, &modeled_by_context);
+    let atomic_payload_transports =
+        atomic_payload_transports(&mut synchronization_subjects, &modeled_by_context);
     let written_once = synchronization_subjects
         .location_stores
         .iter()
@@ -5283,6 +5458,7 @@ fn solve_concurrent_access_conflicts(
         &reference_allocations,
         &pending_synchronizations,
         &sync_map_payload_transports,
+        &atomic_payload_transports,
         &summary_effect_free_call_targets,
         &closed_recursive_calls,
         provider,
@@ -5396,6 +5572,7 @@ fn solve_concurrent_access_conflicts(
             &reference_allocations,
             &pending_synchronizations,
             &sync_map_payload_transports,
+            &atomic_payload_transports,
             &summary_effect_free_call_targets,
             &closed_recursive_calls,
             provider,
@@ -5457,7 +5634,21 @@ fn solve_concurrent_access_conflicts(
                     .contains(&member_locator_key(&domain.member))
             })
     });
-    canonicalize_bound_accesses(&mut synchronization_subjects, &invocations, &mut accesses);
+    let scalar_index_ranges = match prove_scalar_index_ranges(&accesses, &invocations, request) {
+        Ok(ranges) => ranges,
+        Err(reason) => {
+            report.reasons.push(reason);
+            report.reasons.sort();
+            report.reasons.dedup();
+            return Ok(report);
+        }
+    };
+    canonicalize_bound_accesses(
+        &mut synchronization_subjects,
+        &invocations,
+        &scalar_index_ranges,
+        &mut accesses,
+    );
     if let Err(reason) =
         associate_wait_group_tasks(&mut tasks, &modeled_by_context, &synchronous_calls, request)
     {
@@ -6303,30 +6494,32 @@ fn propagate_memory_payload_identities(
             closed &= reference_evidence_is_complete(semantics, call.evidence)
                 && match targets {
                     ConcurrencyAnswer::Proven(targets) => {
-                        !targets.is_empty()
-                            && targets.iter().all(|target| {
-                                if invocations.entries.iter().any(|entry| {
-                                    entry.caller == Some((context.invocation, call.id))
-                                        && entry.context.procedure == *target
-                                }) {
-                                    return true;
-                                }
-                                if let Some(ancestor) = recursive_call_preserves_inputs(
-                                    classes,
-                                    invocations,
-                                    tasks,
-                                    context,
-                                    call,
-                                    target,
-                                    provider,
-                                    request,
-                                ) {
-                                    recursive_roots.insert(ancestor);
-                                    true
-                                } else {
-                                    false
-                                }
-                            })
+                        // An exhaustive empty target set is closed: a call the
+                        // provider proved dispatches to nothing cannot invoke
+                        // a body this closure still needs to enter.
+                        targets.iter().all(|target| {
+                            if invocations.entries.iter().any(|entry| {
+                                entry.caller == Some((context.invocation, call.id))
+                                    && entry.context.procedure == *target
+                            }) {
+                                return true;
+                            }
+                            if let Some(ancestor) = recursive_call_preserves_inputs(
+                                classes,
+                                invocations,
+                                tasks,
+                                context,
+                                call,
+                                target,
+                                provider,
+                                request,
+                            ) {
+                                recursive_roots.insert(ancestor);
+                                true
+                            } else {
+                                false
+                            }
+                        })
                     }
                     ConcurrencyAnswer::Open { .. } => false,
                 };
@@ -8003,6 +8196,331 @@ fn sync_map_payload_transports(
     transports
 }
 
+/// The reference one atomically updated slot transports from its single
+/// unconditional `Store` to every `Load` (issue #3405).
+///
+/// An `atomic.Value` entry is not an ordinary cell: the documented operation
+/// publishes the stored payload, and the loaded value still is the stored
+/// object, so a later assertion on it keeps that object's identity. The same
+/// holds for the receiver form of every reviewed atomic store: `Store` on a
+/// receiver keeps the payload the argument that is not the effect's location
+/// subject, which is the `value` argument for both the receiver form
+/// (`sync/atomic.Value.Store(val any)`) and the pointer form
+/// (`sync/atomic.StoreInt64(addr, val)`).
+///
+/// The transport is claimed only for the one shape the reviewed model names
+/// exactly: one unconditional `Store` on one slot, no other operation on that
+/// slot, and `Load` observers. A competing store, a swap, a compare-and-swap,
+/// an arithmetic operation, or a store whose payload argument does not
+/// resolve leaves the loaded value unnamed.
+fn atomic_payload_transports(
+    classes: &mut SynchronizationSubjectClasses,
+    modeled: &HashMap<ContextKey, Vec<(ProgramPointId, ResolvedConcurrencyEffect)>>,
+) -> Vec<(LocalSynchronizationSubject, ReferenceIdentityUse)> {
+    #[derive(Default)]
+    struct Slot {
+        store: Option<ReferenceIdentityUse>,
+        disqualified: bool,
+        observers: Vec<LocalSynchronizationSubject>,
+    }
+    let mut slots = HashMap::<LocalSynchronizationSubject, Slot>::default();
+    for (context, effects) in modeled {
+        let semantics = context.procedure.semantics();
+        let subject = |value| LocalSynchronizationSubject::Value {
+            task: context.task,
+            invocation: context.invocation,
+            procedure: context.procedure.clone(),
+            value,
+        };
+        for (point, effect) in effects {
+            let ResolvedConcurrencyEffect::Atomic {
+                location,
+                operation,
+            } = effect
+            else {
+                continue;
+            };
+            let slot = slots
+                .entry(classes.root(subject(location.value)))
+                .or_default();
+            let Some(call) = semantics
+                .call_sites()
+                .iter()
+                .find(|call| call.point == *point)
+            else {
+                slot.disqualified = true;
+                continue;
+            };
+            let event = semantics
+                .point(*point)
+                .and_then(|point| {
+                    point.events.iter().position(|row| {
+                        matches!(row.effect, SemanticEffect::Invoke { call_site } if call_site == call.id)
+                    })
+                })
+                .unwrap_or(0);
+            match operation {
+                ConcurrencyAtomicOperation::Store => {
+                    let mut payloads = call
+                        .arguments
+                        .iter()
+                        .map(|argument| argument.value)
+                        .filter(|value| *value != location.value);
+                    let (Some(value), None) = (payloads.next(), payloads.next()) else {
+                        slot.disqualified = true;
+                        continue;
+                    };
+                    if slot.store.is_some() {
+                        slot.disqualified = true;
+                        continue;
+                    }
+                    slot.store = Some(ReferenceIdentityUse {
+                        subject: subject(value),
+                        invocation: context.invocation,
+                        point: *point,
+                        event,
+                    });
+                }
+                ConcurrencyAtomicOperation::Load => {
+                    if let Some(result) = call.normal_result(0) {
+                        slot.observers.push(subject(result));
+                    }
+                }
+                // A read-modify-write may install a different object than any
+                // single store did, so the slot transports no named payload.
+                ConcurrencyAtomicOperation::ReadModifyWrite => slot.disqualified = true,
+            }
+        }
+    }
+    let mut transports = Vec::new();
+    for slot in slots.into_values() {
+        if slot.disqualified {
+            continue;
+        }
+        let Some(store) = slot.store else {
+            continue;
+        };
+        for destination in slot.observers {
+            transports.push((destination, store.clone()));
+        }
+    }
+    transports
+}
+
+/// One payload a retained fresh channel hands from its single complete send to
+/// its single complete receive, with the copy the producer proved for its
+/// element.
+struct ChannelPayloadTransport {
+    destination: LocalSynchronizationSubject,
+    source: ReferenceIdentityUse,
+    copy: SynchronizationPayloadCopy,
+}
+
+/// The payload a retained fresh channel transports from its one complete send
+/// to its one complete receive (issues #2902, #3405).
+///
+/// An interface element boxes the sent operand, and the receive result is that
+/// boxed reference: the reference keeps its object identity inside the
+/// wrapper, exactly as a direct `pointer_type` element does, so a later
+/// assertion on the receive result narrows precisely the object the sender
+/// named, the same way a `sync.Map` entry publishes its stored value.
+///
+/// A receive is a must-equal payload only when one exact send can supply it.
+/// Multiple sends or receives describe a choice and must never be unioned into
+/// this equality relation. Restrict the transport proof to fresh, nonrepeating
+/// channels and direct reference or zero-offset backing-store payloads retained
+/// entirely by this invocation/task slice.
+#[allow(clippy::too_many_arguments)]
+fn channel_payload_transports(
+    classes: &mut SynchronizationSubjectClasses,
+    invocations: &Invocations,
+    tasks: &[Task],
+    synchronizations: &[PendingIntrinsicSynchronization],
+    reference_allocations: &HashSet<CanonicalConcurrencyLocation>,
+    effect_free_call_targets: &HashMap<(InvocationId, CallSiteId), ProcedureHandle>,
+    closed_recursive_calls: &HashSet<(InvocationId, CallSiteId)>,
+    provider: &impl ConcurrencyProvider,
+    request: &mut SolveRequest<'_, '_>,
+) -> Vec<ChannelPayloadTransport> {
+    let mut transports = Vec::new();
+    for receive in synchronizations {
+        let Some(SynchronizationPayload::Receive { result }) = receive.payload else {
+            continue;
+        };
+        let channel = LocalSynchronizationSubject::Value {
+            task: receive.task,
+            invocation: receive.invocation,
+            procedure: receive.procedure.clone(),
+            value: receive.subject,
+        };
+        let Some(channel_fact) = classes.canonical_backing_identity(channel.clone()) else {
+            continue;
+        };
+        let allocation_nonrepeating = match channel_fact.resolved.independent_storage {
+            Some(ConcurrencyStorageFamily::Allocation {
+                invocation,
+                allocation,
+            }) => {
+                let owner = &invocations.entries[invocation.0 as usize];
+                let allocation = owner
+                    .context
+                    .procedure
+                    .semantics()
+                    .allocation(allocation)
+                    .expect("identity allocation belongs to its invocation");
+                if owner.repetition.is_some() {
+                    false
+                } else {
+                    match point_is_cyclic(&owner.context, allocation.point, request) {
+                        Ok(cyclic) => !cyclic,
+                        Err(reason) => {
+                            classes.identity_reasons.push(reason);
+                            false
+                        }
+                    }
+                }
+            }
+            _ => false,
+        };
+        if !receive.complete
+            || channel_fact.storage_origin.as_ref() != Some(channel_fact.canonical())
+            || !reference_allocations.contains(channel_fact.canonical())
+            || !allocation_nonrepeating
+            || !classes.contains_fresh_backing_allocation(channel.clone())
+            || invocations.entries[receive.invocation.0 as usize]
+                .repetition
+                .is_some()
+        {
+            continue;
+        }
+        let mut sends = Vec::new();
+        let mut receives = Vec::new();
+        let mut closed_or_incomplete = false;
+        for candidate in synchronizations {
+            let candidate_channel = LocalSynchronizationSubject::Value {
+                task: candidate.task,
+                invocation: candidate.invocation,
+                procedure: candidate.procedure.clone(),
+                value: candidate.subject,
+            };
+            let Some(candidate_fact) =
+                classes.canonical_backing_identity(candidate_channel.clone())
+            else {
+                continue;
+            };
+            if candidate_fact.canonical() != channel_fact.canonical() {
+                continue;
+            }
+            if !candidate.complete
+                || invocations.entries[candidate.invocation.0 as usize]
+                    .repetition
+                    .is_some()
+            {
+                closed_or_incomplete = true;
+                continue;
+            }
+            let cyclic = match point_is_cyclic(
+                &invocations.entries[candidate.invocation.0 as usize].context,
+                candidate.point,
+                request,
+            ) {
+                Ok(cyclic) => cyclic,
+                Err(reason) => {
+                    classes.identity_reasons.push(reason);
+                    true
+                }
+            };
+            if cyclic {
+                closed_or_incomplete = true;
+                continue;
+            }
+            match (candidate.operation, candidate.payload) {
+                (
+                    crate::analyzer::semantic::SynchronizationOperation::ChannelSend,
+                    Some(SynchronizationPayload::Send {
+                        value,
+                        copy: SynchronizationPayloadCopy::Reference,
+                    }),
+                ) => sends.push((
+                    ReferenceIdentityUse {
+                        subject: LocalSynchronizationSubject::Value {
+                            task: candidate.task,
+                            invocation: candidate.invocation,
+                            procedure: candidate.procedure.clone(),
+                            value,
+                        },
+                        invocation: candidate.invocation,
+                        point: candidate.point,
+                        event: candidate.event,
+                    },
+                    SynchronizationPayloadCopy::Reference,
+                )),
+                (
+                    crate::analyzer::semantic::SynchronizationOperation::ChannelSend,
+                    Some(SynchronizationPayload::Send {
+                        value,
+                        copy: copy @ SynchronizationPayloadCopy::BackingStore { .. },
+                    }),
+                ) => sends.push((
+                    ReferenceIdentityUse {
+                        subject: LocalSynchronizationSubject::Value {
+                            task: candidate.task,
+                            invocation: candidate.invocation,
+                            procedure: candidate.procedure.clone(),
+                            value,
+                        },
+                        invocation: candidate.invocation,
+                        point: candidate.point,
+                        event: candidate.event,
+                    },
+                    copy,
+                )),
+                (
+                    crate::analyzer::semantic::SynchronizationOperation::ChannelReceive,
+                    Some(SynchronizationPayload::Receive { result }),
+                ) => receives.push((candidate.invocation, candidate.point, result)),
+                _ => closed_or_incomplete = true,
+            }
+        }
+        let [send] = sends.as_slice() else {
+            continue;
+        };
+        let [only_receive] = receives.as_slice() else {
+            continue;
+        };
+        let retained = channel_transport_is_retained(
+            classes,
+            invocations,
+            tasks,
+            effect_free_call_targets,
+            closed_recursive_calls,
+            channel.clone(),
+            provider,
+            request,
+        );
+        let stable = reference_source_is_stable(classes, invocations, tasks, &send.0, request);
+        if closed_or_incomplete
+            || *only_receive != (receive.invocation, receive.point, result)
+            || !retained
+            || !stable
+        {
+            continue;
+        }
+        let destination = LocalSynchronizationSubject::Value {
+            task: receive.task,
+            invocation: receive.invocation,
+            procedure: receive.procedure.clone(),
+            value: result,
+        };
+        transports.push(ChannelPayloadTransport {
+            destination,
+            source: send.0.clone(),
+            copy: send.1,
+        });
+    }
+    transports
+}
+
 #[allow(clippy::too_many_arguments)]
 fn propagate_reference_identities(
     classes: &mut SynchronizationSubjectClasses,
@@ -8013,6 +8531,7 @@ fn propagate_reference_identities(
     reference_allocations: &HashSet<CanonicalConcurrencyLocation>,
     synchronizations: &[PendingIntrinsicSynchronization],
     sync_map_transports: &[(LocalSynchronizationSubject, ReferenceIdentityUse)],
+    atomic_transports: &[(LocalSynchronizationSubject, ReferenceIdentityUse)],
     effect_free_call_targets: &HashMap<(InvocationId, CallSiteId), ProcedureHandle>,
     closed_recursive_calls: &HashSet<(InvocationId, CallSiteId)>,
     provider: &impl ConcurrencyProvider,
@@ -8039,11 +8558,149 @@ fn propagate_reference_identities(
     // A value read back from one exactly named `sync.Map` entry is the value
     // its single unconditional `Store` installed, so a later assertion on it
     // pairs with that stored object exactly as a directly boxed payload does.
-    for (destination, source) in sync_map_transports {
+    // A value loaded from one exactly named atomic slot transports the same
+    // way (issue #3405).
+    for (destination, source) in sync_map_transports.iter().chain(atomic_transports) {
         boxed_payloads
             .entry(classes.root(destination.clone()))
             .or_default()
             .push(Some(source.clone()));
+    }
+    // A retained fresh channel hands its one sent payload to its one receive
+    // result, which a later assertion on that result narrows exactly as a
+    // directly boxed payload is narrowed. The receive result also takes the
+    // sent reference's identity, so a write through the narrowed value races
+    // the access that produced the object (issue #3405). This must be seeded
+    // before the assertion extraction below reads the payload table, exactly
+    // as the `sync.Map` and atomic transports are.
+    for transport in channel_payload_transports(
+        classes,
+        invocations,
+        tasks,
+        synchronizations,
+        reference_allocations,
+        effect_free_call_targets,
+        closed_recursive_calls,
+        provider,
+        request,
+    ) {
+        match transport.copy {
+            SynchronizationPayloadCopy::Reference => {
+                boxed_payloads
+                    .entry(classes.root(transport.destination.clone()))
+                    .or_default()
+                    .push(Some(transport.source.clone()));
+                pending.push(PendingReferenceIdentity {
+                    destination: transport.destination,
+                    sources: Some(vec![transport.source]),
+                });
+            }
+            SynchronizationPayloadCopy::BackingStore { .. } => {
+                classes.union_backing(transport.source.subject, transport.destination);
+            }
+            SynchronizationPayloadCopy::Unknown => {
+                unreachable!("only a proved channel copy is transported")
+            }
+        }
+    }
+    // An interface-typed parameter boxes the reference argument exactly as a
+    // channel element or an atomic slot does: the callee copies the wrapper
+    // but it still holds the caller's object, so a compatible assertion on
+    // the formal narrows back to that object (issue #3425). Seed the formal's
+    // wrapper before the extraction below reads the payload table. An actual
+    // this loop cannot name leaves a `None` entry, which keeps the wrapper
+    // unnamed and reports the existing open boundary rather than dropping the
+    // pair silently.
+    let interface_formals = classes
+        .backing_formal_bindings
+        .iter()
+        .filter(|(formal, _)| !classes.formal_bindings.contains_key(*formal))
+        .filter_map(|(formal, actual)| {
+            let LocalSynchronizationSubject::Value {
+                invocation,
+                procedure,
+                value,
+                ..
+            } = formal
+            else {
+                unreachable!("a formal binding has a semantic value");
+            };
+            let crate::analyzer::semantic::SemanticValueKind::Parameter { ordinal, .. } = procedure
+                .semantics()
+                .value(*value)
+                .expect("owned formal")
+                .kind
+            else {
+                return None;
+            };
+            (provider.parameter_boxes_reference_payload(procedure, ordinal) == Some(true))
+                .then(|| (formal.clone(), actual.clone(), *invocation, ordinal))
+        })
+        .collect::<Vec<_>>();
+    let ambiguous_backing = {
+        let ambiguous = classes.backing_ambiguous.clone();
+        let mut roots = Vec::new();
+        for (left, right) in ambiguous {
+            let left = classes.backing_root(left);
+            let right = classes.backing_root(right);
+            if left != right {
+                roots.extend([left, right]);
+            }
+        }
+        roots
+    };
+    for (formal, actual, invocation, _) in interface_formals {
+        // The wrapper carries the caller's object only when the actual is a
+        // reference payload: a pointed-to object or a channel. A slice or map
+        // header, an inline value, and an allocation this solver cannot name
+        // keep the wrapper unnamed, exactly as the interface channel element
+        // transport keeps them unnamed (issue #3405).
+        let boxes_payload = match classes.bound_canonical_identity(actual.clone()) {
+            ConcurrencyAnswer::Proven(Some(fact)) => match fact.resolved.independent_storage {
+                Some(ConcurrencyStorageFamily::Allocation {
+                    invocation,
+                    allocation,
+                }) => {
+                    let owner = &invocations.entries[invocation.0 as usize];
+                    provider
+                        .allocation_boxes_reference_payload(&owner.context.procedure, allocation)
+                        == Some(true)
+                }
+                _ => false,
+            },
+            _ => false,
+        };
+        let ambiguous = ambiguous_backing
+            .iter()
+            .any(|root| root == &classes.backing_root(formal.clone()));
+        let source = (boxes_payload && !ambiguous)
+            .then(|| {
+                let (caller, call) = invocations.entries[invocation.0 as usize]
+                    .caller
+                    .expect("bound formal has a caller");
+                let context = &invocations.entries[caller.0 as usize].context;
+                let point = context
+                    .procedure
+                    .semantics()
+                    .call_site(call)
+                    .expect("owned call")
+                    .point;
+                let event = context.procedure.semantics().point(point).expect("owned call point")
+                    .events.iter()
+                    .position(|event| matches!(event.effect, SemanticEffect::Invoke { call_site } if call_site == call))
+                    .expect("validated call has its invocation event");
+                ReferenceIdentityUse {
+                    subject: actual.clone(),
+                    invocation: caller,
+                    point,
+                    event,
+                }
+            })
+            .filter(|use_| reference_source_is_stable(classes, invocations, tasks, use_, request));
+        boxed_payloads
+            .entry(classes.root(formal))
+            .or_default()
+            .push(source);
     }
     let mut extractions = Vec::new();
     for entry in &invocations.entries {
@@ -8244,193 +8901,6 @@ fn propagate_reference_identities(
             destination,
             sources: source.map(|source| vec![source]),
         });
-    }
-    // A receive is a must-equal payload only when one exact send can supply
-    // it. Multiple sends or receives describe a choice and must never be
-    // unioned into this equality relation. Restrict the first transport proof
-    // to fresh, nonrepeating channels and direct reference or zero-offset
-    // backing-store payloads retained entirely by this invocation/task slice.
-    for receive in synchronizations {
-        let Some(SynchronizationPayload::Receive { result }) = receive.payload else {
-            continue;
-        };
-        let channel = LocalSynchronizationSubject::Value {
-            task: receive.task,
-            invocation: receive.invocation,
-            procedure: receive.procedure.clone(),
-            value: receive.subject,
-        };
-        let Some(channel_fact) = classes.canonical_backing_identity(channel.clone()) else {
-            continue;
-        };
-        let allocation_nonrepeating = match channel_fact.resolved.independent_storage {
-            Some(ConcurrencyStorageFamily::Allocation {
-                invocation,
-                allocation,
-            }) => {
-                let owner = &invocations.entries[invocation.0 as usize];
-                let allocation = owner
-                    .context
-                    .procedure
-                    .semantics()
-                    .allocation(allocation)
-                    .expect("identity allocation belongs to its invocation");
-                if owner.repetition.is_some() {
-                    false
-                } else {
-                    match point_is_cyclic(&owner.context, allocation.point, request) {
-                        Ok(cyclic) => !cyclic,
-                        Err(reason) => {
-                            classes.identity_reasons.push(reason);
-                            false
-                        }
-                    }
-                }
-            }
-            _ => false,
-        };
-        if !receive.complete
-            || channel_fact.storage_origin.as_ref() != Some(channel_fact.canonical())
-            || !reference_allocations.contains(channel_fact.canonical())
-            || !allocation_nonrepeating
-            || !classes.contains_fresh_backing_allocation(channel.clone())
-            || invocations.entries[receive.invocation.0 as usize]
-                .repetition
-                .is_some()
-        {
-            continue;
-        }
-        let mut sends = Vec::new();
-        let mut receives = Vec::new();
-        let mut closed_or_incomplete = false;
-        for candidate in synchronizations {
-            let candidate_channel = LocalSynchronizationSubject::Value {
-                task: candidate.task,
-                invocation: candidate.invocation,
-                procedure: candidate.procedure.clone(),
-                value: candidate.subject,
-            };
-            let Some(candidate_fact) =
-                classes.canonical_backing_identity(candidate_channel.clone())
-            else {
-                continue;
-            };
-            if candidate_fact.canonical() != channel_fact.canonical() {
-                continue;
-            }
-            if !candidate.complete
-                || invocations.entries[candidate.invocation.0 as usize]
-                    .repetition
-                    .is_some()
-            {
-                closed_or_incomplete = true;
-                continue;
-            }
-            let cyclic = match point_is_cyclic(
-                &invocations.entries[candidate.invocation.0 as usize].context,
-                candidate.point,
-                request,
-            ) {
-                Ok(cyclic) => cyclic,
-                Err(reason) => {
-                    classes.identity_reasons.push(reason);
-                    true
-                }
-            };
-            if cyclic {
-                closed_or_incomplete = true;
-                continue;
-            }
-            match (candidate.operation, candidate.payload) {
-                (
-                    crate::analyzer::semantic::SynchronizationOperation::ChannelSend,
-                    Some(SynchronizationPayload::Send {
-                        value,
-                        copy: SynchronizationPayloadCopy::Reference,
-                    }),
-                ) => sends.push((
-                    ReferenceIdentityUse {
-                        subject: LocalSynchronizationSubject::Value {
-                            task: candidate.task,
-                            invocation: candidate.invocation,
-                            procedure: candidate.procedure.clone(),
-                            value,
-                        },
-                        invocation: candidate.invocation,
-                        point: candidate.point,
-                        event: candidate.event,
-                    },
-                    SynchronizationPayloadCopy::Reference,
-                )),
-                (
-                    crate::analyzer::semantic::SynchronizationOperation::ChannelSend,
-                    Some(SynchronizationPayload::Send {
-                        value,
-                        copy: copy @ SynchronizationPayloadCopy::BackingStore { .. },
-                    }),
-                ) => sends.push((
-                    ReferenceIdentityUse {
-                        subject: LocalSynchronizationSubject::Value {
-                            task: candidate.task,
-                            invocation: candidate.invocation,
-                            procedure: candidate.procedure.clone(),
-                            value,
-                        },
-                        invocation: candidate.invocation,
-                        point: candidate.point,
-                        event: candidate.event,
-                    },
-                    copy,
-                )),
-                (
-                    crate::analyzer::semantic::SynchronizationOperation::ChannelReceive,
-                    Some(SynchronizationPayload::Receive { result }),
-                ) => receives.push((candidate.invocation, candidate.point, result)),
-                _ => closed_or_incomplete = true,
-            }
-        }
-        let [send] = sends.as_slice() else {
-            continue;
-        };
-        let [only_receive] = receives.as_slice() else {
-            continue;
-        };
-        let retained = channel_transport_is_retained(
-            classes,
-            invocations,
-            tasks,
-            effect_free_call_targets,
-            closed_recursive_calls,
-            channel.clone(),
-            provider,
-            request,
-        );
-        let stable = reference_source_is_stable(classes, invocations, tasks, &send.0, request);
-        if closed_or_incomplete
-            || *only_receive != (receive.invocation, receive.point, result)
-            || !retained
-            || !stable
-        {
-            continue;
-        }
-        let destination = LocalSynchronizationSubject::Value {
-            task: receive.task,
-            invocation: receive.invocation,
-            procedure: receive.procedure.clone(),
-            value: result,
-        };
-        match send.1 {
-            SynchronizationPayloadCopy::Unknown => {
-                unreachable!("only proved channel copies enter sends")
-            }
-            SynchronizationPayloadCopy::Reference => pending.push(PendingReferenceIdentity {
-                destination,
-                sources: Some(vec![send.0.clone()]),
-            }),
-            SynchronizationPayloadCopy::BackingStore { .. } => {
-                classes.union_backing(send.0.subject.clone(), destination);
-            }
-        }
     }
     for entry in &invocations.entries {
         let context = &entry.context;
@@ -9822,12 +10292,14 @@ fn bind_conditional_task_spawns(
                 ResolvedConcurrencyEffect::TaskSpawn {
                     callable,
                     targets,
+                    receiver,
                     group,
                     condition: ResolvedTaskSpawnCondition::CallResultTrue,
                     timer,
                 } => ResolvedConcurrencyEffect::TaskSpawn {
                     callable,
                     targets,
+                    receiver,
                     group,
                     condition: ResolvedTaskSpawnCondition::OnResultTrue {
                         point: guard_point,
@@ -9953,6 +10425,15 @@ impl From<SemanticProviderError> for SubtestClassifyError {
     }
 }
 
+/// The classification of one `Run` callback set (issues #3383, #3407): the
+/// shared verdict and, for a parallel subtest, one proven `Parallel` point
+/// set per callback target, aligned with the target list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SubtestClassification {
+    parallelism: SubtestParallelism,
+    parallel_points: Vec<Vec<ProgramPointId>>,
+}
+
 /// Classify one `Run` callback set by its `Parallel` evidence (issue #3383).
 ///
 /// Every target is scanned for reviewed `Parallel` calls. All sequential
@@ -9965,26 +10446,59 @@ fn classify_subtest_callback(
     targets: &[ProcedureHandle],
     provider: &impl ConcurrencyProvider,
     request: &mut SolveRequest<'_, '_>,
-) -> Result<SubtestParallelism, SubtestClassifyError> {
+) -> Result<SubtestClassification, SubtestClassifyError> {
     assert!(
         !targets.is_empty(),
         "a subtest spawn names its callback targets"
     );
-    let mut parallel = 0;
+    let mut verdicts = Vec::with_capacity(targets.len());
+    let mut parallel_points = Vec::with_capacity(targets.len());
     for target in targets {
-        match classify_subtest_target(target, provider, request)? {
-            SubtestParallelism::Sequential => {}
-            SubtestParallelism::Parallel => parallel += 1,
-            SubtestParallelism::Unknown => return Ok(SubtestParallelism::Unknown),
-        }
+        let target = classify_subtest_target(target, provider, request)?;
+        verdicts.push(target.parallelism);
+        parallel_points.push(target.parallel_points);
     }
-    Ok(if parallel == targets.len() {
+    let parallel = verdicts
+        .iter()
+        .filter(|verdict| **verdict == SubtestParallelism::Parallel)
+        .count();
+    // Any unresolved target, and any mixed target set, keeps the typed
+    // boundary: neither a sequential nor a parallel task may be guessed.
+    let unresolved = verdicts.contains(&SubtestParallelism::Unknown);
+    let parallelism = if !unresolved && parallel == targets.len() {
         SubtestParallelism::Parallel
-    } else if parallel == 0 {
+    } else if !unresolved && parallel == 0 {
         SubtestParallelism::Sequential
     } else {
         SubtestParallelism::Unknown
+    };
+    // A parallel target's classification comes from a mandatory `Parallel`
+    // call, so its point set is non-empty; no other verdict keeps one.
+    assert!(
+        verdicts
+            .iter()
+            .zip(&parallel_points)
+            .all(
+                |(verdict, points)| (*verdict == SubtestParallelism::Parallel)
+                    == !points.is_empty()
+            ),
+        "only a parallel target names its Parallel points"
+    );
+    if parallelism != SubtestParallelism::Parallel {
+        parallel_points = vec![Vec::new(); targets.len()];
+    }
+    Ok(SubtestClassification {
+        parallelism,
+        parallel_points,
     })
+}
+
+/// One callback target's `Parallel` evidence (issue #3407).
+struct SubtestTargetClassification {
+    parallelism: SubtestParallelism,
+    /// The target's proven `Parallel` call points, empty unless the target is
+    /// a parallel subtest.
+    parallel_points: Vec<ProgramPointId>,
 }
 
 /// Classify one callback procedure by its reviewed `Parallel` evidence.
@@ -10002,7 +10516,7 @@ fn classify_subtest_target(
     target: &ProcedureHandle,
     provider: &impl ConcurrencyProvider,
     request: &mut SolveRequest<'_, '_>,
-) -> Result<SubtestParallelism, SubtestClassifyError> {
+) -> Result<SubtestTargetClassification, SubtestClassifyError> {
     let own = target.semantics().values().iter().find_map(|value| {
         matches!(
             value.kind,
@@ -10017,7 +10531,16 @@ fn classify_subtest_target(
         veto: false,
     };
     scan.scan_procedure(target, true, provider, request)?;
-    scan.verdict(target, request)
+    let parallelism = scan.verdict(target, request)?;
+    let parallel_points = if parallelism == SubtestParallelism::Parallel {
+        scan.parallel_points
+    } else {
+        Vec::new()
+    };
+    Ok(SubtestTargetClassification {
+        parallelism,
+        parallel_points,
+    })
 }
 
 struct SubtestParallelScan {
@@ -10861,7 +11384,8 @@ fn canonicalize_access(
             let domain = base.map(|base| IndexAliasDomain {
                 base,
                 identity: *identity,
-                constant_index: *constant_index,
+                index: constant_index
+                    .map(|magnitude| IndexRange::exact(ScalarIntegerValue::unsigned(magnitude))),
             });
             if base_is_exact && let Some(exact) = domain.as_ref().and_then(exact_index_location) {
                 canonical = Some(exact.clone());
@@ -10918,9 +11442,12 @@ pub fn field_step_selector(member: &crate::analyzer::semantic::SemanticLocator) 
 }
 
 fn exact_index_location(domain: &IndexAliasDomain) -> Option<CanonicalConcurrencyLocation> {
-    let selector = match (domain.identity, domain.constant_index) {
+    let selector = match (
+        domain.identity,
+        domain.index.and_then(IndexRange::selected_element),
+    ) {
         (IndexedLocationIdentity::Aggregate, _) => "aggregate".to_owned(),
-        (IndexedLocationIdentity::Element, Some(index)) => index.to_string(),
+        (IndexedLocationIdentity::Element, Some(element)) => element_index_selector(element),
         (IndexedLocationIdentity::Element, None) => return None,
     };
     Some(CanonicalConcurrencyLocation::new(
@@ -11032,21 +11559,31 @@ fn exact_scalar_fact(value: u128) -> ScalarFact {
     ))
 }
 
-fn invocation_scalar_entry_facts(
+/// One invocation's formals paired with the caller values that bind them.
+struct InvocationFormalBindings {
+    caller: InvocationId,
+    /// The caller point at which every pair below is bound.
+    point: ProgramPointId,
+    /// The formal and the caller actual that supplies it, in formal order.
+    pairs: Vec<(ValueId, ValueId)>,
+}
+
+/// Pair every parameter of one invocation with the caller value that binds it.
+///
+/// `None` for a root invocation, which has no caller to ask.
+fn invocation_formal_bindings(
     invocations: &Invocations,
     invocation: InvocationId,
-) -> Vec<ScalarEntryFact> {
+) -> Option<InvocationFormalBindings> {
     let entry = &invocations.entries[invocation.0 as usize];
-    let Some((parent, call)) = entry.caller else {
-        return Vec::new();
-    };
-    let caller = &invocations.entries[parent.0 as usize].context;
-    let call = caller
+    let (caller, call) = entry.caller?;
+    let call = invocations.entries[caller.0 as usize]
+        .context
         .procedure
         .semantics()
         .call_site(call)
         .expect("invocation caller owns its call site");
-    entry
+    let pairs = entry
         .context
         .procedure
         .semantics()
@@ -11059,9 +11596,81 @@ fn invocation_scalar_entry_facts(
                 return None;
             };
             let actual = call.arguments.get(usize::try_from(ordinal).ok()?)?.value;
-            invocation_scalar_integer(invocations, parent, actual).map(|value| ScalarEntryFact {
-                target: formal.id,
-                fact: exact_scalar_fact(value),
+            Some((formal.id, actual))
+        })
+        .collect();
+    Some(InvocationFormalBindings {
+        caller,
+        point: call.point,
+        pairs,
+    })
+}
+
+fn invocation_scalar_entry_facts(
+    invocations: &Invocations,
+    invocation: InvocationId,
+) -> Vec<ScalarEntryFact> {
+    let Some(bindings) = invocation_formal_bindings(invocations, invocation) else {
+        return Vec::new();
+    };
+    bindings
+        .pairs
+        .into_iter()
+        .filter_map(|(formal, actual)| {
+            invocation_scalar_integer(invocations, bindings.caller, actual).map(|value| {
+                ScalarEntryFact {
+                    target: formal,
+                    fact: exact_scalar_fact(value),
+                }
+            })
+        })
+        .collect()
+}
+
+/// Entry facts that also read the caller's own scalar derivation.
+///
+/// The invocation-chained snapshot stops at a memory load, so a caller that
+/// passed a local integer variable supplies nothing at all. The caller's
+/// derivation does model that closed cell, and it answers with a range when
+/// the actual is not one constant, which is what lets a callee prove two
+/// element ranges disjoint. An exact chained snapshot still wins: it names
+/// one value, so it is never wider than the derived range that contains it.
+fn invocation_derived_entry_facts(
+    invocations: &Invocations,
+    derivations: &HashMap<InvocationId, ScalarStateDerivation>,
+    invocation: InvocationId,
+) -> Vec<ScalarEntryFact> {
+    let Some(bindings) = invocation_formal_bindings(invocations, invocation) else {
+        return Vec::new();
+    };
+    let point = bindings.point;
+    bindings
+        .pairs
+        .iter()
+        .map(|(formal, actual)| (*formal, *actual))
+        .filter_map(|(formal, actual)| {
+            let derived = derivations
+                .get(&bindings.caller)
+                .and_then(|derivation| match derivation.fact_at(point, actual) {
+                    ScalarFact::Integer(interval) => Some(interval),
+                    _ => None,
+                });
+            let chained = invocation_scalar_integer(invocations, bindings.caller, actual);
+            if let (Some(interval), Some(value)) = (derived, chained) {
+                let value = ScalarIntegerValue::unsigned(value);
+                assert!(
+                    interval.lower() <= value && value <= interval.upper(),
+                    "one actual's scalar proofs agree: {interval:?} contains {value:?}"
+                );
+            }
+            let fact = match (derived, chained) {
+                (_, Some(value)) => exact_scalar_fact(value),
+                (Some(interval), None) => ScalarFact::Integer(interval),
+                (None, None) => return None,
+            };
+            Some(ScalarEntryFact {
+                target: formal,
+                fact,
             })
         })
         .collect()
@@ -11127,9 +11736,142 @@ fn scalar_inputs_strictly_decrease(
             .any(|((_, current), (_, next))| next < current)
 }
 
+/// The element ranges the bounded scalar domain proved for the indexed
+/// accesses whose producer could not name a literal index.
+///
+/// One derivation answers every such access in an invocation, so the map is
+/// keyed by the access's own point and index value and built per invocation.
+type ScalarIndexRanges = HashMap<(InvocationId, ProgramPointId, ValueId), IndexRange>;
+
+/// Decide the dynamic element indexes of one solve with the bounded scalar
+/// domain (issue #2903).
+///
+/// Go lowers a local integer variable to a lexical cell, so an index written
+/// as `values[i]` reaches the producer as a value with no literal magnitude
+/// even when `i` is a compile-time constant. The invocation-chained scalar
+/// snapshot cannot cross that memory load, but the procedure's scalar
+/// derivation models closed lexical cells, branch joins, ordered guards, and
+/// checked offsets, so it decides the element or proves the range it lies in.
+///
+/// Only an element-identified access with no literal index needs an answer,
+/// and one derivation serves all of them in its invocation. Each derivation
+/// is charged against the solve budget like any other retained work.
+fn prove_scalar_index_ranges(
+    accesses: &[Access],
+    invocations: &Invocations,
+    request: &mut SolveRequest<'_, '_>,
+) -> Result<ScalarIndexRanges, ConcurrencyOpenReason> {
+    let mut undecided = HashMap::<InvocationId, Vec<(ProgramPointId, ValueId)>>::default();
+    for access in accesses {
+        let Some(local) = access.local_location.as_ref() else {
+            continue;
+        };
+        let MemoryLocationKind::Index {
+            index: Some(index),
+            constant_index: None,
+            identity: IndexedLocationIdentity::Element,
+            ..
+        } = access
+            .site
+            .procedure
+            .semantics()
+            .memory_location(local.location)
+            .expect("validated concurrent access location exists")
+            .kind
+        else {
+            continue;
+        };
+        undecided
+            .entry(access.site.invocation)
+            .or_default()
+            .push((access.site.point, index));
+    }
+    // An index the producer could not name usually arrives as an argument, so
+    // the accessing invocation can only be seeded once every ancestor has its
+    // own derivation. A callee is always pushed after its caller, so sorting
+    // by invocation identity puts each caller before the callees it binds.
+    let mut required = undecided.keys().copied().collect::<HashSet<_>>();
+    let mut ancestors = required.iter().copied().collect::<Vec<_>>();
+    while let Some(invocation) = ancestors.pop() {
+        charge_concurrency_work(request, 1)?;
+        if let Some((caller, _)) = invocations.entries[invocation.0 as usize].caller
+            && required.insert(caller)
+        {
+            ancestors.push(caller);
+        }
+    }
+    let mut ordered = required.into_iter().collect::<Vec<_>>();
+    ordered.sort_unstable_by_key(|invocation| invocation.get());
+
+    let mut derivations = HashMap::<InvocationId, ScalarStateDerivation>::default();
+    for invocation in ordered {
+        let procedure = &invocations.entries[invocation.0 as usize].context.procedure;
+        let semantics = procedure.semantics();
+        charge_concurrency_work(
+            request,
+            semantics
+                .points()
+                .len()
+                .saturating_mul(semantics.values().len().saturating_add(1)),
+        )?;
+        let entry_facts = invocation_derived_entry_facts(invocations, &derivations, invocation);
+        derivations.insert(
+            invocation,
+            ScalarStateDerivation::derive_with_entry_facts(
+                procedure,
+                ScalarCallEffects::default(),
+                &entry_facts,
+            ),
+        );
+    }
+
+    let mut ranges = ScalarIndexRanges::default();
+    for (invocation, sites) in undecided {
+        let derivation = &derivations[&invocation];
+        for (point, index) in sites {
+            if let ScalarFact::Integer(interval) = derivation.fact_at(point, index) {
+                ranges.insert(
+                    (invocation, point, index),
+                    IndexRange::from_interval(interval),
+                );
+            }
+        }
+    }
+    Ok(ranges)
+}
+
+/// The element range one indexed access selects in its invocation.
+///
+/// Three bounded proofs can decide it, and the narrowest survives: the
+/// literal index the producer recorded, the exact scalar snapshot the
+/// invocation chain carries across call boundaries, and the scalar derivation
+/// of the accessing procedure. All three describe the same runtime value, so
+/// intersecting them is sound and keeps every element that resolves today
+/// resolving to the same name.
+fn proven_index_range(
+    invocations: &Invocations,
+    scalar_ranges: &ScalarIndexRanges,
+    invocation: InvocationId,
+    point: ProgramPointId,
+    constant_index: Option<u128>,
+    index: Option<ValueId>,
+) -> Option<IndexRange> {
+    [
+        constant_index.map(|magnitude| IndexRange::exact(ScalarIntegerValue::unsigned(magnitude))),
+        index
+            .and_then(|index| invocation_scalar_integer(invocations, invocation, index))
+            .map(|magnitude| IndexRange::exact(ScalarIntegerValue::unsigned(magnitude))),
+        index.and_then(|index| scalar_ranges.get(&(invocation, point, index)).copied()),
+    ]
+    .into_iter()
+    .flatten()
+    .reduce(IndexRange::narrow)
+}
+
 fn canonicalize_bound_accesses(
     classes: &mut SynchronizationSubjectClasses,
     invocations: &Invocations,
+    scalar_ranges: &ScalarIndexRanges,
     accesses: &mut [Access],
 ) {
     for access in accesses {
@@ -11173,21 +11915,25 @@ fn canonicalize_bound_accesses(
                 identity,
                 ..
             } => {
-                let constant_index = (*constant_index).or_else(|| {
-                    (*index).and_then(|index| {
-                        invocation_scalar_integer(invocations, access.site.invocation, index)
-                    })
-                });
-                let selector = match (identity, constant_index) {
+                let range = proven_index_range(
+                    invocations,
+                    scalar_ranges,
+                    access.site.invocation,
+                    access.site.point,
+                    *constant_index,
+                    *index,
+                );
+                let selector = match (identity, range.and_then(IndexRange::selected_element)) {
                     (IndexedLocationIdentity::Aggregate, _) => {
                         Some(ConcurrencyStorageSelector::Aggregate)
                     }
-                    (IndexedLocationIdentity::Element, Some(index)) => i128::try_from(index)
-                        .ok()
-                        .map(ConcurrencyStorageSelector::ConstantIndex),
+                    (IndexedLocationIdentity::Element, Some(element)) => {
+                        element_index_constant(element)
+                            .map(ConcurrencyStorageSelector::ConstantIndex)
+                    }
                     (IndexedLocationIdentity::Element, None) => None,
                 };
-                (*base, selector, Some((*identity, constant_index)))
+                (*base, selector, Some((*identity, range)))
             }
             _ => continue,
         };
@@ -11253,11 +11999,11 @@ fn canonicalize_bound_accesses(
                 member: classes.canonical_member(member).clone(),
             });
         }
-        if let Some((identity, constant_index)) = indexed {
+        if let Some((identity, index)) = indexed {
             access.index_alias_domain = Some(IndexAliasDomain {
                 base: base.canonical().clone(),
                 identity,
-                constant_index,
+                index,
             });
         }
         if let Some(selector) = selector {
@@ -12690,6 +13436,7 @@ fn source_summary_modeled_effect(
         return Ok(ResolvedConcurrencyEffect::TaskSpawn {
             callable,
             targets,
+            receiver: None,
             group,
             condition: match condition {
                 SummaryTaskSpawnCondition::Unconditional => {
@@ -13567,22 +14314,7 @@ fn bind_call_inputs(
     request: &mut SolveRequest<'_, '_>,
 ) -> Result<(), SemanticProviderError> {
     for formal in target.semantics().values() {
-        let dispatch_receiver = matches!(
-            formal.kind,
-            crate::analyzer::semantic::SemanticValueKind::Receiver { dispatch: true }
-        );
-        let parameter_ordinal = match formal.kind {
-            crate::analyzer::semantic::SemanticValueKind::Parameter { ordinal, .. } => {
-                Some(ordinal)
-            }
-            _ => None,
-        };
-        let parameter_binding =
-            parameter_ordinal.and_then(|ordinal| provider.parameter_binding(target, ordinal));
-        let parameter_preserves_backing = parameter_ordinal
-            .is_some_and(|ordinal| provider.parameter_preserves_backing(target, ordinal));
-        let receiver_binding = dispatch_receiver && provider.receiver_binds_by_reference(target);
-        let actual = match formal.kind {
+        let actual_value = match formal.kind {
             crate::analyzer::semantic::SemanticValueKind::Parameter { ordinal, .. } => call
                 .arguments
                 .get(usize::try_from(ordinal).expect("Go parameter ordinals fit usize"))
@@ -13592,44 +14324,167 @@ fn bind_call_inputs(
             }
             _ => None,
         };
-        let Some(actual_value) = actual else {
+        let Some(actual_value) = actual_value else {
             continue;
         };
-        let actual = LocalSynchronizationSubject::Value {
-            task: caller.task,
-            invocation: caller.invocation,
-            procedure: caller.procedure.clone(),
-            value: actual_value,
-        };
-        let formal_value = formal.id;
-        let formal = LocalSynchronizationSubject::Value {
-            task: target_task,
-            invocation: target_invocation,
-            procedure: target.clone(),
-            value: formal_value,
-        };
-        let formal_cell = target.semantics().binding_memory_location(formal_value);
-        let reassigned = target.semantics().points().iter().any(|point| {
-            point.events.iter().any(|event| match event.effect {
-                SemanticEffect::Assignment { target, .. } => target == formal_value,
-                SemanticEffect::MemoryStore { location, .. } => Some(location) == formal_cell,
-                _ => false,
-            })
-        });
-        if reassigned {
-            // Entry identity cannot describe every use of a mutable formal.
-            // In particular, an unsupported replacement result contributes no
-            // competing identity to invalidate an eager or deferred binding.
-            // Keep the missing reaching-definition evidence explicit before
-            // either ordinary or backing-store equivalence can cross the call.
-            classes
-                .note_formal_binding_reasons(formal, vec![ConcurrencyOpenReason::UnknownLocation]);
-            continue;
-        }
-        // Carry the callable the actual denotes, so a call on this formal can
-        // resolve the body it reaches. This is the callable counterpart of the
-        // object identity the rest of this loop carries.
-        if let Some(callable) = callable_values
+        bind_formal_input(
+            classes,
+            callable_values,
+            invocations,
+            tasks,
+            caller,
+            call,
+            target_task,
+            target_invocation,
+            target,
+            formal,
+            actual_value,
+            task_transfer,
+            provider,
+            request,
+        )?;
+    }
+    Ok(())
+}
+
+/// Bind the receiver formal of a task a reviewed model spawns on an object the
+/// caller names (issue #3428).
+///
+/// The reviewed model names the callable the spawn runs, and the caller names
+/// the object that callable is reached through. That object is the spawn's
+/// environment: binding it as the task's receiver is what makes the child's
+/// accesses name the caller's object, and the transfer mark is what keeps that
+/// identity alive across the call that created the task. A procedure that
+/// declares no receiver formal -- Go's unnamed receiver -- has nothing to bind.
+#[allow(clippy::too_many_arguments)]
+fn bind_modeled_receiver_input(
+    classes: &mut SynchronizationSubjectClasses,
+    callable_values: &mut HashMap<
+        (TaskId, InvocationId, ProcedureHandle, ValueId),
+        ProcedureHandle,
+    >,
+    invocations: &Invocations,
+    tasks: &[Task],
+    caller: &ContextKey,
+    call: &crate::analyzer::semantic::SemanticCallSite,
+    target_task: TaskId,
+    target_invocation: InvocationId,
+    target: &ProcedureHandle,
+    receiver: ValueId,
+    provider: &impl ConcurrencyProvider,
+    request: &mut SolveRequest<'_, '_>,
+) -> Result<(), SemanticProviderError> {
+    // A receiver formal exists only when the procedure's body can name the
+    // receiver. Go declares one value per lexical binding, so a method whose
+    // receiver is unnamed (`func (counter) ServeHTTP(...)`) has no receiver
+    // formal at all: the same shape an ordinary call leaves unbound when its
+    // target declares none. Nothing in that body can reach the object the
+    // caller registered, so there is nothing to bind, and the task is still
+    // the method the model named -- its other accesses, such as package-level
+    // state, are analyzed as usual.
+    let Some(formal) = target.semantics().values().iter().find(|value| {
+        matches!(
+            value.kind,
+            crate::analyzer::semantic::SemanticValueKind::Receiver { dispatch: true }
+        )
+    }) else {
+        return Ok(());
+    };
+    bind_formal_input(
+        classes,
+        callable_values,
+        invocations,
+        tasks,
+        caller,
+        call,
+        target_task,
+        target_invocation,
+        target,
+        formal,
+        receiver,
+        true,
+        provider,
+        request,
+    )
+}
+
+/// Bind one formal of the callee `target` to the caller's value for it.
+///
+/// The caller selects the actual -- `bind_call_inputs` from the call's
+/// receiver and argument list, a modeled spawn from the receiver its reviewed
+/// model dispatches through -- and everything after that selection is one set
+/// of rules, so an ordinary call and a model-dispatched task agree about
+/// identity, copies, and what may cross the boundary.
+#[allow(clippy::too_many_arguments)]
+fn bind_formal_input(
+    classes: &mut SynchronizationSubjectClasses,
+    callable_values: &mut HashMap<
+        (TaskId, InvocationId, ProcedureHandle, ValueId),
+        ProcedureHandle,
+    >,
+    invocations: &Invocations,
+    tasks: &[Task],
+    caller: &ContextKey,
+    call: &crate::analyzer::semantic::SemanticCallSite,
+    target_task: TaskId,
+    target_invocation: InvocationId,
+    target: &ProcedureHandle,
+    formal: &crate::analyzer::semantic::SemanticValue,
+    actual_value: ValueId,
+    task_transfer: bool,
+    provider: &impl ConcurrencyProvider,
+    request: &mut SolveRequest<'_, '_>,
+) -> Result<(), SemanticProviderError> {
+    let dispatch_receiver = matches!(
+        formal.kind,
+        crate::analyzer::semantic::SemanticValueKind::Receiver { dispatch: true }
+    );
+    let parameter_ordinal = match formal.kind {
+        crate::analyzer::semantic::SemanticValueKind::Parameter { ordinal, .. } => Some(ordinal),
+        _ => None,
+    };
+    let parameter_binding =
+        parameter_ordinal.and_then(|ordinal| provider.parameter_binding(target, ordinal));
+    let parameter_preserves_backing = parameter_ordinal
+        .is_some_and(|ordinal| provider.parameter_preserves_backing(target, ordinal));
+    let receiver_binding = dispatch_receiver && provider.receiver_binds_by_reference(target);
+    let actual = LocalSynchronizationSubject::Value {
+        task: caller.task,
+        invocation: caller.invocation,
+        procedure: caller.procedure.clone(),
+        value: actual_value,
+    };
+    let formal_value = formal.id;
+    let formal_subject = LocalSynchronizationSubject::Value {
+        task: target_task,
+        invocation: target_invocation,
+        procedure: target.clone(),
+        value: formal_value,
+    };
+    let formal_cell = target.semantics().binding_memory_location(formal_value);
+    let reassigned = target.semantics().points().iter().any(|point| {
+        point.events.iter().any(|event| match event.effect {
+            SemanticEffect::Assignment { target, .. } => target == formal_value,
+            SemanticEffect::MemoryStore { location, .. } => Some(location) == formal_cell,
+            _ => false,
+        })
+    });
+    if reassigned {
+        // Entry identity cannot describe every use of a mutable formal.
+        // In particular, an unsupported replacement result contributes no
+        // competing identity to invalidate an eager or deferred binding.
+        // Keep the missing reaching-definition evidence explicit before
+        // either ordinary or backing-store equivalence can cross the call.
+        classes.note_formal_binding_reasons(
+            formal_subject.clone(),
+            vec![ConcurrencyOpenReason::UnknownLocation],
+        );
+        return Ok(());
+    }
+    // Carry the callable the actual denotes, so a call on this formal can
+    // resolve the body it reaches. This is the callable counterpart of the
+    // object identity the rest of this loop carries.
+    if let Some(callable) = callable_values
             .get(&(
                 caller.task,
                 caller.invocation,
@@ -13652,114 +14507,115 @@ fn bind_call_inputs(
                 callable,
             );
         }
-        if !receiver_binding && parameter_binding != Some(true) && !parameter_preserves_backing {
-            classes.value_copy_formals.insert(formal.clone());
-        }
-        classes.bind_backing_formal(formal.clone(), actual.clone());
-        // A pointer receiver copies the pointer, so the callee's field
-        // accesses reach the caller's object. Name that object exactly as the
-        // caller's own field accesses name it, which is what the overlap gate
-        // compares. `canonical_capture_identity` prefers a proven runtime
-        // identity and otherwise issues a capture identity, and it issues one
-        // only for a cell stored once, so the name cannot outlive the binding
-        // it stands for.
-        if dispatch_receiver && !receiver_binding {
-            // The callee writes a copy of the receiver's fields, so nothing
-            // it writes reaches the caller's object. No identity crosses.
-            classes
-                .note_formal_binding_reasons(formal, vec![ConcurrencyOpenReason::UnknownLocation]);
-            continue;
-        }
-        // Go copies an argument, so a parameter answers the same question a
-        // receiver does. A pointer parameter copies the pointer and still
-        // reaches the caller's object; a value parameter copies the fields
-        // and cannot, and binding one reported the callee's write on its own
-        // copy as racing the caller's read.
-        if parameter_ordinal.is_some() {
-            match parameter_binding {
-                Some(false) | None => {
-                    classes.note_formal_binding_reasons(
-                        formal,
-                        vec![ConcurrencyOpenReason::UnknownLocation],
-                    );
-                    continue;
-                }
-                Some(true) if classes.canonical_capture_identity(actual.clone()).is_some() => {
-                    if task_transfer {
-                        classes.mark_captured_value(actual.clone());
-                    }
-                    classes.bind_formal(formal, actual);
-                    continue;
-                }
-                // A reference-shaped parameter still needs the identity of
-                // the actual object before a snapshot can cross the call.
-                Some(true) => {}
+    if !receiver_binding && parameter_binding != Some(true) && !parameter_preserves_backing {
+        classes.value_copy_formals.insert(formal_subject.clone());
+    }
+    classes.bind_backing_formal(formal_subject.clone(), actual.clone());
+    // A pointer receiver copies the pointer, so the callee's field
+    // accesses reach the caller's object. Name that object exactly as the
+    // caller's own field accesses name it, which is what the overlap gate
+    // compares. `canonical_capture_identity` prefers a proven runtime
+    // identity and otherwise issues a capture identity, and it issues one
+    // only for a cell stored once, so the name cannot outlive the binding
+    // it stands for.
+    if dispatch_receiver && !receiver_binding {
+        // The callee writes a copy of the receiver's fields, so nothing
+        // it writes reaches the caller's object. No identity crosses.
+        classes.note_formal_binding_reasons(
+            formal_subject.clone(),
+            vec![ConcurrencyOpenReason::UnknownLocation],
+        );
+        return Ok(());
+    }
+    // Go copies an argument, so a parameter answers the same question a
+    // receiver does. A pointer parameter copies the pointer and still
+    // reaches the caller's object; a value parameter copies the fields
+    // and cannot, and binding one reported the callee's write on its own
+    // copy as racing the caller's read.
+    if parameter_ordinal.is_some() {
+        match parameter_binding {
+            Some(false) | None => {
+                classes.note_formal_binding_reasons(
+                    formal_subject.clone(),
+                    vec![ConcurrencyOpenReason::UnknownLocation],
+                );
+                return Ok(());
             }
-        }
-        // A receiver that does bind by reference must name the caller's
-        // object exactly as the caller's own field accesses name it, since
-        // that is what the overlap gate compares. `canonical_capture_identity`
-        // prefers a proven runtime identity and otherwise issues a capture
-        // identity, and it issues one only for a cell stored once, so the
-        // name cannot outlive the binding it stands for.
-        if dispatch_receiver && classes.canonical_capture_identity(actual.clone()).is_some() {
-            if task_transfer {
-                classes.mark_captured_value(actual.clone());
-            }
-            classes.bind_formal(formal, actual);
-            continue;
-        }
-        let (bound, mut binding_reasons) = classes
-            .bound_canonical_identity(actual.clone())
-            .into_parts();
-        let canonicals = if let Some(canonical) = bound {
-            vec![canonical]
-        } else {
-            let mut canonicals = Vec::new();
-            for (task, invocation, procedure, value) in classes.equivalent_values(actual.clone()) {
-                if task != caller.task
-                    || invocation != caller.invocation
-                    || procedure != caller.procedure
-                {
-                    continue;
+            Some(true) if classes.canonical_capture_identity(actual.clone()).is_some() => {
+                if task_transfer {
+                    classes.mark_captured_value(actual.clone());
                 }
-                let (resolved, reasons) = provider
-                    .resolved_value(&procedure, call.point, value, request)?
-                    .into_parts();
-                binding_reasons.extend(reasons);
-                if binding_reasons.is_empty() && resolved.exact_candidate().is_some() {
-                    let fact = ConcurrencyIdentityFact {
-                        resolved,
-                        storage_origin: None,
-                    };
-                    if !canonicals.contains(&fact) {
-                        canonicals.push(fact);
-                    }
-                }
+                classes.bind_formal(formal_subject.clone(), actual);
+                return Ok(());
             }
-            canonicals
-        };
-        binding_reasons.sort();
-        binding_reasons.dedup();
-        if !binding_reasons.is_empty() {
-            classes.note_formal_binding_reasons(formal, binding_reasons);
-            continue;
+            // A reference-shaped parameter still needs the identity of
+            // the actual object before a snapshot can cross the call.
+            Some(true) => {}
         }
-        let [canonical] = canonicals.as_slice() else {
-            // Go copies ordinary argument and receiver values. Only a proven
-            // runtime object identity may cross this call boundary; equating
-            // an otherwise identity-less aggregate with its formal would
-            // conflate distinct struct copies in separate task instances.
-            binding_reasons.push(ConcurrencyOpenReason::UnknownLocation);
-            classes.note_formal_binding_reasons(formal, binding_reasons);
-            continue;
-        };
-        classes.bind_canonical_value(actual.clone(), canonical.clone());
+    }
+    // A receiver that does bind by reference must name the caller's
+    // object exactly as the caller's own field accesses name it, since
+    // that is what the overlap gate compares. `canonical_capture_identity`
+    // prefers a proven runtime identity and otherwise issues a capture
+    // identity, and it issues one only for a cell stored once, so the
+    // name cannot outlive the binding it stands for.
+    if dispatch_receiver && classes.canonical_capture_identity(actual.clone()).is_some() {
         if task_transfer {
             classes.mark_captured_value(actual.clone());
         }
-        classes.bind_formal(formal, actual);
+        classes.bind_formal(formal_subject.clone(), actual);
+        return Ok(());
     }
+    let (bound, mut binding_reasons) = classes
+        .bound_canonical_identity(actual.clone())
+        .into_parts();
+    let canonicals = if let Some(canonical) = bound {
+        vec![canonical]
+    } else {
+        let mut canonicals = Vec::new();
+        for (task, invocation, procedure, value) in classes.equivalent_values(actual.clone()) {
+            if task != caller.task
+                || invocation != caller.invocation
+                || procedure != caller.procedure
+            {
+                continue;
+            }
+            let (resolved, reasons) = provider
+                .resolved_value(&procedure, call.point, value, request)?
+                .into_parts();
+            binding_reasons.extend(reasons);
+            if binding_reasons.is_empty() && resolved.exact_candidate().is_some() {
+                let fact = ConcurrencyIdentityFact {
+                    resolved,
+                    storage_origin: None,
+                };
+                if !canonicals.contains(&fact) {
+                    canonicals.push(fact);
+                }
+            }
+        }
+        canonicals
+    };
+    binding_reasons.sort();
+    binding_reasons.dedup();
+    if !binding_reasons.is_empty() {
+        classes.note_formal_binding_reasons(formal_subject.clone(), binding_reasons);
+        return Ok(());
+    }
+    let [canonical] = canonicals.as_slice() else {
+        // Go copies ordinary argument and receiver values. Only a proven
+        // runtime object identity may cross this call boundary; equating
+        // an otherwise identity-less aggregate with its formal would
+        // conflate distinct struct copies in separate task instances.
+        binding_reasons.push(ConcurrencyOpenReason::UnknownLocation);
+        classes.note_formal_binding_reasons(formal_subject.clone(), binding_reasons);
+        return Ok(());
+    };
+    classes.bind_canonical_value(actual.clone(), canonical.clone());
+    if task_transfer {
+        classes.mark_captured_value(actual.clone());
+    }
+    classes.bind_formal(formal_subject.clone(), actual);
     Ok(())
 }
 
@@ -14229,7 +15085,7 @@ fn compare_accesses(
             };
             let mut reasons = first.reasons.clone();
             reasons.extend(second.reasons.iter().cloned());
-            reasons.extend(ordering_reasons);
+            reasons.extend(ordering_reasons.iter().cloned());
             if alias_open {
                 reasons.push(ConcurrencyOpenReason::UnknownLocation);
             }
@@ -14550,11 +15406,20 @@ fn access_location_overlap(first: &Access, second: &Access) -> AccessOverlap {
                 );
             }
             (IndexedLocationIdentity::Element, IndexedLocationIdentity::Element) => {
-                if let (Some(first_index), Some(second_index)) =
-                    (first.constant_index, second.constant_index)
-                {
-                    return if first_index == second_index {
-                        exact_index_location(first).map_or(
+                // One backing store is already proven above, so the elements
+                // decide the rest. Two ranges that cannot meet select
+                // different elements on every execution, whether each is a
+                // single proven index or a bound the scalar domain derived.
+                // A range that still holds several elements can only name a
+                // location once it holds exactly one.
+                if let (Some(first_index), Some(second_index)) = (first.index, second.index) {
+                    if first_index.is_disjoint(second_index) {
+                        return AccessOverlap::Disjoint;
+                    }
+                    if first_index.selected_element().is_some()
+                        && second_index.selected_element().is_some()
+                    {
+                        return exact_index_location(first).map_or(
                             AccessOverlap::MayAlias(None),
                             |location| {
                                 if exact {
@@ -14563,10 +15428,8 @@ fn access_location_overlap(first: &Access, second: &Access) -> AccessOverlap {
                                     AccessOverlap::MayAlias(Some(location))
                                 }
                             },
-                        )
-                    } else {
-                        AccessOverlap::Disjoint
-                    };
+                        );
+                    }
                 }
             }
             (IndexedLocationIdentity::Aggregate, IndexedLocationIdentity::Element)
@@ -14959,6 +15822,25 @@ fn subtest_deferred_separates(tasks: &[Task], first: TaskId, second: TaskId) -> 
             && side_runs_in_ancestor_body(tasks, ancestor, first)
 }
 
+/// Whether one side is an ancestor body and the other is a direct parallel
+/// `Run` child of it (issue #3407). A parallel callback splits at its
+/// `Parallel` call, so this pair needs the ordinary comparison instead of
+/// the deferred-subtree separation: the prefix is ordered with the ancestor
+/// body and the suffix is concurrent with its continuation. A deeper
+/// descendant of the parallel child keeps the separation, because the split
+/// is a property of the callback's own body and its accesses are not proven
+/// to lie on either side of the marker.
+fn parallel_subtest_body_pair(tasks: &[Task], first: TaskId, second: TaskId) -> bool {
+    let ancestor = least_common_task(tasks, first, second);
+    let direct_parallel_child = |side: TaskId| {
+        side != ancestor
+            && tasks[side.0 as usize].parent == Some(ancestor)
+            && is_parallel_subtest(tasks, side)
+    };
+    (first == ancestor && direct_parallel_child(second))
+        || (second == ancestor && direct_parallel_child(first))
+}
+
 /// The single-inflow root of a receiver use value (issue #3383). The lowerer
 /// evaluates each receiver expression to a fresh value, so two uses name one
 /// runtime value only when both single-inflow chains reach one root: every
@@ -15129,7 +16011,13 @@ fn tasks_may_parallel(
     // A deferred subtest subtree (parallel or cleanup, issue #3383) runs
     // after its parent body, so a body side and a deferred side of one
     // ancestor never overlap and need no ordering relation to explain them.
-    if subtest_deferred_separates(tasks, first.site.task, second.site.task) {
+    // A parallel callback is the exception (issue #3407): its prefix runs
+    // while the ancestor is blocked inside `Run`, so that pair needs the
+    // ordinary comparison -- a prefix barrier orders it and a suffix access
+    // stays unordered against the ancestor's continuation.
+    if subtest_deferred_separates(tasks, first.site.task, second.site.task)
+        && !parallel_subtest_body_pair(tasks, first.site.task, second.site.task)
+    {
         return Ok(false);
     }
     // Two cleanup callbacks of one test node run sequentially in
@@ -17240,6 +18128,7 @@ fn cleanup_tasks_spawned_at(
 /// cleanup joins apply only inside the cleanup subtree.
 fn subtest_join_barriers(
     tasks: &[Task],
+    invocations: &Invocations,
     child: &Access,
     modeled: &HashMap<ContextKey, Vec<(ProgramPointId, ResolvedConcurrencyEffect)>>,
     completion_reasons: &[ConcurrencyOpenReason],
@@ -17250,6 +18139,54 @@ fn subtest_join_barriers(
     while let Some(current) = descendant {
         charge_concurrency_work(request, 1)?;
         let task = &tasks[current.0 as usize];
+        // A parallel callback splits at its `Parallel` call (issue #3407):
+        // the prefix runs while the spawning test is blocked inside `Run`,
+        // so it completes at the `Run` point exactly like a sequential
+        // subtest. The access must lie in the callback's own synchronous
+        // body (the callback itself or a callee it calls) and every path
+        // from it to an exit must still cross a proven `Parallel` point;
+        // the suffix after the call runs past the `Run` return and keeps no
+        // barrier.
+        if let Some(subtest) = task.subtest.as_ref()
+            && matches!(
+                subtest.kind,
+                SubtestSpawnKind::Run(SubtestParallelism::Parallel)
+            )
+            && !subtest.parallel_points.is_empty()
+            && let Some(callback) = task.entry_procedure.as_ref()
+        {
+            let points = invocations.ancestry_points_bounded(
+                child.site.invocation,
+                child.site.point,
+                request,
+            )?;
+            if let Some(point) = points.get(&task.entry_invocation)
+                && all_exit_paths_cross_points(
+                    callback,
+                    *point,
+                    &HashSet::from_iter(subtest.parallel_points.iter().copied()),
+                    request,
+                )?
+                && let (Some(procedure), Some(invocation), Some(call)) = (
+                    task.spawn_procedure.as_ref(),
+                    task.spawn_invocation,
+                    task.spawn_call,
+                )
+            {
+                let point = procedure
+                    .semantics()
+                    .call_site(call)
+                    .expect("spawn belongs to its caller")
+                    .point;
+                barriers.push(CompletionBarrier {
+                    invocation,
+                    points: HashSet::from_iter([point]),
+                    reasons: completion_reasons.to_vec(),
+                    conditional: None,
+                    cleanup_scope: None,
+                });
+            }
+        }
         if matches!(
             task.subtest.as_ref().map(|spawn| &spawn.kind),
             Some(SubtestSpawnKind::Run(SubtestParallelism::Sequential))
@@ -17336,6 +18273,7 @@ fn join_completion_barriers(
     let mut barriers = Vec::new();
     barriers.extend(subtest_join_barriers(
         tasks,
+        invocations,
         child,
         modeled,
         &completion_reasons,
@@ -21026,7 +21964,8 @@ func root() {}
             index_alias_domain: Some(IndexAliasDomain {
                 base: canonical.clone(),
                 identity,
-                constant_index,
+                index: constant_index
+                    .map(|magnitude| IndexRange::exact(ScalarIntegerValue::unsigned(magnitude))),
             }),
             field_alias_domain: None,
             local_identity: false,
@@ -21050,6 +21989,7 @@ func root() {}
         canonicalize_bound_accesses(
             &mut classes,
             &invocations,
+            &ScalarIndexRanges::default(),
             std::slice::from_mut(&mut access),
         );
         assert_eq!(access.canonical, Some(canonical));
@@ -21067,6 +22007,7 @@ func root() {}
         canonicalize_bound_accesses(
             &mut classes,
             &invocations,
+            &ScalarIndexRanges::default(),
             std::slice::from_mut(&mut access),
         );
         assert_eq!(access.canonical, None);
@@ -21322,6 +22263,7 @@ func root() {
                 &[],
                 &cells,
                 &reference_allocations,
+                &[],
                 &[],
                 &[],
                 &HashMap::default(),

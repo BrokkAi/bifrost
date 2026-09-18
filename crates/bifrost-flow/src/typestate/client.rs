@@ -1155,8 +1155,11 @@ impl<'plan> TypestateFlowProblem<'plan> {
                         if subject == Some(binding.subject()) {
                             eligible_events.push(EligibleEvent::from_binding(binding));
                         }
-                        if (edge.boundary().is_none() || modeled_boundary)
-                            && !self.apply_binding(&mut facts, binding, out)
+                        if event_survives_dispatch_boundary(
+                            edge.boundary(),
+                            binding,
+                            modeled_boundary,
+                        ) && !self.apply_binding(&mut facts, binding, out)
                         {
                             return facts.emit(out);
                         }
@@ -1212,8 +1215,11 @@ impl<'plan> TypestateFlowProblem<'plan> {
                         if subject == Some(binding.subject()) {
                             eligible_events.push(EligibleEvent::from_binding(binding));
                         }
-                        if (edge.boundary().is_none() || modeled_boundary)
-                            && !self.apply_binding(&mut facts, binding, out)
+                        if event_survives_dispatch_boundary(
+                            edge.boundary(),
+                            binding,
+                            modeled_boundary,
+                        ) && !self.apply_binding(&mut facts, binding, out)
                         {
                             return facts.emit(out);
                         }
@@ -2656,6 +2662,41 @@ fn modeled_external_boundary(boundary: &crate::analyzer::semantic::DispatchBound
             | crate::analyzer::semantic::DispatchBoundaryKind::Deferred { .. }
             | crate::analyzer::semantic::DispatchBoundaryKind::Unresolved
     )
+}
+
+/// Whether a call-stage event binding still applies on an edge whose call has a
+/// dispatch boundary.
+///
+/// A dispatch boundary about target identity describes which callee bodies this
+/// call may reach. It is not evidence about which value the call site bound:
+/// the typestate selector compiler resolves that binding itself and publishes
+/// `Proven` + `Complete` for a call site selected under the selector's
+/// declared-call contract (see `PolicySelectorSession::selected_sites` in
+/// `bifrost-policy`). A definitive binding therefore carries an identity proof
+/// the boundary cannot take away, and dropping the event would report the
+/// reviewed call as if it had never happened.
+///
+/// The boundary still reaches the answer through the uncertainty the transfer
+/// emits for the edge, and through `eligible_events`, so an unresolved or
+/// unmodeled target keeps the run inconclusive instead of being silently
+/// discharged. A binding that is not definitive keeps the conservative rule:
+/// only an authored external model may apply it across a boundary.
+///
+/// A `Deferred` boundary is the exception, because it is about *when* the
+/// callee runs rather than which declaration it is: the call is registered at
+/// this edge and executes later, so its event belongs to the deferred edge and
+/// never to the registration edge.
+fn event_survives_dispatch_boundary(
+    boundary: Option<&crate::analyzer::semantic::DispatchBoundaryKind>,
+    binding: &BoundTypestateEvent,
+    modeled_boundary: bool,
+) -> bool {
+    match boundary {
+        None => true,
+        Some(_) if modeled_boundary => true,
+        Some(crate::analyzer::semantic::DispatchBoundaryKind::Deferred { .. }) => false,
+        Some(_) => binding.quality().is_definitive(),
+    }
 }
 
 fn deferred_boundary(boundary: &crate::analyzer::semantic::DispatchBoundaryKind) -> bool {

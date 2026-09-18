@@ -1,0 +1,37 @@
+; Declared-storage required validation, Java specialization.
+;
+; Opt-in obligation, active only with the reviewed endpoint-set documents
+; selected by the imports below: every request value the application stores
+; through the declared job-store write must have passed the configured
+; validator first. This policy does not claim that every application
+; requires validation before storage -- the obligation exists because the
+; workspace configured it -- and a function merely named `validate` never
+; satisfies it. The obligation is independent of SQL safety: a parameterized
+; query does not discharge it, and passing the validator does not sanitize
+; SQL.
+(policy
+  :schema-version 1
+  :id "bifrost.security.java.store-requires-validation"
+  :name "Stored request value requires the configured validator (Java)"
+  :message "a request value reached the declared job store without passing the configured validator"
+  :severity warning
+  :description "Diagnoses servlet request values that reach the declared job-store write without passing through the validator the workspace configured. The observed store write and the required validator are exact proven calls named by the reviewed endpoint-set documents; selecting this policy without that configuration fails activation rather than reporting a clean pass."
+  :help-uri "https://bifrost.brokk.ai/static-analysis-policies/#declared-storage"
+  :tags ["security" "java" "provenance" "declared-storage"]
+  :analysis (analysis
+    :type flow
+    :mode may
+    :call-modeling (call-modeling :unmodeled paranoid)
+    :origins (endpoint-set :entries [
+      (origin :id servlet-request-parameter
+        :display-name "ServletRequest.getParameter(String)"
+        :selector (rql :schema-version 1
+          (language java
+            (call-sites-to :proof proven
+              (enclosing-decl
+                (inside-decl (class :name "ServletRequest") (method :name "getParameter"))))))
+        :bind return-value)])
+    :observations (endpoint-set :include-files [
+      (endpoint-set-file :path ".bifrost/endpoint-sets/observations/java-declared-store-write.rqlp")])
+    :kills (endpoint-set :include-files [
+      (endpoint-set-file :path ".bifrost/endpoint-sets/kills/java-required-validator.rqlp")])))

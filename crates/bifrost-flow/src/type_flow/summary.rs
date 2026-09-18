@@ -68,7 +68,9 @@ use super::{FieldSlotIndex, TypeFlowPlan};
 // a guard that proves a class now installs on the remainder.
 // #3344 replaces a pending return when cleanup returns again; summaries
 // computed with joining return ports must not survive that transfer change.
-const CLASS_SET_SUMMARY_SEMANTICS: &[u8] = b"bifrost-class-set-summary-semantics-v13";
+// #3430 keys a guard source by what it states instead of by a per-plan
+// counter, so rows naming the old positional keys must not be restored.
+const CLASS_SET_SUMMARY_SEMANTICS: &[u8] = b"bifrost-class-set-summary-semantics-v14";
 const CLASS_SET_SUMMARY_CONTEXT: &[u8] = b"bifrost-class-set-summary-context-v1";
 const CLASS_SET_SUMMARY_BEHAVIOR: &[u8] = b"bifrost-class-set-summary-behavior-v3";
 const CLASS_SET_SUMMARY_ATOM: &[u8] = b"bifrost-class-set-summary-atom-v1";
@@ -3419,7 +3421,11 @@ impl<'plan> PreparedClassSetSummaries<'plan> {
                 match store.class_set_summary_for_digest(*nodes[index].current_lookup.as_bytes()) {
                     Ok(Some(row)) => {
                         match restore_persisted_summary(self.plan, &current_key, &reads, row) {
-                            Ok(summary) => {
+                            Ok(None) => {
+                                self.profile.record(SummaryProfileReason::LookupLiveRemap);
+                                None
+                            }
+                            Ok(Some(summary)) => {
                                 let dependencies_live = match self.dependencies_are_live(
                                     &summary.dependencies,
                                     nodes[index].publication_rank,
@@ -3767,7 +3773,11 @@ impl<'plan> PreparedClassSetSummaries<'plan> {
             }
         };
         let restored = match restore_persisted_summary(self.plan, key, reads, row.clone()) {
-            Ok(summary) => summary,
+            Ok(Some(summary)) => summary,
+            Ok(None) => {
+                self.profile.record(SummaryProfileReason::LookupLiveRemap);
+                return RootObservationPreflight::Indeterminate;
+            }
             Err(_) => return RootObservationPreflight::Indeterminate,
         };
         match self.root_observation_coverage(procedure, &restored) {
@@ -4075,7 +4085,11 @@ impl<'plan> PreparedClassSetSummaries<'plan> {
                 return Ok(None);
             }
             let mut summary = match restore_persisted_summary(self.plan, &frame.key, &reads, row) {
-                Ok(summary) => summary,
+                Ok(Some(summary)) => summary,
+                Ok(None) => {
+                    self.profile.record(SummaryProfileReason::LookupLiveRemap);
+                    return Ok(None);
+                }
                 Err(error) => {
                     self.workspace
                         .analyzer()
@@ -4687,7 +4701,7 @@ fn compare_qualities(left: &[PathQuality], right: &[PathQuality]) -> std::cmp::O
         .cmp(right.iter().map(|quality| quality.ordinal()))
 }
 
-fn class_atom_fingerprint(atom: &ClassAtom) -> StableDigest {
+pub(super) fn class_atom_fingerprint(atom: &ClassAtom) -> StableDigest {
     let mut digest = LengthDelimitedDigest::new(CLASS_SET_SUMMARY_ATOM);
     match atom {
         ClassAtom::Class(ClassIdentity::Workspace(unit)) => {
@@ -5175,12 +5189,18 @@ fn persisted_fact_keys(
     }
 }
 
+/// The summary a persisted row states for this plan.
+///
+/// `Ok(None)` reports that the row does not fit the live plan: one of its
+/// facts names an event this plan does not seed, or seeds more than once.
+/// That is staleness, and the caller records it as a live-remap miss. Every
+/// other rejection is corruption and stays a hard error.
 fn restore_persisted_summary(
     plan: &ValueFlowPlan,
     expected: &ClassSetSummaryLookupKey,
     expected_reads: &[ReadKey],
     row: ClassSetSummaryRow,
-) -> Result<ClassSetProcedureSummary, StoreError> {
+) -> Result<Option<ClassSetProcedureSummary>, StoreError> {
     let procedure = &expected.procedure;
     let header = &row.header;
     let expected_lookup = *class_set_lookup_fingerprint(expected).as_bytes();
@@ -5215,11 +5235,14 @@ fn restore_persisted_summary(
 
     let keys = persisted_fact_keys(plan, &expected.procedure_locator);
 
-    let facts = row
+    let Some(facts) = row
         .facts
         .iter()
         .map(|fact| restore_persisted_fact(fact, &keys.carriers, &keys.sources, &keys.sinks))
-        .collect::<Result<Vec<_>, StoreError>>()?;
+        .collect::<Result<Option<Vec<_>>, StoreError>>()?
+    else {
+        return Ok(None);
+    };
     if facts.windows(2).any(|pair| pair[0] >= pair[1]) {
         return Err(StoreError::new(
             "persisted class-set fact table is not in canonical order",
@@ -5373,14 +5396,14 @@ fn restore_persisted_summary(
             "persisted class-set dependencies are not in canonical order",
         ));
     }
-    Ok(ClassSetProcedureSummary {
+    Ok(Some(ClassSetProcedureSummary {
         key: expected.clone(),
         exits: exits.into_boxed_slice(),
         reached: reached.into_boxed_slice(),
         dependencies: dependencies.into_boxed_slice(),
         reads: expected_reads.into(),
         output_digest,
-    })
+    }))
 }
 
 fn insert_stable_key<T: Clone + Eq>(
@@ -5402,60 +5425,81 @@ fn restore_persisted_fact(
     carriers: &HashMap<[u8; 32], Option<ValueFlowCarrierKey>>,
     sources: &HashMap<[u8; 32], Option<ValueFlowEventKey>>,
     sinks: &HashMap<[u8; 32], Option<ValueFlowEventKey>>,
-) -> Result<StableValueFlowFact, StoreError> {
+) -> Result<Option<StableValueFlowFact>, StoreError> {
     match &row.shape {
-        ClassSetSummaryFactShapeRow::Zero => Ok(StableValueFlowFact::Zero),
+        ClassSetSummaryFactShapeRow::Zero => Ok(Some(StableValueFlowFact::Zero)),
         ClassSetSummaryFactShapeRow::Carrier {
             source,
             carrier_key,
             uncertain,
-        } => Ok(StableValueFlowFact::Carrier {
-            source: restore_persisted_source(source, sources)?,
-            carrier: unique_stable_key(carriers, carrier_key, "carrier")?.clone(),
-            uncertain: *uncertain,
-        }),
+        } => {
+            let (Some(source), Some(carrier)) = (
+                restore_persisted_source(source, sources)?,
+                unique_stable_key(carriers, carrier_key, "carrier")?,
+            ) else {
+                return Ok(None);
+            };
+            Ok(Some(StableValueFlowFact::Carrier {
+                source,
+                carrier: carrier.clone(),
+                uncertain: *uncertain,
+            }))
+        }
         ClassSetSummaryFactShapeRow::Meeting {
             source,
             sink_event_key,
             uncertain,
-        } => Ok(StableValueFlowFact::Meeting {
-            source: restore_persisted_source(source, sources)?,
-            sink: unique_stable_key(sinks, sink_event_key, "sink event")?.clone(),
-            uncertain: *uncertain,
-        }),
+        } => {
+            let (Some(source), Some(sink)) = (
+                restore_persisted_source(source, sources)?,
+                unique_stable_key(sinks, sink_event_key, "sink event")?,
+            ) else {
+                return Ok(None);
+            };
+            Ok(Some(StableValueFlowFact::Meeting {
+                source,
+                sink: sink.clone(),
+                uncertain: *uncertain,
+            }))
+        }
     }
 }
 
 fn restore_persisted_source(
     source: &ClassSetSummaryFactSourceRow,
     sources: &HashMap<[u8; 32], Option<ValueFlowEventKey>>,
-) -> Result<StableSource, StoreError> {
+) -> Result<Option<StableSource>, StoreError> {
     match source {
-        ClassSetSummaryFactSourceRow::Entry => Ok(StableSource::Entry),
-        ClassSetSummaryFactSourceRow::Event(event) => Ok(StableSource::Event(
-            unique_stable_key(sources, event, "source event")?.clone(),
-        )),
+        ClassSetSummaryFactSourceRow::Entry => Ok(Some(StableSource::Entry)),
+        ClassSetSummaryFactSourceRow::Event(event) => {
+            Ok(unique_stable_key(sources, event, "source event")?
+                .cloned()
+                .map(StableSource::Event))
+        }
         ClassSetSummaryFactSourceRow::None => Err(StoreError::new(
             "persisted nonzero class-set fact has no source",
         )),
     }
 }
 
+/// The live event or carrier a persisted fact names, or `None` when this plan
+/// does not name it uniquely.
+///
+/// Absence and ambiguity are both ordinary staleness, not corruption: a plan
+/// seeds the events its own discovery reaches, so a row published under one
+/// root can name an event another root's plan never seeds. The caller reports
+/// the miss and recomputes.
 fn unique_stable_key<'a, T>(
     keys: &'a HashMap<[u8; 32], Option<T>>,
     encoded: &[u8],
     label: &str,
-) -> Result<&'a T, StoreError> {
+) -> Result<Option<&'a T>, StoreError> {
     let digest: [u8; 32] = encoded.try_into().map_err(|_| {
         StoreError::new(format!(
             "persisted class-set {label} digest is not 32 bytes"
         ))
     })?;
-    keys.get(&digest).and_then(Option::as_ref).ok_or_else(|| {
-        StoreError::new(format!(
-            "persisted class-set {label} does not map uniquely to the live plan"
-        ))
-    })
+    Ok(keys.get(&digest).and_then(Option::as_ref))
 }
 
 fn qualities_from_mask(mask: u8) -> Result<Box<[PathQuality]>, StoreError> {

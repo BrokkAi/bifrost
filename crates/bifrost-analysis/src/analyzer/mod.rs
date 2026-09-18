@@ -16,8 +16,8 @@ mod go;
 pub use go::package_identity::modeled_go_callable_result_pointer_field;
 pub use go::{
     GO_MODELED_RESULT_BINDING_TYPE_PROOF_MAX_SOURCE_BYTES,
-    GO_MODELED_RESULT_BINDING_TYPE_PROOF_MAX_STEPS,
-    go_modeled_result_binding_type_identity_is_exact,
+    GO_MODELED_RESULT_BINDING_TYPE_PROOF_MAX_STEPS, GoHttpHandlerDispatch, GoHttpHandlerOpenReason,
+    go_http_handler_dispatch, go_modeled_result_binding_type_identity_is_exact,
     go_modeled_result_binding_type_identity_proof_work, reference_assertion_payload_type_is_exact,
     workspace_reference_assertion_accepts_payload,
 };
@@ -39,7 +39,6 @@ pub mod read_ledger;
 pub mod read_verification;
 pub mod reference_candidates;
 pub(crate) mod relational_frontier;
-pub mod resolution;
 mod ruby;
 mod rust;
 pub(crate) use rust::crate_identity::RustOverlayCrates;

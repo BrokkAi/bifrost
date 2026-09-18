@@ -99,7 +99,7 @@
     },
     {
       "policy_id": "bifrost.performance.parsing-in-loop",
-      "finding_id": "3efcd06f8f67a0f426130f71e613577a8985905c7c3a9b63522ad4e47124c3a5",
+      "finding_id": "0f24fa8b44b904743f3b8f483f8793a32726f6a1758b156b68b3bd6b825534e9",
       "path": "crates/bifrost-analysis/src/analyzer/rust/dependency_discovery.rs",
       "identity_stability": "strong",
       "status": "accepted",
@@ -351,7 +351,7 @@
     },
     {
       "policy_id": "bifrost.performance.parsing-in-loop",
-      "finding_id": "a3de48cb75f4d8293103851238afc6a66bfc3fbe36c3648d0d0b9fdec0b08269",
+      "finding_id": "a0f5657853ebab396f549d8c8d189e7d7d47b677630932d2f44aceafc454d769",
       "path": "src/bin/bifrost.rs",
       "identity_stability": "strong",
       "status": "accepted",
@@ -399,7 +399,7 @@
     },
     {
       "policy_id": "bifrost.performance.sleep-in-loop",
-      "finding_id": "7b37948e423d2f61b09862a9777229d29331647d22f76ca8f4a5cb697b3545d9",
+      "finding_id": "84168f68d051075e79ad0a68c348298e124726b62b6a878e739a3bd3b81af052",
       "path": "crates/bifrost-analysis/src/analyzer/store/mod.rs",
       "identity_stability": "strong",
       "status": "accepted",

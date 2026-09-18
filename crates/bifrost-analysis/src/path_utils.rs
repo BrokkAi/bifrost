@@ -108,7 +108,7 @@ impl WorkspacePathSelector {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 pub struct AmbiguousPathInput {
     pub input: String,
     pub matches: Vec<String>,

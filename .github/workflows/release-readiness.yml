@@ -218,7 +218,7 @@ jobs:
   semantic-pack-tool:
     name: build exact semantic-pack tool
     if: ${{ inputs.requalify_from_run == '' }}
-    needs: preflight
+    needs: [preflight, notices]
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
@@ -233,20 +233,73 @@ jobs:
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           toolchain: 1.97.1
+          targets: x86_64-unknown-linux-gnu
+      - name: Download Rust notice report
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: rust-third-party-licenses
+          path: licenses
       - name: Cache Cargo dependencies for semantic-pack tool
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: release-readiness-semantic-pack-tool
           cache-workspace-crates: false
+      - name: Resolve Python version for pinned Zig cache
+        id: semantic-pack-pinned-python
+        shell: bash
+        run: python3 -c 'import sys; print(f"version={sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}")' >> "$GITHUB_OUTPUT"
+      - name: Cache pinned cargo-zigbuild
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .cache/release-pinned-tools/cargo-zigbuild/0.23.3
+          key: ${{ runner.os }}-pinned-cargo-zigbuild-0.23.3-v1
+      - name: Cache pinned Zig
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .cache/release-pinned-tools/ziglang/0.15.2
+          key: ${{ runner.os }}-pinned-ziglang-0.15.2-${{ steps.semantic-pack-pinned-python.outputs.version }}-v1
+      - name: Install pinned GNU/Linux linker toolchain
+        shell: bash
+        run: |
+          cargo_zigbuild_root="$PWD/.cache/release-pinned-tools/cargo-zigbuild/0.23.3"
+          zig_root="$PWD/.cache/release-pinned-tools/ziglang/0.15.2"
+          bash scripts/public/install-pinned-release-tool.sh cargo-zigbuild "$cargo_zigbuild_root" 0.23.3
+          bash scripts/public/install-pinned-release-tool.sh ziglang "$zig_root" 0.15.2
+          echo "$cargo_zigbuild_root/bin" >> "$GITHUB_PATH"
+          echo "CARGO_ZIGBUILD_ZIG_PATH=$zig_root/bin/python-zig" >> "$GITHUB_ENV"
       - name: Build exact semantic-pack tool
-        run: cargo build --locked --release --features release-tooling -p brokk-bifrost-semantic-packs --bin bifrost-semantic-pack
+        env:
+          LIBZ_SYS_STATIC: '1'
+        run: >-
+          cargo zigbuild --locked --release --features release-tooling
+          -p brokk-bifrost-semantic-packs --bin bifrost-semantic-pack
+          --target x86_64-unknown-linux-gnu.2.28
+      - name: Verify semantic-pack installer ELF contract
+        run: >-
+          bash scripts/public/verify-linux-release-elf.sh
+          target/x86_64-unknown-linux-gnu/release/bifrost-semantic-pack
+          x86_64-unknown-linux-gnu
       - name: Stage exact semantic-pack tool
         shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
         run: |
           set -euo pipefail
           mkdir -p "${RUNNER_TEMP}/semantic-pack-tool"
-          cp target/release/bifrost-semantic-pack "${RUNNER_TEMP}/semantic-pack-tool/"
-          (cd "${RUNNER_TEMP}/semantic-pack-tool" && sha256sum bifrost-semantic-pack > bifrost-semantic-pack.sha256)
+          semantic_tool_dir="${RUNNER_TEMP}/semantic-pack-tool"
+          installer_name="bifrost-semantic-pack-${RELEASE_TAG}-x86_64-unknown-linux-gnu"
+          installer_parent="${RUNNER_TEMP}/semantic-pack-installer-stage"
+          installer_stage="${installer_parent}/${installer_name}"
+          cp target/x86_64-unknown-linux-gnu/release/bifrost-semantic-pack "${semantic_tool_dir}/"
+          mkdir -p "$installer_stage"
+          cp target/x86_64-unknown-linux-gnu/release/bifrost-semantic-pack "$installer_stage/"
+          cp LICENSE.md licenses/THIRD_PARTY_LICENSES.html licenses/SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt "$installer_stage/"
+          (
+            cd "${semantic_tool_dir}"
+            sha256sum bifrost-semantic-pack > bifrost-semantic-pack.sha256
+            tar -C "$installer_parent" -czf "${installer_name}.tar.gz" "${installer_name}"
+            sha256sum "${installer_name}.tar.gz" > "${installer_name}.tar.gz.sha256"
+          )
       - name: Upload exact semantic-pack tool
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
@@ -566,6 +619,11 @@ jobs:
       - name: Verify GNU/Linux ELF contract
         shell: bash
         run: bash scripts/public/verify-linux-release-elf.sh "target/x86_64-unknown-linux-gnu/release/${BIN_NAME}" x86_64-unknown-linux-gnu
+      - name: Verify shipped LSP compatibility identity
+        run: >-
+          python3 scripts/public/verify-lsp-compatibility.py
+          "target/x86_64-unknown-linux-gnu/release/${BIN_NAME}"
+          --engine-version "${{ needs.preflight.outputs.version }}"
       - name: Stage Unix archive
         shell: bash
         env:
@@ -1079,7 +1137,7 @@ jobs:
     # Keep this explicit so the new artifact dependency does not change that
     # release path into a rebuild.
     if: ${{ inputs.requalify_from_run == '' }}
-    needs: [preflight, semantic-pack-tool, build-linux-x86-64, semantic-pack-python]
+    needs: [preflight, semantic-pack-tool, semantic-pack-bundle, build-linux-x86-64]
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
@@ -1105,30 +1163,21 @@ jobs:
           (cd "${RUNNER_TEMP}/semantic-pack-tool" && sha256sum --check bifrost-semantic-pack.sha256)
           chmod +x "${RUNNER_TEMP}/semantic-pack-tool/bifrost-semantic-pack"
           echo "BIFROST_SEMANTIC_PACK_BIN=${RUNNER_TEMP}/semantic-pack-tool/bifrost-semantic-pack" >> "$GITHUB_ENV"
-      - name: Download exact Python semantic-pack bundle
+      - name: Download exact merged semantic-pack bundle
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
-          name: bifrost-semantic-packs-python
-          path: ${{ runner.temp }}/bifrost-semantic-packs-python
-      - name: Verify and install Python semantic-pack bundle
+          name: bifrost-semantic-packs
+          path: ${{ runner.temp }}/bifrost-semantic-pack-release
+      - name: Stage exact merged semantic-pack bundle
         shell: bash
         env:
-          BUNDLE_DIR: ${{ runner.temp }}/bifrost-semantic-packs-python
-          CACHE_ROOT: ${{ runner.temp }}/bifrost-python-semantic-pack-cache
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
         run: |
           set -euo pipefail
-          "$BIFROST_SEMANTIC_PACK_BIN" verify "$BUNDLE_DIR"
-          catalog_version=$(sed -nE \
-            's/^pub\(super\) const CURRENT_CATALOG_VERSION: i64 = ([0-9]+);$/\1/p' \
-            crates/bifrost-analysis/src/analyzer/semantic_model/catalog/db.rs)
-          if [[ ! "$catalog_version" =~ ^[0-9]+$ ]]; then
-            echo "could not derive exactly one numeric semantic-pack catalog version" >&2
-            exit 2
-          fi
-          catalog_root="$CACHE_ROOT/semantic-pack-catalog.v${catalog_version}"
-          mkdir -p "$CACHE_ROOT"
-          "$BIFROST_SEMANTIC_PACK_BIN" install \
-            "$BUNDLE_DIR" "$catalog_root"
+          archive="${RUNNER_TEMP}/bifrost-semantic-pack-release/bifrost-semantic-packs-${RELEASE_TAG}.tar.gz"
+          sidecar="${archive}.sha256"
+          (cd "$(dirname "$archive")" && sha256sum --check "$(basename "$sidecar")")
+          tar -C "${RUNNER_TEMP}/bifrost-semantic-pack-release" -xzf "$archive"
       # Keep this after the Cargo cache restore and installer build: restoring
       # target/release before this point could replace the exact qualified
       # binary with a cached build.
@@ -1146,15 +1195,31 @@ jobs:
           mkdir -p target/release
           cp "$binary" target/release/$BIN_NAME
           chmod +x target/release/$BIN_NAME
-      - name: Scan repository with staged binary
-        uses: ./.github/actions/policy-scan
+          echo "STAGED_BIFROST=$PWD/target/release/$BIN_NAME" >> "$GITHUB_ENV"
+      - name: Download pinned Linux JDK acceptance input
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="${RUNNER_TEMP}/OpenJDK21U-jdk_x64_linux_hotspot_21.0.8_9.tar.gz"
+          curl --fail --location --retry 3 \
+            --output "$archive" \
+            'https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.8%2B9/OpenJDK21U-jdk_x64_linux_hotspot_21.0.8_9.tar.gz'
+          echo 'f2dc5418092c43003db8f9005c4a286e1c0104fea96ccdd49e8ebd037cac9219  '"$archive" | sha256sum --check
+          mkdir -p "${RUNNER_TEMP}/jdk"
+          tar -C "${RUNNER_TEMP}/jdk" --strip-components 1 -xzf "$archive"
+      - name: Accept offline installer and typed catalog failures
+        shell: bash
         env:
-          BIFROST_SEMANTIC_PACK_CACHE_ROOT: ${{ runner.temp }}/bifrost-python-semantic-pack-cache
-        with:
-          version: local
-          upload: 'false'
-          cache: 'false'
-          fail-on: never
+          BUNDLE_DIR: ${{ runner.temp }}/bifrost-semantic-pack-release/bifrost-semantic-packs
+          JAVA_HOME: ${{ runner.temp }}/jdk
+          SCRATCH_ROOT: ${{ runner.temp }}/offline-semantic-pack-acceptance
+        run: >-
+          bash scripts/public/accept-offline-semantic-pack-install.sh
+          "$STAGED_BIFROST"
+          "$BIFROST_SEMANTIC_PACK_BIN"
+          "$BUNDLE_DIR"
+          "$JAVA_HOME"
+          "$SCRATCH_ROOT"
 
   pi-package:
     name: package Pi archive
@@ -1470,7 +1535,21 @@ jobs:
           merge-multiple: true
       - name: Remove internal readiness tools from the qualification bundle
         shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
         run: rm -f qualification-bundle/bifrost-semantic-pack qualification-bundle/bifrost-semantic-pack.sha256
+      - name: Verify release installer retained for publication
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+        run: |
+          set -euo pipefail
+          release_tool="bifrost-semantic-pack-${RELEASE_TAG}-x86_64-unknown-linux-gnu.tar.gz"
+          test -f "qualification-bundle/${release_tool}"
+          test -f "qualification-bundle/${release_tool}.sha256"
+          test ! -e "qualification-bundle/bifrost-semantic-pack"
+          test ! -e "qualification-bundle/bifrost-semantic-pack.sha256"
+          (cd qualification-bundle && sha256sum --check "${release_tool}.sha256")
       - name: Verify expected release inventory is present
         shell: bash
         run: bash scripts/public/check-qualification-inventory.sh qualification-bundle

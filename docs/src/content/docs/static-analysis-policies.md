@@ -109,6 +109,41 @@ sinks, and unresolved or incomplete dispatch remains inconclusive instead of
 clean. The built-in catalog groups the code-smell and security manifests in
 stable pack order and permits selection by pack, category, or policy ID.
 
+Pack version 1.2 adds the **declared-storage family**: two independently
+selectable obligations per supported source language, each an opt-in policy
+that runs only when a policy-ID selector names it. The taint obligation
+(`bifrost.security.<lang>.stored-request-to-sql`) reports a request value that
+crosses the workspace's declared persistence boundary -- written to the
+application's own store in one file, read back in another -- and reaches the
+driver's SQL-text operand, with the write-to-read edge exposed in the finding
+as a declared model assumption rather than an observed database connection.
+The required-validation obligation
+(`bifrost.security.<lang>.store-requires-validation`) is a separate flow
+policy that diagnoses a request value reaching the declared store write
+without passing through the validator the workspace configured; it never
+claims that every application requires validation before storage, and a
+function merely named `validate` never satisfies it. The two are independent
+by construction: a parameterized query removes only the SQL-structure flow,
+and passing a domain validator never sanitizes SQL.
+
+Every rule binds exact proven calls of the declared request, store, validator,
+and SQL APIs -- never same-named members of unrelated classes -- and the
+store, key, and instance contracts come from the workspace's reviewed
+endpoint-set documents under `.bifrost/endpoint-sets/`: a `stores` document
+naming the write/read pair and its store, key, and instance contracts for the
+taint rule, and `observations` and `kills` documents naming the observed store
+write and the required validator for the flow rule. The checked-in fixture for
+each language carries a worked copy of all three documents; copy it, rename
+the application classes and the channel keys, and keep the file paths the
+policies import. Selecting a rule without its documents fails activation with
+a typed error naming the missing file -- a missing required model never counts
+as a passed check. The family ships rows for JavaScript, TypeScript, Python,
+Java, Rust, Go, Ruby, C, C++, PHP, Scala, C#, and Kotlin, each with an
+idiomatic multi-file fixture, the four validator-present/absent crossed with
+concatenated/parameterized combinations, and near-miss controls. The C# row
+stays open: two matched endpoints currently fail C# taint discovery closed,
+which reports an inconclusive run rather than the flow.
+
 Pack version 1.1 adds Rust coverage to eight performance policies. The Rust
 selectors recognize the standard slice `sort*` family, `Regex::new`,
 `fs::read` / `fs::read_to_string`, `serde_json::{to_string, to_vec, from_str,
@@ -2772,7 +2807,8 @@ gate needs:
   nothing must not sit in the document unnoticed. Repair it by re-keying the
   record to the current identity or by deleting it; the review lists the
   policy's unclaimed identities in that same file as `rekey_candidates`.
-- `path_not_analyzed`: the run did not analyze the record's file, so it says
+- `path_not_analyzed`: the run did not analyze the record's file, or root
+  exclusions removed possible calling contexts for that policy, so it says
   nothing about the record and never fails the run.
 - `path_unrecorded`: the record names no `path`, so the two cases above
   cannot be told apart. It never fails the run. Adding `path` to the record
@@ -2802,7 +2838,8 @@ records the directory-level decision once:
   "scopes": [
     {
       "path": "tests/fixtures",
-      "reason": "Intentional smell corpus used as policy test fixtures."
+      "reason": "Intentional smell corpus used as policy test fixtures.",
+      "exclude_roots": true
     },
     {
       "path": "tests",
@@ -2815,10 +2852,16 @@ records the directory-level decision once:
 
 Each entry names one workspace-relative directory with a mandatory reason.
 `path` follows the portable path rules: forward slashes, no absolute paths,
-no `.` or `..` components. Matching is a component-wise directory prefix on
-the finding's primary location, so `tests` covers `tests/app.py` but never
-`tests_extra/app.py`. Entries have no expiry: a directory scope describes
-what the directory is, not one review cycle.
+no `.` or `..` components. Finding acceptance uses a component-wise directory
+prefix on the finding's primary location, so `tests` covers `tests/app.py`
+but never `tests_extra/app.py`. Entries have no expiry: a directory scope
+describes what the directory is, not one review cycle.
+
+Root exclusion is explicit and opt-in with `exclude_roots: true`. That flag
+changes only policy-analysis starting roots; it does not change finding
+acceptance. Omitting it (the default `false`) preserves the original scope
+contract: every policy-analysis root remains eligible, while findings anchored
+under the entry are accepted.
 
 An entry without selectors applies to every policy. `policy_ids` and
 `policy_categories` restrict it, as a union: the entry applies to a policy
@@ -2827,20 +2870,45 @@ exist only for built-in pack policies, so an entry that should also cover a
 repository `.rqlp` policy must list its id or omit selectors entirely. Two
 entries may share a path when their selectors differ.
 
-Scoping is applied after evaluation and after suppressions, and it never
-hides anything. A scoped finding stays in the canonical report with an
-attached `scope` decision (path and reason) and stops counting toward the
-failure threshold, exactly like a suppressed finding; a finding that already
-carries a suppression is not claimed by scope. The report's top-level `scope`
-array audits every entry with its matched-finding count. An entry that
-matched nothing is reported as unapplied so dead entries stay visible, and
-concise human output hides scoped findings from the active list while
+With `exclude_roots: true`, a matching entry has two distinct effects. First,
+it excludes a matching file as a policy-analysis starting root. The rest of
+the dependency workspace remains visible, so a retained root can still reach
+code under a scoped directory. Second, after evaluation and suppressions, a
+resulting finding whose primary anchor matches the entry is accepted. These
+are root and finding contracts, not interchangeable labels: an anchor inside a
+scope does not prove that every excluded calling context that can reach it was
+analyzed.
+
+A scoped finding stays in the canonical report with an attached `scope`
+decision (path and reason) and stops counting toward the failure threshold,
+exactly like a suppressed finding; a finding that already carries a
+suppression is not claimed by scope. The report's top-level `scope` array
+audits every entry, its `exclude_roots` coverage choice, its matched-finding
+count, and its `excluded_root_files` count. The latter counts policy/file
+exclusion pairs before policy language and query filters are applied; when
+overlapping policies exclude the same file, each pair counts. It is not a
+count of procedures or of files the policy would actually query. The human
+summary sums entry/policy/file matches, so overlapping entries count separately. An entry is
+applied when it did either kind of work, so an entry with no matched finding
+but at least one excluded root remains visible rather than being reported as
+dead. Concise human output hides scoped findings from the active list while
 counting them in the summary.
 
-This is deliberately not `.bifrostignore`. That file removes paths from
-analysis entirely (navigation, search, usages); a scoped directory is still
-fully analyzed and still visible in reports; only the policy failure status
-changes.
+Explicit root exclusion supports Match and Assertion policies whose file-backed
+seed sources honor scope. Taint, flow, and typestate policies, and
+configuration-fact seed sources, fail explicitly rather than silently
+discarding roots; the run remains unreliable and no unscoped fallback is
+presented as applied. Scoped executions bypass unit and subject-query caches
+because those cache whole-workspace identities; whole-base identities that are
+already scope-keyed remain reusable. An unsupported family or query source must
+not publish root-exclusion work: its scope-review excluded-root count stays
+zero, and the run remains explicitly unreliable. For a diff base, the head's
+normalized scope is applied to both revisions.
+
+This is deliberately not `.bifrostignore` for navigation, search, and usages:
+the dependency workspace remains visible in those surfaces. For policy
+evaluation, an opted-in scoped file is no longer used as an analysis starting
+root.
 
 A missing scope file means no scoping. A malformed one produces a
 `scope-load-failed` report diagnostic, applies none of that document, and

@@ -641,6 +641,35 @@ impl BoundedProducerDiagnostics {
         }
     }
 
+    /// A set that retains every diagnostic it is given.
+    ///
+    /// A producer that cannot bound diagnostics as it goes - one that splits
+    /// its work across workers and only knows the artifact-wide arrival order
+    /// once the work is done - collects each worker's diagnostics in one of
+    /// these, then folds the batches into the artifact's single bounded set in
+    /// arrival order ([`Self::absorb`]). Nothing is dropped on the way in, so
+    /// the bounded set makes every retention decision exactly once, in the
+    /// order it would have seen the diagnostics in a single pass. The message
+    /// bound still applies, and it is idempotent, so folding a batch does not
+    /// truncate a message twice.
+    pub fn unbounded(limits: &ArtifactProducerLimits) -> Self {
+        Self {
+            diagnostics: Vec::new(),
+            suppressed: SuppressedDiagnostics::default(),
+            max_diagnostics: usize::MAX,
+            max_message_bytes: limits.max_diagnostic_message_bytes,
+        }
+    }
+
+    /// Take every diagnostic retained so far, in arrival order.
+    ///
+    /// The set keeps collecting afterwards, so a producer cuts its work into
+    /// batches at the points where the artifact-wide order has to be
+    /// reconstructed.
+    pub fn take_retained(&mut self) -> Vec<ProducerDiagnostic> {
+        std::mem::take(&mut self.diagnostics)
+    }
+
     pub fn warning(
         &mut self,
         code: impl Into<String>,
@@ -762,6 +791,18 @@ impl BoundedProducerDiagnostics {
 
     pub fn finish(self) -> (Vec<ProducerDiagnostic>, SuppressedDiagnostics) {
         (self.diagnostics, self.suppressed)
+    }
+
+    /// Fold a batch of diagnostics produced elsewhere into this set, in
+    /// arrival order.
+    ///
+    /// The batch must come from an unbounded set ([`Self::unbounded`]), which
+    /// drops nothing, so this set makes the retention decision for every
+    /// diagnostic of the batch exactly as it would for one arriving directly.
+    pub fn absorb(&mut self, diagnostics: Vec<ProducerDiagnostic>) {
+        for diagnostic in diagnostics {
+            self.push_diagnostic(diagnostic);
+        }
     }
 
     pub fn is_empty(&self) -> bool {

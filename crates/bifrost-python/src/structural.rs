@@ -52,6 +52,10 @@ pub const PYTHON_KIND_TABLE: &[(&str, NormalizedKind)] = &[
     ("lambda", NormalizedKind::Lambda),
     ("class_definition", NormalizedKind::Class),
     ("assignment", NormalizedKind::Assignment),
+    // The implicit `__exit__` of a `with` statement runs at the construct's
+    // own exit, so the statement is the source fact the resource-lifecycle
+    // selector names for that release.
+    ("with_statement", NormalizedKind::ResourceRelease),
     ("import_statement", NormalizedKind::Import),
     ("import_from_statement", NormalizedKind::Import),
     ("identifier", NormalizedKind::Identifier),

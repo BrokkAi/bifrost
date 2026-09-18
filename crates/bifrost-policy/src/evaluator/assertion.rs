@@ -453,6 +453,7 @@ impl<'a> AssertionRun<'a> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn evaluate_assertion_policy(
     policy: &LoadedPolicy,
     spec: &AssertionPolicySpec,
@@ -460,11 +461,18 @@ pub(super) fn evaluate_assertion_policy(
     budget: &PolicyBudget,
     active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
     subject_batch: Option<&SubjectQueryBatch<'_>>,
+    execution_scope: Option<CodeQueryExecutionScope<'_>>,
 ) -> Result<PolicyRun, PolicyRunError> {
     if let Some(plan) = &spec.relational {
         // A relational plan is sliced by its own bindings, and records its own
         // reuse review while doing it.
-        return evaluate_relational_assertion_policy(policy, plan, context, budget);
+        return evaluate_relational_assertion_policy(
+            policy,
+            plan,
+            context,
+            budget,
+            execution_scope,
+        );
     }
     let subject_query = match assertion_subject_query(policy, budget) {
         Ok(query) => query,
@@ -473,7 +481,7 @@ pub(super) fn evaluate_assertion_policy(
         }
     };
 
-    let Some(incremental) = context.incremental else {
+    let Some(incremental) = context.incremental.filter(|_| execution_scope.is_none()) else {
         return whole_assertion_run(
             policy,
             spec,
@@ -482,6 +490,7 @@ pub(super) fn evaluate_assertion_policy(
             budget,
             active_semantic_model_snapshot,
             subject_batch,
+            execution_scope,
         );
     };
     let mut attempt = UnitAttempt::default();
@@ -506,6 +515,7 @@ pub(super) fn evaluate_assertion_policy(
                 budget,
                 active_semantic_model_snapshot,
                 subject_batch,
+                execution_scope,
             ),
             Some(reason),
         ),
@@ -757,6 +767,7 @@ fn subject_rows_digest(
 }
 
 /// Evaluate one assertion policy over the whole workspace.
+#[allow(clippy::too_many_arguments)]
 fn whole_assertion_run(
     policy: &LoadedPolicy,
     spec: &AssertionPolicySpec,
@@ -765,6 +776,7 @@ fn whole_assertion_run(
     budget: &PolicyBudget,
     active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
     subject_batch: Option<&SubjectQueryBatch<'_>>,
+    execution_scope: Option<CodeQueryExecutionScope<'_>>,
 ) -> Result<PolicyRun, PolicyRunError> {
     let rows = {
         let _timing = brokk_bifrost_analysis::profiling::scope_with(|| {
@@ -773,11 +785,12 @@ fn whole_assertion_run(
         match subject_batch {
             Some(batch) => batch.execute(subject_query, context, budget),
             None => Rc::new(ExecutedQueryRows::of_detailed(
-                execute_code_query_detailed_eager_index(
+                execute_code_query_detailed_eager_index_in_scope(
                     context.analyzer,
                     subject_query,
                     budget.query_limits(),
                     context.cancellation,
+                    execution_scope.unwrap_or_else(CodeQueryExecutionScope::whole_workspace),
                 ),
             )),
         }
@@ -2130,6 +2143,7 @@ fn evaluate_relational_assertion_policy(
     plan: &super::super::definition::RelationalAssertionPlan,
     context: &PolicyEvaluationContext<'_>,
     budget: &PolicyBudget,
+    execution_scope: Option<CodeQueryExecutionScope<'_>>,
 ) -> Result<PolicyRun, PolicyRunError> {
     use super::super::definition::{
         RowBindingName, RowBindingSource, relational_binding_selector_path,
@@ -2177,7 +2191,7 @@ fn evaluate_relational_assertion_policy(
         binding_queries.push(query);
     }
 
-    let Some(incremental) = context.incremental else {
+    let Some(incremental) = context.incremental.filter(|_| execution_scope.is_none()) else {
         let executed = {
             let _timing = brokk_bifrost_analysis::profiling::scope_with(|| {
                 format!(
@@ -2185,7 +2199,7 @@ fn evaluate_relational_assertion_policy(
                     policy.definition().metadata.id
                 )
             });
-            whole_relational_bindings(&binding_queries, context, budget)
+            whole_relational_bindings(&binding_queries, context, budget, execution_scope)
         };
         let _timing = brokk_bifrost_analysis::profiling::scope_with(|| {
             format!(
@@ -2230,7 +2244,7 @@ fn evaluate_relational_assertion_policy(
                 )
             });
             (
-                whole_relational_bindings(&binding_queries, context, budget),
+                whole_relational_bindings(&binding_queries, context, budget, execution_scope),
                 Some(reason),
             )
         }
@@ -2257,22 +2271,25 @@ fn whole_relational_bindings(
     queries: &[CodeQuery],
     context: &PolicyEvaluationContext<'_>,
     budget: &PolicyBudget,
+    execution_scope: Option<CodeQueryExecutionScope<'_>>,
 ) -> Vec<ExecutedQueryRows> {
     queries
         .iter()
         .map(|query| {
             ExecutedQueryRows::of_detailed(match context.workspace {
-                Some(workspace) => execute_code_query_detailed_eager_index_workspace(
+                Some(workspace) => execute_code_query_detailed_eager_index_workspace_in_scope(
                     workspace,
                     query,
                     budget.query_limits(),
                     context.cancellation,
+                    execution_scope.unwrap_or_else(CodeQueryExecutionScope::whole_workspace),
                 ),
-                None => execute_code_query_detailed_eager_index(
+                None => execute_code_query_detailed_eager_index_in_scope(
                     context.analyzer,
                     query,
                     budget.query_limits(),
                     context.cancellation,
+                    execution_scope.unwrap_or_else(CodeQueryExecutionScope::whole_workspace),
                 ),
             })
         })

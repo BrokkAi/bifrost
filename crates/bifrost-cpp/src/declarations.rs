@@ -674,7 +674,8 @@ fn fragmented_export_function_body_region(
         });
     }
     let siblings = cpp_following_named_siblings(node, source, &ParentIndex::unindexed());
-    let boundary = fragmented_export_sibling_class_boundary(node, source);
+    let boundary =
+        fragmented_export_sibling_class_boundary(node, source, &ParentIndex::unindexed());
     let boundary_index = boundary.and_then(|boundary| {
         siblings
             .iter()
@@ -766,14 +767,15 @@ fn fragmented_export_function_body_region(
 fn fragmented_export_sibling_class_boundary<'tree>(
     node: Node<'tree>,
     source: &str,
+    ancestry: &ParentIndex<'tree>,
 ) -> Option<Node<'tree>> {
-    let node_parent = node.parent()?;
-    cpp_following_named_siblings(node, source, &ParentIndex::unindexed())
+    let node_parent = ancestry.parent(node)?;
+    cpp_following_named_siblings(node, source, ancestry)
         .into_iter()
         .find(|candidate| {
             recover_exported_class_function_definition(*candidate, source).is_some()
-                && candidate
-                    .parent()
+                && ancestry
+                    .parent(*candidate)
                     .is_none_or(|candidate_parent| !same_node(node_parent, candidate_parent))
         })
 }
@@ -833,8 +835,22 @@ fn cpp_following_named_siblings<'tree>(
     let mut anchor = node;
     while let Some(parent) = ancestry.parent(anchor) {
         let at_translation_unit = parent.kind() == "translation_unit";
-        let mut sibling = anchor.next_named_sibling();
-        while let Some(current) = sibling {
+        let mut cursor = parent.walk();
+        assert!(
+            cursor.goto_first_child(),
+            "ParentIndex returned a parent without children"
+        );
+        while !same_node(cursor.node(), anchor) {
+            assert!(
+                cursor.goto_next_sibling(),
+                "ParentIndex parent does not contain its child anchor"
+            );
+        }
+        while cursor.goto_next_sibling() {
+            let current = cursor.node();
+            if !current.is_named() {
+                continue;
+            }
             if at_translation_unit
                 && (current.kind() == "namespace_definition"
                     || (current.kind() == "function_definition"
@@ -858,7 +874,6 @@ fn cpp_following_named_siblings<'tree>(
             {
                 return siblings;
             }
-            sibling = current.next_named_sibling();
         }
         anchor = parent;
     }
@@ -6040,8 +6055,9 @@ impl<'a> CppVisitor<'a> {
                 // The lifted sibling no longer sits below the parser-visible
                 // namespace node. Restore the current parent scope when the
                 // ordinary work walk reaches that class.
-                if let Some(boundary) = fragmented_export_sibling_class_boundary(node, self.source)
-                    .filter(|boundary| boundary.start_byte() == fragmented.reparse_end)
+                if let Some(boundary) =
+                    fragmented_export_sibling_class_boundary(node, self.source, ancestry)
+                        .filter(|boundary| boundary.start_byte() == fragmented.reparse_end)
                 {
                     let mut boundary_scope = scope.clone();
                     for sibling in cpp_following_named_siblings(node, self.source, ancestry) {
@@ -18188,11 +18204,13 @@ class TINYXML2_LIB XMLNode {
             if let Some((_, name, _)) = recover_exported_class_function_definition(node, source)
                 && name == "XMLUtil"
             {
-                boundary_found = fragmented_export_sibling_class_boundary(node, source)
-                    .and_then(|boundary| {
-                        recover_exported_class_function_definition(boundary, source)
-                    })
-                    .is_some_and(|(_, name, _)| name == "XMLNode");
+                boundary_found = fragmented_export_sibling_class_boundary(
+                    node,
+                    source,
+                    &ParentIndex::unindexed(),
+                )
+                .and_then(|boundary| recover_exported_class_function_definition(boundary, source))
+                .is_some_and(|(_, name, _)| name == "XMLNode");
             }
             WalkControl::Continue
         });
@@ -21842,6 +21860,115 @@ public:
         // A body that is not member-shaped at all still has to reparse the same
         // way, because the admission gate reads the tree to reject it.
         fragmented_class_reparse_agreement("public:\n   value + other;\n   return value;\n");
+    }
+
+    fn native_following_named_siblings<'tree>(node: Node<'tree>, source: &str) -> Vec<Node<'tree>> {
+        let mut siblings = Vec::new();
+        let mut anchor = node;
+        while let Some(parent) = anchor.parent() {
+            let at_translation_unit = parent.kind() == "translation_unit";
+            let mut sibling = anchor.next_named_sibling();
+            while let Some(current) = sibling {
+                if at_translation_unit
+                    && (current.kind() == "namespace_definition"
+                        || (current.kind() == "function_definition"
+                            && first_class_like_child(current).is_some()))
+                {
+                    return siblings;
+                }
+                siblings.push(current);
+                if cpp_is_stray_close_brace(current, source) {
+                    if let Some(semicolon) = current
+                        .next_named_sibling()
+                        .filter(|candidate| cpp_is_stray_semicolon(*candidate, source))
+                    {
+                        siblings.push(semicolon);
+                    }
+                    return siblings;
+                }
+                if current.start_byte() >= node.end_byte()
+                    && matches!(current.kind(), "ERROR" | "labeled_statement")
+                    && cpp_nested_stray_close_brace(current, source).is_some()
+                {
+                    return siblings;
+                }
+                sibling = current.next_named_sibling();
+            }
+            anchor = parent;
+        }
+        siblings
+    }
+
+    #[test]
+    fn following_named_siblings_cursor_matches_native_traversal() {
+        // The damaged #2924 shape scatters members across container siblings,
+        // and the anonymous punctuation forces the cursor to filter children
+        // exactly as Node::next_named_sibling does.
+        let source = r#"
+namespace api {
+class PROJECT_API(2, 0) Widget : public virtual Base {
+  public:
+    Widget() {}
+    void first();
+};
+enum After { Value };
+}
+"#;
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_cpp::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let root = tree.root_node();
+        assert!(root.has_error(), "fixture must remain damaged");
+
+        let ancestry = ParentIndex::new(root);
+        let mut stack = vec![root];
+        let mut checked = 0;
+        let mut damaged = 0;
+        let mut anonymous = 0;
+        let mut nonempty_sequences = 0;
+        let mut named_then_anonymous = 0;
+        while let Some(node) = stack.pop() {
+            let expected = native_following_named_siblings(node, source)
+                .iter()
+                .map(Node::id)
+                .collect::<Vec<_>>();
+            let actual = cpp_following_named_siblings(node, source, &ancestry)
+                .iter()
+                .map(Node::id)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                actual,
+                expected,
+                "cursor traversal diverged at byte {}",
+                node.start_byte()
+            );
+
+            let mut cursor = node.walk();
+            let children = node.children(&mut cursor).collect::<Vec<_>>();
+            stack.extend(children.iter().copied());
+            checked += 1;
+            damaged += usize::from(node.is_error() || node.is_missing());
+            anonymous += usize::from(!node.is_named());
+            nonempty_sequences += usize::from(!actual.is_empty());
+            named_then_anonymous += usize::from(
+                children
+                    .windows(2)
+                    .any(|pair| pair[0].is_named() && !pair[1].is_named()),
+            );
+        }
+        assert!(checked > 0, "fixture must provide nodes to compare");
+        assert!(damaged > 0, "fixture must cover damaged nodes");
+        assert!(anonymous > 0, "fixture must cover anonymous nodes");
+        assert!(
+            nonempty_sequences > 0,
+            "fixture must exercise following named siblings"
+        );
+        assert!(
+            named_then_anonymous > 0,
+            "fixture must exercise anonymous nodes following a named anchor"
+        );
     }
 
     /// A header shaped like the generated ones this walk is slow on: many

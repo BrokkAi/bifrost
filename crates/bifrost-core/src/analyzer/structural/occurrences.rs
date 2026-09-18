@@ -118,14 +118,12 @@ impl fmt::Display for OccurrenceRole {
 }
 
 macro_rules! labelled_enum {
-    ($(#[$meta:meta])* $name:ident, $all:ident {
-        $($(#[$variant_meta:meta])* $variant:ident => $label:literal,)+
-    }) => {
+    ($(#[$meta:meta])* $name:ident, $all:ident { $($variant:ident => $label:literal,)+ }) => {
         $(#[$meta])*
         #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
         #[serde(rename_all = "snake_case")]
         pub enum $name {
-            $($(#[$variant_meta])* $variant,)+
+            $($variant,)+
         }
 
         pub const $all: &[$name] = &[$($name::$variant,)+];

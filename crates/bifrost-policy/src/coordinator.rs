@@ -39,14 +39,16 @@ use brokk_bifrost_analysis::analyzer::usages::effects::ModeledProcedureKey;
 use brokk_bifrost_analysis::analyzer::usages::effects::modeled_procedure_key_for_unit;
 use brokk_bifrost_analysis::analyzer::{
     AnalyzerConfig, AnalyzerQueryScope, ChangedFacts, CodeUnit, DependencyPackEcosystem,
-    FilesystemProject, GoDependencyDiscoveryMode, Project, WorkspaceAnalyzer,
+    FilesystemProject, GoDependencyDiscoveryMode, Project, ProjectFile, WorkspaceAnalyzer,
 };
 use brokk_bifrost_analysis::diff_analysis::{
     RevisionExport, RevisionWorkspace, export_revision, resolve_revision_subtree,
 };
+use brokk_bifrost_analysis::path_utils::rel_path_string;
 use brokk_bifrost_analysis::schema_version::SchemaVersionOrigin;
 use brokk_bifrost_analysis::workspace_document::WorkspaceRoot;
 use brokk_bifrost_rql::structural::CodeQueryExecutionLimits;
+use brokk_bifrost_rql::structural::search::CodeQueryExecutionScope;
 
 use super::baseline::{
     PolicyBaselineDocument, PolicyBaselineEntryReview, PolicyBaselineMatchState,
@@ -57,7 +59,10 @@ use super::catalog::{CatalogRegistryLimits, TaintCatalogRegistry};
 use super::definition::{
     FindingSeverity, PolicyCategoryId, PolicyId, RqlpDocument, UnknownVerdict,
 };
-use super::evaluator::{DefaultPolicyEvaluator, PolicyEvaluationContext, PolicyEvaluator};
+use super::evaluator::{
+    DefaultPolicyEvaluator, PolicyEvaluationContext, PolicyEvaluator,
+    policy_supports_execution_scope,
+};
 use super::finding::{FindingDiffDisposition, PolicyFindingDiff};
 use super::finding::{
     PolicyDiagnostic, PolicyDiagnosticCode, PolicyDiagnosticImpact, PolicyDiagnosticSeverity,
@@ -99,8 +104,8 @@ use super::suppression::{
 };
 use super::units::{
     InMemoryPolicyUnitStore, IncrementalBaseState, PersistedPolicyUnitStore,
-    PolicyIncrementalContext, PolicyIncrementalReview, PolicyUnitStore, WidenReason,
-    WorkspaceUnitInputs, row_key,
+    PolicyIncrementalContext, PolicyIncrementalReview, PolicyIncrementalRun, PolicyUnitStore,
+    WidenReason, WorkspaceUnitInputs, row_key,
 };
 
 use super::taint_policy::ProductionTaintPolicyEvaluator;
@@ -144,6 +149,8 @@ pub struct PolicyEvaluationOptions {
     evaluation_date: PolicyEvaluationDate,
     suppressions: PolicySuppressionOptions,
     scope: PolicyScopeOptions,
+    // The diff base uses the head's normalized execution domain, including no scope.
+    scope_override: Option<Option<PolicyScopeDocument>>,
     baseline: PolicyBaselineOptions,
     require_explicit_schema_versions: bool,
     fail_on: PolicyFailOn,
@@ -177,6 +184,7 @@ impl PolicyEvaluationOptions {
             evaluation_date,
             suppressions: PolicySuppressionOptions::default(),
             scope: PolicyScopeOptions::default(),
+            scope_override: None,
             baseline: PolicyBaselineOptions::default(),
             require_explicit_schema_versions: false,
             fail_on: PolicyFailOn::Never,
@@ -194,6 +202,7 @@ impl PolicyEvaluationOptions {
             evaluation_date,
             suppressions,
             scope: PolicyScopeOptions::new(PolicyScopeSource::Conventional),
+            scope_override: None,
             baseline: PolicyBaselineOptions::new(
                 super::baseline::PolicyBaselineSource::Conventional,
             ),
@@ -2042,7 +2051,10 @@ fn evaluate_prepared_policy_inputs(
     let suppression_sources = suppression_load.sources;
     let (scope_document, scope_document_state) = {
         let _scope = brokk_bifrost_analysis::profiling::scope("policy.registration.scope_document");
-        match load_policy_scope_from_root(read_root, options.scope()) {
+        match options.scope_override.as_ref().map_or_else(
+            || load_policy_scope_from_root(read_root, options.scope()),
+            |scope| Ok(scope.clone()),
+        ) {
             Ok(Some(document)) => (Some(document), PolicyScopeDocumentState::Loaded),
             Ok(None) => (None, PolicyScopeDocumentState::NotFound),
             Err(error) => {
@@ -2507,11 +2519,39 @@ fn evaluate_prepared_policy_inputs(
     // Reuse the resolved runtime the activation already built, exactly as an
     // API caller would, and only when it is `Ready`: an incomplete activation
     // must not silently model calls it never resolved.
+    let policy_categories = built_in_scope_categories();
+    let workspace_files = workspace
+        .map(|workspace| workspace.analyzer().analyzed_files())
+        .unwrap_or_default();
+    let scoped_files = registry
+        .policies()
+        .filter_map(|policy| {
+            let id = &policy.definition().metadata.id;
+            let document = scope_document.as_ref()?;
+            let categories = policy_categories
+                .get(id)
+                .map(std::slice::from_ref)
+                .unwrap_or_default();
+            let selected = workspace_files
+                .iter()
+                .filter(|file| !document.excludes_root(&rel_path_string(file), id, categories))
+                .cloned()
+                .collect::<Vec<_>>();
+            let unsupported_scope = !policy_supports_execution_scope(policy)
+                && document
+                    .scopes()
+                    .iter()
+                    .any(|entry| entry.excludes_roots() && entry.matches_policy(id, categories));
+            (selected.len() != workspace_files.len() || unsupported_scope)
+                .then(|| (id.clone(), selected))
+        })
+        .collect::<HashMap<PolicyId, Vec<ProjectFile>>>();
     let taint = workspace.map_or_else(ProductionTaintPolicyEvaluator::default, |workspace| {
         ProductionTaintPolicyEvaluator::prepare(
             registry
                 .policies()
-                .filter(|policy| runnable_ids.contains(&policy.definition().metadata.id)),
+                .filter(|policy| runnable_ids.contains(&policy.definition().metadata.id))
+                .filter(|policy| !scoped_files.contains_key(&policy.definition().metadata.id)),
             workspace,
             active_semantic_model_snapshot,
             cancellation,
@@ -2569,6 +2609,7 @@ fn evaluate_prepared_policy_inputs(
                 base_evaluation_key(
                     &runnable_policies,
                     options,
+                    scope_document.as_ref(),
                     batch_budget,
                     registry_limits,
                     WorkspaceUnitInputs::of(head, icfg_active_semantic_model_snapshot.as_deref()),
@@ -2596,6 +2637,7 @@ fn evaluate_prepared_policy_inputs(
                     workspace,
                     revision,
                     options,
+                    scope_document.as_ref(),
                     base_inputs,
                     batch_budget,
                     registry_limits,
@@ -2661,7 +2703,8 @@ fn evaluate_prepared_policy_inputs(
             workspace.analyzer(),
             registry
                 .policies()
-                .filter(|policy| runnable_ids.contains(&policy.definition().metadata.id)),
+                .filter(|policy| runnable_ids.contains(&policy.definition().metadata.id))
+                .filter(|policy| !scoped_files.contains_key(&policy.definition().metadata.id)),
             &per_policy_budget,
         )
     });
@@ -2681,6 +2724,13 @@ fn evaluate_prepared_policy_inputs(
             deadline_stage.get_or_insert(PolicyExecutionStage::PolicyEvaluation);
         }
         let mut evaluation_budget = per_policy_budget;
+        if scoped_files.contains_key(&policy.definition().metadata.id)
+            && let Some(incremental) = head_incremental
+        {
+            incremental.record_run(PolicyIncrementalRun::whole_family(
+                policy.definition().metadata.id.clone(),
+            ));
+        }
         let context = PolicyEvaluationContext {
             analyzer: workspace.map(WorkspaceAnalyzer::analyzer).ok_or_else(|| {
                 PolicyCoordinatorError::new(format!(
@@ -2693,7 +2743,12 @@ fn evaluate_prepared_policy_inputs(
             cancellation,
             cvss_overlays: &[],
             organizational_risk: &[],
-            incremental: head_incremental,
+            // Scoped evaluations do not publish or replay whole-domain units.
+            incremental: if scoped_files.contains_key(&policy.definition().metadata.id) {
+                None
+            } else {
+                head_incremental
+            },
         };
         let policy_started = Instant::now();
         let evaluated = {
@@ -2703,7 +2758,15 @@ fn evaluate_prepared_policy_inputs(
                     policy.definition().metadata.id.as_str()
                 )
             });
-            evaluator.evaluate(policy, &context, &mut evaluation_budget)
+            match scoped_files.get(&policy.definition().metadata.id) {
+                Some(selected) => evaluator.evaluate_in_scope(
+                    policy,
+                    &context,
+                    &mut evaluation_budget,
+                    CodeQueryExecutionScope::for_seed_files(selected, &workspace_files),
+                ),
+                None => evaluator.evaluate(policy, &context, &mut evaluation_budget),
+            }
         };
         let policy_elapsed = policy_started.elapsed();
         policy_evaluation_elapsed += policy_elapsed;
@@ -2838,12 +2901,44 @@ fn evaluate_prepared_policy_inputs(
             options.evaluation_date(),
             &registry,
             workspace,
+            &scoped_files,
             &mut runs,
         )?,
         None => Vec::new(),
     };
     let scope_reviews = match scope_document.as_ref() {
-        Some(document) => apply_policy_scope(document, &mut runs)?,
+        Some(document) => {
+            let mut reviews = apply_policy_scope(document, &policy_categories, &mut runs)?;
+            for review in &mut reviews {
+                if !review.entry().excludes_roots() {
+                    continue;
+                }
+                let count = registry
+                    .policies()
+                    .filter(|policy| {
+                        runs.contains_key(&policy.definition().metadata.id)
+                            && policy_supports_execution_scope(policy)
+                    })
+                    .map(|policy| {
+                        let id = &policy.definition().metadata.id;
+                        let categories = policy_categories
+                            .get(id)
+                            .map(std::slice::from_ref)
+                            .unwrap_or_default();
+                        workspace_files
+                            .iter()
+                            .filter(|file| {
+                                review
+                                    .entry()
+                                    .matches(&rel_path_string(file), id, categories)
+                            })
+                            .count() as u64
+                    })
+                    .sum();
+                review.set_excluded_root_files(count);
+            }
+            reviews
+        }
         None => Vec::new(),
     };
     let evaluation = PolicyReportEvaluationContext::new(
@@ -2867,7 +2962,19 @@ fn evaluate_prepared_policy_inputs(
             }
             secondary_diagnostics.push(report_diagnostic(
                 PolicyReportDiagnosticCode::SuppressionAuditRetentionExceeded,
-                "suppression and scope audits exceed the report retention budget; no suppressions or scopes were applied",
+                format!(
+                    "suppression and scope audits exceed the report retention budget; finding acceptance was rolled back, but execution root exclusions remain in effect under {} for policies {:?}",
+                    options.scope().source().relative_path(),
+                    {
+                        let mut ids = registry.policies()
+                            .filter(|policy| policy_supports_execution_scope(policy))
+                            .map(|policy| &policy.definition().metadata.id)
+                            .filter(|id| scoped_files.contains_key(*id))
+                            .collect::<Vec<_>>();
+                        ids.sort();
+                        ids
+                    },
+                ),
                 Some(PolicySourceIdentity::new(
                     options.suppressions().primary_relative_path(),
                 )),
@@ -3285,6 +3392,7 @@ impl BatchUnitStore {
 fn base_evaluation_key(
     policies: &[&LoadedPolicy],
     options: &PolicyEvaluationOptions,
+    scope: Option<&PolicyScopeDocument>,
     batch_budget: PolicyBatchBudget,
     registry_limits: PolicyRegistryLimits,
     inputs: WorkspaceUnitInputs,
@@ -3302,10 +3410,10 @@ fn base_evaluation_key(
         .collect::<Vec<_>>();
     policy_set.sort();
     // The base's own options, not the head's: it evaluates with the head's
-    // suppression, scope and gate configuration deliberately stripped, and the
+    // suppression and gate configuration deliberately stripped, and the
     // budgets and registry limits it inherits decide what it retains.
     let base_options = format!(
-        "{:?}\u{1}{}\u{1}{batch_budget:?}\u{1}{registry_limits:?}",
+        "{:?}\u{1}{}\u{1}{batch_budget:?}\u{1}{registry_limits:?}\u{1}{scope:?}",
         options.evaluation_date(),
         options.require_explicit_schema_versions(),
     );
@@ -3536,6 +3644,7 @@ fn evaluate_policy_diff_baseline(
     head_workspace: Option<&WorkspaceAnalyzer>,
     revision: &str,
     head_options: &PolicyEvaluationOptions,
+    head_scope: Option<&PolicyScopeDocument>,
     base_inputs: Vec<PolicyEvaluationInput>,
     batch_budget: PolicyBatchBudget,
     registry_limits: PolicyRegistryLimits,
@@ -3639,10 +3748,12 @@ fn evaluate_policy_diff_baseline(
         }
     }
     // The base run needs raw identities only: no diff base (which would
-    // recurse), no gating threshold, and the head's suppression and scope
-    // configuration deliberately not forwarded.
-    let base_options = PolicyEvaluationOptions::new(head_options.evaluation_date())
+    // recurse), no gating threshold, and no head suppression configuration.
+    // Its execution domain must match the head, even when the committed base
+    // scope differs or the head intentionally has no scope document.
+    let mut base_options = PolicyEvaluationOptions::new(head_options.evaluation_date())
         .with_required_schema_versions(head_options.require_explicit_schema_versions());
+    base_options.scope_override = Some(head_scope.cloned());
     // The base evaluates unit by unit for the same reason the head does: a
     // whole execution cannot attribute its reads to seed files, so unit-wise
     // execution is the only way to publish a per-unit read set at all. Its
@@ -4049,6 +4160,7 @@ fn apply_policy_suppressions(
     evaluation_date: PolicyEvaluationDate,
     registry: &PolicyRegistry,
     workspace: Option<&WorkspaceAnalyzer>,
+    scoped_files: &HashMap<PolicyId, Vec<ProjectFile>>,
     runs: &mut HashMap<PolicyId, PolicyRun>,
 ) -> Result<Vec<PolicySuppressionReview>, PolicyCoordinatorError> {
     let policy_hashes = registry
@@ -4095,27 +4207,31 @@ fn apply_policy_suppressions(
             }
             None => (PolicySuppressionMatchState::PolicyNotEvaluated, None),
         };
-        let (orphan_state, candidates) =
-            if match_state == PolicySuppressionMatchState::FindingAbsent {
-                match record.path() {
-                    None => (PolicySuppressionOrphanState::PathUnrecorded, Vec::new()),
-                    Some(path) => {
-                        let analyzed =
-                            analyzed_paths.get_or_insert_with(|| AnalyzedPaths::collect(workspace));
-                        if analyzed.contains(path) {
-                            let candidates =
-                                runs.get(record.policy_id()).map_or_else(Vec::new, |run| {
-                                    rekey_candidates(run, path, &claimed_identities)
-                                });
-                            (PolicySuppressionOrphanState::Orphaned, candidates)
-                        } else {
-                            (PolicySuppressionOrphanState::PathNotAnalyzed, Vec::new())
-                        }
+        let (orphan_state, candidates) = if match_state
+            == PolicySuppressionMatchState::FindingAbsent
+        {
+            match record.path() {
+                None => (PolicySuppressionOrphanState::PathUnrecorded, Vec::new()),
+                Some(path) => {
+                    let analyzed =
+                        analyzed_paths.get_or_insert_with(|| AnalyzedPaths::collect(workspace));
+                    // Findings can anchor outside their analysis root. If any
+                    // roots were excluded for this policy, absence at a retained
+                    // path does not prove that an old finding was resolved.
+                    if analyzed.contains(path) && !scoped_files.contains_key(record.policy_id()) {
+                        let candidates =
+                            runs.get(record.policy_id()).map_or_else(Vec::new, |run| {
+                                rekey_candidates(run, path, &claimed_identities)
+                            });
+                        (PolicySuppressionOrphanState::Orphaned, candidates)
+                    } else {
+                        (PolicySuppressionOrphanState::PathNotAnalyzed, Vec::new())
                     }
                 }
-            } else {
-                (PolicySuppressionOrphanState::Resolved, Vec::new())
-            };
+            }
+        } else {
+            (PolicySuppressionOrphanState::Resolved, Vec::new())
+        };
         let review = PolicySuppressionReview::new(
             record,
             match_state,
@@ -4148,14 +4264,11 @@ fn apply_policy_suppressions(
     Ok(reviews)
 }
 
-fn apply_policy_scope(
-    document: &PolicyScopeDocument,
-    runs: &mut HashMap<PolicyId, PolicyRun>,
-) -> Result<Vec<PolicyScopeReview>, PolicyCoordinatorError> {
+fn built_in_scope_categories() -> HashMap<PolicyId, PolicyCategoryId> {
     // Category membership is a built-in pack manifest concept; repository
     // policies have no category and match only via policy_ids or an
     // all-policies entry.
-    let policy_categories = match super::builtin::built_in_policy_catalog() {
+    match super::builtin::built_in_policy_catalog() {
         Ok(catalog) => catalog
             .document()
             .packs
@@ -4168,7 +4281,14 @@ fn apply_policy_scope(
             })
             .collect::<HashMap<_, _>>(),
         Err(_) => HashMap::new(),
-    };
+    }
+}
+
+fn apply_policy_scope(
+    document: &PolicyScopeDocument,
+    policy_categories: &HashMap<PolicyId, PolicyCategoryId>,
+    runs: &mut HashMap<PolicyId, PolicyRun>,
+) -> Result<Vec<PolicyScopeReview>, PolicyCoordinatorError> {
     let mut reviews = Vec::with_capacity(document.scopes().len());
     for entry in document.scopes() {
         let mut matched_findings = 0_u64;

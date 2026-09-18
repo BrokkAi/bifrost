@@ -1,0 +1,34 @@
+; Reviewed application configuration: the declared persistence boundary.
+;
+; One store named `job-store`, written by JobStore.put and read by
+; JobStore.get. The key contract separates channels by their proven key
+; constants; the instance contract separates proven-distinct store objects
+; and joins every dimension it cannot prove. The write-to-read edge is this
+; declaration's model assumption: the analyzer never observes the store's
+; bodies, which are empty.
+(endpoint-set-document
+  :schema-version 1
+  :kind stores
+  :language python
+  :rql-schema-version 1
+  :set (endpoint-set :entries [
+      (store-write :id job-store-put
+        :selector (rql :schema-version 1
+          (language python
+            (call-sites-to :proof proven
+              (enclosing-decl
+                (inside-decl (class :name "JobStore") (method :name "put"))))))
+        :store job-store
+        :key (argument :index 0)
+        :instance receiver
+        :input (argument :index 1))
+      (store-read :id job-store-get
+        :selector (rql :schema-version 1
+          (language python
+            (call-sites-to :proof proven
+              (enclosing-decl
+                (inside-decl (class :name "JobStore") (method :name "get"))))))
+        :store job-store
+        :key (argument :index 0)
+        :instance receiver
+        :output return-value)]))

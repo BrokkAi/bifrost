@@ -45,6 +45,7 @@ pub struct PolicyScopeEntry {
     #[serde(serialize_with = "serialize_workspace_relative_path")]
     path: WorkspaceRelativePath,
     reason: Box<str>,
+    exclude_roots: bool,
     policy_ids: Box<[PolicyId]>,
     policy_categories: Box<[PolicyCategoryId]>,
 }
@@ -56,6 +57,10 @@ impl PolicyScopeEntry {
 
     pub fn reason(&self) -> &str {
         &self.reason
+    }
+
+    pub const fn excludes_roots(&self) -> bool {
+        self.exclude_roots
     }
 
     pub fn policy_ids(&self) -> &[PolicyId] {
@@ -77,7 +82,22 @@ impl PolicyScopeEntry {
         self.matches_policy(policy_id, categories) && self.contains_path(primary_path)
     }
 
-    fn matches_policy(&self, policy_id: &PolicyId, categories: &[PolicyCategoryId]) -> bool {
+    /// Whether this opt-in entry excludes `root_path` as an analysis starting
+    /// file for `policy_id`. Acceptance matching does not use this method.
+    pub fn excludes_root(
+        &self,
+        root_path: &str,
+        policy_id: &PolicyId,
+        categories: &[PolicyCategoryId],
+    ) -> bool {
+        self.exclude_roots && self.matches(root_path, policy_id, categories)
+    }
+
+    pub(crate) fn matches_policy(
+        &self,
+        policy_id: &PolicyId,
+        categories: &[PolicyCategoryId],
+    ) -> bool {
         if self.policy_ids.is_empty() && self.policy_categories.is_empty() {
             return true;
         }
@@ -113,6 +133,10 @@ pub struct PolicyScopeDocument {
     scopes: Box<[PolicyScopeEntry]>,
 }
 
+const fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
 impl PolicyScopeDocument {
     pub const fn schema_version(&self) -> u32 {
         self.schema_version
@@ -120,6 +144,19 @@ impl PolicyScopeDocument {
 
     pub fn scopes(&self) -> &[PolicyScopeEntry] {
         &self.scopes
+    }
+
+    /// Whether any entry matching `policy_id` excludes `root_path` as an
+    /// analysis starting file. Dependency files are not tested here.
+    pub fn excludes_root(
+        &self,
+        root_path: &str,
+        policy_id: &PolicyId,
+        categories: &[PolicyCategoryId],
+    ) -> bool {
+        self.scopes
+            .iter()
+            .any(|entry| entry.excludes_root(root_path, policy_id, categories))
     }
 }
 
@@ -236,6 +273,8 @@ pub struct PolicyScopeReview {
     #[serde(flatten)]
     entry: PolicyScopeEntry,
     matched_findings: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    excluded_root_files: u64,
     applied: bool,
     result_omitted: bool,
 }
@@ -245,6 +284,7 @@ impl PolicyScopeReview {
         Self {
             entry: entry.clone(),
             matched_findings,
+            excluded_root_files: 0,
             applied: matched_findings > 0,
             result_omitted: false,
         }
@@ -258,8 +298,19 @@ impl PolicyScopeReview {
         self.matched_findings
     }
 
+    /// The number of root-file exclusions for this entry, counted as
+    /// policy/file pairs across a run. Overlapping policies count separately.
+    pub const fn excluded_root_files(&self) -> u64 {
+        self.excluded_root_files
+    }
+
     pub const fn applied(&self) -> bool {
         self.applied
+    }
+
+    pub(crate) fn set_excluded_root_files(&mut self, excluded_root_files: u64) {
+        self.excluded_root_files = excluded_root_files;
+        self.applied = self.matched_findings > 0 || self.excluded_root_files > 0;
     }
 
     pub const fn result_omitted(&self) -> bool {
@@ -400,6 +451,7 @@ fn normalize_wire_entry(
     Ok(PolicyScopeEntry {
         path,
         reason: wire.reason.into_boxed_str(),
+        exclude_roots: wire.exclude_roots,
         policy_ids,
         policy_categories,
     })
@@ -448,6 +500,7 @@ where
 fn compare_scope_key(left: &PolicyScopeEntry, right: &PolicyScopeEntry) -> Ordering {
     left.path
         .cmp(&right.path)
+        .then_with(|| left.exclude_roots.cmp(&right.exclude_roots))
         .then_with(|| left.policy_ids.cmp(&right.policy_ids))
         .then_with(|| left.policy_categories.cmp(&right.policy_categories))
 }
@@ -483,6 +536,8 @@ struct WireScopeDocument {
 struct WireScopeEntry {
     path: String,
     reason: String,
+    #[serde(default)]
+    exclude_roots: bool,
     #[serde(default)]
     policy_ids: Option<Vec<String>>,
     #[serde(default)]
@@ -738,6 +793,63 @@ mod tests {
 
     fn parse(source: &str) -> Result<PolicyScopeDocument, PolicyScopeDocumentError> {
         parse_policy_scope_document(source)
+    }
+
+    #[test]
+    fn document_excludes_roots_and_review_counts_excluded_files() {
+        let document = parse(
+            r#"{
+                "schema_version": 1,
+                "scopes": [
+                    {"path": "tests", "reason": "policy roots", "exclude_roots": true, "policy_categories": ["performance"]}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let performance = PolicyCategoryId::new("performance").unwrap();
+        let correctness = PolicyCategoryId::new("correctness").unwrap();
+        let sleep = PolicyId::new("bifrost.performance.sleep-in-loop").unwrap();
+        let dynamic = PolicyId::new("bifrost.correctness.dynamic-evaluation").unwrap();
+
+        assert!(document.excludes_root("tests/a.py", &sleep, std::slice::from_ref(&performance)));
+        assert!(!document.excludes_root(
+            "tests/a.py",
+            &dynamic,
+            std::slice::from_ref(&correctness)
+        ));
+        assert!(!document.excludes_root("src/a.py", &sleep, &[performance]));
+
+        let entry = entry(&document, 0);
+        assert!(entry.excludes_roots());
+        let mut review = PolicyScopeReview::new(entry, 0);
+        assert!(!review.applied());
+        review.set_excluded_root_files(2);
+        assert_eq!(review.excluded_root_files(), 2);
+        assert!(review.applied());
+    }
+
+    #[test]
+    fn root_exclusion_defaults_off_for_existing_acceptance_scopes() {
+        let document = parse(
+            r#"{
+                "schema_version": 1,
+                "scopes": [
+                    {"path": "tests", "reason": "acceptance only"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let entry = entry(&document, 0);
+        let correctness = PolicyCategoryId::new("correctness").unwrap();
+        let dynamic = PolicyId::new("bifrost.correctness.dynamic-evaluation").unwrap();
+
+        assert!(!entry.excludes_roots());
+        assert!(entry.matches("tests/a.py", &dynamic, std::slice::from_ref(&correctness)));
+        assert!(!document.excludes_root(
+            "tests/a.py",
+            &dynamic,
+            std::slice::from_ref(&correctness)
+        ));
     }
 
     fn entry(document: &PolicyScopeDocument, index: usize) -> &PolicyScopeEntry {
