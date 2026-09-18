@@ -1394,6 +1394,7 @@ pub(super) struct TypeFlowDiscovery<'provider, 'workspace> {
     provider: &'provider WorkspaceValueFlowProvider<'workspace>,
     closure: DiscoveredClosure,
     dispatch_reads: DispatchReadCollector,
+    demands: Vec<ValueFlowCarrier>,
 }
 
 struct NoSummaryCuts;
@@ -1452,6 +1453,7 @@ impl<'provider, 'workspace> TypeFlowDiscovery<'provider, 'workspace> {
             provider,
             closure,
             dispatch_reads,
+            demands: Vec::new(),
         })
     }
 
@@ -1539,6 +1541,11 @@ impl<'provider, 'workspace> TypeFlowDiscovery<'provider, 'workspace> {
             refinements,
         )
     }
+
+    pub(super) fn demanding(mut self, demands: impl IntoIterator<Item = ValueFlowCarrier>) -> Self {
+        self.demands.extend(demands);
+        self
+    }
 }
 
 impl TypeFlowPlan {
@@ -1614,6 +1621,7 @@ impl TypeFlowPlan {
             provider,
             mut closure,
             dispatch_reads,
+            mut demands,
         } = discovery;
         let _scope = profiling::scope("type_flow.plan_build");
         if closure.root_snapshot.is_none() {
@@ -1959,6 +1967,65 @@ impl TypeFlowPlan {
                 value_flow = value_flow.with_external_summaries(summaries)?;
             }
         }
+        // Refinement evidence is queried on carriers that need not have an
+        // ordinary transfer edge to the value the refinement replaces. For
+        // example, an indexed load from a call result asks which classes reach
+        // the call-result base before deciding whether its unknown load source
+        // can be removed. Make those structured query inputs explicit slice
+        // demands so the preliminary solve retains the proof it needs.
+        for (procedure, analysis) in &correlations {
+            for candidate in &analysis.guard_edge_exclusions {
+                demands.extend(
+                    candidate
+                        .all_reaching_data_defs
+                        .iter()
+                        .filter_map(|definition| {
+                            if let Some(value) = definition.rhs {
+                                Some(ValueFlowCarrier::Value(
+                                    procedure
+                                        .value_handle(value)
+                                        .expect("a definition source is live"),
+                                ))
+                            } else if definition.is_entry() {
+                                Some(binding_carrier(procedure, definition.binding))
+                            } else {
+                                None
+                            }
+                        }),
+                );
+            }
+        }
+        demands.extend(field_refinements.iter().flat_map(|(procedure, field)| {
+            field.alternatives.iter().filter_map(|alternative| {
+                let FieldVersion::Store { value, .. } = alternative.version else {
+                    return None;
+                };
+                Some(ValueFlowCarrier::Value(
+                    procedure
+                        .value_handle(value)
+                        .expect("a field store value is live"),
+                ))
+            })
+        }));
+        demands.extend(
+            class_closed_load_refinements
+                .iter()
+                .map(|(procedure, load)| {
+                    ValueFlowCarrier::Value(
+                        procedure
+                            .value_handle(load.base)
+                            .expect("a class-refined load base is live"),
+                    )
+                }),
+        );
+
+        // Class-set observations exist only at member receivers. Keep the full
+        // discovery result and its typed boundaries, but do not tabulate
+        // transfer chains that cannot reach one of those observations. Source
+        // refinement inputs above are explicit demands; the plan method also
+        // conservatively retains edge-kill carriers, summary locations, and
+        // fallback call inputs whose result is demanded.
+        value_flow = value_flow.retain_flows_reaching(demands);
         let mut atoms = Vec::with_capacity(value_flow.sources().len());
         let mut source_sites = Vec::with_capacity(value_flow.sources().len());
         for (id, spec) in value_flow.sources() {

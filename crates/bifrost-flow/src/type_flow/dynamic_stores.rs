@@ -231,6 +231,13 @@ pub(super) fn survey(
             adapter.enclosing_class(workspace, &write.procedure)
         })
         .collect::<Vec<_>>();
+    let survey_demands = observations
+        .iter()
+        .filter_map(|observation| match observation.as_ref()? {
+            WriteObservation::Event { carrier, .. }
+            | WriteObservation::ReceiverEntry { carrier, .. } => Some(carrier.clone()),
+        })
+        .collect::<Vec<_>>();
     // A write whose receiver reaches a root parameter takes its identity from
     // an actual argument supplied by some caller. A root whose survey failed
     // may have carried that caller, so such a write cannot be trusted as
@@ -284,6 +291,7 @@ pub(super) fn survey(
                 return Ok(None);
             }
             discovered
+                .demanding(survey_demands.iter().cloned())
                 .into_plan(
                     workspace,
                     adapter,

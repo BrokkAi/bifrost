@@ -77,13 +77,18 @@ run_scan() {
     ubuntu:22.04 \
     env -i PATH=/usr/bin:/bin HOME=/work/empty-home USERPROFILE=/work/empty-home \
       JAVA_HOME="$mounted_java_home" BIFROST_SEMANTIC_PACK_DOWNLOAD=off \
-      "/release/$(basename "$bifrost")" scan /work/workspace \
+      "/release/$(basename "$bifrost")" --root /work/workspace \
       --policy-id bifrost.security.java.system-getenv-to-runtime-exec \
       --format json --fail-on never --evaluation-date 2026-09-17 \
       > "$scratch/$label.json" 2> "$scratch/$label.stderr"
   local status=$?
   set -e
   printf '%s\n' "$status" > "$scratch/$label.status"
+  if [[ ! -s "$scratch/$label.json" ]]; then
+    echo "scan '$label' produced no JSON (exit $status)" >&2
+    cat "$scratch/$label.stderr" >&2
+    return 1
+  fi
 }
 
 # Missing explicit state must fail before installation, even though the exact

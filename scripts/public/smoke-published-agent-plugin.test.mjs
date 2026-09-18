@@ -71,7 +71,7 @@ test("requires the policy pack and at least one policy from a successful MCP cal
     result: {
       isError: false,
       structuredContent: {
-        schema_version: 1,
+        schema_version: 2,
         packs: [
           {
             id: "bifrost.code-smells",
@@ -94,7 +94,7 @@ test("requires the policy pack and at least one policy from a successful MCP cal
     /MCP error/u,
   );
   assert.throws(
-    () => assertPolicyCatalog({ result: { isError: false, structuredContent: { schema_version: 1, packs: [{ id: "bifrost.code-smells", policies: [] }] } } }, "Claude"),
+    () => assertPolicyCatalog({ result: { isError: false, structuredContent: { schema_version: 2, packs: [{ id: "bifrost.code-smells", policies: [] }] } } }, "Claude"),
     /wrong policy catalog envelope|no security policies/u,
   );
 });

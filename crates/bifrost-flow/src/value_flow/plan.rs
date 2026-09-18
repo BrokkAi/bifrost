@@ -1974,6 +1974,190 @@ fn procedure_infeasible_points(procedure: &ProcedureSemantics) -> Box<[ProgramPo
 }
 
 impl ValueFlowPlan {
+    /// Retain only sources and transfer rules that can contribute to `demands`.
+    ///
+    /// This is a solve-plan slice, not a discovery slice. All carriers, sinks,
+    /// semantic input status, coverage, and typed incomplete causes remain
+    /// unchanged; only sources proven unable to reach a demand are omitted.
+    /// The reverse walk follows the already validated, direction-aware local
+    /// and call rules. Call fallback profiles add the conservative
+    /// input-to-result relation used by unmodeled and externally summarized
+    /// calls, so a summary-controlled boundary cannot be mistaken for an
+    /// irrelevant local computation.
+    pub(crate) fn retain_flows_reaching(
+        mut self,
+        demands: impl IntoIterator<Item = ValueFlowCarrier>,
+    ) -> Self {
+        if self.sinks.is_empty() {
+            return self;
+        }
+        let mut relevant = demands
+            .into_iter()
+            .filter_map(|carrier| self.carrier_ids.get(&carrier).copied())
+            .collect::<HashSet<_>>();
+        relevant.extend(self.sinks.iter().map(|sink| sink.carrier));
+        relevant.extend(
+            self.edge_kills
+                .iter()
+                .filter_map(|kill| self.carrier_ids.get(&kill.carrier).copied()),
+        );
+        // A retained summary-location binding may be read or written by a
+        // semantic summary without a concrete local rule spelling that
+        // transfer. Keep its component demanded rather than trying to infer a
+        // smaller contract from summary internals.
+        relevant.extend(
+            self.summary_location_bindings
+                .iter()
+                .map(|binding| binding.carrier),
+        );
+        // The root's procedure ports and all abstract locations are public
+        // summary and heap boundaries. They may be demanded by a caller,
+        // persisted summary, or later refinement even when this root has no
+        // local sink on the same carrier. Callee ports are internal to this
+        // root solve, however: exact call rules, fallback profiles, and
+        // summary-location bindings above retain the ones that can contribute
+        // to a demanded root boundary or receiver observation.
+        relevant.extend(
+            self.carriers
+                .iter()
+                .enumerate()
+                .filter(|(_, carrier)| {
+                    matches!(carrier, ValueFlowCarrier::Location(_))
+                        || matches!(carrier, ValueFlowCarrier::Port(port) if port.procedure() == &self.root)
+                })
+                .map(|(index, _)| {
+                    ValueFlowCarrierId::try_from_index(index)
+                        .expect("a retained carrier ID fits u32")
+                }),
+        );
+
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for rule in self.local_rules.iter().rev() {
+                if relevant.contains(&rule.target) && relevant.insert(rule.source) {
+                    changed = true;
+                }
+            }
+            for rule in self.call_rules.iter().rev() {
+                if relevant.contains(&rule.target) && relevant.insert(rule.source) {
+                    changed = true;
+                }
+            }
+            for profile in &self.fallback_profiles {
+                let output_is_relevant = profile
+                    .normal_output
+                    .into_iter()
+                    .chain(profile.exceptional_output)
+                    .any(|output| relevant.contains(&output));
+                if output_is_relevant {
+                    for input in &profile.inputs {
+                        if relevant.insert(*input) {
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Source facts that cannot reach any demand cannot affect a class-set
+        // observation. Removing them is important as well as removing their
+        // transfer rules: reusable-summary preparation otherwise still stages
+        // every dead source witness and can exhaust the solver before the
+        // smaller rule graph is evaluated. Keep all source-driven guard
+        // machinery conservative by retaining every edge-kill carrier above;
+        // sources named by a retained kill are therefore already relevant.
+        let mut retained_source_ids = self
+            .sources
+            .iter()
+            .filter_map(|source| relevant.contains(&source.carrier).then_some(source.id))
+            .collect::<HashSet<_>>();
+        let retained_source_keys = self
+            .edge_kills
+            .iter()
+            .flat_map(|kill| kill.sources.iter())
+            .collect::<HashSet<_>>();
+        retained_source_ids.extend(self.sources.iter().filter_map(|source| {
+            retained_source_keys
+                .contains(source.spec.key())
+                .then_some(source.id)
+        }));
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for source in &self.sources {
+                if retained_source_ids.contains(&source.id)
+                    && let Some(triggers) = &source.activation_triggers
+                {
+                    for trigger in triggers {
+                        changed |= retained_source_ids.insert(*trigger);
+                    }
+                }
+            }
+        }
+        let mut old_to_new_source_ids = HashMap::default();
+        let mut sources = Vec::new();
+        for source in &self.sources {
+            if retained_source_ids.contains(&source.id) {
+                let id = ValueFlowSourceId::try_from_index(sources.len())
+                    .expect("a retained source ID fits u32");
+                old_to_new_source_ids.insert(source.id, id);
+                let mut source = source.clone();
+                source.id = id;
+                sources.push(source);
+            }
+        }
+        for source in &mut sources {
+            if let Some(triggers) = source.activation_triggers.as_mut() {
+                *triggers = triggers
+                    .iter()
+                    .map(|trigger| {
+                        old_to_new_source_ids
+                            .get(trigger)
+                            .copied()
+                            .expect("retained conditional source keeps its triggers")
+                    })
+                    .collect();
+            }
+        }
+        self.sources = sources.into_boxed_slice();
+        self.source_index = build_observation_index(&self.sources, |source| ObservationKey {
+            point: source.spec.point().clone(),
+            phase: source.spec.phase(),
+        });
+        let source_specs = self
+            .sources
+            .iter()
+            .map(|source| source.spec.clone())
+            .collect::<Vec<_>>();
+        self.edge_kill_index = build_edge_kill_index(
+            &self.edge_kills,
+            &self.carrier_ids,
+            &SourceKeyIndex::new(&source_specs),
+        )
+        .expect("retained edge kills keep every referenced source");
+
+        self.local_rules = self
+            .local_rules
+            .iter()
+            .filter(|rule| relevant.contains(&rule.target))
+            .cloned()
+            .collect();
+        self.call_rules = self
+            .call_rules
+            .iter()
+            .filter(|rule| relevant.contains(&rule.target))
+            .cloned()
+            .collect();
+        self.local_rule_point_index = build_local_rule_point_index(&self.local_rules);
+        self.call_rule_reverse_index = build_call_rule_reverse_index(&self.call_rules);
+        // Keep the original fallback components and profiles. They are a
+        // conservative boundary contract and participate in reusable-summary
+        // identity; deriving them from the smaller execution slice would turn
+        // an optimization into a semantic change.
+        self
+    }
+
     pub fn try_new(
         root: ProcedureHandle,
         snapshots: Vec<ValueFlowInput<ValueFlowSnapshot>>,
@@ -5175,6 +5359,7 @@ mod tests {
         CancellationToken, OracleCallContext, SemanticBudget, SemanticRequest, ValueFlowOracle,
     };
     use crate::analyzer::{AnalyzerConfig, Language};
+    use crate::value_flow::ValueFlowEventKind;
 
     use super::*;
     use crate::inline_project::InlineTestProject;
@@ -5196,6 +5381,90 @@ mod tests {
         let mut trace = HashTrace::default();
         plan.propagation_semantics_hash(&mut trace);
         trace.0
+    }
+
+    #[test]
+    fn receiver_slice_drops_only_local_rules_that_cannot_reach_a_sink() {
+        let project = InlineTestProject::with_language(Language::Go)
+            .file(
+                "flow.go",
+                "package fixture\nfunc run(input string, other string) string {\n    observed := input\n    dead := other\n    _ = dead\n    return observed\n}\n",
+            )
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let cancellation = CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let artifact = workspace
+            .materialize_program_semantics(
+                &project.file("flow.go"),
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .expect("fixture semantics materialize")
+            .available_value()
+            .cloned()
+            .expect("fixture semantics remain available");
+        let root = artifact
+            .procedures()
+            .iter()
+            .find(|procedure| {
+                procedure
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|segment| segment.name())
+                    == Some("run")
+            })
+            .and_then(|procedure| artifact.procedure_handle(procedure.id()))
+            .expect("fixture declares run");
+        let mut budget = SemanticBudget::default();
+        let snapshot_outcome = workspace
+            .semantic_oracle_provider()
+            .procedure_relations(
+                &root,
+                &OracleCallContext::empty(),
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .expect("fixture value-flow snapshot materializes");
+        let status = SemanticInputStatus::from_outcome(&snapshot_outcome);
+        let snapshot = snapshot_outcome
+            .available_value()
+            .cloned()
+            .expect("fixture value-flow snapshot remains available");
+        let relations = snapshot.relations().to_vec();
+        let observed = relations.last().expect("fixture retains a return relation");
+        let sink_carrier = ValueFlowCarrier::from(&observed.target);
+        let sink = ValueFlowSinkSpec::new(
+            ValueFlowEventKey::at_point(observed.point(), 0, ValueFlowEventKind::Sink)
+                .expect("fixture sink key is valid"),
+            observed.point().clone(),
+            ValueFlowObservationPhase::AfterEffects,
+            sink_carrier,
+            ProofStatus::Proven,
+            EvidenceCompleteness::Complete,
+        );
+        let plan = ValueFlowPlan::try_new(
+            root,
+            vec![ValueFlowInput::new(snapshot, status)],
+            Vec::new(),
+            Vec::new(),
+            vec![sink],
+        )
+        .expect("fixture value-flow plan");
+        let before = plan.local_rules.len();
+        let sliced = plan.retain_flows_reaching(std::iter::empty());
+
+        assert!(
+            sliced.local_rules.len() < before,
+            "the dead assignment is sliced"
+        );
+        assert!(
+            sliced
+                .local_rules
+                .iter()
+                .any(|rule| rule.target == sliced.sinks[0].carrier),
+            "the observed receiver chain remains"
+        );
     }
 
     #[test]

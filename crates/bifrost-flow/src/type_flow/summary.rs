@@ -70,7 +70,7 @@ use super::{FieldSlotIndex, TypeFlowPlan};
 // computed with joining return ports must not survive that transfer change.
 // #3430 keys a guard source by what it states instead of by a per-plan
 // counter, so rows naming the old positional keys must not be restored.
-const CLASS_SET_SUMMARY_SEMANTICS: &[u8] = b"bifrost-class-set-summary-semantics-v14";
+const CLASS_SET_SUMMARY_SEMANTICS: &[u8] = b"bifrost-class-set-summary-semantics-v15";
 const CLASS_SET_SUMMARY_CONTEXT: &[u8] = b"bifrost-class-set-summary-context-v1";
 const CLASS_SET_SUMMARY_BEHAVIOR: &[u8] = b"bifrost-class-set-summary-behavior-v3";
 const CLASS_SET_SUMMARY_ATOM: &[u8] = b"bifrost-class-set-summary-atom-v1";

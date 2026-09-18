@@ -147,7 +147,7 @@ export async function validatePublishedPackage(pluginDir, expectedVersion) {
 export function assertPolicyCatalog(response, host) {
   assert.equal(response.result?.isError, false, `${host} list_policies returned an MCP error`);
   const content = response.result?.structuredContent;
-  assert.equal(content?.schema_version, 1, `${host} returned the wrong policy catalog schema`);
+  assert.equal(content?.schema_version, 2, `${host} returned the wrong policy catalog schema`);
   const packs = content?.packs;
   assert.ok(Array.isArray(packs) && packs.length === 2, `${host} returned the wrong policy catalog envelope`);
   const codeSmells = packs.find((pack) => pack.id === "bifrost.code-smells");
