@@ -71,6 +71,7 @@ run_scan() {
   fi
   set +e
   docker run --rm --network none \
+    --user "$(id -u):$(id -g)" \
     --mount "type=bind,src=$(dirname "$bifrost"),dst=/release,readonly" \
     --mount "type=bind,src=$java_home,dst=/jdk,readonly" \
     --mount "type=bind,src=$scratch,dst=/work" \
