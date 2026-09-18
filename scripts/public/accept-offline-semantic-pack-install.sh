@@ -95,7 +95,8 @@ run_scan() {
 # runtime toolchain is available and the facade's acquisition provider exists.
 run_scan missing
 
-"$installer" verify "$bundle"
+"$installer" verify "$bundle" > "$scratch/bundle-verify.txt"
+sed -n '1p' "$scratch/bundle-verify.txt"
 "$installer" install "$bundle" "$catalog"
 "$installer" list "$catalog" --format json > "$scratch/inventory.json"
 

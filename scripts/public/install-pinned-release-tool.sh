@@ -33,7 +33,7 @@ find_binary() {
 reported_version() {
   local binary=$1
   shift
-  "$binary" "$@" 2>/dev/null | tail -n 1
+  "$binary" "$@" 2>/dev/null | tail -n 1 || true
 }
 
 verify_or_install_cargo_tool() {

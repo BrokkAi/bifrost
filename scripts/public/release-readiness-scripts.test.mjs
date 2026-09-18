@@ -963,3 +963,37 @@ chmod +x "$3/bin/pip"
     assert.equal(fs.readFileSync(pythonLog, "utf8").split("\n").filter(Boolean).length, 2);
   });
 });
+
+test("pinned Zig repairs a cached venv whose entry point cannot execute", () => {
+  withTempDir((dir) => {
+    const installer = script("install-pinned-release-tool.sh");
+    const fakeBin = path.join(dir, "fake-bin");
+    const pythonLog = path.join(dir, "python.log");
+    const zigRoot = path.join(dir, "ziglang");
+    writeExecutable(
+      path.join(fakeBin, "python3"),
+      `#!/usr/bin/env bash
+printf '%s\\n' "$*" >> '${pythonLog}'
+[[ "$1" == -m && "$2" == venv ]] || exit 64
+mkdir -p "$3/bin"
+cat > "$3/bin/pip" <<'FAKE'
+#!/usr/bin/env bash
+cat > '${zigRoot}/bin/python-zig' <<'ZIG'
+#!/usr/bin/env bash
+echo 0.15.2
+ZIG
+chmod +x '${zigRoot}/bin/python-zig'
+FAKE
+chmod +x "$3/bin/pip"
+`,
+    );
+    writeExecutable(path.join(zigRoot, "bin", "python-zig"), "#!/usr/bin/env bash\nexit 126\n");
+
+    const result = run(BASH, [installer, "ziglang", zigRoot, "0.15.2"], {
+      env: { PATH: `${fakeBin}:${process.env.PATH}` },
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(fs.readFileSync(pythonLog, "utf8").split("\n").filter(Boolean).length, 1);
+  });
+});
