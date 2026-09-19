@@ -460,7 +460,7 @@ fn bifrost_lsp_server_indexes_all_startup_workspace_folders() {
         "method": "workspace/symbol",
         "params": {"query": "Only"}
     }));
-    let symbols_response = server.read_message();
+    let symbols_response = server.read_response_for_id(2);
     let symbols = symbols_response["result"]
         .as_array()
         .unwrap_or_else(|| panic!("expected workspace symbols, got {symbols_response}"));
@@ -479,7 +479,7 @@ fn bifrost_lsp_server_indexes_all_startup_workspace_folders() {
         "method": "textDocument/documentSymbol",
         "params": {"textDocument": {"uri": uri_for(&beta_path)}}
     }));
-    let document_symbols_response = server.read_message();
+    let document_symbols_response = server.read_response_for_id(3);
     assert_eq!(
         document_symbols_response["id"], 3,
         "expected documentSymbol response: {document_symbols_response}"
