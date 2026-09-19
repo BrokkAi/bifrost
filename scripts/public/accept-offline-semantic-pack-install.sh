@@ -78,7 +78,7 @@ run_scan() {
     ubuntu:22.04 \
     env -i PATH=/usr/bin:/bin HOME=/work/empty-home USERPROFILE=/work/empty-home \
       JAVA_HOME="$mounted_java_home" BIFROST_SEMANTIC_PACK_DOWNLOAD=off \
-      "/release/$(basename "$bifrost")" scan /work/workspace \
+      "/release/$(basename "$bifrost")" --root /work/workspace --policy \
       --policy-id bifrost.security.java.system-getenv-to-runtime-exec \
       --format json --fail-on never --evaluation-date 2026-09-17 \
       > "$scratch/$label.json" 2> "$scratch/$label.stderr"
