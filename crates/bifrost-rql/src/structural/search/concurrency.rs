@@ -38,12 +38,14 @@ use brokk_bifrost_flow::typestate::TypestateObjectKey;
 /// type's `ServeHTTP` method (issue #3428).
 const NET_HTTP_HANDLER_TYPE: &str = "net/http.Handler";
 
-/// The two exact callable bindings one modeled interface-form `net/http`
-/// handler registration resolves to, bound next to the effect it spawns.
+/// The exact callable one modeled task spawn runs, bound next to the effect
+/// it spawns.
 ///
 /// A spawn the model dispatches through an object the caller names carries
-/// that object as its task's receiver; the func-value forms carry `None` and
-/// keep their callable in the caller's own value.
+/// that object as its task's receiver: the handler argument of a
+/// `net/http.Handler` registration, or the receiver a method value bound when
+/// its evaluation selected the method. A func-value spawn of a plain function
+/// or closure carries `None` and keeps its callable in the caller's own value.
 struct TaskSpawnCallableBinding {
     callable: ValueId,
     targets: Vec<ProcedureHandle>,
@@ -552,17 +554,31 @@ impl<'a> WorkspaceConcurrencyProvider<'a> {
         call: &CallSiteHandle,
         input: &CompiledSummaryInput,
     ) -> ConcurrencyAnswer<Vec<ProcedureHandle>> {
+        Self::callback_value(call, input).map(|callable| callable.targets)
+    }
+
+    /// The callable value one callback input names, with the receiver its
+    /// evaluation bound when it selected a method. A modeled func-value spawn
+    /// runs that callable exactly as the call form would, so it must carry the
+    /// bound receiver into the spawned task.
+    fn callback_value(
+        call: &CallSiteHandle,
+        input: &CompiledSummaryInput,
+    ) -> ConcurrencyAnswer<brokk_bifrost_flow::concurrency::SourceCallable> {
         let semantics = call.procedure().semantics();
         let row = semantics
             .call_site(call.id())
             .expect("validated call handle resolves");
         let Some(value) = Self::actual_input(row, input) else {
             return ConcurrencyAnswer::Open {
-                partial: Vec::new(),
+                partial: brokk_bifrost_flow::concurrency::SourceCallable {
+                    targets: Vec::new(),
+                    receiver: None,
+                },
                 reasons: vec![ConcurrencyOpenReason::UnresolvedTarget],
             };
         };
-        brokk_bifrost_flow::concurrency::source_callable_targets(call.procedure(), value)
+        brokk_bifrost_flow::concurrency::source_callable(call.procedure(), value)
     }
 
     fn declaration_has_concurrency_model(
@@ -1334,14 +1350,15 @@ impl<'a> WorkspaceConcurrencyProvider<'a> {
     /// Bind the callable one modeled task spawn runs.
     ///
     /// The func-value forms resolve the spawn's argument through the
-    /// callable-reference events #3408 records. The `net/http.Handler`
-    /// interface forms resolve the argument's dynamic type instead (issue
-    /// #3428): the analyzer's handler-dispatch proof names the `ServeHTTP`
-    /// method of the argument's exact workspace type -- with the argument as
-    /// the task's receiver -- or the conversion's own argument for an exact
-    /// `http.HandlerFunc` conversion. An inexact dynamic type keeps the
-    /// reviewed typed boundary this summary carried before, and a bounded
-    /// proof that stops reports the exhaustion.
+    /// callable-reference events #3408 records, including the receiver a
+    /// method value bound when it was evaluated (issue #3469). The
+    /// `net/http.Handler` interface forms resolve the argument's dynamic type
+    /// instead (issue #3428): the analyzer's handler-dispatch proof names the
+    /// `ServeHTTP` method of the argument's exact workspace type -- with the
+    /// argument as the task's receiver -- or the conversion's own argument
+    /// for an exact `http.HandlerFunc` conversion. An inexact dynamic type
+    /// keeps the reviewed typed boundary this summary carried before, and a
+    /// bounded proof that stops reports the exhaustion.
     fn bind_task_spawn_callable(
         &self,
         call: &CallSiteHandle,
@@ -1351,8 +1368,8 @@ impl<'a> WorkspaceConcurrencyProvider<'a> {
     ) -> Result<(Option<TaskSpawnCallableBinding>, Vec<ConcurrencyOpenReason>), SemanticProviderError>
     {
         if !self.spawn_callable_is_net_http_handler(summary, callable) {
-            let (targets, reasons) = Self::callback_targets(call, callable).into_parts();
-            let binding = (!targets.is_empty()).then(|| TaskSpawnCallableBinding {
+            let (callable_value, reasons) = Self::callback_value(call, callable).into_parts();
+            let binding = (!callable_value.targets.is_empty()).then(|| TaskSpawnCallableBinding {
                 callable: Self::actual_input(
                     call.procedure()
                         .semantics()
@@ -1361,8 +1378,8 @@ impl<'a> WorkspaceConcurrencyProvider<'a> {
                     callable,
                 )
                 .expect("callback targets require an actual callable value"),
-                targets,
-                receiver: None,
+                targets: callable_value.targets,
+                receiver: callable_value.receiver,
             });
             return Ok((binding, reasons));
         }
@@ -1390,14 +1407,18 @@ impl<'a> WorkspaceConcurrencyProvider<'a> {
                 Vec::new(),
             )),
             crate::analyzer::GoHttpHandlerDispatch::HandlerFuncConversion { argument } => {
-                let (targets, reasons) =
-                    brokk_bifrost_flow::concurrency::source_callable_targets(procedure, argument)
+                // The conversion renames a callable value without changing it,
+                // so the converted func keeps the receiver the converted
+                // method value bound when it was evaluated.
+                let (callable_value, reasons) =
+                    brokk_bifrost_flow::concurrency::source_callable(procedure, argument)
                         .into_parts();
-                let binding = (!targets.is_empty()).then_some(TaskSpawnCallableBinding {
-                    callable: argument,
-                    targets,
-                    receiver: None,
-                });
+                let binding =
+                    (!callable_value.targets.is_empty()).then_some(TaskSpawnCallableBinding {
+                        callable: argument,
+                        targets: callable_value.targets,
+                        receiver: callable_value.receiver,
+                    });
                 Ok((binding, reasons))
             }
             crate::analyzer::GoHttpHandlerDispatch::Open {

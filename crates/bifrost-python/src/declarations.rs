@@ -9,6 +9,7 @@ use brokk_bifrost_core::analyzer::model::{
     StructuredImportPathKind,
 };
 use brokk_bifrost_core::analyzer::parsed_file::ParsedFile;
+use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
 use brokk_bifrost_core::analyzer::tree_walk::{WalkControl, walk_named_tree_preorder};
 use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
@@ -890,6 +891,13 @@ impl<'a> PythonVisitor<'a> {
             return;
         }
 
+        // Only the shapes a reviewed summary can name are declarations: a
+        // function written at module level (at most one control level deep, so
+        // a `def` under `if TYPE_CHECKING:` still counts) or directly in a
+        // class body. A function nested inside another function's body is a
+        // local binding of its enclosing function, not a member of any owner,
+        // so it mints no declaration and no procedure key; `@x.setter` is a
+        // write into its class's attribute rather than a callable member.
         let capture = !python_is_property_mutator(range_node, self.source)
             && ((scope.is_empty() && module_control_depth <= 1)
                 || scope
@@ -1223,14 +1231,25 @@ fn python_function_signature(node: Node<'_>, source: &str) -> String {
 }
 
 fn python_signature_metadata(signature: String, node: Node<'_>, source: &str) -> SignatureMetadata {
+    let with_modifiers = |metadata: SignatureMetadata| {
+        metadata.with_callable_modifiers(
+            python_callable_is_static(node, source),
+            false,
+            DeclaredVisibility::Unknown,
+        )
+    };
     let Some(parameters_node) = node.child_by_field_name("parameters") else {
-        return SignatureMetadata::new(signature, Vec::new())
-            .with_dispatch_extensibility(DispatchExtensibility::Open);
+        return with_modifiers(
+            SignatureMetadata::new(signature, Vec::new())
+                .with_dispatch_extensibility(DispatchExtensibility::Open),
+        );
     };
     let parameter_text = py_node_text(parameters_node, source).trim();
     let Some(parameters_start) = signature.find(parameter_text) else {
-        return SignatureMetadata::new(signature, Vec::new())
-            .with_dispatch_extensibility(DispatchExtensibility::Open);
+        return with_modifiers(
+            SignatureMetadata::new(signature, Vec::new())
+                .with_dispatch_extensibility(DispatchExtensibility::Open),
+        );
     };
     let parameters_end = parameters_start + parameter_text.len();
     let mut search_start = parameters_start;
@@ -1249,8 +1268,44 @@ fn python_signature_metadata(signature: String, node: Node<'_>, source: &str) ->
             Some(ParameterMetadata::new(label, start_byte, end_byte))
         })
         .collect();
-    SignatureMetadata::new(signature, parameters)
-        .with_dispatch_extensibility(DispatchExtensibility::Open)
+    with_modifiers(
+        SignatureMetadata::new(signature, parameters)
+            .with_dispatch_extensibility(DispatchExtensibility::Open),
+    )
+}
+
+/// Whether this Python callable binds no instance receiver, read from its own
+/// declaration nodes (#3451).
+///
+/// Recording the fact is what makes a Python declaration keyable for
+/// procedure-summary binding: `receiver_contract_of` refuses to answer for a
+/// callable whose adapter never inspected modifiers, so before this every
+/// Python workspace callee contributed `callee_unkeyable` and no Python effect
+/// coverage could be exhaustive.
+///
+/// Only a callable written in a class body can bind an instance receiver, and
+/// the two decorators that remove it are `@staticmethod` and `@classmethod`.
+/// The decorator check is the language's own
+/// [`python_function_has_decorator`], read through the `decorated_definition`
+/// node that owns the decorators, so the receiver contract agrees with the
+/// receiver [`python_instance_method_receiver_name`] already resolves. A
+/// module-level function, and a function nested in another function's body, has
+/// no type owner at all, so its contract falls out of the owner rather than out
+/// of this flag; it is not static either.
+///
+/// Python spells no constructor modifier for `__init__`: calling the class
+/// reaches an ordinary instance method, exactly as Ruby's `initialize`, so the
+/// constructor flag stays false and its receiver contract is `Instance`.
+/// Visibility is a naming convention (`_name`), not a declaration node, so it
+/// stays `Unknown`.
+fn python_callable_is_static(node: Node<'_>, source: &str) -> bool {
+    debug_assert!(
+        node.kind() == "function_definition",
+        "Python callable signature metadata is built for function_definition, not {}",
+        node.kind()
+    );
+    python_function_has_decorator(node, source, "staticmethod")
+        || python_function_has_decorator(node, source, "classmethod")
 }
 
 fn python_parameter_label_nodes(parameters_node: Node<'_>) -> Vec<Node<'_>> {
@@ -1664,5 +1719,137 @@ mod supertype_tests {
                 "supertypes of {source}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod callable_modifier_tests {
+    use super::*;
+
+    /// The Python half of #3451. Every declaration this walk mints as a
+    /// callable states whether it binds an instance receiver, read from its own
+    /// decorator and definition nodes: `@staticmethod` and `@classmethod`
+    /// remove the receiver, every other `def` in a class body keeps it, and a
+    /// module-level or async function has none to keep. `receiver_contract_of`
+    /// reports no contract at all for a callable whose adapter never inspected
+    /// modifiers, so without this every Python procedure key is refused.
+    ///
+    /// The kinds that are deliberately not keyable are asserted here with their
+    /// reason, so the coverage is the walk's decision rather than an omission:
+    ///
+    /// - `@property` is a `Field`, because Python reads it as an attribute; a
+    ///   member whose unit kind is not a callable minted no key before and does
+    ///   not now.
+    /// - `assigned = lambda ...` is a `Field` too: the module walk records the
+    ///   assignment as a field and never mints a callable declaration for the
+    ///   lambda, so there are no signature modifiers to read and nothing for a
+    ///   reviewed summary to bind.
+    /// - `inner`, a function defined inside another function's body, is a local
+    ///   binding of its enclosing function rather than a member of any owner, so
+    ///   this walk mints no declaration, no `SignatureMetadata`, and no
+    ///   procedure key for it.
+    #[test]
+    fn callable_metadata_records_python_receiver_contracts_structurally() {
+        let source = "def free(value):\n    return value\n\nclass Widget:\n    def __init__(self, spec):\n        self.spec = spec\n\n    def render(self, target):\n        return target\n\n    @staticmethod\n    def build(spec):\n        return spec\n\n    @classmethod\n    def measure(cls, target):\n        return target\n\n    @property\n    def label(self):\n        return \"widget\"\n\nasync def fetch_all(url):\n    return url\n\ndef outer(seed):\n    def inner(value):\n        return value\n    return inner(seed)\n\nassigned = lambda value: value\n";
+        let file = ProjectFile::new(std::env::temp_dir(), "widget.py");
+        let tree = parse_python_tree(source).expect("parse the Python fixture");
+        let parsed = parse_python_file(&file, source, &tree);
+
+        let entry = |fq_name: &str| {
+            parsed
+                .signature_metadata
+                .iter()
+                .find(|(unit, _)| unit.fq_name() == fq_name)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "missing Python declaration {fq_name}; recorded {:?}",
+                        parsed
+                            .signature_metadata
+                            .keys()
+                            .map(CodeUnit::fq_name)
+                            .collect::<Vec<_>>()
+                    )
+                })
+        };
+        let modifiers = |fq_name: &str| {
+            let (_, entries) = entry(fq_name);
+            let metadata = entries
+                .first()
+                .unwrap_or_else(|| panic!("{fq_name} carries no signature metadata"));
+            assert!(
+                metadata.callable_modifiers_recorded(),
+                "{fq_name} must record that the walk read its declaration shape"
+            );
+            (
+                metadata.callable_is_static(),
+                metadata.callable_is_constructor(),
+                metadata.parameters().len(),
+            )
+        };
+
+        assert_eq!(modifiers("widget.free"), (false, false, 1));
+        assert_eq!(
+            modifiers("widget.Widget.__init__"),
+            (false, false, 2),
+            "`__init__` is an ordinary instance method, exactly as Ruby's `initialize`"
+        );
+        assert_eq!(modifiers("widget.Widget.render"), (false, false, 2));
+        assert_eq!(
+            modifiers("widget.Widget.build"),
+            (true, false, 1),
+            "`@staticmethod` binds no instance receiver"
+        );
+        assert_eq!(
+            modifiers("widget.Widget.measure"),
+            (true, false, 2),
+            "`@classmethod` receives the class, not an instance"
+        );
+        assert_eq!(
+            modifiers("widget.fetch_all"),
+            (false, false, 1),
+            "an async def is the same function_definition node"
+        );
+        assert_eq!(modifiers("widget.outer"), (false, false, 1));
+
+        let (property_unit, property_entries) = entry("widget.Widget.label");
+        assert_eq!(
+            property_unit.kind(),
+            CodeUnitType::Field,
+            "`@property` is read as an attribute, so it mints a Field and no key"
+        );
+        assert!(!property_unit.is_callable());
+        assert!(
+            property_entries
+                .first()
+                .expect("the property still carries signature metadata")
+                .callable_modifiers_recorded(),
+            "the shared metadata path records modifiers for every declaration it mints"
+        );
+
+        // The assignment walk records `assigned` as a field through
+        // `add_signature`, which mints no `SignatureMetadata` at all, so there
+        // are no callable modifiers to record and nothing a reviewed summary
+        // could bind.
+        let lambda_unit = parsed
+            .declarations()
+            .iter()
+            .find(|unit| unit.fq_name() == "widget.assigned")
+            .expect("the module walk still records the name-bound lambda's assignment");
+        assert_eq!(
+            lambda_unit.kind(),
+            CodeUnitType::Field,
+            "a name-bound lambda is recorded as a field, not as a callable declaration"
+        );
+        assert!(
+            !parsed.signature_metadata.contains_key(lambda_unit),
+            "a field assignment carries signature text but no callable signature metadata"
+        );
+        assert!(
+            parsed
+                .declarations()
+                .iter()
+                .all(|unit| unit.terminal_name() != "inner"),
+            "a function nested in another function is a local binding, not a declaration"
+        );
     }
 }

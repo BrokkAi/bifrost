@@ -21,6 +21,16 @@ explicit compatible `enable` control names the pack id. The activation
 report retains that enable decision; the published endpoint rows retain
 the exposure, behavior, and active-model-set identities.
 
+A workspace states the Node artifact coordinates, profile configuration,
+and artifact digest by declaring the reviewed revision: root
+`package.json` `engines.node` or `volta.node`, `.nvmrc`, or
+`.node-version` set to `22.11.0`. The workspace activation transaction
+turns that declaration into the evidence rows above, so the pack selects
+through the same contract the acceptance tests exercise. A declaration of
+another revision, a range, or no declaration at all mints no evidence and
+leaves the pack `incompatible`, with a reason naming the missing
+coordinate and the digest and configuration the selector requires.
+
 The packs carry no authored binding evidence or observations. Only
 workspace-derived analyzer evidence can authoritatively describe lexical
 bindings, rebinding exclusions, keyed loads, mutation state, and
@@ -67,8 +77,13 @@ preload customization on Linux x64 in CommonJS mode. Worker threads,
 which receive a copy of the parent environment, other platforms and
 architectures, other module modes, and other `process` members are
 outside the reviewed contract and stay incomplete. The mutation proof
-closes a single-file module for direct writes to the `process` root;
-unknown external calls outside the read's own function and unmodeled
+closes a single-file module for direct writes to the `process` root: a
+write to that root anywhere in the module leaves every read typed
+incomplete. Effect and accessor hazards are scoped to the read's own
+execution context and ordered against it, so only a hazard that can run
+before the read -- module linkage, an earlier statement in the same
+function, or a hazard inside a loop that also contains the read -- leaves
+it typed incomplete. The profile still assumes no preloads: unmodeled
 module-load effects are outside the closed proof and are excluded by the
 `closed-workspace-no-preloads` host assumption the profile carries. A
 workspace whose module loading writes `process.env` or `process.argv`

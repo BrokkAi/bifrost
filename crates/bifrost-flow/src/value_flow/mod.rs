@@ -58,7 +58,7 @@ pub use model::{
 pub use plan::{
     AuthoredArmClosure, ValueFlowCuratedCallModel, ValueFlowEdgeKillSpec, ValueFlowIncompleteCause,
     ValueFlowInput, ValueFlowLocalRuleSpec, ValueFlowPlan, ValueFlowPlanError, ValueFlowPlanLimits,
-    ValueFlowSummaryLocationBinding,
+    ValueFlowReturnedCallable, ValueFlowSummaryLocationBinding,
 };
 pub(crate) use plan::{ValueFlowCarrierSummaryIdentity, ValueFlowSourceBehaviorIdentity};
 pub use planned::{

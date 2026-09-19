@@ -84,7 +84,11 @@ pub const CATALOG_SCHEMA_VERSION: i64 = db::CURRENT_CATALOG_VERSION;
 /// `builtins.quit` carry the `_sitebuiltins.Quitter.__call__` contract
 /// (#3135). Warm generated packs publish those names as signature-less
 /// constants.
-pub const GENERATED_PRODUCTION_CACHE_VERSION: u32 = 28;
+/// 29: the Java source-JAR producer records an interface's `extends` clause as
+/// an interface-table edge, so a source archive answers the members an
+/// inherited interface declares (#3466). Warm generated packs lose every one
+/// of those edges.
+pub const GENERATED_PRODUCTION_CACHE_VERSION: u32 = 29;
 pub const SEMANTIC_PACK_CACHE_ROOT_ENV: &str = "BIFROST_SEMANTIC_PACK_CACHE_ROOT";
 
 /// Resolve the generated catalog used when no explicit catalog is configured.

@@ -1,6 +1,6 @@
 use super::super::ids::{
-    DeclarationLocator, DeclarationSegment, SemanticArtifactKey, SemanticLanguage, SemanticLocator,
-    SemanticRole, WorkspaceMountId, WorkspaceRelativePath,
+    DeclarationLocator, DeclarationSegment, MemoryLocationId, SemanticArtifactKey,
+    SemanticLanguage, SemanticLocator, SemanticRole, WorkspaceMountId, WorkspaceRelativePath,
 };
 use super::super::ir::{
     CallSiteHandle, EvidenceCompleteness, ProcedureHandle, ProcedureKind, ProofStatus,
@@ -869,6 +869,69 @@ pub fn split_canonical_qualified_callee(
     (!owner.is_empty() && !member.is_empty()).then(|| (owner, member.to_owned()))
 }
 
+/// Provenance of a callable value that one producing call returned.
+///
+/// An invocation whose local callee is proven to hold exactly one callable
+/// returned by a producing call publishes this row. It names the producing
+/// call and callee, the exact closure body the invocation dispatches to, and
+/// the environment slots the producing procedure bound into that closure. A
+/// consumer can therefore keep the closed-over storage connected across the
+/// producing call's normal return without re-deriving which callable the value
+/// names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReturnedCallableProvenance {
+    producer: CallSiteHandle,
+    producer_callee: ProcedureHandle,
+    closure: ProcedureHandle,
+    captures: Box<[MemoryLocationId]>,
+}
+
+impl ReturnedCallableProvenance {
+    pub(crate) fn new(
+        producer: CallSiteHandle,
+        producer_callee: ProcedureHandle,
+        closure: ProcedureHandle,
+        captures: Box<[MemoryLocationId]>,
+    ) -> Self {
+        assert_eq!(
+            producer.procedure().artifact().key().mount(),
+            producer_callee.artifact().key().mount(),
+            "a producing call and its callee belong to one workspace mount"
+        );
+        assert_eq!(
+            producer_callee.artifact().key().mount(),
+            closure.artifact().key().mount(),
+            "a returned closure belongs to its producing procedure's mount"
+        );
+        Self {
+            producer,
+            producer_callee,
+            closure,
+            captures,
+        }
+    }
+
+    /// The call whose result supplied the callable value.
+    pub const fn producer(&self) -> &CallSiteHandle {
+        &self.producer
+    }
+
+    /// The procedure the producing call resolved to.
+    pub const fn producer_callee(&self) -> &ProcedureHandle {
+        &self.producer_callee
+    }
+
+    /// The local callable body the invocation dispatches to.
+    pub const fn closure(&self) -> &ProcedureHandle {
+        &self.closure
+    }
+
+    /// The closure's environment slots, in the closure's own procedure.
+    pub fn captures(&self) -> &[MemoryLocationId] {
+        &self.captures
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DispatchResult {
     candidates: Box<[DispatchCandidate]>,
@@ -876,6 +939,7 @@ pub struct DispatchResult {
     coverage: CandidateCoverage,
     complete_receiver_hint_refinable: bool,
     resolver_proved_no_callee: bool,
+    returned_callable: Option<Box<ReturnedCallableProvenance>>,
 }
 
 impl DispatchResult {
@@ -908,6 +972,7 @@ impl DispatchResult {
             coverage,
             complete_receiver_hint_refinable: false,
             resolver_proved_no_callee: false,
+            returned_callable: None,
         };
         let has_unresolved = result
             .boundaries
@@ -975,6 +1040,33 @@ impl DispatchResult {
     /// unreached one.
     pub const fn resolver_proved_no_callee(&self) -> bool {
         self.resolver_proved_no_callee
+    }
+
+    /// The proven callable-result provenance of this answer, when the
+    /// invocation's callee was proven to hold exactly one callable a producing
+    /// call returned.
+    pub fn returned_callable(&self) -> Option<&ReturnedCallableProvenance> {
+        self.returned_callable.as_deref()
+    }
+
+    /// Record the proof that this invocation's callee holds the exact callable
+    /// the named producing call returned.
+    pub(crate) fn mark_returned_callable(&mut self, provenance: ReturnedCallableProvenance) {
+        debug_assert_eq!(
+            self.coverage,
+            CandidateCoverage::Exhaustive,
+            "a proven returned callable is one complete target set"
+        );
+        debug_assert_eq!(
+            self.candidates.len(),
+            1,
+            "a proven returned callable names exactly one dispatch target"
+        );
+        debug_assert!(
+            self.returned_callable.is_none(),
+            "one dispatch answer carries one returned-callable provenance"
+        );
+        self.returned_callable = Some(Box::new(provenance));
     }
 
     pub(crate) fn mark_resolver_proved_no_callee(&mut self) {

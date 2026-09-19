@@ -29,13 +29,13 @@ use crate::analyzer::semantic::{
     AbstractLocation, AbstractObject, AbstractObjectIdentity, AccessPath, AccessPathRoot,
     AccessPathTail, AccessSelector, AllocationHandle, BackingStoreOffset, CallArgumentEndpoint,
     CallArgumentExpansion, CallArgumentGroup, CallArgumentMapping, CallArgumentMember, CallBinding,
-    CallBindings, CallPassingMode, CallerReceiverBinding, CandidateCoverage, CaptureSource,
-    ControlEdgeKind, DeclarationSegmentKind, DispatchCandidate, EvidenceCompleteness,
-    EvidenceHandle, FormalMultiplicity, HeapOracle, ImplicitArgumentKind, IndexSelector,
-    MemoryLocationId, MemoryLocationKind, MemoryValueCopy, ObjectCardinality, OracleCallContext,
-    OracleCandidate, OracleRelationArena, OracleRelationHandle, OracleRelationId,
-    OracleRelationKind, OracleRelationOwner, OracleRelationRecord, ProcedureCallBoundary,
-    ProcedureHandle, ProcedureKind, ProcedurePortHandle, ProcedurePortKind,
+    CallBindings, CallPassingMode, CallableTarget, CallableTargetResolution, CallerReceiverBinding,
+    CandidateCoverage, CaptureSource, ControlEdgeKind, DeclarationSegmentKind, DispatchCandidate,
+    EvidenceCompleteness, EvidenceHandle, FormalMultiplicity, HeapOracle, ImplicitArgumentKind,
+    IndexSelector, MemoryLocationId, MemoryLocationKind, MemoryValueCopy, ObjectCardinality,
+    OracleCallContext, OracleCandidate, OracleRelationArena, OracleRelationHandle,
+    OracleRelationId, OracleRelationKind, OracleRelationOwner, OracleRelationRecord,
+    ProcedureCallBoundary, ProcedureHandle, ProcedureKind, ProcedurePortHandle, ProcedurePortKind,
     ProcedureReceiverBinding, ProgramPointHandle, ProgramPointId, ProofStatus,
     ScopedSemanticLocator, SemanticCapability, SemanticEffect, SemanticGapDischarge,
     SemanticGapImpact, SemanticGapKind, SemanticGapSubject, SemanticLocator, SemanticOutcome,
@@ -3610,6 +3610,287 @@ impl WorkspaceSemanticOracle<'_> {
             _ => Ok(false),
         }
     }
+
+    /// Prove that one call result holds exactly one local callable the callee
+    /// returned, and materialize that callable's procedure.
+    ///
+    /// The proof is the callee's own call-binding provenance: the caller result
+    /// must be bound to the callee's normal return port, and the unique return
+    /// flow feeding that port must derive, through local assignments only,
+    /// from one exact callable creation. Every contributing row must carry
+    /// proven complete evidence. A second matching return binding, a second
+    /// return flow, a competing definition of a value on the derivation chain,
+    /// or a callable target that is not one local procedure all refuse the
+    /// question instead of picking a callable.
+    ///
+    /// The answer also carries the creation's structured capture association:
+    /// every `CaptureBind` row the callee published for the closure names the
+    /// exact environment slot that will observe the value the closure reads.
+    /// That association is what lets a consumer keep the escaped environment
+    /// connected to the callee's writes without re-deriving the callable's
+    /// provenance from syntax.
+    pub(crate) fn returned_callable_target(
+        &self,
+        call: &crate::analyzer::semantic::CallSiteHandle,
+        candidate: &DispatchCandidate,
+        result: ValueId,
+        context: &OracleCallContext,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<SemanticOutcome<Option<ReturnedCallableTarget>>, SemanticProviderError> {
+        if request.cancellation.is_cancelled() {
+            return Ok(SemanticOutcome::Cancelled {
+                partial: None,
+                work: SemanticWork::default(),
+            });
+        }
+        let mut staged = WorkStager::new(request);
+        let bindings_outcome = self.call_bindings(
+            call,
+            candidate,
+            context,
+            &mut staged.request(request.cancellation),
+        )?;
+        staged.work = staged.work.conservative_add(bindings_outcome.work());
+        let bindings = match bindings_outcome {
+            SemanticOutcome::Complete { value, .. } => value,
+            SemanticOutcome::ExceededBudget { exceeded, .. } => {
+                return Ok(returned_callable_interruption(
+                    Interruption::Budget(exceeded),
+                    staged.work,
+                ));
+            }
+            SemanticOutcome::Cancelled { .. } => {
+                return Ok(returned_callable_interruption(
+                    Interruption::Cancelled,
+                    staged.work,
+                ));
+            }
+            _ => return Ok(returned_callable_refusal(request, &staged)),
+        };
+        if bindings.coverage() != CandidateCoverage::Exhaustive {
+            return Ok(returned_callable_refusal(request, &staged));
+        }
+        let mut matching_normal_returns = 0usize;
+        for binding in bindings.bindings() {
+            let CallBinding::NormalReturn {
+                formal,
+                result: returned,
+                ..
+            } = binding
+            else {
+                continue;
+            };
+            if returned.id() != result
+                || !matches!(
+                    formal.kind(),
+                    ProcedurePortKind::NormalReturn
+                        | ProcedurePortKind::IndexedNormalReturn { ordinal: 0 }
+                )
+            {
+                continue;
+            }
+            matching_normal_returns += 1;
+        }
+        if matching_normal_returns != 1 {
+            return Ok(returned_callable_refusal(request, &staged));
+        }
+        let callee = candidate.target();
+        let artifact = callee.artifact();
+        let semantics = callee.semantics();
+        let mut returned_source = None;
+        for point in semantics.points() {
+            if request.cancellation.is_cancelled() {
+                return Ok(returned_callable_interruption(
+                    Interruption::Cancelled,
+                    staged.work,
+                ));
+            }
+            if let Err(stop) = staged.charge(SemanticWork {
+                program_points: 1,
+                nested_entries: point.events.len(),
+                ..SemanticWork::default()
+            }) {
+                return Ok(returned_callable_interruption(stop, staged.work));
+            }
+            for event in point.events.iter() {
+                let SemanticEffect::ValueFlow {
+                    kind: ValueFlowKind::Return | ValueFlowKind::IndexedReturn { ordinal: 0 },
+                    source,
+                    ..
+                } = event.effect
+                else {
+                    continue;
+                };
+                if !proven_complete(&[evidence_handle(callee, event.evidence)?])
+                    || returned_source.replace(source).is_some()
+                {
+                    return Ok(returned_callable_refusal(request, &staged));
+                }
+            }
+        }
+        let Some(mut current) = returned_source else {
+            return Ok(returned_callable_refusal(request, &staged));
+        };
+        let mut visited: HashSet<ValueId> = HashSet::default();
+        loop {
+            if !visited.insert(current) {
+                return Ok(returned_callable_refusal(request, &staged));
+            }
+            let mut definition: Option<ValueId> = None;
+            let mut created: Option<ProcedureHandle> = None;
+            let mut created_value: Option<ValueId> = None;
+            for point in semantics.points() {
+                if request.cancellation.is_cancelled() {
+                    return Ok(returned_callable_interruption(
+                        Interruption::Cancelled,
+                        staged.work,
+                    ));
+                }
+                if let Err(stop) = staged.charge(SemanticWork {
+                    program_points: 1,
+                    nested_entries: point.events.len(),
+                    ..SemanticWork::default()
+                }) {
+                    return Ok(returned_callable_interruption(stop, staged.work));
+                }
+                for event in point.events.iter() {
+                    match &event.effect {
+                        SemanticEffect::CallableCreation {
+                            result: creation,
+                            callable,
+                        } if *creation == current => {
+                            if !proven_complete(&[evidence_handle(callee, event.evidence)?])
+                                || !proven_complete(&[evidence_handle(
+                                    callee,
+                                    callable.target_evidence,
+                                )?])
+                            {
+                                return Ok(returned_callable_refusal(request, &staged));
+                            }
+                            let CallableTargetResolution::Proven(CallableTarget::Local(closure)) =
+                                &callable.targets
+                            else {
+                                return Ok(returned_callable_refusal(request, &staged));
+                            };
+                            let procedure = artifact.procedure_handle(*closure).ok_or_else(|| {
+                                SemanticProviderError::internal(
+                                    "returned local callable is absent from its semantic artifact",
+                                )
+                            })?;
+                            if created.is_some() {
+                                return Ok(returned_callable_refusal(request, &staged));
+                            }
+                            created = Some(procedure);
+                            created_value = Some(*creation);
+                        }
+                        SemanticEffect::Assignment {
+                            target,
+                            value: source,
+                        }
+                        | SemanticEffect::ValueFlow {
+                            kind: ValueFlowKind::Local,
+                            source,
+                            target,
+                        } if *target == current => {
+                            if !proven_complete(&[evidence_handle(callee, event.evidence)?]) {
+                                return Ok(returned_callable_refusal(request, &staged));
+                            }
+                            if definition.is_some_and(|existing| existing != *source) {
+                                return Ok(returned_callable_refusal(request, &staged));
+                            }
+                            definition = Some(*source);
+                        }
+                        SemanticEffect::ValueFlow { target, .. }
+                        | SemanticEffect::MemoryLoad { result: target, .. }
+                            if *target == current =>
+                        {
+                            return Ok(returned_callable_refusal(request, &staged));
+                        }
+                        // The adapter's operand annotation is not a competing
+                        // definition of the value.
+                        SemanticEffect::CallableReference { result, .. } if *result == current => {}
+                        _ => {}
+                    }
+                }
+            }
+            if let Some(procedure) = created {
+                let creation = created_value.expect("a retained callable records its value");
+                let mut captures = Vec::new();
+                for row in semantics.captures() {
+                    if row.target != procedure.id() {
+                        continue;
+                    }
+                    // A row that targets the closure from another creating
+                    // value, or without proven complete evidence, makes the
+                    // environment association ambiguous. The caller must keep
+                    // its refusal rather than trust one storage row.
+                    if row.callable != creation
+                        || !proven_complete(&[evidence_handle(callee, row.evidence)?])
+                    {
+                        return Ok(returned_callable_refusal(request, &staged));
+                    }
+                    captures.push(row.destination);
+                }
+                captures.sort_unstable();
+                captures.dedup();
+                *request.budget = staged.budget;
+                return Ok(SemanticOutcome::Complete {
+                    value: Some(ReturnedCallableTarget {
+                        closure: procedure,
+                        captures: captures.into_boxed_slice(),
+                    }),
+                    work: staged.work,
+                });
+            }
+            let Some(next) = definition else {
+                return Ok(returned_callable_refusal(request, &staged));
+            };
+            current = next;
+        }
+    }
+}
+
+fn returned_callable_interruption(
+    interruption: Interruption,
+    work: SemanticWork,
+) -> SemanticOutcome<Option<ReturnedCallableTarget>> {
+    match interruption {
+        Interruption::Budget(exceeded) => SemanticOutcome::ExceededBudget {
+            partial: None,
+            exceeded,
+            work,
+        },
+        Interruption::Cancelled => SemanticOutcome::Cancelled {
+            partial: None,
+            work,
+        },
+    }
+}
+
+/// A refuted returned-callable question: no callable is proven, and the work
+/// the probe already spent stays charged to the caller's request.
+fn returned_callable_refusal(
+    request: &mut SemanticRequest<'_>,
+    staged: &WorkStager,
+) -> SemanticOutcome<Option<ReturnedCallableTarget>> {
+    *request.budget = staged.budget.clone();
+    SemanticOutcome::Complete {
+        value: None,
+        work: staged.work,
+    }
+}
+
+/// One local callable a callee returned, with the environment slots the same
+/// procedure bound at the closure's creation.
+///
+/// The closure is the exact body an invocation of the callable dispatches to.
+/// Each slot is the structured destination of one `CaptureBind` row the callee
+/// published for that creation, so a consumer can name the closure's captured
+/// storage without reading the source again.
+#[derive(Debug, Clone)]
+pub(crate) struct ReturnedCallableTarget {
+    pub(crate) closure: ProcedureHandle,
+    pub(crate) captures: Box<[MemoryLocationId]>,
 }
 
 impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {

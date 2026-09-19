@@ -371,6 +371,16 @@ declared effect's pack/model/summary provenance; the relational row publishes
 `depth`, `classification` (direct or transitive), `certainty`, `timing`,
 `coverage`, and a bounded witness chain.
 
+The Java specialization
+(`bifrost.effects.java.selected-boundary-no-network-io`) is a separate policy
+with its own stable ID. It consumes one reviewed JDK model,
+`semantic-packs/web-network/jvm/bifrost.web-network-jvm.json`, which declares
+`java.net.URL.openConnection()` at its written arity zero. That model is
+declared once for the whole JVM realm: Java, Kotlin and Scala compile to one
+classpath, so a Kotlin or Scala call site binds the same reviewed declaration
+through the JVM external identity route, and none of the three rows ships a
+second JDK model.
+
 <!-- policy-doc-test:rqlp:tests/fixtures/network-effect-boundary/policies/javascript.rqlp -->
 ```lisp
 ; Network-effect boundary for one explicitly selected JavaScript declaration.

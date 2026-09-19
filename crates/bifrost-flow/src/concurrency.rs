@@ -517,9 +517,11 @@ pub enum ResolvedConcurrencyEffect {
         targets: Vec<ProcedureHandle>,
         /// The caller-frame value the spawned task's receiver formal binds to,
         /// when the spawn dispatches through a reviewed model to a method of a
-        /// value the call already names (`net/http.Handler` registration,
-        /// issue #3428). The callable of a method-value spawn carries its own
-        /// receiver through the closure environment and leaves this `None`.
+        /// value the call already names: a `net/http.Handler` registration
+        /// (issue #3428) or the receiver a method-value callable bound when it
+        /// was evaluated (issue #3469). A func-value spawn whose callable is a
+        /// plain function or closure carries no receiver and leaves this
+        /// `None`.
         receiver: Option<ValueId>,
         group: Option<ResolvedConcurrencySubject>,
         condition: ResolvedTaskSpawnCondition,
@@ -4060,12 +4062,24 @@ fn solve_concurrent_access_conflicts(
                     }
                 )
             });
+        // Whether a creation point repeats is a control-topology question, so
+        // a `NormalControlFlow` gap blocks it only when its producer did not
+        // retain the topology. `RetainedControlTopology` retains it directly.
+        // `RetainedEvaluationOrder` retains every evaluation and only fixes
+        // the order the language leaves open, so it removes no control node
+        // the loop walk reads; the repeating-creation set is exactly the
+        // set-of-evaluations answer that discharge admits. A gap that omits
+        // control syntax outright carries no such claim, and the loop set
+        // stays unknown.
         let creation_cyclic_points = if semantics.allocations().is_empty() && !has_aggregate_copy {
             Some(HashSet::default())
         } else if semantics.gaps().iter().any(|gap| {
             gap.capability == crate::analyzer::semantic::SemanticCapability::NormalControlFlow
-                && gap.discharge
-                    != crate::analyzer::semantic::SemanticGapDischarge::RetainedControlTopology
+                && !matches!(
+                    gap.discharge,
+                    crate::analyzer::semantic::SemanticGapDischarge::RetainedControlTopology
+                        | crate::analyzer::semantic::SemanticGapDischarge::RetainedEvaluationOrder
+                )
         }) {
             None
         } else if request
@@ -5241,6 +5255,32 @@ fn solve_concurrent_access_conflicts(
                             provider,
                             request,
                         )?;
+                        // A detached call through a callable value (`go f()`,
+                        // where `f` holds `c.serve`) reaches the method through
+                        // the value, so the call site names no receiver. The
+                        // callable's own evaluation bound one, and the spawned
+                        // task binds it exactly as the call form `go c.serve()`
+                        // binds the call site's receiver.
+                        if call.receiver.is_none()
+                            && let ConcurrencyAnswer::Proven(callable_value) =
+                                source_callable(&context.procedure, call.callee)
+                            && let Some(receiver) = callable_value.receiver
+                        {
+                            bind_modeled_receiver_input(
+                                &mut synchronization_subjects,
+                                &mut callable_values,
+                                &invocations,
+                                &tasks,
+                                &context,
+                                call,
+                                child,
+                                target_context.invocation,
+                                &target,
+                                receiver,
+                                provider,
+                                request,
+                            )?;
+                        }
                     } else if let Some(receiver) = receiver {
                         bind_modeled_receiver_input(
                             &mut synchronization_subjects,
@@ -10949,18 +10989,40 @@ fn append_atomic_accesses(
     }
 }
 
-/// Recover local callable targets from the same structured source events for
-/// live modeled spawns and retained modeled-call replay.
-pub fn source_callable_targets(
+/// The callable one structured source value denotes: the exact local targets
+/// it resolves to and the receiver its evaluation bound when it selected a
+/// method.
+///
+/// A method value keeps its receiver inside the callable, so a modeled spawn
+/// that runs one must bind that value as the spawned task's receiver exactly
+/// as the call form binds the method's receiver. A plain function or closure
+/// carries none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceCallable {
+    pub targets: Vec<ProcedureHandle>,
+    /// The caller-frame value every visited callable evaluates as its
+    /// receiver. `None` when none of them bound one, or when they disagree:
+    /// an ambiguous receiver cannot name the object the task would reach, so
+    /// the answer keeps its open boundary instead of guessing one.
+    pub receiver: Option<ValueId>,
+}
+
+/// Recover the callable a structured source value denotes from the callable
+/// creation and reference events, for live modeled spawns and retained
+/// modeled-call replay.
+pub fn source_callable(
     procedure: &ProcedureHandle,
     value: ValueId,
-) -> ConcurrencyAnswer<Vec<ProcedureHandle>> {
+) -> ConcurrencyAnswer<SourceCallable> {
     let semantics = procedure.semantics();
     let mut targets = Vec::new();
+    let mut receiver: Option<ValueId> = None;
+    let mut receiver_disagreement = false;
     let mut open = false;
     // A callable stored in a variable reaches the call through one local
     // flow per copy, so follow the chain back to its creations. The visited
-    // set bounds the walk; every visited creation contributes its targets.
+    // set bounds the walk; every visited creation contributes its targets
+    // and, when it selected a method, the receiver it bound.
     let mut visited = HashSet::default();
     visited.insert(value);
     let mut queue = VecDeque::from([value]);
@@ -10978,6 +11040,12 @@ pub fn source_callable_targets(
                             &mut targets,
                             &mut open,
                         );
+                        if let Some(bound) = callable.bound_receiver {
+                            if receiver.is_some_and(|previous| previous != bound) {
+                                receiver_disagreement = true;
+                            }
+                            receiver = Some(bound);
+                        }
                     }
                     SemanticEffect::ValueFlow {
                         source,
@@ -10999,14 +11067,31 @@ pub fn source_callable_targets(
     // locator, not a field read.
     targets.sort_by_cached_key(crate::flow_state::procedure_wire_id);
     targets.dedup();
-    if !open && !targets.is_empty() {
-        ConcurrencyAnswer::Proven(targets)
+    if receiver_disagreement {
+        // One value may hold callables of several evaluations whose receivers
+        // are different objects. Binding any single one of them would name an
+        // object the task does not necessarily reach, so the answer stays
+        // open and binds nothing.
+        open = true;
+        receiver = None;
+    }
+    let callable = SourceCallable { targets, receiver };
+    if !open && !callable.targets.is_empty() {
+        ConcurrencyAnswer::Proven(callable)
     } else {
         ConcurrencyAnswer::Open {
-            partial: targets,
+            partial: callable,
             reasons: vec![ConcurrencyOpenReason::UnresolvedTarget],
         }
     }
+}
+
+/// Recover local callable targets from the same structured source events.
+pub fn source_callable_targets(
+    procedure: &ProcedureHandle,
+    value: ValueId,
+) -> ConcurrencyAnswer<Vec<ProcedureHandle>> {
+    source_callable(procedure, value).map(|callable| callable.targets)
 }
 
 fn collect_local_callable_targets(
@@ -13411,8 +13496,11 @@ fn source_summary_modeled_effect(
             .get(*ordinal as usize)
             .ok_or("summary task callable argument is unavailable")?
             .value;
-        let ConcurrencyAnswer::Proven(targets) =
-            source_callable_targets(&pending.context.procedure, callable)
+        // The callable's own bound receiver travels with the effect: a
+        // method value lowered in the caller names the object its evaluation
+        // bound, and the spawned task binds that object as its receiver.
+        let ConcurrencyAnswer::Proven(source_callable_value) =
+            source_callable(&pending.context.procedure, callable)
         else {
             return Err("summary task callable targets are unavailable");
         };
@@ -13435,8 +13523,8 @@ fn source_summary_modeled_effect(
             .transpose()?;
         return Ok(ResolvedConcurrencyEffect::TaskSpawn {
             callable,
-            targets,
-            receiver: None,
+            targets: source_callable_value.targets,
+            receiver: source_callable_value.receiver,
             group,
             condition: match condition {
                 SummaryTaskSpawnCondition::Unconditional => {

@@ -839,6 +839,33 @@ fn external_seed(
     }
 }
 
+/// The module and member an import statement binds `reference` to.
+///
+/// A bare imported name and a namespaced path are the same question for the
+/// import binder: `from abc import ABC` and `import abc` + `abc.ABC` both name
+/// `abc.ABC`, and an external callee, decorator, or base is whatever the
+/// binder's shadowing and uniqueness proofs say it is. The binder answers
+/// nothing when a workspace declaration owns the name, so an activated model
+/// never stands in for workspace code.
+fn import_bound_external_symbol(
+    python: &PythonAnalyzer,
+    file: &ProjectFile,
+    prepared: &PreparedSyntaxTree,
+    reference: Node<'_>,
+) -> Option<(String, String)> {
+    let scope = AnalyzerQueryScope::new(python);
+    let session = ResolutionSession::bounded(INTERACTIVE_TYPE_LOOKUP_BUDGET, None);
+    let support = PythonDefinitionProvider::new(python, &session);
+    python_external_imported_symbol_bounded(
+        &support,
+        scope.token(),
+        file,
+        prepared.source(),
+        prepared.tree().root_node(),
+        reference,
+    )
+}
+
 /// Whether a base spelling names a typing marker rather than a class that
 /// contributes members.
 ///
@@ -868,17 +895,9 @@ fn python_typing_marker_base(python: &PythonAnalyzer, owner: &CodeUnit, raw: &st
     else {
         return false;
     };
-    let scope = AnalyzerQueryScope::new(python);
-    let session = ResolutionSession::bounded(INTERACTIVE_TYPE_LOOKUP_BUDGET, None);
-    let support = PythonDefinitionProvider::new(python, &session);
-    let Some((module, member)) = python_external_imported_symbol_bounded(
-        &support,
-        scope.token(),
-        owner.source(),
-        prepared.source(),
-        prepared.tree().root_node(),
-        base,
-    ) else {
+    let Some((module, member)) =
+        import_bound_external_symbol(python, owner.source(), &prepared, base)
+    else {
         return false;
     };
     matches!(
@@ -890,10 +909,42 @@ fn python_typing_marker_base(python: &PythonAnalyzer, owner: &CodeUnit, raw: &st
     )
 }
 
+/// The active model's class for one canonical dotted name.
+///
+/// The name index admits aliases and simple-name postings, so a match is a
+/// proof of this name only when the record's own qualified name is the name
+/// asked for, or when the name is one of the record's exact exported aliases.
+/// A terminal-name posting alone is not proof of a base.
+fn exact_external_class_name(
+    overlay: Option<&SemanticModelOverlay>,
+    qualified_name: &str,
+    cache: &mut ExternalClassCache,
+) -> Option<ClassIdentity> {
+    let identity = external_class_identity(overlay, Language::Python, qualified_name, None, cache)?;
+    if identity.qualified_name() == qualified_name {
+        return Some(identity);
+    }
+    let ClassIdentity::External { symbol_id, .. } = &identity else {
+        unreachable!("external class lookup returns an external identity")
+    };
+    let matched = overlay?.symbols_with_id(symbol_id);
+    let [record] = matched.records.as_slice() else {
+        return None;
+    };
+    record
+        .aliases
+        .iter()
+        .any(|alias| alias == qualified_name)
+        .then_some(identity)
+}
+
 /// Raw supertypes retain source spelling, not a resolved import identity. A
-/// terminal-name overlay match such as `ABC` -> `abc.ABC` is therefore not a
-/// proof of the base. A builtin spelling is accepted only after proving that
-/// the actual base expression has no competing lexical or module binding.
+/// base spelling therefore resolves only through one of the base expression's
+/// own bindings: the import binder for a name an import statement owns, or
+/// the builtin surface for an unshadowed builtin name. A bare name that the
+/// binder proves is an imported symbol resolves to that dependency's class;
+/// the active model must confirm the class, and a name the model does not
+/// model stays unresolved rather than falling back to a spelling match.
 fn exact_external_base(
     python: &PythonAnalyzer,
     owner: &CodeUnit,
@@ -929,29 +980,28 @@ fn exact_external_base(
         if canonical != raw {
             return None;
         }
-        let identity = external_class_identity(overlay, Language::Python, &canonical, None, cache)?;
-        if identity.qualified_name() != canonical {
-            // Exact exported aliases name the same external declaration.
-            // A terminal-name posting alone is not proof of this base.
-            let ClassIdentity::External { symbol_id, .. } = &identity else {
-                unreachable!("external class lookup returns an external identity")
-            };
-            let matched = overlay?.symbols_with_id(symbol_id);
-            let [record] = matched.records.as_slice() else {
-                return None;
-            };
-            if !record.aliases.iter().any(|alias| alias == &canonical) {
-                return None;
+        exact_external_class_name(overlay, &canonical, cache)?
+    } else {
+        // A plain name is not always a builtin: `from abc import ABC` binds a
+        // dependency class that no workspace declaration resolves, and the
+        // import binder is the same proof the namespaced branch uses. The
+        // builtin spelling is the fallback for names no import owns, which is
+        // also why a name both imported and builtin prefers the import.
+        let imported = import_bound_external_symbol(python, owner.source(), &prepared, base)
+            .and_then(|(module, member)| {
+                exact_external_class_name(overlay, &format!("{module}.{member}"), cache)
+            });
+        match imported {
+            Some(identity) => identity,
+            None => {
+                let ClassSeed::Class(identity) =
+                    builtin_class_reference(overlay, base, prepared.source(), cache)?
+                else {
+                    return None;
+                };
+                identity
             }
         }
-        identity
-    } else {
-        let ClassSeed::Class(identity) =
-            builtin_class_reference(overlay, base, prepared.source(), cache)?
-        else {
-            return None;
-        };
-        identity
     };
     python
         .indexed_source_matches(owner.source(), prepared.source())
@@ -1377,18 +1427,8 @@ fn imported_external_class(
     prepared: &PreparedSyntaxTree,
     reference: Node<'_>,
 ) -> Option<ClassIdentity> {
-    let python = python_analyzer(workspace);
-    let scope = AnalyzerQueryScope::new(python);
-    let session = ResolutionSession::bounded(INTERACTIVE_TYPE_LOOKUP_BUDGET, None);
-    let support = PythonDefinitionProvider::new(python, &session);
-    let (module, member) = python_external_imported_symbol_bounded(
-        &support,
-        scope.token(),
-        file,
-        prepared.source(),
-        prepared.tree().root_node(),
-        reference,
-    )?;
+    let (module, member) =
+        import_bound_external_symbol(python_analyzer(workspace), file, prepared, reference)?;
     external_class_identity(
         overlay_of(workspace).as_deref(),
         Language::Python,
@@ -2016,10 +2056,11 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
         // seeds, the classes a guard's true arm now proves about a
         // remainder, the arm-proven classes that now reach the guard's
         // reconvergence instead of ending there, and the class-body binding
-        // a member name resolves to.
+        // a member name resolves to, and the dependency class a bare
+        // import-bound base denotes.
         AdapterSemanticsVersion::hash_bytes(
             "python-type-flow",
-            b"python-type-flow-unmodeled-guards-scoped-dynamic-writes-subscripted-annotation-outer-class-class-object-reference-imports-unmodeled-predicate-type-is-guard-exact-binding-replacement-stable-receiver-entry-implicit-tuples-closed-native-members-sequence-initializers-module-binding-reuse-comprehension-scope-closed-sequence-loads-implicit-none-returns-returned-sequence-loads-arm-proven-classes-reach-joins-class-body-member-binding-v49",
+            b"python-type-flow-unmodeled-guards-scoped-dynamic-writes-subscripted-annotation-outer-class-class-object-reference-imports-unmodeled-predicate-type-is-guard-exact-binding-replacement-stable-receiver-entry-implicit-tuples-closed-native-members-sequence-initializers-module-binding-reuse-comprehension-scope-closed-sequence-loads-implicit-none-returns-returned-sequence-loads-arm-proven-classes-reach-joins-class-body-member-binding-import-bound-bases-v50",
         )
         .expect("adapter name is non-empty")
     }

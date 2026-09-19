@@ -1,0 +1,106 @@
+{
+  "schema_version": 2,
+  "pack_id": "bifrost.web-network-jvm",
+  "version": "1.0.0",
+  "producer": { "name": "bifrost-reviewed-web-models", "version": "1.0.0" },
+  "language": "java",
+  "ecosystem": "jdk",
+  "compatibility": {
+    "bifrost": ">=0.8.0, <1.0.0",
+    "toolchains": []
+  },
+  "provenance": {
+    "source": "JDK java.base module declarations, java.net.URL",
+    "revision": "openjdk-25.0.4.1"
+  },
+  "license": "Apache-2.0",
+  "completeness": "complete",
+  "safety": { "generated_code_only": false, "review_required": false },
+  "shards": [
+    {
+      "id": "declarations.web-network.jvm",
+      "activation": [{ "targets": [], "configurations": [] }],
+      "payload": {
+        "kind": "declaration_facts",
+        "types": [
+          {
+            "id": "type.web-network.jvm.java-net-url",
+            "name": "java.net.URL",
+            "type_kind": "class",
+            "visibility": "public",
+            "is_abstract": false,
+            "is_sealed": false,
+            "has_explicit_type_terms": false,
+            "type_parameters": [],
+            "type_parameter_constraints": [],
+            "embedded_types": [],
+            "hierarchy": [],
+            "aliases": [],
+            "extension_surfaces": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "java.base/java/net/URL.java",
+              "symbol": "java.net.URL"
+            }
+          }
+        ],
+        "members": [
+          {
+            "id": "member.web-network.jvm.java-net-url.openconnection",
+            "owner": "type.web-network.jvm.java-net-url",
+            "name": "openConnection",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": false,
+            "is_virtual": true,
+            "callable_family_complete": true,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [],
+              "returns": {
+                "kind": "named",
+                "name": "java.net.URLConnection",
+                "arguments": [],
+                "nullable": false
+              }
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "java.base/java/net/URL.java",
+              "symbol": "openConnection()"
+            }
+          }
+        ],
+        "relations": []
+      }
+    },
+    {
+      "id": "summaries.web-network.jvm",
+      "activation": [{ "targets": [], "configurations": [] }],
+      "payload": {
+        "kind": "procedure_summaries",
+        "summaries": [
+          {
+            "id": "summary.web-network.jvm.java-net-url.openconnection",
+            "target": {
+              "path": "java.base/java/net/URL.java",
+              "symbol": "java.net.URL.openConnection()",
+              "has_receiver": true,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "covers_overrides": true,
+            "locations": [],
+            "transfers": [],
+            "effects": [],
+            "declared_effects": [
+              { "id": "bifrost.network_io", "timing": "immediate", "certainty": "definite" }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

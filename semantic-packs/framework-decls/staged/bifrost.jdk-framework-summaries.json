@@ -1346,11 +1346,11 @@
             "target": {
               "path": "java.base/java/nio/file/Paths.java",
               "symbol": "java.nio.file.Paths.get(java.lang.String,java.lang.String[])",
-              "has_receiver": true,
+              "has_receiver": false,
               "parameter_count": 2
             },
             "completeness": "complete",
-            "covers_overrides": true,
+            "covers_overrides": false,
             "locations": [],
             "transfers": [
               {
@@ -1371,11 +1371,11 @@
             "target": {
               "path": "java.base/java/nio/file/Files.java",
               "symbol": "java.nio.file.Files.newInputStream(java.nio.file.Path)",
-              "has_receiver": true,
+              "has_receiver": false,
               "parameter_count": 1
             },
             "completeness": "complete",
-            "covers_overrides": true,
+            "covers_overrides": false,
             "locations": [],
             "transfers": [
               {
@@ -1492,11 +1492,11 @@
             "target": {
               "path": "java.base/java/lang/Runtime.java",
               "symbol": "java.lang.Runtime.getRuntime()",
-              "has_receiver": true,
+              "has_receiver": false,
               "parameter_count": 0
             },
             "completeness": "complete",
-            "covers_overrides": true,
+            "covers_overrides": false,
             "locations": [],
             "transfers": [],
             "effects": [
@@ -1916,11 +1916,11 @@
             "target": {
               "path": "java.xml/javax/xml/parsers/DocumentBuilderFactory.java",
               "symbol": "javax.xml.parsers.DocumentBuilderFactory.newInstance()",
-              "has_receiver": true,
+              "has_receiver": false,
               "parameter_count": 0
             },
             "completeness": "complete",
-            "covers_overrides": true,
+            "covers_overrides": false,
             "locations": [],
             "transfers": [],
             "effects": [
@@ -2025,11 +2025,11 @@
             "target": {
               "path": "java.xml/javax/xml/xpath/XPathFactory.java",
               "symbol": "javax.xml.xpath.XPathFactory.newInstance()",
-              "has_receiver": true,
+              "has_receiver": false,
               "parameter_count": 0
             },
             "completeness": "complete",
-            "covers_overrides": true,
+            "covers_overrides": false,
             "locations": [],
             "transfers": [],
             "effects": [

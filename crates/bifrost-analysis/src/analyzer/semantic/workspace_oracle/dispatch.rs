@@ -20,13 +20,14 @@ use crate::analyzer::semantic::{
     ExactExternalProcedureTarget, HeapOracle, MemberDeclaration, MemoryLocationKind,
     ObjectCardinality, ObservationPhase, OracleCallContext, OracleLimits, OracleRelationArena,
     OracleRelationId, OracleRelationOwner, OracleRelationRecord, OracleRelationSubject,
-    ProcedureHandle, ProcedureKind, ProcedureSemantics, ProofStatus, SemanticArtifact,
-    SemanticBudgetExceeded, SemanticCallSite, SemanticCapability, SemanticGap, SemanticGapImpact,
-    SemanticGapKind, SemanticGapSubject, SemanticLanguage, SemanticLocator, SemanticOutcome,
-    SemanticProviderError, SemanticRequest, SemanticRole, SemanticWork, SourceAnchor,
-    SourcePosition, SourceSpan, StableDigest, UnmaterializedExternalTarget, ValueAtPoint,
-    WorkspaceMountId, WorkspaceRelativePath, split_canonical_qualified_callee,
-    unmaterialized_external_mount, unmaterialized_external_path,
+    ProcedureHandle, ProcedureKind, ProcedureSemantics, ProofStatus, ReturnedCallableProvenance,
+    SemanticArtifact, SemanticBudgetExceeded, SemanticCallSite, SemanticCapability, SemanticEffect,
+    SemanticGap, SemanticGapImpact, SemanticGapKind, SemanticGapSubject, SemanticLanguage,
+    SemanticLocator, SemanticOutcome, SemanticProviderError, SemanticRequest, SemanticRole,
+    SemanticWork, SourceAnchor, SourcePosition, SourceSpan, StableDigest,
+    UnmaterializedExternalTarget, ValueAtPoint, ValueFlowKind, ValueId, WorkspaceMountId,
+    WorkspaceRelativePath, split_canonical_qualified_callee, unmaterialized_external_mount,
+    unmaterialized_external_path,
 };
 use crate::analyzer::semantic_model::{
     CompiledProcedureSummary, Completeness, ProcedureSummaryMemberKey,
@@ -305,6 +306,26 @@ impl PreparedWorkspaceDispatchSession<'_> {
         if let Some(outcome) = self.resolve_declared_indirect_local_call(call, request)? {
             return Ok(outcome);
         }
+        if let Some(outcome) = self.resolve_returned_local_callable(call, request)? {
+            return Ok(outcome);
+        }
+        self.resolve_call_through_source(call, request)
+    }
+
+    /// Finish one invocation on the ordinary source-resolver route.
+    ///
+    /// The extracted body owns the lazy exact-syntax session and its paid
+    /// source accounting, so every route that reaches the resolver pays the
+    /// same way and the session cannot return with unpaid exact syntax.
+    fn resolve_call_through_source(
+        &mut self,
+        call: &CallSiteHandle,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<SemanticOutcome<DispatchResult>, SemanticProviderError> {
+        let _scope = AnalyzerQueryScope::with_active_semantic_model_snapshot(
+            self.oracle.workspace.analyzer(),
+            self.oracle.active_semantic_model_snapshot(),
+        );
         let call_span = exact_call_range(call)?;
         debug_assert_eq!(
             self.low_level.is_some(),
@@ -509,6 +530,262 @@ impl PreparedWorkspaceDispatchSession<'_> {
             value: result,
             work,
         }))
+    }
+
+    /// Resolve an invocation whose local callee is proven to hold the exact
+    /// callable one procedure returned.
+    ///
+    /// This is the shared consumer of callable-result provenance. The value
+    /// walk locates the producing call site from the invocation's own callee
+    /// value, the ordinary resolver identifies that call, and the value-flow
+    /// provider proves which local callable the result carries. Only the
+    /// adapters that publish the structured local capture association the
+    /// proof consumes are gated in; every other language keeps the ordinary
+    /// resolver route, and an unproven chain keeps the refusal it has today.
+    fn resolve_returned_local_callable(
+        &mut self,
+        call: &CallSiteHandle,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<Option<SemanticOutcome<DispatchResult>>, SemanticProviderError> {
+        let SemanticLanguage::Standard(language) = self.artifact.key().language() else {
+            return Ok(None);
+        };
+        if !matches!(
+            language,
+            Language::Go | Language::JavaScript | Language::TypeScript
+        ) {
+            return Ok(None);
+        }
+        let _scope = AnalyzerQueryScope::with_active_semantic_model_snapshot(
+            self.oracle.workspace.analyzer(),
+            self.oracle.active_semantic_model_snapshot(),
+        );
+        let semantic_call = call
+            .procedure()
+            .semantics()
+            .call_site(call.id())
+            .ok_or_else(|| SemanticProviderError::internal("semantic call-site handle is stale"))?;
+        let Some((factory_call, returned_result)) =
+            returned_callable_producer(call.procedure(), semantic_call.callee)?
+        else {
+            return Ok(None);
+        };
+        debug_assert_ne!(
+            factory_call.id(),
+            call.id(),
+            "an invocation cannot consume its own result as its callee"
+        );
+        let factory_outcome =
+            match self.resolve_declared_indirect_local_call(&factory_call, request)? {
+                Some(outcome) => outcome,
+                None => self.resolve_call_through_source(&factory_call, request)?,
+            };
+        let factory_work = factory_outcome.work();
+        let factory_result = match factory_outcome {
+            SemanticOutcome::Complete { value, .. } => value,
+            SemanticOutcome::ExceededBudget { exceeded, work, .. } => {
+                return Ok(Some(SemanticOutcome::ExceededBudget {
+                    partial: None,
+                    exceeded,
+                    work,
+                }));
+            }
+            SemanticOutcome::Cancelled { work, .. } => {
+                return Ok(Some(SemanticOutcome::Cancelled {
+                    partial: None,
+                    work,
+                }));
+            }
+            _ => return Ok(None),
+        };
+        if factory_result.coverage() != CandidateCoverage::Exhaustive {
+            return Ok(None);
+        }
+        let [candidate] = factory_result.candidates() else {
+            return Ok(None);
+        };
+        if !matches!(candidate.proof(), ProofStatus::Proven)
+            || !matches!(candidate.completeness(), EvidenceCompleteness::Complete)
+        {
+            return Ok(None);
+        }
+        let target_outcome = self.oracle.returned_callable_target(
+            &factory_call,
+            candidate,
+            returned_result,
+            &OracleCallContext::empty(),
+            request,
+        )?;
+        let target_work = target_outcome.work();
+        let Some(target) = (match target_outcome {
+            SemanticOutcome::Complete { value, .. } => value,
+            SemanticOutcome::ExceededBudget { exceeded, work, .. } => {
+                return Ok(Some(SemanticOutcome::ExceededBudget {
+                    partial: None,
+                    exceeded,
+                    work,
+                }));
+            }
+            SemanticOutcome::Cancelled { work, .. } => {
+                return Ok(Some(SemanticOutcome::Cancelled {
+                    partial: None,
+                    work,
+                }));
+            }
+            _ => None,
+        }) else {
+            return Ok(None);
+        };
+        let provenance = ReturnedCallableProvenance::new(
+            factory_call.clone(),
+            candidate.target().clone(),
+            target.closure.clone(),
+            target.captures.clone(),
+        );
+        let mut candidates = vec![
+            DispatchCandidate::new(
+                target.closure,
+                ProofStatus::Proven,
+                EvidenceCompleteness::Complete,
+                std::iter::empty(),
+                *self.oracle.limits(),
+            )
+            .map_err(|error| {
+                SemanticProviderError::internal(format!(
+                    "returned-callable dispatch candidate is invalid: {error}"
+                ))
+            })?,
+        ];
+        let mut boundaries = Vec::new();
+        attach_dispatch_provenance(
+            call,
+            &mut candidates,
+            &mut boundaries,
+            scoped_call_dispatch_gap(call.procedure().semantics(), semantic_call),
+            scoped_procedure_dispatch_gap(call.procedure()),
+            *self.oracle.limits(),
+        )?;
+        let mut result = DispatchResult::new(
+            call,
+            candidates,
+            boundaries,
+            CandidateCoverage::Exhaustive,
+            *self.oracle.limits(),
+        )
+        .map_err(|error| {
+            SemanticProviderError::internal(format!(
+                "returned-callable dispatch result is invalid: {error}"
+            ))
+        })?;
+        result.mark_returned_callable(provenance);
+        let result_work = dispatch_result_work(&result);
+        let work = sum_semantic_work(sum_semantic_work(factory_work, target_work), result_work);
+        if let Err(exceeded) = request.budget.charge(result_work) {
+            return Ok(Some(SemanticOutcome::ExceededBudget {
+                partial: None,
+                exceeded,
+                work,
+            }));
+        }
+        Ok(Some(SemanticOutcome::Complete {
+            value: result,
+            work,
+        }))
+    }
+}
+
+/// Walk one invocation's local callee value back to the unique call result it
+/// derives from, requiring the path to cross a local binding.
+///
+/// `Assignment` and `Local` value flow are the only definitions this walk
+/// follows. A callable creation, a loaded value, a callable reference, any
+/// other flow kind, and any competing call result all refuse the walk instead
+/// of choosing one producer. Requiring at least one `Local` edge keeps an
+/// immediately invoked call result (`factory()()`) off this route, which
+/// answers only the bound-and-then-invoked shape.
+fn returned_callable_producer(
+    procedure: &ProcedureHandle,
+    callee: ValueId,
+) -> Result<Option<(CallSiteHandle, ValueId)>, SemanticProviderError> {
+    let semantics = procedure.semantics();
+    let mut current = callee;
+    let mut crossed_local_binding = false;
+    let mut visited = HashSet::default();
+    loop {
+        if !visited.insert(current) {
+            return Ok(None);
+        }
+        let mut definition: Option<ValueId> = None;
+        let mut definition_is_local = false;
+        for point in semantics.points() {
+            for event in point.events.iter() {
+                match &event.effect {
+                    SemanticEffect::Assignment { target, value } if *target == current => {
+                        if definition.is_some_and(|existing| existing != *value) {
+                            return Ok(None);
+                        }
+                        definition = Some(*value);
+                    }
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::Local,
+                        source,
+                        target,
+                    } if *target == current => {
+                        if definition.is_some_and(|existing| existing != *source) {
+                            return Ok(None);
+                        }
+                        definition = Some(*source);
+                        definition_is_local = true;
+                    }
+                    SemanticEffect::ValueFlow { target, .. }
+                    | SemanticEffect::MemoryLoad { result: target, .. }
+                    | SemanticEffect::CallableCreation { result: target, .. }
+                        if *target == current =>
+                    {
+                        return Ok(None);
+                    }
+                    // An operand annotation with no proven target says only
+                    // that the value is callable. It is not a competing
+                    // definition of the value.
+                    SemanticEffect::CallableReference { result, callable }
+                        if *result == current =>
+                    {
+                        if matches!(callable.targets, CallableTargetResolution::Unknown) {
+                            continue;
+                        }
+                        return Ok(None);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let mut producer: Option<CallSiteHandle> = None;
+        for call_site in semantics.call_sites() {
+            if call_site
+                .normal_result_values()
+                .any(|result| result == current)
+            {
+                if producer.is_some() {
+                    return Ok(None);
+                }
+                producer = Some(procedure.call_site_handle(call_site.id).ok_or_else(|| {
+                    SemanticProviderError::internal("semantic call site has no handle")
+                })?);
+            }
+        }
+        match (producer, definition) {
+            (Some(producer), None) => {
+                if !crossed_local_binding {
+                    return Ok(None);
+                }
+                return Ok(Some((producer, current)));
+            }
+            (None, Some(next)) => {
+                crossed_local_binding |= definition_is_local;
+                current = next;
+            }
+            _ => return Ok(None),
+        }
     }
 }
 

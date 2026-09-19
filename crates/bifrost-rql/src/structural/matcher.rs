@@ -504,6 +504,19 @@ fn eval_callable_signature(
             incomplete.visibility_unrecorded.set(true);
             return false;
         };
+        // `unknown` is the adapter's own statement that it read the
+        // declaration and could not classify it, so a constraint on a concrete
+        // label is unanswered rather than refuted: `unknown` is never equal to
+        // `public`. Only a query that names `unknown` is answered by it.
+        // Without this, an adapter that started recording modifiers (JS/TS,
+        // Rust, and now Python) would turn every such constraint into a silent
+        // clean miss.
+        if visibility == DeclaredVisibility::Unknown
+            && !pattern.visibility.contains(&DeclaredVisibility::Unknown)
+        {
+            incomplete.visibility_unrecorded.set(true);
+            return false;
+        }
         if !pattern.visibility.contains(&visibility) {
             return false;
         }

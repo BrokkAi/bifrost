@@ -247,6 +247,29 @@ pub enum LanguageDialect {
     CppC,
 }
 
+/// The semantic-pack languages that describe one JVM classpath.
+///
+/// Java, Kotlin and Scala compile to the same bytecode and share one external
+/// declaration surface, so a reviewed model declared for any one of them
+/// answers the same external identity for all three.
+pub const JVM_SEMANTIC_PACK_LANGUAGES: [&str; 3] = ["java", "kotlin", "scala"];
+
+/// The durable key one semantic-pack language's shared facts are indexed under.
+///
+/// Java, Kotlin and Scala describe one classpath, so a summary declared for any
+/// one of them is addressable from all three. Folding the three labels into one
+/// realm key lets the runtime index such facts once and answer every caller
+/// from it, instead of either duplicating the facts per label or probing three
+/// keys at lookup. Every other label is its own realm, so an npm or pypi pack is
+/// never reachable from a JVM reference and vice versa.
+pub fn semantic_pack_realm(language: &str) -> &str {
+    if JVM_SEMANTIC_PACK_LANGUAGES.contains(&language) {
+        "jvm"
+    } else {
+        language
+    }
+}
+
 impl LanguageDialect {
     /// Parse a user-facing language or dialect label.
     pub fn from_config_label(label: &str) -> Option<Self> {
@@ -334,6 +357,26 @@ impl LanguageDialect {
         }
     }
 
+    /// Whether a semantic-pack manifest that declares `manifest_language`
+    /// supplies facts for this dialect.
+    ///
+    /// Java, Kotlin and Scala compile to one JVM classpath, so a reviewed model
+    /// that declares a JDK identity for any one of them declares that same
+    /// identity for all three. The declaration surface
+    /// (`JvmExternalDeclarations`) already answers one JVM name for the whole
+    /// realm; this keeps the summary and declaration *selection* agreeing with
+    /// it, so a pack labelled `java` is readable from a Kotlin or Scala call
+    /// site without either row shipping a second model.
+    ///
+    /// Every other label stays an exact match, so an npm or pypi pack can never
+    /// answer a JVM reference, and a JVM pack can never answer one of theirs.
+    pub fn accepts_semantic_pack_language(self, manifest_language: &str) -> bool {
+        let label = self.semantic_pack_label();
+        label == manifest_language
+            || (JVM_SEMANTIC_PACK_LANGUAGES.contains(&label)
+                && JVM_SEMANTIC_PACK_LANGUAGES.contains(&manifest_language))
+    }
+
     /// Short user-facing configuration label retained by Rune IR and the CLI.
     pub fn config_label(self) -> &'static str {
         match self {
@@ -393,6 +436,37 @@ mod language_dialect_tests {
             "javascript"
         );
         assert_eq!(LanguageDialect::CppC.semantic_pack_label(), "cpp-c");
+    }
+
+    /// The JVM realm shares one external declaration surface, and only that
+    /// realm widens: a pack labelled for one JVM language answers the other
+    /// two, while every other label stays exact.
+    #[test]
+    fn a_jvm_pack_language_applies_to_the_whole_jvm_realm() {
+        for dialect in [
+            LanguageDialect::Standard(Language::Java),
+            LanguageDialect::Standard(Language::Kotlin),
+            LanguageDialect::Standard(Language::Scala),
+        ] {
+            for manifest in JVM_SEMANTIC_PACK_LANGUAGES {
+                assert!(
+                    dialect.accepts_semantic_pack_language(manifest),
+                    "{dialect:?} must read a `{manifest}` pack"
+                );
+            }
+            assert!(!dialect.accepts_semantic_pack_language("npm"));
+            assert!(!dialect.accepts_semantic_pack_language("python"));
+        }
+        assert!(
+            LanguageDialect::Standard(Language::JavaScript)
+                .accepts_semantic_pack_language("javascript")
+        );
+        assert!(
+            !LanguageDialect::Standard(Language::JavaScript).accepts_semantic_pack_language("java")
+        );
+        assert!(
+            !LanguageDialect::Standard(Language::Python).accepts_semantic_pack_language("kotlin")
+        );
     }
 
     /// `.jsx` selects the TSX grammar, and it does so from the path alone:

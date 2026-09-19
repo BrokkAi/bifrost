@@ -58,11 +58,11 @@ use brokk_bifrost_analysis::analyzer::semantic::{
     CandidateCoverage, DispatchCandidate, DispatchHints, DispatchReadAttribution, DispatchResult,
     DurablePortIdentity, EvidenceCompleteness, ExactExternalProcedureTarget, LengthDelimitedDigest,
     ObservationPhase, OracleCallContext, ProcedureHandle, ProcedurePortHandle, ProcedurePortKind,
-    ProgramPointHandle, ProofStatus, RuntimeReadSourceOrigin, SemanticArtifactKey, SemanticBudget,
-    SemanticExecutionBudget, SemanticOutcome, SemanticRequest, SemanticValueKind, SemanticWork,
-    SourceMappingKind, UnmaterializedExternalTarget, ValueFlowSnapshot, ValueHandle,
-    WorkspaceIcfgProvider, WorkspaceRelativePath, WorkspaceSemanticOracle,
-    authored_procedure_target_identity, dispatch_read_attribution,
+    ProgramPointHandle, ProofStatus, ReturnedCallableProvenance, RuntimeReadSourceOrigin,
+    SemanticArtifactKey, SemanticBudget, SemanticExecutionBudget, SemanticOutcome, SemanticRequest,
+    SemanticValueKind, SemanticWork, SourceMappingKind, UnmaterializedExternalTarget,
+    ValueFlowSnapshot, ValueHandle, WorkspaceIcfgProvider, WorkspaceRelativePath,
+    WorkspaceSemanticOracle, authored_procedure_target_identity, dispatch_read_attribution,
 };
 use brokk_bifrost_analysis::analyzer::semantic::{DispatchOracle, ValueFlowOracle};
 use brokk_bifrost_analysis::analyzer::semantic_model::{
@@ -95,8 +95,8 @@ use brokk_bifrost_flow::value_flow::{
     ClosureLimits, ValueFlowCarrier, ValueFlowCarrierId, ValueFlowCuratedCallModel,
     ValueFlowEventKey, ValueFlowEventKind, ValueFlowIncompleteCause, ValueFlowInput,
     ValueFlowLocalRuleSpec, ValueFlowObservationPhase, ValueFlowPlan, ValueFlowProvider,
-    ValueFlowSinkId, ValueFlowSinkSpec, ValueFlowSourceId, ValueFlowSourceSpec,
-    ValueFlowSummaryLocationBinding, discover_closure_with,
+    ValueFlowReturnedCallable, ValueFlowSinkId, ValueFlowSinkSpec, ValueFlowSourceId,
+    ValueFlowSourceSpec, ValueFlowSummaryLocationBinding, discover_closure_with,
 };
 use brokk_bifrost_flow::{
     ExactProcedureSummaryBoundary, ExactProcedureSummaryParameter, ExactProcedureSummaryReceiver,
@@ -1125,6 +1125,11 @@ struct DiscoveredValueFlow {
     root: ProcedureHandle,
     snapshots: Vec<ValueFlowInput<brokk_bifrost_analysis::analyzer::semantic::ValueFlowSnapshot>>,
     bindings: Vec<ValueFlowInput<brokk_bifrost_analysis::analyzer::semantic::CallBindings>>,
+    /// Proven returned-callable associations the walk's dispatch answers
+    /// published, keyed durably and deduplicated. The plan keeps each
+    /// closure's captured environment connected across the call that
+    /// returned it (#3470).
+    returned_callables: Vec<ValueFlowReturnedCallable>,
     /// Region membership, by durable procedure identity rather than by handle.
     /// A selected source or sink is tested against this set, and its handle can
     /// come from a different materialization than the walk's, so handle
@@ -1353,9 +1358,39 @@ struct PolicyDiscoveryProvider<'a, 'cache> {
     execution_budget: SemanticExecutionBudget,
     cache: &'cache DiscoveryMaterializationCache,
     poison: RefCell<Option<TaintPolicyCompileError>>,
+    /// Returned-callable provenance every dispatch answer in this walk
+    /// published, in the order the walk saw it. The walk drains this once at
+    /// the end, so the vector is scoped to one root's discovery.
+    returned_callables: RefCell<Vec<ReturnedCallableProvenance>>,
 }
 
 impl PolicyDiscoveryProvider<'_, '_> {
+    /// Take the returned-callable provenance of this walk, deduplicated by
+    /// durable identity.
+    ///
+    /// One provenance row can be published more than once: the compile-wide
+    /// dispatch cache replays an answer for every root that reaches the same
+    /// call, and a call's answer is also re-read when the walk revisits it.
+    /// Rows are keyed on the producing call, the producing callee, the
+    /// closure, and the capture slots, so two rows that name the same
+    /// association in two materializations of one artifact collapse to one.
+    fn take_returned_callables(&self) -> Vec<ReturnedCallableProvenance> {
+        let mut seen = HashSet::new();
+        let mut rows = Vec::new();
+        for row in self.returned_callables.take() {
+            let key = (
+                row.producer().durable_key(),
+                row.producer_callee().durable_key(),
+                row.closure().durable_key(),
+                row.captures().to_vec(),
+            );
+            if seen.insert(key) {
+                rows.push(row);
+            }
+        }
+        rows
+    }
+
     fn poison(&self, error: TaintPolicyCompileError) -> TaintPolicyCompileError {
         let mut poison = self.poison.borrow_mut();
         if poison.is_none() {
@@ -1376,6 +1411,24 @@ impl PolicyDiscoveryProvider<'_, '_> {
             Some(error) => Err(error),
             None => Ok(()),
         }
+    }
+
+    /// Retain the returned-callable provenance of one dispatch answer.
+    ///
+    /// The walk records on both the fresh and the cached path: the
+    /// compile-wide dispatch cache serves later roots the answer a first root
+    /// paid for, and every root's plan needs the association that answer
+    /// published. Duplicates collapse when the walk drains the rows.
+    fn record_returned_callables(&self, outcome: &SemanticOutcome<DispatchResult>) {
+        let Some(result) = outcome.available_value() else {
+            return;
+        };
+        let Some(provenance) = result.returned_callable() else {
+            return;
+        };
+        self.returned_callables
+            .borrow_mut()
+            .push(provenance.clone());
     }
 
     fn require_outcome<T>(
@@ -1466,6 +1519,7 @@ impl ValueFlowProvider for PolicyDiscoveryProvider<'_, '_> {
         if let Some(cached) = self.cache.dispatch.borrow().get(&key).cloned() {
             let outcome = cached.replay();
             record_taint_dispatch_read(self.oracle.workspace(), call, &outcome);
+            self.record_returned_callables(&outcome);
             return Ok(outcome);
         }
         let outcome = self
@@ -1479,6 +1533,7 @@ impl ValueFlowProvider for PolicyDiscoveryProvider<'_, '_> {
             })?;
         record_taint_dispatch_read(self.oracle.workspace(), call, &outcome);
         self.require_outcome(&outcome, "taint call dispatch")?;
+        self.record_returned_callables(&outcome);
         self.cache
             .dispatch
             .borrow_mut()
@@ -3992,6 +4047,7 @@ impl<'a> TaintPolicyCompiler<'a> {
             execution_budget: self.selectors.execution_budget().clone(),
             cache,
             poison: RefCell::new(None),
+            returned_callables: RefCell::new(Vec::new()),
         };
         // Anchor the returned root to the same compile-wide artifact instance
         // the provider uses for every procedure the shared walk touches.
@@ -4014,6 +4070,18 @@ impl<'a> TaintPolicyCompiler<'a> {
             return Err(error);
         }
         let discovered = discovered?;
+        let returned_callables = provider
+            .take_returned_callables()
+            .into_iter()
+            .map(|row| {
+                ValueFlowReturnedCallable::new(
+                    row.producer().clone(),
+                    row.producer_callee().clone(),
+                    row.closure().clone(),
+                    row.captures().to_vec(),
+                )
+            })
+            .collect();
 
         let mut seen_external_targets = HashSet::new();
         let mut seen_unmaterialized_targets = HashSet::new();
@@ -4045,6 +4113,7 @@ impl<'a> TaintPolicyCompiler<'a> {
             root,
             snapshots: discovered.snapshots,
             bindings,
+            returned_callables,
             procedures,
             external_targets,
             unmaterialized_external_targets,
@@ -4073,6 +4142,9 @@ impl<'a> TaintPolicyCompiler<'a> {
             call_behavior,
         )
         .map_err(|error| TaintPolicyCompileError::Plan(error.to_string()))?;
+        let plan = plan
+            .with_returned_callable_captures(discovery.returned_callables)
+            .map_err(|error| TaintPolicyCompileError::Plan(error.to_string()))?;
         match external_summaries {
             Some(summaries) => plan
                 .with_external_summaries(summaries)

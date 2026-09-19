@@ -6021,6 +6021,46 @@ fn resolve_cpp_call(
                     ),
                 );
             }
+            // Every workspace channel above answered nothing for this written
+            // name: local bindings, using-declarations, enclosing classes, the
+            // visible free-function set, callable variables and macros. When
+            // the same file includes an unresolved header before this call,
+            // the structured include facts say where the missing declaration
+            // most plausibly lives. `getenv` after `#include <stdlib.h>` is
+            // the shape: a C or C++ free function the workspace cannot index
+            // because its declaring header is outside it (#3466).
+            //
+            // A plain lowercase name is the free-function shape, the one a
+            // header can export into this scope; a capitalized one is the
+            // construction shape (`Absent("boom")`), whose class declaration
+            // must come from the workspace's own types, so its miss stays a
+            // workspace miss (#1832) exactly as
+            // [`cpp_unresolved_include_boundary`] draws the same split for the
+            // member and qualified arms.
+            //
+            // gated upstream: the include fact is the external signal and the
+            // exhaustive workspace lookup above is the workspace half, so the
+            // claim stands unless this very file declares the name -- the
+            // same-file honesty probe (#3285) answers that case with what the
+            // index holds instead.
+            if !cpp_written_reference_is_type_shaped(name)
+                && ctx
+                    .visibility
+                    .has_unresolved_include_visible_before(ctx.file, name_node.start_byte())
+            {
+                if let Some(outcome) =
+                    cpp_indexed_same_file_outcome(ctx.support, ctx.file, name, "callable")
+                {
+                    return outcome;
+                }
+                super::trace::record_named_boundary(name.to_owned());
+                return boundary_unchecked(
+                    format!(
+                        "`{name}` appears to cross a C++ include boundary not indexed in this workspace"
+                    ),
+                    UnindexedClaim::external_boundary(name.to_owned(), ClaimSubjectRole::Member),
+                );
+            }
             no_definition(
                 "no_indexed_definition",
                 format!("`{name}` did not resolve to an indexed C++ callable"),
@@ -11102,10 +11142,27 @@ fn cpp_unresolved_include_boundary(
     reference: &str,
     node: Node<'_>,
 ) -> bool {
-    if !reference.contains("::") && !reference.chars().next().is_some_and(char::is_uppercase) {
+    if !cpp_written_reference_is_type_shaped(reference) {
         return false;
     }
     visibility.has_unresolved_include_visible_before(file, node.start_byte())
+}
+
+/// Whether one written C++ reference carries the type-shaped spelling: a
+/// qualified path, or a plain name that opens with a capital.
+///
+/// C++ has no structural marker separating a class name from a function name
+/// in call or member position, so the spelling convention is the structured
+/// fact the index holds: `reference` is always the text of a grammar name
+/// node. The member and qualified call arms read a type-shaped reference as
+/// the construction or member shape, whose declaration must be a workspace
+/// type, so an unresolved include above it is what carries the missing
+/// declaration. The plain identifier call arm reads the complement: a
+/// lowercase name is the free-function shape a header can declare, while a
+/// capitalized one is still the construction shape and stays a workspace miss
+/// (#1832, #3466).
+fn cpp_written_reference_is_type_shaped(reference: &str) -> bool {
+    reference.contains("::") || reference.chars().next().is_some_and(char::is_uppercase)
 }
 
 /// The honest outcome when an include-boundary claim about `reference` would

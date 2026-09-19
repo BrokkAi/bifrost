@@ -2638,6 +2638,21 @@
       "classification": "blocked_missing_adapter_or_identity_evidence",
       "generation_strategy": "retain_until_profile_support",
       "native_source_kind": "authored_semantic_model",
+      "path": "semantic-packs/web-network/jvm/bifrost.web-network-jvm.json",
+      "profiles": [
+        "java-jvm"
+      ],
+      "reason": "Reviewed network-effect model for the #3387 boundary family, declared once for the shared JVM realm so the Java, Kotlin and Scala rows bind one JDK identity; exportability remains pending lossless field and applicability audit."
+    },
+    {
+      "asset_role": "authored_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "authored_semantic_model",
       "path": "semantic-packs/web-network/python/bifrost.web-network-python.json",
       "profiles": [
         "python"

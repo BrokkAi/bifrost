@@ -24,8 +24,9 @@ use crate::analyzer::semantic_model::{
     normalize_artifact_locator_paths, read_exact_artifact_while,
 };
 use crate::analyzer::{
-    JvmAnalyzerConfig, JvmDependencyDiscoveryMode, JvmExternalArtifact, JvmExternalArtifactOrigin,
-    JvmExternalDependencies, JvmMavenCoordinate, Project, ProjectFile,
+    JVM_SEMANTIC_PACK_LANGUAGES, JvmAnalyzerConfig, JvmDependencyDiscoveryMode,
+    JvmExternalArtifact, JvmExternalArtifactOrigin, JvmExternalDependencies, JvmMavenCoordinate,
+    Project, ProjectFile,
 };
 use crate::hash::HashMap;
 use brokk_bifrost_jvm::java::declarations::{
@@ -2594,14 +2595,6 @@ fn semantic_visibility(visibility: Visibility) -> JvmVisibility {
     }
 }
 
-/// The manifest languages whose declaration facts answer a JVM name.
-///
-/// Java, Kotlin and Scala compile to one classpath, so a pack that declares a
-/// type for any of them declares it for all three. A pack for any other
-/// language never answers here, so activating a Python or npm pack cannot
-/// upgrade a JVM reference.
-const JVM_PACK_LANGUAGES: [&str; 3] = ["java", "kotlin", "scala"];
-
 /// The external declaration surface one JVM lookup reads: the artifact-derived
 /// index first, then the declaration facts the activated semantic packs
 /// publish (#1893).
@@ -2832,7 +2825,7 @@ impl<'a> JvmExternalDeclarations<'a> {
                 .find(|symbol| {
                     symbol.name == member_name
                         && !symbol.provenance.ambiguous
-                        && JVM_PACK_LANGUAGES.contains(&symbol.language.as_str())
+                        && JVM_SEMANTIC_PACK_LANGUAGES.contains(&symbol.language.as_str())
                 })?;
             Some(JvmExternalMember {
                 fqn: member.qualified_name.clone(),
@@ -2976,7 +2969,7 @@ impl JvmExternalMember {
 fn pack_external_type(
     symbol: &crate::analyzer::semantic_model::SemanticModelSymbol,
 ) -> Option<JvmExternalType> {
-    if !JVM_PACK_LANGUAGES.contains(&symbol.language.as_str()) {
+    if !JVM_SEMANTIC_PACK_LANGUAGES.contains(&symbol.language.as_str()) {
         return None;
     }
     let kind = pack_type_kind(symbol.kind)?;

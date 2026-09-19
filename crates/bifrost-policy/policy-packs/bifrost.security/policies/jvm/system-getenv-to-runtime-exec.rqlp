@@ -48,10 +48,51 @@
                         :resolves-to member.runtime.exec-string
                         :proof declared
                         (call-bindings
+                        (call-shape
+                          (call :callee (name "exec") (arity 1))))))))
+              :dangerous-operand (argument :index 0)
+              :accepts [attacker-controlled])])
+      :external-models
+        (endpoint-set
+          :entries [
+            (external-model
+              :id environment-variable-call
+              :selector
+                (rql
+                  :schema-version 1
+                  (language java
+                    (call-argument :formal-index 0
+                      (resolved-call
+                        :resolves-to member.system.getenv-string
+                        :proof exact
+                        (call-bindings
+                          (call-shape
+                            (call :callee (name "getenv") (arity 1))))))))
+              :transfers [
+                (transfer
+                  :from (argument :index 0)
+                  :to return-value
+                  :labels [attacker-controlled]
+                  :effect propagate)])
+            (external-model
+              :id runtime-exec-command-call
+              :selector
+                (rql
+                  :schema-version 1
+                  (language java
+                    (call-argument :formal-index 0
+                      (resolved-call
+                        :resolves-to member.runtime.exec-string
+                        :proof declared
+                        (call-bindings
                           (call-shape
                             (call :callee (name "exec") (arity 1))))))))
-              :dangerous-operand (argument :index 0)
-              :accepts [attacker-controlled])]))
+              :transfers [
+                (transfer
+                  :from receiver
+                  :to receiver
+                  :labels [attacker-controlled]
+                  :effect propagate)])]))
   :classification
     (classification
       :fallback (classification-id :taxonomy "CWE" :id "78")))

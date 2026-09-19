@@ -299,6 +299,12 @@ const SECURITY_POLICY_SOURCES: &[(&str, &str)] = &[
 
 const EFFECTS_POLICY_SOURCES: &[(&str, &str)] = &[
     (
+        "policies/java/selected-boundary-no-network-io.rqlp",
+        include_str!(
+            "../policy-packs/bifrost.effects/policies/java/selected-boundary-no-network-io.rqlp"
+        ),
+    ),
+    (
         "policies/javascript/selected-boundary-no-network-io.rqlp",
         include_str!(
             "../policy-packs/bifrost.effects/policies/javascript/selected-boundary-no-network-io.rqlp"
@@ -1111,7 +1117,7 @@ mod tests {
         let effects = catalog
             .pack_manifest(EFFECTS_PACK_ID)
             .expect("effects pack");
-        assert_eq!(effects.policies.len(), 3);
+        assert_eq!(effects.policies.len(), 4);
         assert_eq!(
             effects
                 .policies
@@ -1119,6 +1125,7 @@ mod tests {
                 .map(|entry| entry.id.as_str())
                 .collect::<Vec<_>>(),
             vec![
+                "bifrost.effects.java.selected-boundary-no-network-io",
                 "bifrost.effects.javascript.selected-boundary-no-network-io",
                 "bifrost.effects.python.selected-boundary-no-network-io",
                 "bifrost.effects.typescript.selected-boundary-no-network-io",

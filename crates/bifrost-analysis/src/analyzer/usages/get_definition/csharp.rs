@@ -952,6 +952,18 @@ fn resolve_csharp_in_session(
                 receiver_type_names.sort();
                 receiver_type_names.dedup();
             }
+            if owners.is_empty() && receiver_type_names.is_empty() {
+                receiver_type_names = csharp_unindexed_type_qualifier_names(
+                    analyzer,
+                    token,
+                    csharp,
+                    definitions,
+                    file,
+                    source,
+                    tree.root_node(),
+                    receiver,
+                );
+            }
             let arity = csharp_invocation_arity(name, source, definitions);
             // Indexed ordinary members retain precedence. For external types,
             // invocation syntax and a precise receiver identity admit the same
@@ -4582,6 +4594,61 @@ fn csharp_receiver_base_is_shadowed(
     } else {
         false
     }
+}
+
+/// The type names a member access's bare receiver leaves behind when the
+/// workspace indexes neither the receiver nor the type it names.
+///
+/// `Environment.GetEnvironmentVariable` is a static member access whose
+/// receiver is a type, but nothing about the identifier says so: it is also
+/// exactly the shape of a value receiver whose declaration the workspace
+/// failed to index. The two are told apart structurally. A visible local,
+/// parameter, or enclosing member of that name is a value, and the missing
+/// fact is then its type -- `unsupported_csharp_receiver`, never an external
+/// type boundary. Only after every value channel answers nothing does the
+/// name itself become the one structured fact left: the receiver names a type
+/// the workspace does not index, which is the same frontier
+/// `csharp_receiver_type_unindexed` publishes for receivers whose type was
+/// read but not indexed (#3466).
+#[allow(clippy::too_many_arguments)]
+fn csharp_unindexed_type_qualifier_names(
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    csharp: &CSharpAnalyzer,
+    definitions: &CSharpDefinitionProvider<'_>,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    receiver: Node<'_>,
+) -> Vec<String> {
+    if receiver.kind() != "identifier" || !definitions.scope_step() {
+        return Vec::new();
+    }
+    let name = csharp_node_text(receiver, source);
+    if name.is_empty() {
+        return Vec::new();
+    }
+    let bindings = csharp_type_bindings_before_scoped(
+        csharp,
+        token,
+        definitions,
+        file,
+        source,
+        root,
+        receiver.start_byte(),
+    );
+    if bindings.is_shadowed(name) {
+        return Vec::new();
+    }
+    for owner in csharp_enclosing_class_chain(analyzer, definitions, file, receiver.start_byte()) {
+        if !definitions
+            .members_for_owner_name(&owner.fq_name(), name)
+            .is_empty()
+        {
+            return Vec::new();
+        }
+    }
+    csharp_structured_receiver_reference_type_names(csharp, token, definitions, file, name)
 }
 
 fn canonical_csharp_predefined_type(reference: &str) -> Option<&'static str> {

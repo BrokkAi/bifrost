@@ -20838,6 +20838,52 @@ mod tests {
         );
     }
 
+    /// #3451: Python now records callable modifier metadata, and it recorded
+    /// none before. A blob persisted under the prior epoch deserializes as
+    /// "nobody read the modifiers", which is indistinguishable from a callable
+    /// whose adapter honestly never looked, so `receiver_contract_of` reports
+    /// no contract and every Python procedure summary stays inert. The salt is
+    /// the only thing that retires those rows.
+    #[test]
+    fn python_callable_modifier_metadata_epoch_invalidates_prior_parsed_blobs() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(
+            temp.path(),
+            "widget.py",
+            "class Widget:\n    @staticmethod\n    def build(spec):\n        return spec\n\n    def render(self, target):\n        return target\n",
+        );
+        let state = Arc::new(parse_state(&PythonAdapter, &file));
+        let oid = oid_for(state.source.as_bytes());
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let prior_epoch = epoch::python_epoch_before_callable_modifier_metadata();
+        let prior_generation = store
+            .ensure_language_epoch_value("python", &prior_epoch)
+            .unwrap();
+        store
+            .write_parsed_blob_at_generation(
+                oid,
+                "python",
+                prior_generation,
+                &PythonAdapter,
+                state.as_ref(),
+            )
+            .unwrap();
+        assert!(store.contains_parsed_blob(oid, "python").unwrap());
+
+        let current_generation = store
+            .ensure_language_epoch(Language::Python, &tree_sitter_python::LANGUAGE.into())
+            .unwrap();
+
+        assert_ne!(current_generation, prior_generation);
+        assert!(!store.contains_parsed_blob(oid, "python").unwrap());
+        assert_eq!(
+            store
+                .missing_parsed_blob_keys(&[(oid, "python".to_string())])
+                .unwrap(),
+            vec![(oid, "python".to_string())]
+        );
+    }
+
     #[test]
     fn php_conditional_free_function_epoch_invalidates_prior_parsed_blobs() {
         let temp = tempfile::TempDir::new().unwrap();

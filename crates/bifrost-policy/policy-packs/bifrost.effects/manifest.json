@@ -6,6 +6,25 @@
   "description": "Configurable forbidden-network-effect specializations. Each policy asserts that one explicitly selected declaration reaches no declared network effect, directly or through workspace helpers. The effect is declared by a reviewed semantic model on the exact API identity; purity is never inferred from a name, a file name, a comment, or an unqualified annotation, and a repository that configures no selection carries no obligation.",
   "policies": [
     {
+      "path": "policies/java/selected-boundary-no-network-io.rqlp",
+      "id": "bifrost.effects.java.selected-boundary-no-network-io",
+      "authored_hash": "b3567ffa813b2c36dc787f6631ef2e864ebaa214271cffaf1349e65d05e0d22e",
+      "resolved_semantic_hash": "b3567ffa813b2c36dc787f6631ef2e864ebaa214271cffaf1349e65d05e0d22e",
+      "category": "effects",
+      "supported_languages": [
+        "java"
+      ],
+      "required_capabilities": [
+        "semantic-model-declared-effects",
+        "transitive-procedure-effects",
+        "exhaustive-effect-coverage",
+        "module-identity-declaration-selection",
+        "external-api-identity"
+      ],
+      "severity_rationale": "A declaration the repository reviewed as a pure calculation reaching network I/O breaks the boundary the review relied on and can turn a local computation into an externally visible side effect.",
+      "remediation": "Move the effect to the caller, or make the selected declaration's helper chain reach no declared network effect. Configure the declaration-selection block with the exact declaration this repository protects before enabling the policy."
+    },
+    {
       "path": "policies/javascript/selected-boundary-no-network-io.rqlp",
       "id": "bifrost.effects.javascript.selected-boundary-no-network-io",
       "authored_hash": "1dd58941aa1e7eb9019e33c7d6e515a5c00b5695c62cd0a07e60771de0080090",

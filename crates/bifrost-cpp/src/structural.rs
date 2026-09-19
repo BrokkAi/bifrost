@@ -397,8 +397,9 @@ impl StructuralSpec for CppStructuralSpec {
     }
 
     fn occurrence_role_support(&self) -> &OccurrenceRoleSupport {
-        static SUPPORT: OccurrenceRoleSupport =
-            OccurrenceRoleSupport::NONE.supported(OccurrenceRole::MemberPosition);
+        static SUPPORT: OccurrenceRoleSupport = OccurrenceRoleSupport::NONE
+            .supported(OccurrenceRole::MemberPosition)
+            .supported(OccurrenceRole::ValueReference);
         &SUPPORT
     }
 
@@ -450,6 +451,20 @@ impl StructuralSpec for CppStructuralSpec {
                 };
                 if let Some(function) = node.child_by_field_name(function_field) {
                     attach_terminal_callee(sink, function, expression_name_node(function));
+                    // The callee token of a free-function call is a plain value
+                    // read, and it is the only occurrence the call site leaves
+                    // behind when the function is not indexed (#3466). Member
+                    // calls are excluded: their terminal field is already the
+                    // member-position occurrence, and classifying it twice would
+                    // report one call site as two. A composite callee
+                    // expression names its own callee at an inner node
+                    // (`f()()`), so it is excluded too.
+                    if node.kind() == "call_expression"
+                        && !matches!(function.kind(), "field_expression" | "call_expression")
+                        && let Some(callee) = expression_name_node(function)
+                    {
+                        sink.occurrence_role(callee, OccurrenceRole::ValueReference);
+                    }
                     if function.kind() == "field_expression"
                         && let Some(argument) = function.child_by_field_name("argument")
                     {
@@ -566,9 +581,12 @@ impl StructuralSpec for CppStructuralSpec {
 
 #[cfg(test)]
 mod tests {
+    use super::CPP_STRUCTURAL_SPEC;
     use super::cpp_member_position;
     use brokk_bifrost_core::analyzer::structural::occurrences::OccurrenceRole;
-    use brokk_bifrost_core::analyzer::structural::spec::StructuralSpec;
+    use brokk_bifrost_core::analyzer::structural::spec::{CompiledKinds, RoleSink, StructuralSpec};
+    use brokk_bifrost_core::analyzer::tree_walk::ParentIndex;
+    use brokk_bifrost_core::hash::HashMap;
     use tree_sitter::Parser;
 
     fn member_occurrences(source: &str) -> Vec<(usize, &str, OccurrenceRole)> {
@@ -661,19 +679,112 @@ mod tests {
     }
 
     #[test]
-    fn cpp_member_position_support_declares_only_member_position() {
+    fn cpp_occurrence_support_declares_member_position_and_free_callees() {
         let support = super::CPP_STRUCTURAL_SPEC.occurrence_role_support();
         assert!(support.is_supported(OccurrenceRole::MemberPosition));
+        assert!(support.is_supported(OccurrenceRole::ValueReference));
         for role in [
             OccurrenceRole::ReceiverPosition,
             OccurrenceRole::LabelOrKey,
             OccurrenceRole::DeclarationName,
-            OccurrenceRole::ValueReference,
         ] {
             assert!(
                 !support.is_supported(role),
                 "unexpected C++ support for {role:?}"
             );
         }
+    }
+
+    /// The callee token of a free-function call is the only occurrence a call
+    /// site leaves behind when the function is not indexed (#3466). Member
+    /// calls stay member-position-only, and a composite callee expression
+    /// names its own callee at an inner node.
+    #[test]
+    fn cpp_free_function_callees_are_value_references() {
+        let source = concat!(
+            "int bound(void) { return 1; }\n",
+            "struct Widget { int method(void) { return 0; } };\n",
+            "int go(struct Widget *widget) {\n",
+            "    return getenv(\"PATH\") != 0\n",
+            "        + ns::getenv(\"USER\") != 0\n",
+            "        + bound()\n",
+            "        + widget->method()\n",
+            "        + bound()();\n",
+            "}\n",
+        );
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_cpp::LANGUAGE.into())
+            .expect("C++ grammar");
+        let tree = parser.parse(source, None).expect("C++ parse");
+        assert!(
+            !tree.root_node().has_error(),
+            "{}",
+            tree.root_node().to_sexp()
+        );
+
+        // Drive the same extraction entry the file walk drives: every fact
+        // node admitted by the compiled kind table, through a real RoleSink.
+        // The sink addresses occurrences by fact id, so the test keeps the
+        // fact id to start byte mapping to name the tokens.
+        let language: tree_sitter::Language = tree_sitter_cpp::LANGUAGE.into();
+        let compiled = CompiledKinds::compile(&language, CPP_STRUCTURAL_SPEC.kind_table());
+        let mut facts = HashMap::default();
+        let mut start_by_fact = HashMap::default();
+        let mut extractions = Vec::new();
+        let mut pending = vec![tree.root_node()];
+        while let Some(node) = pending.pop() {
+            if node.is_named()
+                && let Some(kind) = compiled.kind_of(&node)
+                && CPP_STRUCTURAL_SPEC.should_extract(node, kind)
+            {
+                let fact = facts.len() as u32;
+                facts.insert(node.id(), fact);
+                start_by_fact.insert(fact, node.start_byte());
+                extractions.push((node.start_byte(), node, kind));
+            }
+            for index in (0..node.named_child_count()).rev() {
+                if let Some(child) = node.named_child(index) {
+                    pending.push(child);
+                }
+            }
+        }
+        extractions.sort_by_key(|(start, _, _)| *start);
+        let mut roles = Vec::new();
+        let mut occurrences = Vec::new();
+        let parents = ParentIndex::new(tree.root_node());
+        let mut sink = RoleSink::new(&facts, &mut roles, &mut occurrences, 64, None, &parents);
+        for (_, node, kind) in extractions {
+            CPP_STRUCTURAL_SPEC.extract(node, kind, &mut sink);
+        }
+        assert_eq!(sink.into_parts().1, None);
+
+        let roles_at = |needle: &str| {
+            let start = source.find(needle).expect("fixture token");
+            occurrences
+                .iter()
+                .filter(|(fact, _)| start_by_fact[fact] == start)
+                .map(|(_, role)| *role)
+                .collect::<Vec<_>>()
+        };
+        // Free-function callees are value reads, including a qualified callee
+        // whose terminal name is the identifier and the callee of the inner
+        // call in `bound()()`.
+        assert_eq!(
+            roles_at("getenv(\"PATH\")"),
+            vec![OccurrenceRole::ValueReference]
+        );
+        assert_eq!(
+            roles_at("getenv(\"USER\")"),
+            vec![OccurrenceRole::ValueReference],
+            "the terminal name of a qualified callee is the value read"
+        );
+        assert_eq!(roles_at("bound()\n"), vec![OccurrenceRole::ValueReference]);
+        // A member call's terminal field stays one member-position occurrence;
+        // the call itself adds no second row for the same token.
+        assert_eq!(roles_at("method()"), vec![OccurrenceRole::MemberPosition]);
+        // The receiver of a member call is neither a value read of the callee
+        // nor a member position.
+        assert!(roles_at("widget->").is_empty());
     }
 }

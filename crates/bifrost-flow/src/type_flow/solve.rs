@@ -542,10 +542,15 @@ pub fn solve_type_flow_for_root_with_refinements(
             HashSet::<DurableProcedureKey>::default(),
         );
         let mut require_full_plan = false;
-        // The plan as first built this iteration, before source refinement
+        // The plan this iteration actually solves, before source refinement
         // mutates it. It is the whole input to everything the iteration does
-        // next, so it is what the next iteration compares against.
-        let mut first_plan: Option<TypeFlowPlan> = None;
+        // next, so it is what the next iteration compares against. A plan
+        // attempt can be abandoned (a selective summary-cut retry rebuilds the
+        // plan), and an abandoned attempt never solved its plan, so the
+        // assignment below happens on every attempt. Comparing against an
+        // abandoned attempt's plan would report a difference the solve never
+        // observed and re-solve an iteration whose plan is unchanged.
+        let mut solved_plan: Option<TypeFlowPlan> = None;
         let (plan, mut interpreted, iteration_budget, maintenance, publication_writes) = 'plan_attempt: loop {
             let mut iteration_budget = semantic_budget.clone();
             let plan_result = if !require_full_plan {
@@ -587,27 +592,26 @@ pub fn solve_type_flow_for_root_with_refinements(
             if plan_cache_writes {
                 *semantic_budget = iteration_budget.clone();
             }
-            if !require_full_plan {
-                if previous
+            if iteration + 1 < feedback_limits.max_iterations() {
+                solved_plan = Some(plan.clone());
+            }
+            if !require_full_plan
+                && previous
                     .as_ref()
-                    .is_some_and(|completed| completed.plan == plan)
-                {
-                    // The updated hints changed the hint digest without
-                    // changing the plan. Refinement, the witness solve, and
-                    // `interpret` all read this plan, so repeating them would
-                    // repeat the previous iteration's work for the previous
-                    // iteration's answer. That is the feedback fixpoint: stop
-                    // here and keep the result already computed. The staged
-                    // plan-build charge is discarded with the rest of this
-                    // speculative pass unless it retained cache writes, which
-                    // the branch above already committed.
-                    let completed =
-                        previous.expect("the identical plan came from a completed iteration");
-                    return Ok(completed.result);
-                }
-                if iteration + 1 < feedback_limits.max_iterations() {
-                    first_plan = Some(plan.clone());
-                }
+                    .is_some_and(|completed| completed.plan.feedback_fixpoint_matches(&plan))
+            {
+                // The updated hints reached the plan without changing any
+                // input the solve or `interpret` reads. Refinement, the
+                // witness solve, and `interpret` all read this plan, so
+                // repeating them would repeat the previous iteration's
+                // work for the previous iteration's answer. That is the
+                // feedback fixpoint: stop here and keep the result already
+                // computed. The staged plan-build charge is discarded with
+                // the rest of this speculative pass unless it retained
+                // cache writes, which the branch above already committed.
+                let completed =
+                    previous.expect("the identical plan came from a completed iteration");
+                return Ok(completed.result);
             }
             // The refinement round that reproduced the plan, with the solve
             // and interpretation it produced. Refinement rebuilds the plan
@@ -1089,7 +1093,7 @@ pub fn solve_type_flow_for_root_with_refinements(
         }
         previous = Some(CompletedIteration {
             result: interpreted,
-            plan: first_plan.expect("a continuing iteration retained the plan it first built"),
+            plan: solved_plan.expect("a continuing iteration retained the plan it solved"),
         });
         dispatch_hints = next_hints;
     }

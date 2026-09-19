@@ -115,9 +115,10 @@ pub(super) enum SourceRefinement {
 /// (`UnresolvedCall`, `Truncated`) the coverage names, the same derivation
 /// the seeds already use.
 ///
-/// Equality is the feedback loop's fixpoint test: two iterations that built
-/// the same plan cannot solve to different results, so the later one must not
-/// solve again. Every field below is an input the solve or `interpret` reads.
+/// Every field below is an input the solve or `interpret` reads, and
+/// `TypeFlowPlan::feedback_fixpoint_matches` is the feedback loop's fixpoint
+/// test: two iterations whose plans agree on those inputs cannot solve to
+/// different results, so the later one must not solve again.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TypeFlowPlan {
     value_flow: ValueFlowPlan,
@@ -296,6 +297,83 @@ fn provider_failure_observed<'a>(
                     .iter()
                     .any(|binding| matches!(binding, BindingCoverage::ProviderError { .. }))
         })
+}
+
+/// Whether two dispatch read contracts name the same reads.
+///
+/// A read row is a question and the canonical digest of the answer it
+/// returned. Two contracts with the same questions and the same attribution
+/// are the same dependency set even when the answers those questions returned
+/// differ; see `TypeFlowPlan::feedback_fixpoint_matches` for why that
+/// difference cannot reach the solve.
+fn dispatch_read_contracts_name_the_same_reads(
+    left: &HashMap<DurableProcedureKey, ProcedureDispatchReadContract>,
+    right: &HashMap<DurableProcedureKey, ProcedureDispatchReadContract>,
+) -> bool {
+    left.len() == right.len()
+        && left.iter().all(|(procedure, left)| {
+            right
+                .get(procedure)
+                .is_some_and(|right| dispatch_read_rows_name_the_same_reads(left, right))
+        })
+}
+
+fn dispatch_read_rows_name_the_same_reads(
+    left: &ProcedureDispatchReadContract,
+    right: &ProcedureDispatchReadContract,
+) -> bool {
+    match (left, right) {
+        (
+            ProcedureDispatchReadContract::Complete(left),
+            ProcedureDispatchReadContract::Complete(right),
+        ) => {
+            // `canonical_dispatch_read_contract` sorts and deduplicates both
+            // slices by the whole key, so rows naming equal questions are
+            // contiguous in both and pairing by position compares the two
+            // question sets.
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right.iter())
+                    .all(|(left, right)| asks_the_same_question(left, right))
+        }
+        (
+            ProcedureDispatchReadContract::Unattributed(left),
+            ProcedureDispatchReadContract::Unattributed(right),
+        ) => left == right,
+        (
+            ProcedureDispatchReadContract::Complete(_),
+            ProcedureDispatchReadContract::Unattributed(_),
+        )
+        | (
+            ProcedureDispatchReadContract::Unattributed(_),
+            ProcedureDispatchReadContract::Complete(_),
+        ) => false,
+    }
+}
+
+/// Whether two read keys asked the workspace the same question.
+///
+/// [`ReadKey::Lookup`] is the one read key that carries an answer: its
+/// `digest` is the canonical digest of what the question returned. Every other
+/// key already is a question about the workspace's content, so those compare
+/// exactly.
+fn asks_the_same_question(left: &ReadKey, right: &ReadKey) -> bool {
+    match (left, right) {
+        (
+            ReadKey::Lookup {
+                kind: left_kind,
+                question: left_question,
+                ..
+            },
+            ReadKey::Lookup {
+                kind: right_kind,
+                question: right_question,
+                ..
+            },
+        ) => left_kind == right_kind && left_question == right_question,
+        _ => left == right,
+    }
 }
 
 fn canonical_dispatch_read_contract(
@@ -2621,6 +2699,77 @@ impl TypeFlowPlan {
         procedure: &DurableProcedureKey,
     ) -> Option<&ProcedureDispatchReadContract> {
         self.dispatch_reads.get(procedure)
+    }
+
+    /// The feedback fixpoint identity: whether a later iteration that rebuilt
+    /// this plan can reach a different result from the one this plan solved
+    /// to.
+    ///
+    /// [`PartialEq`] says "the same plan". This says "the same solve", which
+    /// is exactly as strict about every input the solve and `interpret`
+    /// read, and deliberately not strict about one thing that is not an input:
+    /// the answer digest each dispatch read row records.
+    ///
+    /// A dispatch read row is `ReadKey::Lookup { kind, question, digest }`:
+    /// the question one call site was asked of the dispatch funnel, and the
+    /// canonical digest of the answer it returned. Every consequence of a
+    /// dispatch answer that this plan can hand to the solve or to the
+    /// interpretation -- the callees discovery entered, the coverage each call
+    /// site published, the provider status, the dispatched class atoms, the
+    /// unmaterialized external targets that were bound as external summaries,
+    /// the summary-cut decision -- is a field this comparison requires to be
+    /// equal. The digest itself is an observation, not an input: it records
+    /// what the question answered at the time it was asked, and hint-driven
+    /// refinement can change it for one call site while leaving everything the
+    /// solve reads byte-identical.
+    ///
+    /// The questions do stay in the identity. A dispatch read set is the
+    /// dependency record a published summary reuses, so reusing rows under a
+    /// different read set would record the wrong dependencies: a contract that
+    /// gained a question, lost one, or stopped being fully attributed is a
+    /// different dependency set and its iteration still solves (#3471).
+    pub(crate) fn feedback_fixpoint_matches(&self, other: &Self) -> bool {
+        // Destructuring exhaustively rather than reading fields off `self` is
+        // what keeps this identity honest: a new plan field is a compile error
+        // here until it is either compared or deliberately excluded.
+        let Self {
+            value_flow,
+            atoms,
+            source_sites,
+            member_surface_sources,
+            sinks,
+            coverage,
+            dispatch_reads,
+            local_structure_digests,
+            summary_cuts,
+            field_slot_semantic_exhausted,
+            field_slot_semantic_exhaustion,
+            discovery_failure,
+            field_refinements,
+            class_closed_load_refinements,
+            refinement_budget_exhausted,
+            refinement_exhaustion,
+            correlations,
+            guard_bindings,
+        } = self;
+        value_flow == &other.value_flow
+            && atoms == &other.atoms
+            && source_sites == &other.source_sites
+            && member_surface_sources == &other.member_surface_sources
+            && sinks == &other.sinks
+            && coverage == &other.coverage
+            && dispatch_read_contracts_name_the_same_reads(dispatch_reads, &other.dispatch_reads)
+            && local_structure_digests == &other.local_structure_digests
+            && summary_cuts == &other.summary_cuts
+            && field_slot_semantic_exhausted == &other.field_slot_semantic_exhausted
+            && field_slot_semantic_exhaustion == &other.field_slot_semantic_exhaustion
+            && discovery_failure == &other.discovery_failure
+            && field_refinements == &other.field_refinements
+            && class_closed_load_refinements == &other.class_closed_load_refinements
+            && refinement_budget_exhausted == &other.refinement_budget_exhausted
+            && refinement_exhaustion == &other.refinement_exhaustion
+            && correlations == &other.correlations
+            && guard_bindings == &other.guard_bindings
     }
 
     pub(crate) fn local_structure_digest(

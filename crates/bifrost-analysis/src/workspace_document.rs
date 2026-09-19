@@ -139,6 +139,30 @@ pub fn read_workspace_document(
 ) -> Result<WorkspaceDocument, WorkspaceDocumentError> {
     let relative_path = validate_workspace_relative_path(relative_path)?;
     validate_extension(&relative_path, allowed_extensions)?;
+    open_workspace_document(root, relative_path, max_bytes)
+}
+
+/// Open, classify, bounded-read, and UTF-8-decode one workspace document whose
+/// name carries no extension.
+///
+/// A conventional dotfile such as `.nvmrc` is entirely a file stem, so
+/// [`read_workspace_document`]'s extension allow-list can never admit it. Path
+/// validation, the opened-handle regular-file check, and the byte bound are the
+/// same ones every other explicitly named document goes through.
+pub fn read_workspace_document_without_extension(
+    root: &WorkspaceRoot,
+    relative_path: &Path,
+    max_bytes: u64,
+) -> Result<WorkspaceDocument, WorkspaceDocumentError> {
+    let relative_path = validate_workspace_relative_path(relative_path)?;
+    open_workspace_document(root, relative_path, max_bytes)
+}
+
+fn open_workspace_document(
+    root: &WorkspaceRoot,
+    relative_path: PathBuf,
+    max_bytes: u64,
+) -> Result<WorkspaceDocument, WorkspaceDocumentError> {
     // Explicit files preserve the existing query behavior of accepting an
     // in-workspace symlink. `cap-std` resolves it beneath the retained root and
     // rejects a target that would escape. Match-directory traversal uses the

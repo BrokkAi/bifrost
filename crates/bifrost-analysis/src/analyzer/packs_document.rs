@@ -18,7 +18,7 @@ use semver::Version;
 use serde::Deserialize;
 
 use crate::analyzer::semantic_model::{
-    CatalogError, CatalogOpenMode, CatalogOptions, DependencyPackLimits,
+    CatalogCoordinate, CatalogError, CatalogOpenMode, CatalogOptions, DependencyPackLimits,
     PendingDependencyPackAcquisition, RegisteredWorkspaceSemanticModel,
     SEMANTIC_PACK_CACHE_ROOT_ENV, SemanticModelActivationControl, SemanticModelActivationEvidence,
     SemanticModelActivationRequest, SemanticModelControlAction, SemanticModelControlScope,
@@ -34,7 +34,7 @@ use crate::analyzer::{
 use crate::gitblob::{CACHE_DIR_ENV, CACHE_ROOT_ENV};
 use crate::workspace_document::{
     WorkspaceDocumentError, WorkspacePathError, WorkspaceRoot, read_workspace_document,
-    validate_workspace_relative_path,
+    read_workspace_document_without_extension, validate_workspace_relative_path,
 };
 
 /// Conventional workspace-relative location of the pack-activation document.
@@ -103,6 +103,144 @@ fn intrinsic_ecosystem(language: Language) -> &'static str {
         Language::CSharp => "nuget",
         Language::Cpp | Language::Php | Language::None => "language",
     }
+}
+
+/// Conventional workspace documents that pin the Node runtime revision.
+const NODE_RUNTIME_DECLARATION_DOCUMENTS: [&str; 2] = [".nvmrc", ".node-version"];
+/// Upper bound for one Node runtime declaration document. Real declarations are
+/// a line or two; this only stops a hostile file from being read.
+const MAX_NODE_RUNTIME_DECLARATION_BYTES: u64 = 1024 * 1024;
+
+/// The one Node revision the shipped runtime-values packs review.
+///
+/// The reviewed packs embed the distribution-archive digest and the profile
+/// configuration for exactly this revision, so a workspace declaration of any
+/// other revision names no reviewed artifact and mints no evidence.
+const REVIEWED_NODE_RUNTIME_VERSION: &str = "22.11.0";
+/// SHA-256 of the reviewed Node distribution archive the shipped packs pin
+/// (`node-v22.11.0.tar.gz`, per `semantic-packs/node/runtime-values/README.md`).
+const REVIEWED_NODE_RUNTIME_ARTIFACT_DIGEST: &str =
+    "24e5130fa7bc1eaab218a0c9cb05e03168fa381bb9e3babddc6a11f655799222";
+/// SHA-256 of the RFC 8785 canonical JSON of the reviewed runtime profile the
+/// shipped packs pin (Node linux/x64 main-realm CommonJS).
+const REVIEWED_NODE_RUNTIME_PROFILE_DIGEST: &str =
+    "70db7f8c799decb554bc25e8bf410079c8b377f2852ee2a982d56db40f054056";
+
+/// Workspace evidence for the reviewed Node runtime the shipped runtime-values
+/// packs model.
+///
+/// The shipped packs activate in-process with the exact Node artifact
+/// coordinates, digest, and profile configuration their shard selector names
+/// (#3329). Nothing on the workspace path minted those coordinates, so a
+/// workspace running `bifrost` could enable a pack that decided perfectly
+/// against a test fixture and never against the workspace (#3462).
+///
+/// A workspace that pins [`REVIEWED_NODE_RUNTIME_VERSION`] in its own manifest
+/// or Node version document declares exactly that reviewed artifact, so this
+/// route mints one evidence row per present JavaScript/TypeScript language. A
+/// workspace that declares another revision, or nothing, mints no row and the
+/// pack's selector stays unsatisfied with a reason naming what is missing.
+pub fn node_runtime_evidence(
+    workspace: &WorkspaceAnalyzer,
+) -> Vec<SemanticModelActivationEvidence> {
+    let languages: Vec<Language> = workspace
+        .analyzer()
+        .languages()
+        .into_iter()
+        .filter(|language| matches!(language, Language::JavaScript | Language::TypeScript))
+        .collect();
+    if languages.is_empty() {
+        return Vec::new();
+    }
+    if workspace_declared_node_version(workspace.analyzer().project().root()).as_deref()
+        != Some(REVIEWED_NODE_RUNTIME_VERSION)
+    {
+        return Vec::new();
+    }
+    let artifact = format!("pkg:generic/nodejs.org/node@{REVIEWED_NODE_RUNTIME_VERSION}");
+    languages
+        .into_iter()
+        .map(|language| SemanticModelActivationEvidence {
+            language: language.config_label().to_owned(),
+            ecosystem: intrinsic_ecosystem(language).to_owned(),
+            package: Some(CatalogCoordinate {
+                name: artifact.clone(),
+                version: None,
+            }),
+            module: None,
+            toolchain: None,
+            target: None,
+            configuration: Some(REVIEWED_NODE_RUNTIME_PROFILE_DIGEST.to_owned()),
+            artifact_sha256: Some(REVIEWED_NODE_RUNTIME_ARTIFACT_DIGEST.to_owned()),
+        })
+        .collect()
+}
+
+/// The exact Node revision the workspace declares, when it declares one.
+///
+/// `package.json` `engines.node` and `volta.node` are read as JSON fields, and
+/// the two conventional version documents as one line of text. An absent,
+/// unreadable, or unparsable declaration names no revision: a workspace still
+/// has to say which runtime it runs.
+fn workspace_declared_node_version(workspace_root: &Path) -> Option<String> {
+    let root = WorkspaceRoot::open(workspace_root).ok()?;
+    package_manifest_node_version(&root).or_else(|| {
+        NODE_RUNTIME_DECLARATION_DOCUMENTS
+            .iter()
+            .find_map(|document| node_version_document(&root, Path::new(document)))
+    })
+}
+
+/// `engines.node` and `volta.node` from the workspace's root `package.json`.
+fn package_manifest_node_version(root: &WorkspaceRoot) -> Option<String> {
+    // An absent, unreadable, malformed, or oversized manifest declares no
+    // revision, which is the same answer as a manifest without a Node pin: the
+    // pack stays incompatible and the report names the evidence that is
+    // missing. Only a declaration can change the decision, so a read failure
+    // cannot silently activate anything.
+    let document = read_workspace_document(
+        root,
+        Path::new("package.json"),
+        &["json"],
+        MAX_NODE_RUNTIME_DECLARATION_BYTES,
+    )
+    .ok()?;
+    let manifest: serde_json::Value = serde_json::from_str(document.source()).ok()?;
+    [["engines", "node"], ["volta", "node"]]
+        .into_iter()
+        .find_map(|[container, member]| {
+            manifest
+                .get(container)?
+                .get(member)?
+                .as_str()
+                .and_then(exact_node_version)
+        })
+}
+
+/// The revision one `.nvmrc` or `.node-version` document names.
+fn node_version_document(root: &WorkspaceRoot, relative_path: &Path) -> Option<String> {
+    let document = read_workspace_document_without_extension(
+        root,
+        relative_path,
+        MAX_NODE_RUNTIME_DECLARATION_BYTES,
+    )
+    .ok()?;
+    exact_node_version(document.source())
+}
+
+/// The revision a declaration names, when it names one exact revision.
+///
+/// Both `.nvmrc` and `.node-version` conventionally accept one optional leading
+/// `v`. A range, a partial version, or any other text names no reviewed
+/// artifact.
+fn exact_node_version(declaration: &str) -> Option<String> {
+    let trimmed = declaration.trim();
+    let version = trimmed.strip_prefix('v').unwrap_or(trimmed);
+    (!version.is_empty()
+        && version
+            .chars()
+            .all(|character| character.is_ascii_digit() || character == '.'))
+    .then(|| version.to_owned())
 }
 
 /// The normalized pack-activation configuration for one workspace.
@@ -644,6 +782,7 @@ fn workspace_activation_prelude(
     evidence.extend(registration.evidence);
     if shipped_models {
         evidence.extend(intrinsic_language_evidence(workspace));
+        evidence.extend(node_runtime_evidence(workspace));
     }
     evidence.sort();
     evidence.dedup();

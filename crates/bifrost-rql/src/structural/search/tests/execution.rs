@@ -8850,16 +8850,12 @@ func onceProjected(once *sync.Once) int {
     // Include a field initialized with a bound method as a near miss for any
     // implementation that classifies the stored target as a method and drops
     // the caller-side field load.
-    // The bound-method fixture also has unresolved callable/identity evidence;
-    // preserve that limitation while requiring the actual read/write pair.
+    // The bound-method fixture's selection now publishes its target (issue
+    // #3469), so its field read and write are proven rather than held open by
+    // unresolved callable evidence.
     for (field_call, proof, coverage, open_reason) in [
         ("functionValuedFieldLoadRace", "proven", "exhaustive", None),
-        (
-            "boundMethodFieldLoadRace",
-            "open",
-            "open",
-            Some("unknown_location"),
-        ),
+        ("boundMethodFieldLoadRace", "proven", "exhaustive", None),
         (
             "functionFieldAfterUnknownCall",
             "open",

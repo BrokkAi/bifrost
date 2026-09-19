@@ -516,7 +516,8 @@ pub struct JsTsRuntimeRead {
     /// Accessor and proxy coverage scoped to this read's own execution
     /// context: its innermost enclosing function, or the program top level
     /// for a top-level read. Direct writes stay module-wide; unknown calls
-    /// and member hazards in another function do not poison this read.
+    /// and member hazards that cannot run before this read, including every
+    /// hazard in another function, do not poison it.
     pub accessor: JsTsRuntimeAccessorCoverage,
 }
 
@@ -2054,16 +2055,14 @@ pub fn extract_js_ts_runtime_reads(
     let (accessor_coverage, accessors_complete) =
         runtime_accessor_coverage_bounded(&bindings, root, source, &mut budget);
     // Effect and accessor hazards are scoped to each read's own execution
-    // context, so an external call in one function cannot poison a read in
-    // another. Direct writes stay module-wide: any write to the root
-    // anywhere in the single-file module still poisons every read. The
-    // file-wide coverages above remain the reported module summary.
+    // context and ordered against it, so an external call in another function,
+    // or one that runs after the read, cannot poison it. Direct writes stay
+    // module-wide: any write to the root anywhere in the single-file module
+    // still poisons every read. The file-wide coverages above remain the
+    // reported module summary.
     let (local_functions, local_functions_complete) =
         local_function_bindings_bounded(root, source, &mut budget);
-    let mut scope_coverages: HashMap<
-        Option<usize>,
-        (JsTsRuntimeEffectCoverage, JsTsRuntimeAccessorCoverage),
-    > = HashMap::default();
+    let mut scope_hazards: HashMap<Option<usize>, Vec<JsTsRuntimeScopeHazard>> = HashMap::default();
     let mut scopes_complete = local_functions_complete;
     let mut reads = Vec::new();
     let mut stack = vec![root];
@@ -2083,30 +2082,30 @@ pub fn extract_js_ts_runtime_reads(
             let key = &segments[1];
             let scope = enclosing_runtime_function(node);
             let scope_key = scope.map(|scope| scope.id());
-            let (scope_effect, scope_accessor) = match scope_coverages.get(&scope_key) {
-                Some(cached) => *cached,
-                None => {
-                    let scope_root = scope.unwrap_or(root);
-                    let (effect, effect_complete) = runtime_effect_coverage_scoped(
-                        &bindings,
-                        &local_functions,
-                        scope_root,
-                        source,
-                        &mut budget,
-                    );
-                    let (accessor, accessor_complete) = runtime_accessor_coverage_scoped(
-                        &bindings,
-                        scope_root,
-                        source,
-                        &mut budget,
-                    );
-                    scopes_complete &= effect_complete && accessor_complete;
-                    scope_coverages.insert(scope_key, (effect, accessor));
-                    (effect, accessor)
-                }
+            let hazards = scope_hazards.entry(scope_key).or_insert_with(|| {
+                let scope_root = scope.unwrap_or(root);
+                let (hazards, hazards_complete) = runtime_scope_hazards(
+                    &bindings,
+                    &local_functions,
+                    scope_root,
+                    source,
+                    &mut budget,
+                );
+                scopes_complete &= hazards_complete;
+                hazards
+            });
+            let read_range = node_source_range(node);
+            let has_unknown_effects = hazards
+                .iter()
+                .any(|hazard| (hazard.effect || hazard.accessor) && hazard.can_precede(read_range));
+            let accessor = if hazards
+                .iter()
+                .any(|hazard| hazard.accessor && hazard.can_precede(read_range))
+            {
+                JsTsRuntimeAccessorCoverage::UnknownAccessorEffects
+            } else {
+                JsTsRuntimeAccessorCoverage::NoKnownAccessorEffects
             };
-            let has_unknown_effects = scope_effect == JsTsRuntimeEffectCoverage::Unknown
-                || scope_accessor == JsTsRuntimeAccessorCoverage::UnknownAccessorEffects;
             let mutation = if has_unknown_effects {
                 if writes.iter().any(|write| {
                     write.root_name == root_name
@@ -2137,7 +2136,7 @@ pub fn extract_js_ts_runtime_reads(
                 root_name,
                 container: runtime_container_name(container, source),
                 access: key.access.clone(),
-                range: node_source_range(node),
+                range: read_range,
                 root_range: node_source_range(path_root),
                 container_range: node_source_range(container.node),
                 candidate_anchor: node_source_range(candidate_anchor),
@@ -2145,7 +2144,7 @@ pub fn extract_js_ts_runtime_reads(
                 lexical_resolution,
                 mutation,
                 execution,
-                accessor: scope_accessor,
+                accessor,
             });
         }
         let mut cursor = node.walk();
@@ -2306,20 +2305,10 @@ fn runtime_effect_coverage_with_bindings_bounded(
         if !budget.visit() {
             break;
         }
-        if matches!(
-            node.kind(),
-            "new_expression"
-                | "await_expression"
-                | "yield_expression"
-                | "with_statement"
-                | "for_in_statement"
-                | "for_of_statement"
-        ) {
+        if runtime_effect_hazard_kind(node.kind()) {
             return (JsTsRuntimeEffectCoverage::Unknown, !budget.exhausted);
         }
-        if matches!(node.kind(), "import_statement")
-            || (node.kind() == "export_statement" && !export_declaration_only(node))
-        {
+        if runtime_linkage_boundary(node) {
             return (JsTsRuntimeEffectCoverage::Unknown, !budget.exhausted);
         }
         if node.kind() == "call_expression"
@@ -2338,49 +2327,39 @@ fn runtime_effect_coverage_with_bindings_bounded(
     )
 }
 
-/// Effect coverage for one execution context: a function body, or the
-/// program top level when the scope root is the file root. Nested function
-/// bodies belong to their own scopes. Local-call resolution still uses the
-/// module-wide function index, so a call into a sibling function whose body
-/// is present stays closed.
-fn runtime_effect_coverage_scoped(
-    bindings: &JsTsLexicalBindingIndex,
-    local_functions: &[JsTsLocalFunctionBinding],
-    scope_root: Node<'_>,
-    source: &str,
-    budget: &mut JsTsRuntimeTraversalBudget,
-) -> (JsTsRuntimeEffectCoverage, bool) {
-    let mut stack = vec![scope_root];
-    while let Some(node) = stack.pop() {
-        if !budget.visit() {
-            break;
-        }
-        if matches!(
-            node.kind(),
-            "new_expression"
-                | "await_expression"
-                | "yield_expression"
-                | "with_statement"
-                | "for_in_statement"
-                | "for_of_statement"
-        ) {
-            return (JsTsRuntimeEffectCoverage::Unknown, !budget.exhausted);
-        }
-        if matches!(node.kind(), "import_statement")
-            || (node.kind() == "export_statement" && !export_declaration_only(node))
-        {
-            return (JsTsRuntimeEffectCoverage::Unknown, !budget.exhausted);
-        }
-        if node.kind() == "call_expression"
-            && !runtime_call_is_local(bindings, local_functions, node, source)
-        {
-            return (JsTsRuntimeEffectCoverage::Unknown, !budget.exhausted);
-        }
-        push_scope_children(&mut stack, node, scope_root);
-    }
-    (
-        JsTsRuntimeEffectCoverage::ClosedLocalCalls,
-        !budget.exhausted,
+/// Effect boundaries that may run code this artifact does not contain, or
+/// that observe the runtime root through an effect the extractor cannot see.
+fn runtime_effect_hazard_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "new_expression"
+            | "await_expression"
+            | "yield_expression"
+            | "with_statement"
+            | "for_in_statement"
+            | "for_of_statement"
+    )
+}
+
+/// Module linkage evaluates before the module body, so its file position does
+/// not order it against a module-scope read. Re-exports and
+/// `export default <expression>` run code this module does not contain;
+/// declaration-only exports introduce no evaluation of their own.
+fn runtime_linkage_boundary(node: Node<'_>) -> bool {
+    matches!(node.kind(), "import_statement")
+        || (node.kind() == "export_statement" && !export_declaration_only(node))
+}
+
+/// Iteration constructs run their body more than once, so a hazard that
+/// follows a read inside one can still precede a later evaluation of it.
+fn runtime_iteration_hazard_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "for_statement"
+            | "for_in_statement"
+            | "for_of_statement"
+            | "while_statement"
+            | "do_statement"
     )
 }
 
@@ -2458,35 +2437,92 @@ fn runtime_accessor_coverage_bounded(
     )
 }
 
-/// Accessor coverage for one execution context, with the same hazard rules
-/// as the module-wide pass. Nested function bodies belong to their own
-/// scopes.
-fn runtime_accessor_coverage_scoped(
+/// One effect or accessor hazard inside a read's execution context.
+///
+/// A hazard can only perturb a read's value when it can run before that read
+/// does. Source position orders straight-line code within one execution
+/// context. A read inside an iteration construct can run again after a hazard
+/// that follows it, and module linkage evaluates before the module body, so
+/// those two are not ordered by position.
+#[derive(Clone, Copy, Debug)]
+struct JsTsRuntimeScopeHazard {
+    start_byte: usize,
+    /// The outermost iteration construct of the same scope that contains the
+    /// hazard, when there is one.
+    iteration: Option<Range>,
+    /// Module linkage, which evaluates before the module body.
+    linkage: bool,
+    effect: bool,
+    accessor: bool,
+}
+
+impl JsTsRuntimeScopeHazard {
+    /// Whether this hazard can run before `read` and so perturb its value.
+    fn can_precede(&self, read: Range) -> bool {
+        self.linkage
+            || self.start_byte < read.end_byte
+            || self.iteration.is_some_and(|iteration| {
+                iteration.start_byte <= read.start_byte && read.end_byte <= iteration.end_byte
+            })
+    }
+}
+
+/// The effect and accessor hazards of one execution context, with the
+/// positions that decide whether each can precede a read. Nested function
+/// bodies belong to their own scopes. Local-call resolution still uses the
+/// module-wide function index, so a call into a sibling function whose body is
+/// present stays closed.
+fn runtime_scope_hazards(
     bindings: &JsTsLexicalBindingIndex,
+    local_functions: &[JsTsLocalFunctionBinding],
     scope_root: Node<'_>,
     source: &str,
     budget: &mut JsTsRuntimeTraversalBudget,
-) -> (JsTsRuntimeAccessorCoverage, bool) {
+) -> (Vec<JsTsRuntimeScopeHazard>, bool) {
+    let mut hazards = Vec::new();
     let mut stack = vec![scope_root];
     while let Some(node) = stack.pop() {
         if !budget.visit() {
             break;
         }
-        if runtime_accessor_hazard_kind(node.kind())
-            || matches!(node.kind(), "member_expression" | "subscript_expression")
-                && !runtime_member_is_known_safe_or_runtime(bindings, node, source)
-        {
-            return (
-                JsTsRuntimeAccessorCoverage::UnknownAccessorEffects,
-                !budget.exhausted,
-            );
+        let linkage = runtime_linkage_boundary(node);
+        let effect = linkage
+            || runtime_effect_hazard_kind(node.kind())
+            || (node.kind() == "call_expression"
+                && !runtime_call_is_local(bindings, local_functions, node, source));
+        let accessor = runtime_accessor_hazard_kind(node.kind())
+            || (matches!(node.kind(), "member_expression" | "subscript_expression")
+                && !runtime_member_is_known_safe_or_runtime(bindings, node, source));
+        if effect || accessor {
+            hazards.push(JsTsRuntimeScopeHazard {
+                start_byte: node.start_byte(),
+                iteration: outermost_scope_iteration(node, scope_root),
+                linkage,
+                effect,
+                accessor,
+            });
         }
         push_scope_children(&mut stack, node, scope_root);
     }
-    (
-        JsTsRuntimeAccessorCoverage::NoKnownAccessorEffects,
-        !budget.exhausted,
-    )
+    (hazards, !budget.exhausted)
+}
+
+/// The outermost iteration construct between `node` and `scope_root`. Any
+/// iteration construct that contains both the hazard and a read is contained
+/// in this one, so testing against it decides loop-carried ordering.
+fn outermost_scope_iteration(node: Node<'_>, scope_root: Node<'_>) -> Option<Range> {
+    let mut iteration = None;
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if parent.id() == scope_root.id() {
+            break;
+        }
+        if runtime_iteration_hazard_kind(parent.kind()) {
+            iteration = Some(node_source_range(parent));
+        }
+        current = parent.parent();
+    }
+    iteration
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -4074,11 +4110,12 @@ run();
 
     #[test]
     fn runtime_read_top_level_effects_stay_in_their_own_scope() {
-        // A top-level external call poisons a top-level read but not a read
-        // inside a function, and a write anywhere still poisons every read.
+        // A top-level external call before a top-level read poisons it but not
+        // a read inside a function, and a write anywhere still poisons every
+        // read.
         let source = r#"
-const top = process.env.TOP_KEY;
 external();
+const top = process.env.TOP_KEY;
 function read() {
   return process.env.FN_KEY;
 }
@@ -4119,6 +4156,92 @@ function read() {
                     || read.mutation == JsTsRuntimeMutationEvidence::KnownWriteAndUnknownEffects
             }),
             "a module-wide write poisons every scope: {facts:#?}"
+        );
+    }
+
+    #[test]
+    fn runtime_read_hazards_are_ordered_against_the_read() {
+        // A hazard that runs after the read cannot change the value the read
+        // already returned, so a reviewed sink call can share a function with
+        // the runtime source it consumes (#3462). The DataFlowBench
+        // native-source-sink witness is exactly this shape.
+        let source = r#"
+const child_process = require("child_process");
+function run() {
+  const value = process.env.DFB_INPUT;
+  child_process.execSync(value);
+}
+run();
+"#;
+        let tree = parse_javascript(source);
+        let facts = extract_js_ts_runtime_reads(tree.root_node(), source, 64);
+        assert!(facts.complete, "{facts:#?}");
+        let read = facts
+            .reads
+            .iter()
+            .find(|read| read.access == JsTsRuntimeAccessKey::Property("DFB_INPUT".into()))
+            .expect("the runtime source read is extracted");
+        assert_eq!(
+            read.mutation,
+            JsTsRuntimeMutationEvidence::NoKnownWrite,
+            "{facts:#?}"
+        );
+        assert_eq!(
+            read.accessor,
+            JsTsRuntimeAccessorCoverage::NoKnownAccessorEffects,
+            "{facts:#?}"
+        );
+        // The module-wide summary still reports the external call and the
+        // unknown member beside the read.
+        assert_eq!(facts.effect_coverage, JsTsRuntimeEffectCoverage::Unknown);
+        assert_eq!(
+            facts.accessor_coverage,
+            JsTsRuntimeAccessorCoverage::UnknownAccessorEffects
+        );
+
+        // The same hazard before the read still poisons it.
+        let before = r#"
+const child_process = require("child_process");
+function run() {
+  child_process.execSync("ls");
+  const value = process.env.DFB_INPUT;
+}
+"#;
+        let tree = parse_javascript(before);
+        let facts = extract_js_ts_runtime_reads(tree.root_node(), before, 64);
+        let read = facts
+            .reads
+            .iter()
+            .find(|read| read.access == JsTsRuntimeAccessKey::Property("DFB_INPUT".into()))
+            .expect("the later read is extracted");
+        assert_eq!(read.mutation, JsTsRuntimeMutationEvidence::UnknownEffects);
+        assert_eq!(
+            read.accessor,
+            JsTsRuntimeAccessorCoverage::UnknownAccessorEffects
+        );
+
+        // An iteration construct runs the read again after a following
+        // hazard, so a loop-carried hazard still poisons it.
+        let looped = r#"
+const child_process = require("child_process");
+function run() {
+  while (true) {
+    const value = process.env.DFB_INPUT;
+    child_process.execSync(value);
+  }
+}
+"#;
+        let tree = parse_javascript(looped);
+        let facts = extract_js_ts_runtime_reads(tree.root_node(), looped, 64);
+        let read = facts
+            .reads
+            .iter()
+            .find(|read| read.access == JsTsRuntimeAccessKey::Property("DFB_INPUT".into()))
+            .expect("the loop read is extracted");
+        assert_eq!(read.mutation, JsTsRuntimeMutationEvidence::UnknownEffects);
+        assert_eq!(
+            read.accessor,
+            JsTsRuntimeAccessorCoverage::UnknownAccessorEffects
         );
     }
 

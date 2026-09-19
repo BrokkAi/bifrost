@@ -5,12 +5,12 @@ use crate::analyzer::semantic::{
     CallArgumentEndpoint, CallBinding, CallBindings, CallSiteHandle, CallSiteId, CallableTarget,
     CallableTargetResolution, CandidateCoverage, ControlEdgeId, ControlEdgeKind,
     DeclarationLocator, DeclarationSegmentKind, DispatchBoundaryKind, EvidenceCompleteness,
-    GuardFact, IcfgEdgeKind, LengthDelimitedDigest, MemoryLocationKind, ObjectCardinality,
-    OracleLimits, ProcedureHandle, ProcedurePortKind, ProcedureSemantics, ProgramPointHandle,
-    ProgramPointId, ProofStatus, SemanticArtifact, SemanticArtifactKey, SemanticCapability,
-    SemanticEffect, SemanticGapHandle, SemanticGapImpact, SemanticGapKind, SemanticGapSubject,
-    SemanticLocator, SemanticValueKind, StableDigest, ValueFlowEndpoint, ValueFlowKind,
-    ValueFlowRelationKind, ValueFlowSnapshot, ValueTransfer,
+    GuardFact, IcfgEdgeKind, LengthDelimitedDigest, MemoryLocationId, MemoryLocationKind,
+    ObjectCardinality, OracleLimits, ProcedureHandle, ProcedurePortHandle, ProcedurePortKind,
+    ProcedureSemantics, ProgramPointHandle, ProgramPointId, ProofStatus, SemanticArtifact,
+    SemanticArtifactKey, SemanticCapability, SemanticEffect, SemanticGapHandle, SemanticGapImpact,
+    SemanticGapKind, SemanticGapSubject, SemanticLocator, SemanticValueKind, StableDigest,
+    ValueFlowEndpoint, ValueFlowKind, ValueFlowRelationKind, ValueFlowSnapshot, ValueTransfer,
 };
 use crate::dataflow::{
     CuratedCallModel, CuratedCallModelFingerprint, ExternalSemanticSummarySet,
@@ -1510,6 +1510,62 @@ impl ValueFlowSummaryLocationBinding {
             port,
             carrier,
         }
+    }
+}
+
+/// One proven returned-callable association: a call whose result is exactly
+/// one local closure, and the environment slots that closure captured.
+///
+/// The producing call returned the callable, and the closure's creation in the
+/// producing procedure bound each listed slot. The slots are the closure's own
+/// memory locations -- the same identities its body reads and writes through
+/// its capture ports -- so a consumer knows that this callable's closed-over
+/// storage stays live for as long as the callable itself does. Because the
+/// callable escapes through the producing call's result, that storage also
+/// survives the call's normal return: a plan can connect each capture port
+/// across that return edge without re-deriving which callable the result
+/// names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValueFlowReturnedCallable {
+    producer: CallSiteHandle,
+    producer_callee: ProcedureHandle,
+    closure: ProcedureHandle,
+    captures: Box<[MemoryLocationId]>,
+}
+
+impl ValueFlowReturnedCallable {
+    pub fn new(
+        producer: CallSiteHandle,
+        producer_callee: ProcedureHandle,
+        closure: ProcedureHandle,
+        captures: Vec<MemoryLocationId>,
+    ) -> Self {
+        Self {
+            producer,
+            producer_callee,
+            closure,
+            captures: captures.into_boxed_slice(),
+        }
+    }
+
+    /// The call whose result supplied the callable value.
+    pub const fn producer(&self) -> &CallSiteHandle {
+        &self.producer
+    }
+
+    /// The procedure the producing call resolved to.
+    pub const fn producer_callee(&self) -> &ProcedureHandle {
+        &self.producer_callee
+    }
+
+    /// The local callable body the returned value names.
+    pub const fn closure(&self) -> &ProcedureHandle {
+        &self.closure
+    }
+
+    /// The closure's environment slots, in the closure's own procedure.
+    pub fn captures(&self) -> &[MemoryLocationId] {
+        &self.captures
     }
 }
 
@@ -3032,6 +3088,85 @@ impl ValueFlowPlan {
             })
             .collect::<Result<Vec<_>, ValueFlowPlanError>>()?
             .into_boxed_slice();
+        Ok(self)
+    }
+
+    /// Keep every returned closure's captured environment connected across the
+    /// call that returned it.
+    ///
+    /// A producing call that returned a callable handed the caller the exact
+    /// closure whose environment slots the same procedure bound at the
+    /// closure's creation. Those slots therefore stay live across the
+    /// producing call's normal return, and this method adds one identity rule
+    /// per slot on that return edge: the closure's capture port is re-emitted
+    /// when the producing call returns, so a later invocation of the returned
+    /// value observes the same closed-over storage it would observe if the
+    /// closure had been created in the caller. The rule carries proven
+    /// complete evidence, because it does not claim new reachability -- it
+    /// keeps the closure's own environment stable across a boundary the
+    /// callable itself crossed.
+    ///
+    /// A row whose closure's capture port the plan did not retain contributes
+    /// no rule: the plan holds no carrier for that slot, so there is no fact to
+    /// transport across the return edge.
+    pub fn with_returned_callable_captures(
+        mut self,
+        mut rows: Vec<ValueFlowReturnedCallable>,
+    ) -> Result<Self, ValueFlowPlanError> {
+        let mount = self.root.artifact().key().mount();
+        for row in &rows {
+            validate_mount(row.producer.procedure(), mount)?;
+            if row
+                .producer
+                .procedure()
+                .semantics()
+                .call_site(row.producer.id())
+                .is_none()
+            {
+                return Err(ValueFlowPlanError::StaleReturnedCallable);
+            }
+        }
+        rows.sort_by(|left, right| {
+            compare_calls(&left.producer, &right.producer)
+                .then_with(|| compare_procedures(&left.producer_callee, &right.producer_callee))
+                .then_with(|| compare_procedures(&left.closure, &right.closure))
+                .then_with(|| left.captures.cmp(&right.captures))
+        });
+        rows.dedup();
+        let mut bound = Vec::new();
+        for row in rows {
+            for slot in row.captures.iter() {
+                let port = ProcedurePortHandle::capture(row.closure.clone(), *slot)
+                    .expect("a returned closure names its own capture slots");
+                let carrier = ValueFlowCarrier::Port(port);
+                let Some(id) = self.carrier_id_for_key(&carrier.stable_key()?) else {
+                    continue;
+                };
+                bound.push((row.producer.clone(), row.producer_callee.clone(), id));
+            }
+        }
+        if self.call_rules.len().saturating_add(bound.len()) > MAX_VALUE_FLOW_RELATIONS {
+            return Err(ValueFlowPlanError::LimitExceeded);
+        }
+        let mut rules = self.call_rules.into_vec();
+        rules.extend(
+            bound
+                .into_iter()
+                .map(|(call, callee, carrier)| CallFlowRule {
+                    call,
+                    callee,
+                    kind: CallFlowRuleKind::NormalReturn,
+                    transfer: None,
+                    source: carrier,
+                    target: carrier,
+                    proof: ProofStatus::Proven,
+                    completeness: EvidenceCompleteness::Complete,
+                }),
+        );
+        rules.sort_by(compare_call_rules);
+        merge_duplicate_call_rules(&mut rules);
+        self.call_rule_reverse_index = build_call_rule_reverse_index(&rules);
+        self.call_rules = rules.into_boxed_slice();
         Ok(self)
     }
 
@@ -6288,6 +6423,7 @@ pub enum ValueFlowPlanError {
     InvalidSourceActivation,
     DuplicateCallModel,
     StaleCallModel,
+    StaleReturnedCallable,
     InvalidSummaryLocationPort,
     DuplicateSummaryLocationBinding,
     IncompatibleExternalSummary,
@@ -6330,6 +6466,9 @@ impl fmt::Display for ValueFlowPlanError {
                 formatter.write_str("multiple curated call models target the same call site")
             }
             Self::StaleCallModel => formatter.write_str("curated call model targets a stale call"),
+            Self::StaleReturnedCallable => {
+                formatter.write_str("returned callable provenance names a stale producing call")
+            }
             Self::InvalidSummaryLocationPort => {
                 formatter.write_str("summary location binding requires a heap or capture port")
             }

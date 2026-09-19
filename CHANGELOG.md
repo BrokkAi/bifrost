@@ -66,6 +66,15 @@ projection and its commit history does not contain every source commit.
   does not seed is an attributed cache miss instead of an analyzer store error.
   The Python absent-member policy previously aborted on Dramatiq with
   `persisted class-set source event does not map uniquely to the live plan`.
+- Go concurrency analysis now carries exact bound receivers for method-value
+  callbacks into modeled task spawns, preserving race evidence for
+  `http.HandleFunc`, `WaitGroup.Go`, and equivalent function-value paths.
+- The JavaScript and TypeScript runtime-values packs now activate from reviewed
+  workspace Node declarations, and runtime-effect hazards are ordered against
+  the read they can actually precede.
+- The Java security policy now completes environment-to-`Runtime.exec` flows
+  through chained JDK static factories, while the network-effect policy ships
+  its reviewed Java/JVM endpoint row.
 
 ### Fixed
 
@@ -110,6 +119,13 @@ projection and its commit history does not contain every source commit.
   language declarations.
 - Release smoke tests now pass the resolved release tag when verifying the
   published DeepSeek Harness checksum.
+- The release flow now ships an offline semantic-pack installer with verified
+  Linux artifacts, and CI shares one exact release-binary bundle between
+  policy and quick-performance consumers.
+- Python type flow now resolves bare imported base classes through the import
+  binder, preserving modeled hierarchy and absent-member evidence.
+- The LSP documentation now covers Vim, Neovim, coc.nvim, and ALE setup from
+  the same Bifrost stdio server contract.
 - JavaScript and TypeScript receiver queries now preserve explicit competing
   or truncated import ambiguity under neutral semantic gates instead of
   rewriting that boundary as an unknown result.

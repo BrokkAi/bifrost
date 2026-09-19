@@ -28,10 +28,18 @@ use crate::analyzer::semantic::{
 use crate::analyzer::store::{
     AnalyzerStore, SemanticPackActivationSourceKind, SemanticPackActiveReference,
 };
-use crate::analyzer::{IAnalyzer, Language, LanguageDialect};
+use crate::analyzer::{IAnalyzer, Language, LanguageDialect, semantic_pack_realm};
 use crate::hash::{HashMap, map_with_capacity};
 
-pub const SEMANTIC_MODEL_RUNTIME_REPRESENTATION_VERSION: u32 = 5;
+/// The encoding version of the resolved semantic-model runtime.
+///
+/// Rotating this value rotates every active-set identity a workspace derives
+/// from its semantic packs. Java, Kotlin and Scala share one classpath and now
+/// one durable index key ([`semantic_pack_realm`]), so the same active pack set
+/// resolves a Kotlin or Scala call differently than the label-exact keying did.
+/// A recorded identity from before this change must not satisfy the new
+/// contract, so the version moves even though no pack changed.
+pub const SEMANTIC_MODEL_RUNTIME_REPRESENTATION_VERSION: u32 = 6;
 
 type DependencyEvidencePublication = (Box<[Language]>, super::DependencyDiscoveryEvidence);
 
@@ -427,7 +435,7 @@ impl ResolvedActiveSemanticModels {
         let shapes = self
             .indexes
             .procedure_summaries_by_target
-            .get(target.language)
+            .get(semantic_pack_realm(target.language))
             .and_then(|paths| paths.get(target.path))
             .and_then(|symbols| symbols.get(target.symbol));
         resolve_exact_procedure_postings(
@@ -447,7 +455,7 @@ impl ResolvedActiveSemanticModels {
         let shapes = self
             .indexes
             .procedure_summaries_by_member
-            .get(target.language)
+            .get(semantic_pack_realm(target.language))
             .and_then(|owners| owners.get(target.owner))
             .and_then(|members| members.get(target.member));
         resolve_applicable_procedure_postings(
@@ -469,7 +477,7 @@ impl ResolvedActiveSemanticModels {
     ) -> bool {
         self.indexes
             .procedure_summaries_by_member
-            .get(language)
+            .get(semantic_pack_realm(language))
             .into_iter()
             .flat_map(|owners| owners.values())
             .filter_map(|members| members.get(member))
@@ -498,7 +506,7 @@ impl ResolvedActiveSemanticModels {
         let symbols = self
             .indexes
             .procedure_summaries_by_target
-            .get(target.language)
+            .get(semantic_pack_realm(target.language))
             .and_then(|paths| paths.get(target.path));
         let maximum_variadic_formals = target.parameter_count.saturating_add(1);
         let postings = symbols.into_iter().flat_map(|symbols| {
@@ -584,7 +592,7 @@ impl ResolvedActiveSemanticModels {
     ) -> bool {
         self.indexes
             .procedure_summaries_by_member
-            .get(language)
+            .get(semantic_pack_realm(language))
             .and_then(|owners| owners.get(owner))
             .and_then(|members| members.get(member))
             .is_some_and(|shapes| {
@@ -813,7 +821,9 @@ impl<'a> ActivatedProcedureSummary<'a> {
         let content = parse_lower_sha256(&self.record.content_sha256)?;
         if self.record.model_id != format!("{}#{}", self.shard.manifest.pack_id, self.record.id)
             || self.record.contract_version == 0
-            || self.shard.manifest.language != target.language().semantic_pack_label()
+            || !target
+                .language()
+                .accepts_semantic_pack_language(&self.shard.manifest.language)
             || self.record.target.has_receiver != target.has_receiver()
             || !self.record.target.accepts_parameter_count(target.arity())
             || target.locator_for_arity(target.arity()) != *target.locator()
@@ -994,6 +1004,10 @@ impl NormalContinuationAbsenceMemberCandidates {
 ///
 /// The index deliberately stops at owner/name/receiver. Exact actual arities
 /// remain runtime lookups, avoiding an unbounded variadic-arity cache.
+///
+/// It is keyed by [`semantic_pack_realm`], the same durable key the procedure
+/// summary postings it is built from use, so a caller's own language label
+/// reaches the candidates a pack declared for any language of that realm.
 #[derive(Debug, Default)]
 struct NormalContinuationAbsenceCandidateIndex {
     by_language: HashMap<String, HashMap<String, NormalContinuationAbsenceMemberCandidates>>,
@@ -1002,13 +1016,13 @@ struct NormalContinuationAbsenceCandidateIndex {
 impl NormalContinuationAbsenceCandidateIndex {
     fn has_language(&self, language: &str) -> bool {
         self.by_language
-            .get(language)
+            .get(semantic_pack_realm(language))
             .is_some_and(|members| !members.is_empty())
     }
 
     fn owners(&self, language: &str, member: &str, has_receiver: bool) -> &[String] {
         self.by_language
-            .get(language)
+            .get(semantic_pack_realm(language))
             .and_then(|members| members.get(member))
             .map(|candidates| candidates.owners(has_receiver))
             .unwrap_or_default()
@@ -1215,7 +1229,7 @@ impl MatcherIndexes {
                         .saturating_add(size_of::<u32>());
                     let paths = indexes
                         .procedure_summaries_by_target
-                        .entry(active_shard.manifest.language.clone())
+                        .entry(semantic_pack_realm(&active_shard.manifest.language).to_owned())
                         .or_default();
                     let symbols = paths.entry(summary.target.path.clone()).or_default();
                     let shapes = symbols.entry(summary.target.symbol.clone()).or_default();
@@ -1247,7 +1261,7 @@ impl MatcherIndexes {
                             .saturating_add(size_of::<u32>());
                         let owners = indexes
                             .procedure_summaries_by_member
-                            .entry(active_shard.manifest.language.clone())
+                            .entry(semantic_pack_realm(&active_shard.manifest.language).to_owned())
                             .or_default();
                         let members = owners.entry(owner.into_owned()).or_default();
                         let shapes = members.entry(member.to_owned()).or_default();
@@ -3115,7 +3129,10 @@ fn strict_coordinate_matches(
 /// Explain a failed strict activation match. When the evidence names a
 /// required coordinate but an exact version requirement rejects it, the
 /// explanation names the workspace version and the pack requirement (#1884).
-/// Every other rejection keeps the generic statement.
+/// When no evidence row names a coordinate the selector requires at all, the
+/// explanation names the missing coordinate and the selector's remaining
+/// predicates, so a caller can act on it (#3462). Every other rejection keeps
+/// the generic statement.
 fn strict_activation_mismatch_reason(
     manifest: &CompiledPackManifest,
     shard: &CompiledShard,
@@ -3225,7 +3242,57 @@ fn strict_activation_mismatch_reason(
             }
         }
     }
+    for selector in shard.activation() {
+        let named = scoped().any(|row| {
+            strict_coordinate_names_match(selector.package.as_ref(), row.package.as_ref())
+                && strict_coordinate_names_match(selector.module.as_ref(), row.module.as_ref())
+                && strict_coordinate_names_match(
+                    selector.toolchain.as_ref(),
+                    row.toolchain.as_ref(),
+                )
+        });
+        if !named && let Some(reason) = missing_activation_evidence_reason(selector) {
+            return reason;
+        }
+    }
     "complete activation evidence does not satisfy the manifest and shard selector".to_owned()
+}
+
+/// Name the activation evidence a selector requires when no evidence row names
+/// its coordinate, or `None` for a selector that names none.
+///
+/// A selector may additionally require exact profile configurations, artifact
+/// digests, or targets; an evidence row alone does not satisfy those, so the
+/// reason lists them beside the missing coordinate.
+fn missing_activation_evidence_reason(selector: &ActivationSelector) -> Option<String> {
+    let (axis, coordinate) = match (&selector.package, &selector.module, &selector.toolchain) {
+        (Some(package), _, _) => ("package", package),
+        (_, Some(module), _) => ("module", module),
+        (_, _, Some(toolchain)) => ("toolchain", toolchain),
+        _ => return None,
+    };
+    let mut requirements = Vec::new();
+    if !selector.targets.is_empty() {
+        requirements.push(format!("target {}", selector.targets.join(", ")));
+    }
+    if !selector.configurations.is_empty() {
+        requirements.push(format!(
+            "profile configuration {}",
+            selector.configurations.join(", ")
+        ));
+    }
+    if let Some(artifact_sha256) = &selector.artifact_sha256 {
+        requirements.push(format!("artifact sha256 {artifact_sha256}"));
+    }
+    let requirements = if requirements.is_empty() {
+        String::new()
+    } else {
+        format!("; the shard selector requires {}", requirements.join(", "))
+    };
+    Some(format!(
+        "no activation evidence names {axis} {}{requirements}",
+        coordinate.name
+    ))
 }
 
 /// The name half of `strict_coordinate_matches`: whether the evidence names
@@ -3791,7 +3858,7 @@ mod active_model_set_identity_tests {
 
     #[test]
     fn value_semantics_schema_rotates_active_set_identity() {
-        assert_eq!(SEMANTIC_MODEL_RUNTIME_REPRESENTATION_VERSION, 5);
+        assert_eq!(SEMANTIC_MODEL_RUNTIME_REPRESENTATION_VERSION, 6);
         let mut previous = Sha256::new();
         previous.update(b"bifrost.semantic-model.active-set.v2\0");
         previous.update(2u32.to_be_bytes());

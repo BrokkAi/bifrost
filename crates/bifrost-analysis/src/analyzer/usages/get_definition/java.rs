@@ -1133,49 +1133,19 @@ fn java_method_invocation_binding(
             );
             return JavaInvocationBinding { outcome, receiver };
         }
-        let mut outcome = java_unresolved_receiver_outcome(
+        let outcome = java_unresolved_receiver_outcome(
             analyzer,
             token,
             session,
             file,
             source,
             root,
+            node,
             object,
+            name_node,
             name,
             format!("receiver for Java method `{name}` is not resolved"),
         );
-        // #2354: workspace receiver typing answered nothing, so the receiver's
-        // written declared type names no indexed class. When the external
-        // declaration surface (classpath artifacts plus activated
-        // declaration-fact packs) does name it, publish the call's canonical
-        // external identity -- `<owner FQN>.<member>` -- as the resolved
-        // reference text. That is the one identity an unmaterialized external
-        // callee leaves behind, and #1978's boundary reads exactly this field.
-        // Without it an instance call on an external interface
-        // (`request.getParameter(...)`) carries only its syntactic receiver
-        // *variable* name, which no summary can ever match.
-        if let Some(owner_fqn) = resolve_analyzer::<JavaAnalyzer>(analyzer).and_then(|java| {
-            java_external_receiver_owner_fqn(
-                analyzer,
-                token,
-                java,
-                session,
-                file,
-                source,
-                root,
-                object,
-                name,
-                JAVA_CHAINED_RECEIVER_LIMIT,
-            )
-        }) {
-            outcome.reference = Some(ResolvedReferenceSite {
-                path: file.to_string(),
-                text: format!("{owner_fqn}.{name}"),
-                range: node_range(node),
-                focus_start_byte: name_node.start_byte(),
-                focus_end_byte: name_node.end_byte(),
-            });
-        }
         return JavaInvocationBinding::without_receiver(outcome);
     }
 
@@ -1781,7 +1751,9 @@ fn resolve_java_field_access(
         file,
         source,
         root,
+        node,
         object,
+        field_node,
         field,
         format!("receiver for Java field `{field}` is not resolved"),
     )
@@ -1803,6 +1775,20 @@ fn resolve_java_field_access(
 /// member surface is on the far side of that import, so the report names the
 /// bound the walk stopped at instead of claiming nothing declares the member
 /// (#2048).
+///
+/// A receiver typed by an instance *variable* hides the same boundary behind
+/// the variable name. Workspace receiver typing has already answered nothing
+/// above, so the receiver's written declared type names no indexed class; when
+/// the external declaration surface (classpath artifacts plus activated
+/// declaration-fact packs) names that type, the call's canonical external
+/// identity is `<owner FQN>.<member>` (#2354). That is the one identity an
+/// unmaterialized external callee leaves behind, and both consumers must read
+/// it from one publication: the call-binding path reads it as the resolved
+/// reference text, and the trace publishes it as the boundary row (#3466).
+/// Without the row an instance call on an external type
+/// (`request.getParameter(...)`) carried only its syntactic receiver *variable*
+/// name in the trace, which no summary can match, while `call_bindings`
+/// resolved the very same call end to end.
 #[allow(clippy::too_many_arguments)]
 fn java_unresolved_receiver_outcome(
     analyzer: &dyn IAnalyzer,
@@ -1811,7 +1797,9 @@ fn java_unresolved_receiver_outcome(
     file: &ProjectFile,
     source: &str,
     root: Node<'_>,
+    node: Node<'_>,
     object: Node<'_>,
+    member_node: Node<'_>,
     member: &str,
     unresolved_message: String,
 ) -> DefinitionLookupOutcome {
@@ -1820,35 +1808,87 @@ fn java_unresolved_receiver_outcome(
     let imported_bound = java.and_then(|java| {
         java_imported_receiver_bound(java, token, session, file, source, root, object)
     });
-    let boundary_message = match &imported_bound {
-        Some(bound) => format!(
-            "`{spelling}` reads a receiver bounded by `{bound}`, a Java type imported from outside the indexed workspace"
-        ),
-        None => format!(
-            "`{spelling}` appears to cross a Java import boundary not indexed in this workspace"
-        ),
+    let external_owner = java.and_then(|java| {
+        java_external_receiver_owner_fqn(
+            analyzer,
+            token,
+            java,
+            session,
+            file,
+            source,
+            root,
+            object,
+            member,
+            JAVA_CHAINED_RECEIVER_LIMIT,
+        )
+    });
+    let canonical = external_owner
+        .as_ref()
+        .map(|owner| format!("{}.{member}", owner.fqn));
+    let mut outcome = if let Some(owner) = external_owner
+        .as_ref()
+        .filter(|owner| owner.member_declared)
+    {
+        // gated upstream: `member_declared` is set only by the external
+        // declaration surface itself -- the classpath index or an activated
+        // declaration-fact pack answered the exact member lookup -- and
+        // workspace receiver typing already answered nothing above. A
+        // workspace declaration of the owner type or the member would have
+        // stopped the walk before this point, so the route is external by
+        // construction; a surface that names only the owner type keeps the
+        // gate's plain miss instead (#1900).
+        //
+        // The row is published under the canonical identity rather than the
+        // receiver *variable* spelling, so the trace and the call-binding path
+        // read one publication (#3466).
+        let canonical = format!("{}.{member}", owner.fqn);
+        trace::record_named_boundary(canonical.clone());
+        boundary_unchecked(
+            format!(
+                "`{canonical}` names a member of a Java type declared outside the indexed workspace"
+            ),
+            UnindexedClaim::external_boundary(canonical, ClaimSubjectRole::Member),
+        )
+    } else {
+        gated_boundary(
+            || {
+                let imported_bound_is_none = imported_bound.is_none();
+                let member_is_none = java.is_none_or(|java| {
+                    let member = session.query_optional_row(|| {
+                        java.resolve_member_name_with_external(
+                            token,
+                            analyzer.semantic_model_overlay(),
+                            file,
+                            &spelling,
+                        )
+                    });
+                    member.is_none()
+                });
+                imported_bound_is_none && member_is_none
+            },
+            match &imported_bound {
+                Some(bound) => format!(
+                    "`{spelling}` reads a receiver bounded by `{bound}`, a Java type imported from outside the indexed workspace"
+                ),
+                None => format!(
+                    "`{spelling}` appears to cross a Java import boundary not indexed in this workspace"
+                ),
+            },
+            UnindexedClaim::external_boundary(spelling.clone(), ClaimSubjectRole::Member),
+            "unsupported_java_receiver",
+            unresolved_message,
+        )
     };
-    gated_boundary(
-        || {
-            imported_bound.is_none()
-                && java.is_none_or(|java| {
-                    session
-                        .query_optional_row(|| {
-                            java.resolve_member_name_with_external(
-                                token,
-                                analyzer.semantic_model_overlay(),
-                                file,
-                                &spelling,
-                            )
-                        })
-                        .is_none()
-                })
-        },
-        boundary_message,
-        UnindexedClaim::external_boundary(spelling.clone(), ClaimSubjectRole::Member),
-        "unsupported_java_receiver",
-        unresolved_message,
-    )
+    if let Some(canonical) = canonical {
+        outcome.reference = Some(ResolvedReferenceSite {
+            path: file.to_string(),
+            text: canonical,
+            range: node_range(node),
+            focus_start_byte: member_node.start_byte(),
+            focus_end_byte: member_node.end_byte(),
+        });
+    }
+    outcome
 }
 
 /// How many chained calls the receiver ladder walks inward before it refuses
@@ -1861,8 +1901,42 @@ fn java_unresolved_receiver_outcome(
 /// rather than a partial identity.
 const JAVA_CHAINED_RECEIVER_LIMIT: usize = 8;
 
-/// The fully-qualified name of the external type a receiver's written declared
-/// type spells, or `None` when no external declaration names it.
+/// The external owner a receiver's written declared type resolves to, and
+/// whether that same declaration surface proved the member the call spells.
+///
+/// The two travel together because the #3466 shared publication needs both:
+/// `fqn` is the owner half of the canonical external-callee identity
+/// `<owner FQN>.<member>`, and `member_declared` decides whether that identity
+/// is a proven boundary crossing or only a spelling. A surface that names the
+/// owner type while the member lookup answers nothing proves nothing about the
+/// member (#1900), so its call keeps the gate's plain miss and records no
+/// route.
+#[derive(Debug)]
+struct JavaExternalOwner {
+    fqn: String,
+    member_declared: bool,
+}
+
+impl JavaExternalOwner {
+    /// The owner type is decided, the member is not.
+    fn type_only(fqn: String) -> Self {
+        Self {
+            fqn,
+            member_declared: false,
+        }
+    }
+
+    /// The declaration surface that named the owner also declared the member.
+    fn with_declared_member(fqn: String) -> Self {
+        Self {
+            fqn,
+            member_declared: true,
+        }
+    }
+}
+
+/// The external type a receiver's written declared type spells, or `None` when
+/// no external declaration names it.
 ///
 /// Called only after workspace receiver typing produced nothing, so the
 /// spelling here is by construction one that resolved to no indexed class. The
@@ -1886,7 +1960,7 @@ fn java_external_receiver_owner_fqn(
     object: Node<'_>,
     member_name: &str,
     chain_budget: usize,
-) -> Option<String> {
+) -> Option<JavaExternalOwner> {
     if let Some(type_node) = java_receiver_type_node(session, file, source, root, object) {
         let normalized = normalize_java_type_text(java_node_text(type_node, source));
         if !normalized.is_empty()
@@ -1894,7 +1968,7 @@ fn java_external_receiver_owner_fqn(
                 type_node, source, normalized,
             )
             .is_none()
-            && let Some(fqn) = java_resolved_type_owner_fqn(
+            && let Some(owner) = java_resolved_type_owner_fqn(
                 analyzer,
                 token,
                 java,
@@ -1904,7 +1978,7 @@ fn java_external_receiver_owner_fqn(
                 member_name,
             )
         {
-            return Some(fqn);
+            return Some(owner);
         }
     }
     // #2454: a receiver that is itself a call writes its type nowhere in the
@@ -2008,7 +2082,7 @@ fn java_external_call_return_type_fqn(
         return None;
     }
     let object = call.child_by_field_name("object")?;
-    let owner_fqn = java_external_receiver_owner_fqn(
+    let owner = java_external_receiver_owner_fqn(
         analyzer,
         token,
         java,
@@ -2025,7 +2099,7 @@ fn java_external_call_return_type_fqn(
             token,
             analyzer.semantic_model_overlay(),
             file,
-            &format!("{owner_fqn}.{member_name}"),
+            &format!("{}.{member_name}", owner.fqn),
         )
     })?;
     member.declared_return_type_fqn().map(str::to_owned)
@@ -2039,7 +2113,7 @@ fn java_resolved_type_owner_fqn(
     file: &ProjectFile,
     normalized: &str,
     member_name: &str,
-) -> Option<String> {
+) -> Option<JavaExternalOwner> {
     if let Some(resolution) = session.query_optional_row(|| {
         java.resolve_type_name_with_external(
             token,
@@ -2062,14 +2136,14 @@ fn java_resolved_type_owner_fqn(
                 &format!("{}.{member_name}", external_type.fqn()),
             )
         }) {
-            return Some(
+            return Some(JavaExternalOwner::with_declared_member(
                 member
                     .fqn()
                     .rsplit_once('.')
                     .map_or_else(|| member.fqn().to_owned(), |(owner, _)| owner.to_owned()),
-            );
+            ));
         }
-        return Some(external_type.fqn().to_owned());
+        return Some(JavaExternalOwner::type_only(external_type.fqn().to_owned()));
     }
     // The overlay and jar index can both be empty in an inline fixture. An
     // explicit single-type import is still file-local structured evidence of
@@ -2077,7 +2151,7 @@ fn java_resolved_type_owner_fqn(
     if let Some(imported) =
         session.query_optional_row(|| java.explicit_imported_type_fqn(token, file, normalized))
     {
-        return Some(imported);
+        return Some(JavaExternalOwner::type_only(imported));
     }
 
     // java.lang is implicitly imported into every compilation unit. A golden
@@ -2095,7 +2169,7 @@ fn java_resolved_type_owner_fqn(
         .filter(|models| {
             models.has_receiverless_procedure_summary_member("java", &owner, member_name)
         })
-        .map(|_| owner)
+        .map(|_| JavaExternalOwner::with_declared_member(owner))
 }
 
 /// The written bound of a type-parameter receiver whose bound this file imports

@@ -101,9 +101,27 @@ an explicit release-preparation step.
 Releases are stabilized on a dedicated RC branch rather than directly on
 `master`. Development on `master` moves quickly and may continue throughout a
 release build, so tagging its moving tip can accidentally include changes that
-were not part of the release candidate. An RC branch freezes a known-stable
-commit while still allowing narrowly scoped release fixes and repeatable
-validation against one immutable source line.
+were not part of the release candidate. An RC branch freezes a certified commit
+while still allowing narrowly scoped release fixes and repeatable validation
+against one immutable source line.
+
+The protected `release-ready` branch records the newest `master` commit that
+has passed all promotion evidence at that exact SHA. The periodic and manually
+dispatchable `promote-release-ready.yml` reconciler reviews each candidate by
+its immutable SHA, not the moving branch tip. It advances the ref only when
+CI, Hourly CI, and Release analyzer validation all report terminal success;
+Release analyzer validation includes policy analysis and performance evidence
+whose artifact digest is verified. Promotion is a fast-forward only, records
+the evidence used, and never resets the performance baseline. If evidence is
+missing, pending, failed, or skipped, the branch stays where it is. Nightly and
+other full benchmark suites remain valuable but are not part of that promotion
+guarantee.
+
+`release-ready` is operated by the reconciler, not edited by people. GitHub
+branch rules must reject deletion and non-fast-forward updates with no bypass
+actors. A new `release-ready` branch may be created only at a commit the same
+reconciler has qualified. Development fixes still land on `master`, which lets
+ordinary review and repair continue independently of promotion.
 
 Rust third-party license HTML is generated rather than committed. Release
 workflows generate it automatically. To inspect or package it locally, install
@@ -198,9 +216,10 @@ To cut a release:
    Confirm that each crate exists on crates.io and has the required trusted
    publisher. Bootstrap any new crate before release preparation. Do not use
    the version release to create a crate for the first time.
-2. Select a known-stable commit from `master` and create a dedicated RC branch
-   from that exact commit, for example `dave/v0.8.22-rc`. Push the branch so the
-   candidate and any subsequent stabilization fixes are preserved remotely.
+2. Resolve the current `release-ready` head to its exact SHA and create a
+   dedicated RC branch from that commit, for example `dave/v0.8.22-rc`. Push
+   the branch so the candidate and any subsequent stabilization fixes are
+   preserved remotely.
    Do not merge the moving `master` tip into the RC branch during stabilization;
    bring over only changes that are deliberately required for the release.
 3. Regenerate the tracked projection inventory from the frozen RC commit, using
@@ -283,8 +302,10 @@ To cut a release:
    each release-only promotion gate has an equivalent pre-tag check, and run it
    on the frozen RC commit.
 7. Sync the release version projection and every stabilization fix from the RC
-   branch back to `master`. An RC-only fix is not complete until its equivalent
-   has landed on `master`; use a cherry-pick or an equivalent focused commit and
+   branch back to `master`. A release repair normally lands on `master` first;
+   it then follows the same checks and promotion rules before it can reach
+   `release-ready`. An RC-only fix is not complete until its equivalent has
+   landed on `master`; use a cherry-pick or an equivalent focused commit and
    resolve any conflicts against current `master` deliberately. Changes that
    land on `master` after the branch point remain outside the release unless
    they are explicitly selected for the RC branch.
@@ -480,16 +501,17 @@ the VS Code release attachment and Marketplace publication separately.
 
 Use one explicit handoff from source projection to release publication:
 
-0. Cut a release branch in the private repository at the reviewed source
-   commit, and treat that branch as the release line for every later step. A
-   qualification takes about an hour and private `master` takes a commit every
+0. Cut a release branch in the private repository at the exact certified
+   `release-ready` SHA, and treat that branch as the release line for every
+   later step. A qualification takes about an hour and private `master` takes
+   a commit every
    few minutes, so a correction based on the qualified source is routinely not
    a fast-forward of `master` by the time it can be made. The release branch is
    the ref that holds still for the length of a release. Merge it back into
    `master` after the tag exists. A remote branch named `vX.Y.Z-rc` or
-   `*/vX.Y.Z-rc` also locks the four-hour scheduled projection of private
-   `master` while its version is newer than the latest stable public tag, so
-   scheduled publication cannot move public `master` during this handoff.
+   `*/vX.Y.Z-rc` also locks the scheduled projection of private `release-ready`
+   while its version is newer than the latest stable public tag, so scheduled
+   publication cannot move public `master` during this handoff.
    Delete an abandoned RC branch to release its lock.
 1. Project the release branch's commit to public `master`, then wait for
    public CI to validate that projection.

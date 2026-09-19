@@ -1417,14 +1417,31 @@ fn source_hierarchy(
     source_path: &str,
     declaration: &str,
 ) -> Vec<HierarchyFact> {
-    let mut result = Vec::new();
+    let mut containers = Vec::new();
     for (field, hierarchy_kind) in [
         ("superclass", HierarchyKind::Extends),
         ("interfaces", HierarchyKind::Implements),
     ] {
-        let Some(container) = node.child_by_field_name(field) else {
-            continue;
-        };
+        if let Some(container) = node.child_by_field_name(field) {
+            containers.push((container, hierarchy_kind));
+        }
+    }
+    // `interface A extends B` spells its superinterfaces in an
+    // `extends_interfaces` child, which is not one of the fields above: the
+    // declaration carries no `superclass` and no `interfaces` field at all.
+    // The class-file producer records every interface-table entry as
+    // `Implements` because the format does not distinguish an interface's
+    // superinterfaces from a class's, and both halves of one dependency's
+    // facts are merged, so the source producer matches that representation
+    // (#3466).
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() == "extends_interfaces" {
+            containers.push((child, HierarchyKind::Implements));
+        }
+    }
+    let mut result = Vec::new();
+    for (container, hierarchy_kind) in containers {
         for candidate in hierarchy_type_nodes(container) {
             if let Some(target) = source_type_ref(
                 candidate,
@@ -3486,6 +3503,66 @@ mod tests {
         assert_eq!(invalid.diagnostics.len(), 1);
         assert!(invalid.suppressed_diagnostics.total() >= 2);
         assert!(invalid.pack.is_none());
+    }
+
+    #[test]
+    fn a_source_interface_extends_records_its_superinterfaces() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_jar = temp.path().join("extends-sources.jar");
+        {
+            let file = fs::File::create(&source_jar).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            for (name, source) in [
+                (
+                    "fixture/api/Parent.java",
+                    "package fixture.api;\npublic interface Parent {\n  String getParameter(String name);\n}\n",
+                ),
+                (
+                    "fixture/api/Child.java",
+                    "package fixture.api;\npublic interface Child extends Parent {}\n",
+                ),
+            ] {
+                zip.start_file(name, SimpleFileOptions::default()).unwrap();
+                zip.write_all(source.as_bytes()).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        let production = JavaJarPackProducer.produce_exact_artifact(
+            &request(source_jar, ExternalArtifactKind::JavaSourceJar),
+            &ArtifactProducerLimits::default(),
+        );
+        assert_eq!(
+            production.completeness,
+            Completeness::Complete,
+            "{:?}",
+            production.diagnostics
+        );
+        let pack = production.pack.as_ref().unwrap();
+        let (types, _) = declarations(pack);
+        let child = types
+            .iter()
+            .find(|fact| fact.name == "fixture.api.Child")
+            .expect("Child is declared");
+
+        // `interface Child extends Parent` spells the superinterface in an
+        // `extends_interfaces` child rather than a field. Losing that edge
+        // loses every member Child inherits, which is what a source archive
+        // has to answer for an instance call on the child type (#3466).
+        assert_eq!(child.hierarchy.len(), 1, "{:#?}", child.hierarchy);
+        let relation = &child.hierarchy[0];
+        assert_eq!(
+            relation.target,
+            TypeRef::Named {
+                name: "fixture.api.Parent".to_owned(),
+                arguments: Vec::new(),
+                nullable: false,
+            }
+        );
+        assert_eq!(
+            relation.hierarchy_kind,
+            HierarchyKind::Implements,
+            "the source half matches the class-file producer, which records every interface-table entry the same way"
+        );
     }
 
     #[test]

@@ -1535,7 +1535,7 @@ pub(super) fn execute_seed(
             impact: CodeQueryDiagnosticImpact::Incomplete,
             branch: Vec::new(),
             language: "workspace",
-            message: "callable visibility is unrecorded for at least one declaration; results that depend on it are incomplete rather than a clean miss".to_string(),
+            message: "callable visibility is unrecorded or recorded as unknown for at least one declaration; results that depend on it are incomplete rather than a clean miss".to_string(),
         exhausted_roots: Vec::new(),
         });
     }

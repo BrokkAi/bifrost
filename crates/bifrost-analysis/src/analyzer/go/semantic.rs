@@ -24,7 +24,7 @@ use crate::analyzer::tree_sitter_analyzer::{
 use crate::analyzer::{GoAnalyzer, Language, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 
-const ADAPTER_VERSION: &[u8] = b"go-value-semantics-v76";
+const ADAPTER_VERSION: &[u8] = b"go-value-semantics-v77";
 
 impl_program_semantics_provider!(GoAnalyzer, GoSemanticLowerer);
 
@@ -363,9 +363,20 @@ struct GoProcedureInventory<'tree> {
     direct_struct_fields: DirectStructFields,
     named_type_definitions: GoNamedTypeDefinitions<'tree>,
     method_inventory: GoMethodInventory,
-    /// Callee AST node -> the function literal it provably denotes, for calls
-    /// made through a stable function-valued binding.
-    indirect_callable_targets: HashMap<usize, usize>,
+    /// Callee AST node -> the callable it provably denotes, for calls made
+    /// through a stable function-valued binding.
+    indirect_callable_targets: HashMap<usize, GoIndirectCallableTarget>,
+}
+
+/// What a call through a stable function-valued binding provably denotes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GoIndirectCallableTarget {
+    /// The function literal the binding was exactly initialized with.
+    Literal(usize),
+    /// The method declaration a method-value selection on the binding's
+    /// initializer names, which the call reaches bound to that selection's
+    /// evaluated receiver.
+    Method(ProcedureId),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -997,7 +1008,9 @@ pub fn reference_assertion_payload_type_is_exact(
             bindings.push(go_callable_lexical_bindings(
                 spec,
                 prepared.source(),
+                &facts.direct_struct_fields,
                 &facts.named_type_definitions,
+                &facts.method_inventory,
                 &mut inventory,
                 cancellation,
             )?);
@@ -1482,14 +1495,16 @@ fn populate_capture_specs<'tree>(
     package_shadowing: PredeclaredShadowing,
     inventory: &mut ProcedureInventoryBuilder<'_>,
     cancellation: &CancellationToken,
-) -> Result<HashMap<usize, usize>, GoInventoryPrepassStop> {
+) -> Result<HashMap<usize, GoIndirectCallableTarget>, GoInventoryPrepassStop> {
     charge_go_inventory_prepass(inventory, cancellation)?;
     let mut lexical_bindings = Vec::with_capacity(specs.len());
     for spec in specs.iter() {
         lexical_bindings.push(go_callable_lexical_bindings(
             spec,
             source,
+            direct_struct_fields,
             named_type_definitions,
+            method_inventory,
             inventory,
             cancellation,
         )?);
@@ -1906,6 +1921,7 @@ fn collect_call_exposure_origins(
                 ) {
                     GoSelectorResolution::Method {
                         pointer_receiver: true,
+                        ..
                     } if receiver_type.is_some_and(|identity| identity.pointer_depth == 0) => {
                         // A method value saves the implicit address even when
                         // its eventual invocation is outside this procedure.
@@ -2097,6 +2113,9 @@ struct GoCallableLexicalBindings {
     /// bindings that have one. Keyed by the literal's AST node so the caller
     /// can reach the same `GoProcedureTarget` a direct literal call reaches.
     callable_literals: HashMap<GoBindingIdentity, usize>,
+    /// The method declaration a binding is exactly initialized with a
+    /// method-value selection of, for the bindings that have one.
+    callable_methods: HashMap<GoBindingIdentity, ProcedureId>,
 }
 
 fn visible_go_binding<T>(
@@ -2299,6 +2318,65 @@ fn go_prepass_expression_receiver_type(
             .checked_sub(dereference_depth)?;
         Some(proof)
     }))
+}
+
+/// The method declaration a method-value selection in value position denotes,
+/// when the selection's operand is a direct binding reference whose proved
+/// type resolves to exactly one workspace method declaration.
+///
+/// `f := c.serve` stores the very callable the call form `c.serve()` invokes,
+/// so a later `go f()` runs that bound method on the receiver the selection
+/// evaluated. Proving it here lets the call site name the same declaration
+/// instead of leaving the spawn unresolved. An operand whose type is not
+/// exactly one workspace type (an interface, or a promoted or embedded
+/// method) resolves to no single declaration and records nothing.
+#[allow(clippy::too_many_arguments)]
+fn go_prepass_method_value_target(
+    selector: Node<'_>,
+    bindings: &GoCallableLexicalBindings,
+    source: &str,
+    named_types: &GoNamedTypeDefinitions<'_>,
+    direct_struct_fields: &DirectStructFields,
+    method_inventory: &GoMethodInventory,
+    byte: usize,
+    inventory: &mut ProcedureInventoryBuilder<'_>,
+    cancellation: &CancellationToken,
+) -> Result<Option<ProcedureId>, GoInventoryPrepassStop> {
+    let Some(operand) = selector
+        .child_by_field_name("operand")
+        .map(transparent_parenthesized_expression)
+    else {
+        return Ok(None);
+    };
+    if !is_go_binding_reference_kind(operand.kind()) {
+        return Ok(None);
+    }
+    let receiver_type = go_prepass_expression_receiver_type(
+        operand,
+        bindings,
+        source,
+        named_types,
+        byte,
+        inventory,
+        cancellation,
+    )?;
+    let field_name = selector
+        .child_by_field_name("field")
+        .and_then(|field| nonempty_node_text(source, field));
+    Ok(
+        match go_same_file_selector_resolution(
+            receiver_type.and_then(|identity| identity.declaration),
+            field_name,
+            direct_struct_fields,
+            method_inventory,
+        ) {
+            GoSelectorResolution::Method { target, .. } => Some(target),
+            GoSelectorResolution::Package
+            | GoSelectorResolution::Field
+            | GoSelectorResolution::InterfaceMethod { .. }
+            | GoSelectorResolution::Unknown => None,
+        },
+    )
 }
 
 fn go_file_underlying_type<'tree>(
@@ -3232,7 +3310,9 @@ fn go_prepass_expression_storage_kind(
 fn go_callable_lexical_bindings(
     spec: &ProcedureSpec<'_>,
     source: &str,
+    direct_struct_fields: &DirectStructFields,
     named_type_definitions: &GoNamedTypeDefinitions<'_>,
+    method_inventory: &GoMethodInventory,
     inventory: &mut ProcedureInventoryBuilder<'_>,
     cancellation: &CancellationToken,
 ) -> Result<GoCallableLexicalBindings, GoInventoryPrepassStop> {
@@ -3248,6 +3328,7 @@ fn go_callable_lexical_bindings(
         channel_payload_types: HashMap::default(),
         declaration_targets: HashMap::default(),
         callable_literals: HashMap::default(),
+        callable_methods: HashMap::default(),
     };
     if let Some(layout) = formal_parameter_slots_for_owner(Language::Go, spec.callable, source) {
         for slot in layout.slots {
@@ -3571,6 +3652,24 @@ fn go_callable_lexical_bindings(
                 {
                     bindings.callable_literals.insert(identity, literal.id());
                 }
+                if exact_value_candidate
+                    && let Some(selector) = declared_value
+                        .map(transparent_parenthesized_expression)
+                        .filter(|value| value.kind() == "selector_expression")
+                    && let Some(method) = go_prepass_method_value_target(
+                        selector,
+                        &bindings,
+                        source,
+                        named_type_definitions,
+                        direct_struct_fields,
+                        method_inventory,
+                        node.start_byte(),
+                        inventory,
+                        cancellation,
+                    )?
+                {
+                    bindings.callable_methods.insert(identity, method);
+                }
             }
             let storage = if let Some(kind) = node.child_by_field_name("type") {
                 go_storage_kind_from_type(kind, source, named_type_definitions, node.start_byte())
@@ -3776,6 +3875,12 @@ fn immutable_captured_binding(
 /// later assignment, no address escape, and no implicit pointer-method
 /// address. That is the same predicate exact value captures use, so a
 /// reassigned binding stays unresolved instead of naming its first value.
+///
+/// A binding exactly initialized with a method-value selection is stable in
+/// the same sense and denotes that method: `f := c.serve; go f()` reaches the
+/// same bound method `go c.serve()` does. The selection's evaluated receiver
+/// stays in the callable the binding holds, so the call site names the method
+/// and the spawn's receiver travels through the callable's own flow.
 fn collect_indirect_callable_targets(
     specs: &[ProcedureSpec<'_>],
     lexical_bindings: &[GoCallableLexicalBindings],
@@ -3783,7 +3888,7 @@ fn collect_indirect_callable_targets(
     source: &str,
     inventory: &mut ProcedureInventoryBuilder<'_>,
     cancellation: &CancellationToken,
-) -> Result<HashMap<usize, usize>, GoInventoryPrepassStop> {
+) -> Result<HashMap<usize, GoIndirectCallableTarget>, GoInventoryPrepassStop> {
     let mut targets = HashMap::default();
     for (procedure_index, spec) in specs.iter().enumerate() {
         try_walk_named_tree_preorder(spec.body, true, |node| {
@@ -3822,12 +3927,20 @@ fn collect_indirect_callable_targets(
             let GoResolvedBinding::Local(identity) = binding else {
                 return Ok(WalkControl::Continue);
             };
-            if let Some(literal) = lexical_bindings[identity.procedure.index()]
+            let callable = lexical_bindings[identity.procedure.index()]
                 .callable_literals
                 .get(&identity)
                 .copied()
-            {
-                targets.insert(callee.id(), literal);
+                .map(GoIndirectCallableTarget::Literal)
+                .or_else(|| {
+                    lexical_bindings[identity.procedure.index()]
+                        .callable_methods
+                        .get(&identity)
+                        .copied()
+                        .map(GoIndirectCallableTarget::Method)
+                });
+            if let Some(callable) = callable {
+                targets.insert(callee.id(), callable);
             }
             Ok(WalkControl::Continue)
         })?;
@@ -4164,7 +4277,7 @@ struct LoweringContext<'tree, 'facts, 'targets, 'imports, 'procedure> {
     procedure_targets: &'imports HashMap<usize, GoProcedureTarget>,
     /// Callee AST node -> the function literal it provably denotes, proven by
     /// the prepass for calls through a stable function-valued binding.
-    indirect_callable_targets: &'imports HashMap<usize, usize>,
+    indirect_callable_targets: &'imports HashMap<usize, GoIndirectCallableTarget>,
     package_shadowing: PredeclaredShadowing,
     predeclared_shadowed: PredeclaredShadowing,
 }
@@ -4283,6 +4396,7 @@ enum GoSelectorResolution {
     Field,
     Method {
         pointer_receiver: bool,
+        target: ProcedureId,
     },
     InterfaceMethod {
         pointer_receiver: bool,
@@ -4310,6 +4424,7 @@ fn go_same_file_selector_resolution(
         .get(&(declaration, name.into()))
         .map(|method| GoSelectorResolution::Method {
             pointer_receiver: method.pointer_receiver,
+            target: method.procedure,
         })
         .unwrap_or(GoSelectorResolution::Unknown)
 }
@@ -4351,7 +4466,7 @@ fn lower_procedure<'tree>(
     package_functions: &HashMap<Box<str>, Option<(ProcedureId, Node<'tree>)>>,
     method_inventory: &GoMethodInventory,
     procedure_targets: &HashMap<usize, GoProcedureTarget>,
-    indirect_callable_targets: &HashMap<usize, usize>,
+    indirect_callable_targets: &HashMap<usize, GoIndirectCallableTarget>,
     budget: &SemanticBudget,
     cancellation: &CancellationToken,
 ) -> Result<(ProcedureSemanticsParts, SemanticWork), GoLoweringError> {
@@ -5247,6 +5362,7 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
                 match self.selector_resolution(node) {
                     GoSelectorResolution::Method {
                         pointer_receiver: true,
+                        ..
                     } if self
                         .expression_type_identity(operand, node.start_byte())
                         .is_some_and(|identity| identity.pointer_depth == 0) =>
@@ -11482,14 +11598,82 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
             {
                 let operand = required_field(node, "operand")?;
                 let boundary = self.point(builder, node, Vec::new())?;
-                self.add_gap(
-                    builder,
-                    boundary,
-                    SemanticGapSubject::Value(result),
-                    SemanticCapability::CallableReferences,
-                    SemanticGapKind::Unknown,
-                    "Go method-value selection is structured but its callable target is not yet published",
-                )?;
+                // A method-value selection in value position denotes the same
+                // bound-method callable a call on the selector produces: the
+                // receiver type resolved to exactly one method declaration, so
+                // the selection publishes that declaration as a proven local
+                // target and the evaluated operand as its bound receiver. The
+                // receiver is the evaluated operand, not a copy the producer
+                // mints here; whether it aliases the caller's object is the
+                // consumer's declared pointer-versus-value receiver rule.
+                if let GoSelectorResolution::Method {
+                    pointer_receiver,
+                    target,
+                } = self.selector_resolution(node)
+                {
+                    let receiver = self.expression_value(
+                        builder,
+                        operand,
+                        self.expression_value_kind(operand),
+                    )?;
+                    let metadata = self.metadata(boundary)?;
+                    self.append_effect(
+                        builder,
+                        boundary,
+                        SemanticEffect::CallableReference {
+                            result,
+                            callable: CallableValue {
+                                kind: CallableReferenceKind::BoundMethod,
+                                targets: CallableTargetResolution::Proven(CallableTarget::Local(
+                                    target,
+                                )),
+                                target_evidence: metadata.evidence,
+                                bound_receiver: Some(receiver),
+                                environment: None,
+                            },
+                        },
+                    )?;
+                    // Selection is the only evaluation step that can abort
+                    // here, and only one shape reaches the pointee: a
+                    // value-receiver method selected through a pointer
+                    // operand dereferences it. A value operand is copied, and
+                    // a pointer-receiver method selected through an
+                    // addressable value saves that value's address; neither
+                    // aborts.
+                    let operand_is_pointer = self
+                        .expression_type_identity(operand, node.start_byte())
+                        .is_some_and(|identity| identity.pointer_depth > 0);
+                    if !pointer_receiver && operand_is_pointer {
+                        self.add_non_rejoining_exceptional_exit_gap(
+                            builder,
+                            scope,
+                            boundary,
+                            SemanticGapSubject::Value(result),
+                            SemanticGapKind::Unknown,
+                            "a value-receiver method value selected through a pointer operand may require an implicit dereference",
+                        )?;
+                    }
+                } else {
+                    // An interface operand's dynamic type is not exact, so the
+                    // callable stays unpublished and the selection keeps its
+                    // reviewed open boundary.
+                    self.add_gap(
+                        builder,
+                        boundary,
+                        SemanticGapSubject::Value(result),
+                        SemanticCapability::CallableReferences,
+                        SemanticGapKind::Unknown,
+                        "Go method-value selection is structured but its callable target is not yet published",
+                    )?;
+                    self.add_non_rejoining_exceptional_exit_gap(
+                        builder,
+                        scope,
+                        boundary,
+                        SemanticGapSubject::Value(result),
+                        SemanticGapKind::Unknown,
+                        "method-value selection may require an implicit dereference",
+                    )?;
+                }
                 self.add_gap(
                     builder,
                     boundary,
@@ -11497,14 +11681,6 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
                     SemanticCapability::DynamicDispatch,
                     SemanticGapKind::Unknown,
                     "Go method-value dispatch requires complete method-set refinement",
-                )?;
-                self.add_non_rejoining_exceptional_exit_gap(
-                    builder,
-                    scope,
-                    boundary,
-                    SemanticGapSubject::Value(result),
-                    SemanticGapKind::Unknown,
-                    "method-value selection may require an implicit dereference",
                 )?;
                 self.edge(builder, boundary, next)?;
                 self.schedule_expressions(
@@ -12282,8 +12458,8 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
         // or through a binding the prepass proved stable and function-valued.
         // Both reach the same `GoProcedureTarget`, so the two spellings of one
         // call cannot disagree about what it denotes.
-        let literal = if direct_function.kind() == "func_literal" {
-            Some(direct_function.id())
+        let callable = if direct_function.kind() == "func_literal" {
+            Some(GoIndirectCallableTarget::Literal(direct_function.id()))
         } else {
             self.indirect_callable_targets
                 .get(&direct_function.id())
@@ -12292,12 +12468,16 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
         let resolution = interface_dispatch
             .as_ref()
             .map(|proof| CallableTargetResolution::Proven(CallableTarget::Local(proof.target)))
-            .or_else(|| {
-                literal
-                    .and_then(|literal| self.procedure_targets.get(&literal))
-                    .map(|target| {
+            .or_else(|| match callable {
+                Some(GoIndirectCallableTarget::Literal(literal)) => {
+                    self.procedure_targets.get(&literal).map(|target| {
                         CallableTargetResolution::Proven(CallableTarget::Local(target.id))
                     })
+                }
+                Some(GoIndirectCallableTarget::Method(target)) => Some(
+                    CallableTargetResolution::Proven(CallableTarget::Local(target)),
+                ),
+                None => None,
             })
             .or_else(|| {
                 self.package_function_target(direct_function)
@@ -13662,6 +13842,7 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
         match resolution {
             GoSelectorResolution::Method {
                 pointer_receiver: true,
+                ..
             }
             | GoSelectorResolution::InterfaceMethod {
                 pointer_receiver: true,
@@ -13671,6 +13852,7 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
             | GoSelectorResolution::Field
             | GoSelectorResolution::Method {
                 pointer_receiver: false,
+                ..
             }
             | GoSelectorResolution::InterfaceMethod {
                 pointer_receiver: false,
@@ -20720,16 +20902,40 @@ func selectors(holder Holder, unknown external.Holder) {
             .collect::<Vec<_>>();
         assert!(load_results.contains(&"unknown.callback"), "{procedure:#?}");
         assert!(!load_results.contains(&"holder.invoke"), "{procedure:#?}");
-        for capability in [
-            SemanticCapability::CallableReferences,
-            SemanticCapability::DynamicDispatch,
-        ] {
-            assert!(procedure.gaps.iter().any(|gap| {
-                gap.capability == capability
-                    && matches!(gap.subject, SemanticGapSubject::Value(value)
-                        if source_text(SOURCE, value_source_span(procedure, value)) == "holder.invoke")
-            }));
-        }
+        // `holder.invoke` resolves to this file's one `invoke` method, so the
+        // selection publishes the bound-method callable (issue #3469) and only
+        // the dispatch-refinement boundary remains on it. The callable-
+        // reference gap belongs to the unknown selector alone.
+        let published = procedure
+            .points
+            .iter()
+            .flat_map(|point| &point.events)
+            .find_map(|event| match &event.effect {
+                SemanticEffect::CallableReference { result, callable }
+                    if source_text(SOURCE, value_source_span(procedure, *result))
+                        == "holder.invoke" =>
+                {
+                    Some(callable)
+                }
+                _ => None,
+            })
+            .expect("the exact method value publishes a callable");
+        assert_eq!(published.kind, CallableReferenceKind::BoundMethod);
+        assert!(matches!(
+            published.targets,
+            CallableTargetResolution::Proven(CallableTarget::Local(_))
+        ));
+        assert!(published.bound_receiver.is_some());
+        assert!(procedure.gaps.iter().any(|gap| {
+            gap.capability == SemanticCapability::DynamicDispatch
+                && matches!(gap.subject, SemanticGapSubject::Value(value)
+                    if source_text(SOURCE, value_source_span(procedure, value)) == "holder.invoke")
+        }));
+        assert!(!procedure.gaps.iter().any(|gap| {
+            gap.capability == SemanticCapability::CallableReferences
+                && matches!(gap.subject, SemanticGapSubject::Value(value)
+                    if source_text(SOURCE, value_source_span(procedure, value)) == "holder.invoke")
+        }));
         assert!(procedure.gaps.iter().any(|gap| {
             gap.capability == SemanticCapability::FieldMemory
                 && gap.impacts.contains(SemanticGapImpact::HeapRead)

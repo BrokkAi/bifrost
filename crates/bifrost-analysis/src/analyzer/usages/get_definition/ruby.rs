@@ -1459,15 +1459,13 @@ fn ruby_method_outcome(
         return no_definition("no_reference_text", "Ruby method reference is blank");
     }
 
-    let receiver = match call.and_then(|call| call.child_by_field_name("receiver")) {
+    let receiver_node = call.and_then(|call| call.child_by_field_name("receiver"));
+    let receiver = match receiver_node {
         Some(receiver) => context.receiver_type(receiver),
         None => context.enclosing_receiver(),
     };
     let Some(receiver) = receiver else {
-        return no_definition(
-            "unsupported_ruby_receiver",
-            format!("receiver for Ruby method `{member}` is not resolved"),
-        );
+        return ruby_unresolved_receiver_outcome(semantic, context, receiver_node, member, source);
     };
 
     let bare = call
@@ -1525,6 +1523,58 @@ fn ruby_method_outcome(
         );
     }
     candidates_outcome(candidates)
+}
+
+/// A method call whose receiver is written as a constant path names its owner
+/// as a class or module (`ENV.fetch`, `Widget::Config.fetch`). When workspace
+/// receiver typing answered nothing above, the receiver path is not one of the
+/// workspace's declarations; this helper decides whether the call's owner is
+/// nevertheless a workspace name.
+///
+/// [`RubySemanticIndex::declares_constant_anywhere`] is the same
+/// visibility-blind workspace gate the constant-reference boundary uses
+/// (#1089): a project file that declares the path without being required still
+/// makes this a workspace-internal miss, and the report stays
+/// `unsupported_ruby_receiver`. Only once no workspace file declares the path
+/// does the written constant become the structured fact that places the
+/// method's owner outside the indexed workspace (#3466). The published
+/// identity is the call's own `<receiver>.<member>` spelling -- the same one
+/// `call_bindings` reports for the call site.
+fn ruby_unresolved_receiver_outcome(
+    semantic: &RubySemanticIndex<'_>,
+    context: &RubyLookupContext<'_>,
+    receiver: Option<Node<'_>>,
+    member: &str,
+    source: &str,
+) -> DefinitionLookupOutcome {
+    let unresolved = || {
+        no_definition(
+            "unsupported_ruby_receiver",
+            format!("receiver for Ruby method `{member}` is not resolved"),
+        )
+    };
+    let Some(receiver) =
+        receiver.filter(|receiver| matches!(receiver.kind(), "constant" | "scope_resolution"))
+    else {
+        return unresolved();
+    };
+    if semantic.declares_constant_anywhere(&context.lexical_stack, receiver, source) {
+        return unresolved();
+    }
+    let receiver_text = ruby_node_text(receiver, source);
+    if receiver_text.is_empty() {
+        return unresolved();
+    }
+    let reference = format!("{receiver_text}.{member}");
+    trace::record_named_boundary(reference.clone());
+    // gated upstream: `declares_constant_anywhere` answered the workspace
+    // half above, over every file, before this boundary is published.
+    boundary_unchecked(
+        format!(
+            "`{reference}` is a member of `{receiver_text}`, a Ruby class or module declared outside the indexed workspace"
+        ),
+        UnindexedClaim::external_boundary(receiver_text, ClaimSubjectRole::Any),
+    )
 }
 
 /// The route the Ruby method walk took from the receiver's own owner to the

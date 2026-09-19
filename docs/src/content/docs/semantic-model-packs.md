@@ -65,6 +65,19 @@ When the document is absent, the shared host path selects every ecosystem that
 serves a language present in the workspace. An explicit `enable` entry can
 satisfy a pack's `review_required` gate; it cannot bypass compatibility checks.
 
+The same transaction mints workspace evidence the reviewed runtime packs need.
+Besides one intrinsic language/ecosystem row per present language, a workspace
+whose root `package.json` (`engines.node` or `volta.node`), `.nvmrc`, or
+`.node-version` pins the reviewed Node revision `22.11.0` supplies one Node
+artifact row per present JavaScript/TypeScript language. The row carries the
+reviewed distribution-archive digest and profile configuration, so the shipped
+runtime-values packs activate with the same evidence the in-process tests
+supply. A workspace that pins another revision, or pins nothing, mints no such
+row; the pack stays `incompatible` and the activation report's reason names the
+artifact coordinate and the reviewed predicates it requires. Only a declaration
+of the exact reviewed revision counts -- a range such as `>=22` or a moving
+label such as `lts/*` names no reviewed artifact.
+
 ## Offline image-build installation
 
 A release can provide a standalone semantic-pack installer for
@@ -1225,6 +1238,15 @@ control naming the pack id. The activation report retains that enable
 decision, and published endpoints retain the exposure, behavior, and
 active-model-set identities.
 
+A workspace supplies that evidence by declaring the reviewed Node revision in
+its root `package.json` (`engines.node` or `volta.node`), `.nvmrc`, or
+`.node-version`. The declaration is code-runtime evidence about the analyzed
+program's runtime, not a configuration document: it is how the workspace states
+that the code under analysis runs on the reviewed `22.11.0` distribution. Only
+that exact revision resolves to the reviewed archive digest and profile
+configuration, so no other pin, and no `enable` entry alone, can select the
+pack.
+
 Authored packs carry no binding evidence or observations. Only
 workspace-derived analyzer evidence can authoritatively describe lexical
 bindings, writes, keyed loads, and observation identity in a particular
@@ -1233,7 +1255,8 @@ behavior records with the workspace's own syntax and executable-semantic
 facts. Lexically bound roots are conclusively excluded; reassignment,
 dynamic keys, unsupported runtimes and profiles, and incomplete analysis
 stay typed incomplete. Configuration documents can neither activate nor
-intersect the code runtime-value domain.
+intersect the code runtime-value domain; a `.bifrost/packs.json` entry names a
+pack for the review gate but is not runtime evidence.
 
 ## Canonical artifacts and digests
 

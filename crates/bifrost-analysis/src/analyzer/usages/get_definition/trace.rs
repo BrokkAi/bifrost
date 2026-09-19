@@ -1362,6 +1362,7 @@ mod boundary_evidence_tests {
         CatalogCoordinate, DependencyDiscoveryOutcome, ResolvedDependency,
         SemanticModelActivationEvidence,
     };
+    use crate::analyzer::structural::occurrences::OccurrenceRole;
     use crate::analyzer::usages::get_definition::DefinitionLookupRequest;
     use crate::analyzer::{AnalyzerConfig, Language, Project, TestProject, WorkspaceAnalyzer};
     use crate::analyzer::{AnalyzerQueryScope, QueryScope};
@@ -1486,6 +1487,81 @@ mod boundary_evidence_tests {
             .filter(|row| matches!(row.candidate, TraceCandidateRef::ExternalRoute { .. }))
             .map(|row| (row.boundary, row.external_target.clone()))
             .collect()
+    }
+
+    /// The written names of one trace's external-route rows, in order.
+    fn route_names(trace: &ResolutionTraceResult) -> Vec<String> {
+        trace
+            .candidates
+            .iter()
+            .filter_map(|row| match &row.candidate {
+                TraceCandidateRef::ExternalRoute { name } => Some(name.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Whether the traced occurrence row at the reference starting with
+    /// `needle` carries the route row the definition trace published.
+    ///
+    /// This is the exact join `candidates_of` performs: it re-locates a
+    /// reference occurrence in the traced file by AST identity and reads the
+    /// candidate rows hanging off it. Both consumers reading one publication
+    /// means this row exists and carries the route (#3466).
+    fn assert_boundary_route_joins_occurrence(
+        fixture: &BoundaryFixture,
+        needle: &str,
+        role: OccurrenceRole,
+    ) {
+        use crate::analyzer::structural::occurrence_rows::{
+            OccurrenceDerivationOptions, occurrences_for_file_with_options,
+        };
+
+        let start = fixture
+            .source
+            .find(needle)
+            .unwrap_or_else(|| panic!("fixture does not contain {needle:?}"));
+        let result = occurrences_for_file_with_options(
+            fixture.workspace.analyzer(),
+            &fixture.file,
+            OccurrenceDerivationOptions::WITH_CANDIDATES,
+            &CancellationToken::new(),
+        )
+        .expect("occurrence rows");
+        let row = result
+            .rows
+            .iter()
+            .find(|row| row.range.start_byte == start)
+            .unwrap_or_else(|| {
+                panic!(
+                    "no occurrence row starts at byte {start} ({needle:?}): {:#?}",
+                    result
+                        .rows
+                        .iter()
+                        .map(|row| (&row.raw_spelling, row.role))
+                        .collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(
+            row.role, role,
+            "the reference token `{needle}` is the row candidates_of joins on"
+        );
+        let candidates = row
+            .candidates
+            .as_ref()
+            .unwrap_or_else(|| panic!("no candidates derived for `{needle}`"));
+        let routes = candidates
+            .candidates
+            .iter()
+            .filter(|candidate| {
+                matches!(candidate.candidate, TraceCandidateRef::ExternalRoute { .. })
+            })
+            .count();
+        assert_eq!(
+            routes, 1,
+            "the occurrence row carries the one route row the definition trace published: {:#?}",
+            candidates.candidates
+        );
     }
 
     /// A reference whose failing segment stays inside the workspace: the status
@@ -2788,6 +2864,302 @@ mod boundary_evidence_tests {
                 .all(|(boundary, _)| *boundary == BoundaryStatus::ExternalUnknown),
             "a member no class file declares must not be upgraded: {routes:?}"
         );
+    }
+
+    /// #3466: an instance-receiver member call on an external type beside a
+    /// workspace-local same-name member. The workspace receiver typing answers
+    /// nothing for the servlet type, and the external declaration surface is
+    /// the class jar below.
+    const SERVLET_FIXTURE_SOURCE: &str = concat!(
+        "package fixture;\n",
+        "\n",
+        "import jakarta.servlet.http.HttpServletRequest;\n",
+        "\n",
+        "final class SameNameRequest {\n",
+        "  String getParameter(String name) { return name; }\n",
+        "}\n",
+        "\n",
+        "final class App {\n",
+        "  String positive(HttpServletRequest servletRequest) {\n",
+        "    return servletRequest.getParameter(\"user\");\n",
+        "  }\n",
+        "\n",
+        "  String sameName(SameNameRequest decoyRequest) {\n",
+        "    return decoyRequest.getParameter(\"name\");\n",
+        "  }\n",
+        "}\n",
+    );
+
+    fn write_servlet_api_jar(path: &Path) {
+        use crate::analyzer::jvm::external::{
+            TestClassFile, TestClassMethod, write_test_class_jar,
+        };
+
+        write_test_class_jar(
+            path,
+            &[
+                TestClassFile {
+                    internal_name: "jakarta/servlet/ServletRequest",
+                    super_internal_name: "java/lang/Object",
+                    methods: &[TestClassMethod {
+                        name: "getParameter",
+                        descriptor: "(Ljava/lang/String;)Ljava/lang/String;",
+                        is_static: false,
+                    }],
+                    private_nested: false,
+                },
+                TestClassFile {
+                    internal_name: "jakarta/servlet/http/HttpServletRequest",
+                    super_internal_name: "jakarta/servlet/ServletRequest",
+                    methods: &[],
+                    private_nested: false,
+                },
+            ],
+        );
+    }
+
+    /// The shared publication for an instance-receiver member call on an
+    /// external type: the outcome is the boundary, its resolved reference text
+    /// is the canonical external identity, and the route row names that same
+    /// identity with the external declaration the resolver landed on. Before
+    /// #3466 the outcome stayed `NoDefinition` and the trace had no row, while
+    /// `call_bindings` read the same call's canonical identity end to end.
+    #[test]
+    fn instance_receiver_member_call_publishes_the_external_route_row() {
+        let jars = tempfile::tempdir().expect("jar dir");
+        let jar = jars.path().join("servlet-api.jar");
+        write_servlet_api_jar(&jar);
+        let fixture = BoundaryFixture::with_config(
+            Language::Java,
+            "src/App.java",
+            SERVLET_FIXTURE_SOURCE,
+            |_| jvm_config_with_artifact_jar(Some(jar.clone())),
+        );
+
+        let (outcome, trace) = fixture.trace("getParameter(\"user\")");
+        assert_eq!(
+            outcome.status,
+            DefinitionLookupStatus::UnresolvableImportBoundary,
+            "an instance call on an external type is the boundary it crossed: {:?}",
+            outcome.diagnostics
+        );
+        assert_eq!(
+            outcome.resolved_reference_target(),
+            Some("jakarta.servlet.ServletRequest.getParameter"),
+            "the boundary names the declaration the external surface resolved: {:?}",
+            outcome.diagnostics
+        );
+        assert_eq!(
+            external_routes(&trace),
+            vec![(
+                BoundaryStatus::ExternalIndexed,
+                Some("jakarta.servlet.ServletRequest.getParameter".to_string()),
+            )],
+            "the same identity is the one candidate row the trace publishes: {:#?}",
+            trace.candidates
+        );
+        assert!(
+            trace
+                .selected()
+                .any(|row| row.boundary == BoundaryStatus::ExternalIndexed),
+            "the external declaration is the answer this reference resolved to: {:#?}",
+            trace.candidates
+        );
+    }
+
+    /// The decoy half of #3466: the workspace-local member of the same name is
+    /// still an ordinary in-workspace resolution. Nothing about the external
+    /// call makes a same-name workspace member a boundary.
+    #[test]
+    fn workspace_same_name_member_decoy_stays_in_workspace() {
+        let jars = tempfile::tempdir().expect("jar dir");
+        let jar = jars.path().join("servlet-api.jar");
+        write_servlet_api_jar(&jar);
+        let fixture = BoundaryFixture::with_config(
+            Language::Java,
+            "src/App.java",
+            SERVLET_FIXTURE_SOURCE,
+            |_| jvm_config_with_artifact_jar(Some(jar.clone())),
+        );
+
+        let (outcome, trace) = fixture.trace("getParameter(\"name\")");
+        assert_eq!(
+            outcome.status,
+            DefinitionLookupStatus::Resolved,
+            "a workspace member is a resolved definition, not a boundary: {:?}",
+            outcome.diagnostics
+        );
+        assert_eq!(
+            outcome
+                .definitions
+                .iter()
+                .map(|unit| unit.fq_name())
+                .collect::<Vec<_>>(),
+            vec!["fixture.SameNameRequest.getParameter".to_string()],
+            "the decoy's own declaration is the answer: {:?}",
+            outcome.diagnostics
+        );
+        assert!(
+            route_rows(&trace).is_empty(),
+            "a workspace resolution reports no route out of the workspace: {:#?}",
+            trace.candidates
+        );
+    }
+
+    /// #3466: a static member call whose receiver is a bare external type
+    /// qualifier. No value channel of the workspace declares `Environment` and
+    /// no indexed assembly owns it, so the receiver identifier is the type the
+    /// member is qualified with, and the call crossed a boundary. Before the fix
+    /// the same call answered `unsupported_csharp_receiver` with no route row
+    /// while `call_bindings` resolved the identical written reference.
+    #[test]
+    fn a_csharp_static_member_call_on_an_unindexed_type_publishes_its_route_row() {
+        let source = concat!(
+            "namespace App;\n",
+            "class Caller {\n",
+            "    string Go() { return Environment.GetEnvironmentVariable(\"PATH\"); }\n",
+            "}\n",
+        );
+        let fixture = BoundaryFixture::new(Language::CSharp, "src/App.cs", source);
+        let (outcome, trace) = fixture.trace("GetEnvironmentVariable");
+        assert_eq!(
+            outcome.status,
+            DefinitionLookupStatus::UnresolvableImportBoundary,
+            "a member on a type the workspace does not index is a boundary: {:?}",
+            outcome.diagnostics
+        );
+        assert_eq!(
+            outcome.resolved_reference_target(),
+            Some("Environment.GetEnvironmentVariable"),
+            "the boundary names the written member identity: {:?}",
+            outcome.diagnostics
+        );
+        assert_eq!(
+            route_names(&trace),
+            vec!["Environment.GetEnvironmentVariable".to_string()],
+            "the trace publishes one route row under the same identity: {:#?}",
+            trace.candidates
+        );
+        assert_eq!(
+            external_routes(&trace),
+            vec![(BoundaryStatus::ExternalUnknown, None)],
+            "no assembly index is configured, so the row names the boundary without sharpening it"
+        );
+        assert_boundary_route_joins_occurrence(
+            &fixture,
+            "GetEnvironmentVariable",
+            OccurrenceRole::MemberPosition,
+        );
+    }
+
+    /// #3466: `ENV.fetch` is a method call on a constant no workspace file
+    /// declares, and no activated pack or retained discovery claims it. The
+    /// call's written `<receiver>.<member>` identity is one boundary row, the
+    /// same identity `call_bindings` reports for the call site.
+    #[test]
+    fn a_ruby_external_constant_receiver_call_publishes_its_route_row() {
+        let fixture = BoundaryFixture::new(Language::Ruby, "app.rb", "ENV.fetch(\"PATH\")\n");
+        let (outcome, trace) = fixture.trace("fetch");
+        assert_eq!(
+            outcome.status,
+            DefinitionLookupStatus::UnresolvableImportBoundary,
+            "a method on a module declared outside the workspace is a boundary: {:?}",
+            outcome.diagnostics
+        );
+        assert_eq!(
+            outcome.resolved_reference_target(),
+            Some("ENV.fetch"),
+            "the boundary names the written member identity: {:?}",
+            outcome.diagnostics
+        );
+        assert_eq!(
+            route_names(&trace),
+            vec!["ENV.fetch".to_string()],
+            "the trace publishes one route row under the same identity: {:#?}",
+            trace.candidates
+        );
+        assert_eq!(
+            external_routes(&trace),
+            vec![(BoundaryStatus::ExternalUnknown, None)],
+            "nothing has discovered a gem for `ENV`, so the row names the boundary without sharpening it"
+        );
+        assert_boundary_route_joins_occurrence(&fixture, "fetch", OccurrenceRole::MemberPosition);
+    }
+
+    /// The workspace guard beside it: a constant receiver the workspace does
+    /// declare is an ordinary in-workspace miss, not a boundary.
+    #[test]
+    fn a_ruby_constant_receiver_declared_in_the_workspace_stays_a_plain_miss() {
+        let fixture = BoundaryFixture::new(
+            Language::Ruby,
+            "app.rb",
+            concat!("module Widget\n", "end\n", "\n", "Widget.fetch(\"PATH\")\n"),
+        );
+        assert_no_boundary_was_drawn("fetch", &fixture);
+    }
+
+    /// #3466: a C free function called across an unresolved include. Two
+    /// defects used to hide the boundary: the adapter classified no occurrence
+    /// at the callee token, leaving the traced route nothing to join against,
+    /// and the identifier call arm had no include-boundary decision. Both
+    /// halves now publish one `getenv` row.
+    #[test]
+    fn a_c_free_function_call_across_an_unindexed_include_publishes_one_row() {
+        let fixture = BoundaryFixture::new(
+            Language::Cpp,
+            "main.c",
+            "#include <stdlib.h>\nint main(void) { return getenv(\"PATH\") != 0; }\n",
+        );
+        let (outcome, trace) = fixture.trace("getenv");
+        assert_eq!(
+            outcome.status,
+            DefinitionLookupStatus::UnresolvableImportBoundary,
+            "the unresolved `<stdlib.h>` above the call makes the callee a boundary: {:?}",
+            outcome.diagnostics
+        );
+        assert_eq!(
+            outcome.resolved_reference_target(),
+            Some("getenv"),
+            "the boundary names the written callee: {:?}",
+            outcome.diagnostics
+        );
+        assert_eq!(
+            route_names(&trace),
+            vec!["getenv".to_string()],
+            "the trace publishes one route row: {:#?}",
+            trace.candidates
+        );
+        assert_eq!(
+            external_routes(&trace),
+            vec![(BoundaryStatus::ExternalUnknown, None)],
+            "no header pack is activated, so the row names the boundary without sharpening it"
+        );
+        assert_boundary_route_joins_occurrence(&fixture, "getenv", OccurrenceRole::ValueReference);
+    }
+
+    /// The C++ half of the same witness: `#include <cstdlib>` and a plain
+    /// `getenv` call.
+    #[test]
+    fn a_cpp_free_function_call_across_an_unindexed_include_publishes_one_row() {
+        let fixture = BoundaryFixture::new(
+            Language::Cpp,
+            "main.cpp",
+            "#include <cstdlib>\nint main() { return getenv(\"PATH\") != nullptr; }\n",
+        );
+        let (outcome, trace) = fixture.trace("getenv");
+        assert_eq!(
+            outcome.status,
+            DefinitionLookupStatus::UnresolvableImportBoundary,
+            "the unresolved `<cstdlib>` above the call makes the callee a boundary: {:?}",
+            outcome.diagnostics
+        );
+        assert_eq!(
+            route_names(&trace),
+            vec!["getenv".to_string()],
+            "the trace publishes one route row: {:#?}",
+            trace.candidates
+        );
+        assert_boundary_route_joins_occurrence(&fixture, "getenv", OccurrenceRole::ValueReference);
     }
 
     #[test]

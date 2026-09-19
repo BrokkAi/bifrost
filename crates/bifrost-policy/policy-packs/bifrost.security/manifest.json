@@ -27,8 +27,8 @@
     {
       "path": "policies/jvm/system-getenv-to-runtime-exec.rqlp",
       "id": "bifrost.security.java.system-getenv-to-runtime-exec",
-      "authored_hash": "e6124423292a84eb827aafd80379d40c788b9759fad5eab9ed046b4a9eeb234e",
-      "resolved_semantic_hash": "e6124423292a84eb827aafd80379d40c788b9759fad5eab9ed046b4a9eeb234e",
+      "authored_hash": "64388737bcc0e1f39382e9f4d21ecf63ab75122b60e9c7b85dfdbd1654085d1d",
+      "resolved_semantic_hash": "64388737bcc0e1f39382e9f4d21ecf63ab75122b60e9c7b85dfdbd1654085d1d",
       "category": "security",
       "supported_languages": [
         "java"

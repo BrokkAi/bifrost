@@ -56,7 +56,7 @@ A pattern combines all supplied constraints with logical AND.
 | `not_kind` | string or string array | Exclude matching kinds and their subtypes. It never helps candidate pruning. |
 | `name` | string or `{ "regex": string }` | Match a normalized name exactly or by Rust regular expression. |
 | `text` | `{ "regex": string }` | Match parser-backed source text by Rust regular expression. There is no exact string shorthand. |
-| `visibility` | string or string array | Match a callable whose adapter recorded one of these modifier visibilities: `public`, `protected`, `internal`, `package_private`, `private`, `crate_or_module`, `unknown`. `unknown` means the adapter looked and could not classify; it is never equal to `public`. Valid only on callable kinds. An unrecorded modifier is incomplete, not a miss. |
+| `visibility` | string or string array | Match a callable whose adapter recorded one of these modifier visibilities: `public`, `protected`, `internal`, `package_private`, `private`, `crate_or_module`, `unknown`. `unknown` means the adapter looked and could not classify; it is never equal to `public`. Valid only on callable kinds. An unrecorded modifier, and a recorded `unknown` against a concrete label, are incomplete, not a miss. |
 | `parameter_type` | string or `{ "regex": string }` | Match a callable that has a parameter whose recorded type spelling satisfies this predicate. The spelling is a discriminator, not a resolved type identity. Valid only on callable kinds. Unrecorded parameter types are incomplete, not a miss. |
 | `capture` | string | Return this node or role target under the supplied capture label. |
 | `has` | pattern | Require some structural descendant to match. |
