@@ -644,16 +644,14 @@ pub(super) fn java_api_facts(
                     .as_ref()
                     .and_then(|signature| signature.returns.as_ref()),
             });
-            let aliases = curated_jdk_member_ids(
+            let curated_member_id = curated_jdk_member_ids(
                 &owner_name,
                 member.member_kind,
                 member.is_static,
                 &member.name,
                 &parameter_types,
-            )
-            .into_iter()
-            .map(str::to_owned)
-            .collect();
+            );
+            let aliases = curated_member_id.into_iter().map(str::to_owned).collect();
             if let (Some(formal_name), Some(signature)) = (
                 curated_jdk_formal_name(
                     &owner_name,
@@ -679,7 +677,8 @@ pub(super) fn java_api_facts(
                 is_virtual: member.is_virtual,
                 implicit_operation: None,
                 explicit_operation: None,
-                callable_family_complete: member.callable_family_complete
+                callable_family_complete: (member.callable_family_complete
+                    || curated_member_id.is_some())
                     && matches!(
                         member.member_kind,
                         MemberKind::Constructor | MemberKind::Method
