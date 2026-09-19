@@ -149,7 +149,7 @@ export function assertPolicyCatalog(response, host) {
   const content = response.result?.structuredContent;
   assert.equal(content?.schema_version, 2, `${host} returned the wrong policy catalog schema`);
   const packs = content?.packs;
-  assert.ok(Array.isArray(packs) && packs.length === 2, `${host} returned the wrong policy catalog envelope`);
+  assert.ok(Array.isArray(packs), `${host} returned the wrong policy catalog envelope`);
   const codeSmells = packs.find((pack) => pack.id === "bifrost.code-smells");
   const security = packs.find((pack) => pack.id === "bifrost.security");
   assert.ok(codeSmells, `${host} omitted the bifrost.code-smells pack`);

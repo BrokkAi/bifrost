@@ -380,9 +380,9 @@ async function assertMcpRootsWorkspaceBinding(codexLaunch, workspaceRoot, env) {
     });
     assert.equal(catalog.result?.isError, false, `MCP list_policies returned an error: ${JSON.stringify(catalog)}`);
     const catalogContent = catalog.result?.structuredContent;
-    assert.equal(catalogContent?.schema_version, 1);
+    assert.equal(catalogContent?.schema_version, 2);
     const packs = catalogContent?.packs;
-    assert.ok(Array.isArray(packs) && packs.length === 2, "MCP list_policies returned the wrong catalog envelope");
+    assert.ok(Array.isArray(packs), "MCP list_policies returned the wrong catalog envelope");
     const codeSmells = packs.find((pack) => pack.id === "bifrost.code-smells");
     const security = packs.find((pack) => pack.id === "bifrost.security");
     assert.ok(codeSmells, "MCP list_policies omitted bifrost.code-smells");

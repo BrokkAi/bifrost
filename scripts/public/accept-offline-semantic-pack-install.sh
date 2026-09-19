@@ -45,8 +45,9 @@ final class SameNameRuntime {
 }
 
 public final class App {
-    void positive(Runtime runtime) throws Exception {
+    void positive() throws Exception {
         String command = System.getenv("COMMAND");
+        Runtime runtime = Runtime.getRuntime();
         runtime.exec(command);
     }
 

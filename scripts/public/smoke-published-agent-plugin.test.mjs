@@ -78,11 +78,19 @@ test("requires the policy pack and at least one policy from a successful MCP cal
             policies: [{ id: "bifrost.correctness.dynamic-evaluation" }],
           },
           {
+            id: "bifrost.correctness",
+            policies: [{ id: "bifrost.correctness.resource-lifecycle" }],
+          },
+          {
             id: "bifrost.security",
             policies: [
               { id: "bifrost.security.java.servlet-parameter-to-jdbc" },
               { id: "bifrost.security.java.system-getenv-to-runtime-exec" },
             ],
+          },
+          {
+            id: "bifrost.effects",
+            policies: [{ id: "bifrost.effects.transitive-network-boundary" }],
           },
         ],
       },
@@ -94,8 +102,17 @@ test("requires the policy pack and at least one policy from a successful MCP cal
     /MCP error/u,
   );
   assert.throws(
-    () => assertPolicyCatalog({ result: { isError: false, structuredContent: { schema_version: 2, packs: [{ id: "bifrost.code-smells", policies: [] }] } } }, "Claude"),
-    /wrong policy catalog envelope|no security policies/u,
+    () =>
+      assertPolicyCatalog(
+        {
+          result: {
+            isError: false,
+            structuredContent: { schema_version: 2, packs: [{ id: "bifrost.code-smells", policies: [] }] },
+          },
+        },
+        "Claude",
+      ),
+    /omitted the bifrost.security pack/u,
   );
 });
 
