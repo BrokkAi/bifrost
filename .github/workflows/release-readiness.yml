@@ -1207,7 +1207,7 @@ jobs:
           echo 'f2dc5418092c43003db8f9005c4a286e1c0104fea96ccdd49e8ebd037cac9219  '"$archive" | sha256sum --check
           mkdir -p "${RUNNER_TEMP}/jdk"
           tar -C "${RUNNER_TEMP}/jdk" --strip-components 1 -xzf "$archive"
-      - name: Accept offline installer and typed catalog failures
+      - name: Verify offline installer and classify typed policy smoke
         shell: bash
         env:
           BUNDLE_DIR: ${{ runner.temp }}/bifrost-semantic-pack-release/bifrost-semantic-packs
@@ -1220,6 +1220,27 @@ jobs:
           "$BUNDLE_DIR"
           "$JAVA_HOME"
           "$SCRATCH_ROOT"
+      - name: Record typed policy smoke status
+        shell: bash
+        env:
+          STATUS_FILE: ${{ runner.temp }}/offline-semantic-pack-acceptance/policy-smoke-status.json
+        run: |
+          set -euo pipefail
+          test -s "$STATUS_FILE"
+          verdict="$(jq -r '.verdict' "$STATUS_FILE")"
+          {
+            echo "### Staged policy smoke"
+            echo
+            echo "- Verdict: \`$verdict\`"
+            echo "- Evidence: \`policy-smoke-status.json\` in the qualification bundle"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload typed policy smoke status
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: policy-smoke-status-${{ needs.preflight.outputs.commit }}
+          path: ${{ runner.temp }}/offline-semantic-pack-acceptance/policy-smoke-status.json
+          if-no-files-found: error
+          retention-days: 14
 
   pi-package:
     name: package Pi archive

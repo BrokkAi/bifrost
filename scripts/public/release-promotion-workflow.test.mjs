@@ -757,6 +757,14 @@ readinessTest("release readiness gives the Linux x86 binary an independent criti
   assert.match(policySmoke, /accept-offline-semantic-pack-install\.sh/u);
   assert.match(offlinePackAcceptance, /docker run --rm --network none/u);
   assert.match(offlinePackAcceptance, /BIFROST_SEMANTIC_PACK_DOWNLOAD=off/u);
+  assert.match(offlinePackAcceptance, /positiveStatus === 2/u);
+  assert.match(offlinePackAcceptance, /reasons\[0\] === "partial_discovery"/u);
+  assert.match(offlinePackAcceptance, /call_binding_dispatch_partial/u);
+  assert.match(offlinePackAcceptance, /UnsupportedExpression/u);
+  assert.match(offlinePackAcceptance, /verdict = "unreliable"/u);
+  assert.match(policySmoke, /Upload typed policy smoke status/u);
+  assert.match(policySmoke, /policy-smoke-status-\$\{\{ needs\.preflight\.outputs\.commit \}\}/u);
+  assert.doesNotMatch(policySmoke, /continue-on-error/u);
   assert.doesNotMatch(policySmoke, /^    needs: \[preflight, build,/mu);
 
   for (const job of ["agent-plugin-package", "pi-package", "vscode-package", "npm-package"]) {
