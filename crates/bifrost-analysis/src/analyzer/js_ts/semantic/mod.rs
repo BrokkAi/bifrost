@@ -8,15 +8,15 @@ use crate::analyzer::semantic::cfg::{
     ScopeBinding, ScopeFrameId,
 };
 use crate::analyzer::semantic::service::{ProgramSemanticsLowerer, SemanticAdapterIdentity};
-use crate::analyzer::semantic::*;
-use crate::analyzer::structural::extract::{
-    LimitedFileFacts, extract_file_facts_from_tree_limited,
+use crate::analyzer::semantic::structural_identity::{
+    StructuralNodeIndex, StructuralNodeIndexOutcome,
 };
+use crate::analyzer::semantic::*;
 use crate::analyzer::structural::facts::STRUCTURAL_FACTS_VERSION;
 use crate::analyzer::tree_sitter_analyzer::{
     PreparedSyntaxTree, WalkControl, try_walk_named_tree_preorder,
 };
-use crate::analyzer::{Language, ProjectFile, Range, parser_language_for_dialect};
+use crate::analyzer::{Language, ProjectFile, Range};
 use crate::hash::{HashMap, HashSet};
 use brokk_bifrost_js_ts::structural::{JAVASCRIPT_STRUCTURAL_SPEC, TYPESCRIPT_STRUCTURAL_SPEC};
 use brokk_bifrost_js_ts::syntax::{
@@ -66,88 +66,6 @@ impl JsTsSemanticFlavor {
 
 pub(crate) struct JsTsSemanticLowerer {
     flavor: JsTsSemanticFlavor,
-}
-
-/// Exact joins from a prepared syntax tree to the normalized structural facts
-/// extracted from that same tree. The map is built once per prepared source,
-/// then each parameter mapping performs only a tree-node-id lookup.
-#[derive(Debug)]
-struct StructuralNodeIndex {
-    content: ContentIdentity,
-    node_ids: HashMap<usize, u32>,
-}
-
-enum StructuralNodeIndexOutcome {
-    Complete {
-        index: StructuralNodeIndex,
-        work_items: usize,
-    },
-    Exceeded {
-        minimum_work_items: usize,
-    },
-    Cancelled,
-}
-
-impl StructuralNodeIndex {
-    fn for_source(
-        prepared: &PreparedSyntaxTree,
-        max_work_items: usize,
-        cancellation: &CancellationToken,
-    ) -> Result<StructuralNodeIndexOutcome, SemanticProviderError> {
-        let grammar = parser_language_for_dialect(prepared.dialect()).ok_or_else(|| {
-            SemanticProviderError::internal(
-                "JS/TS semantic lowering has no structural parser language",
-            )
-        })?;
-        let extracted = extract_file_facts_from_tree_limited(
-            match prepared.dialect().language() {
-                Language::JavaScript => &JAVASCRIPT_STRUCTURAL_SPEC,
-                _ => &TYPESCRIPT_STRUCTURAL_SPEC,
-            },
-            &grammar,
-            prepared.tree(),
-            prepared.source(),
-            max_work_items,
-            Some(cancellation),
-        );
-        let (facts, node_ids) = match extracted {
-            LimitedFileFacts::CompleteWithNodeIndex { facts, node_ids } => (facts, node_ids),
-            LimitedFileFacts::Exceeded { minimum_fact_nodes } => {
-                return Ok(StructuralNodeIndexOutcome::Exceeded {
-                    minimum_work_items: minimum_fact_nodes,
-                });
-            }
-            LimitedFileFacts::Cancelled => return Ok(StructuralNodeIndexOutcome::Cancelled),
-            LimitedFileFacts::Unavailable => {
-                return Err(SemanticProviderError::internal(
-                    "JS/TS structural identity extraction is unavailable",
-                ));
-            }
-            LimitedFileFacts::Complete(_) => {
-                return Err(SemanticProviderError::internal(
-                    "prepared-tree structural extraction omitted its node index",
-                ));
-            }
-        };
-        let work_items = facts.work_item_count();
-        let content = facts.source_identity();
-        assert_eq!(
-            content,
-            ContentIdentity::from_digest(StableDigest::from_array(prepared.source_sha256())),
-            "structural facts must be extracted from the semantic artifact source"
-        );
-        Ok(StructuralNodeIndexOutcome::Complete {
-            index: Self { content, node_ids },
-            work_items,
-        })
-    }
-
-    fn identity(&self, node: Node<'_>) -> Option<StructuralNodeIdentity> {
-        self.node_ids
-            .get(&node.id())
-            .copied()
-            .map(|node_id| StructuralNodeIdentity::new(self.content, node_id))
-    }
 }
 
 impl JsTsSemanticLowerer {
@@ -305,7 +223,12 @@ impl ProgramSemanticsLowerer for JsTsSemanticLowerer {
                 .limits()
                 .nested_entries
                 .saturating_sub(inventory_work.nested_entries);
-            match StructuralNodeIndex::for_source(prepared, max_work_items, cancellation)? {
+            let spec: &dyn brokk_bifrost_core::analyzer::structural::spec::StructuralSpec =
+                match prepared.dialect().language() {
+                    Language::JavaScript => &JAVASCRIPT_STRUCTURAL_SPEC,
+                    _ => &TYPESCRIPT_STRUCTURAL_SPEC,
+                };
+            match StructuralNodeIndex::for_source(spec, prepared, max_work_items, cancellation)? {
                 StructuralNodeIndexOutcome::Complete { index, work_items } => {
                     let work = SemanticWork {
                         nested_entries: work_items,

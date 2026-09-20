@@ -30,8 +30,6 @@ const jsonProjections = [
   "plugins/bifrost-agent/package.json",
   "plugins/bifrost-dsh/package.json",
   "plugins/bifrost-agent/package-lock.json",
-  "editors/vscode/package.json",
-  "editors/vscode/package-lock.json",
 ];
 
 const allProjections = [
@@ -124,12 +122,6 @@ test("release version update includes the current version in release bundle comp
     assert.equal(release.binaryVersion, "2.0.0");
     assert.equal(release.minimumBinaryVersion, "2.0.0");
     assert.equal(release.allowPrerelease, false);
-    const vscode = JSON.parse(
-      await readFile(path.join(root, "editors/vscode/package.json"), "utf8"),
-    );
-    assert.equal(vscode.bifrost.binaryVersion, "2.0.0");
-    assert.equal(vscode.bifrost.minimumBinaryVersion, "2.0.0");
-    assert.equal(vscode.bifrost.allowPrerelease, false);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -210,10 +202,6 @@ test("release version update resets launcher compatibility on a new minor series
     );
     assert.equal(release.binaryVersion, "1.3.0");
     assert.equal(release.minimumBinaryVersion, "1.3.0");
-    const vscode = JSON.parse(
-      await readFile(path.join(root, "editors/vscode/package.json"), "utf8"),
-    );
-    assert.equal(vscode.bifrost.minimumBinaryVersion, "1.3.0");
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -317,16 +305,6 @@ async function createFixture(cargoVersion, projectionVersion, lineEnding) {
     version: projectionVersion,
     packages: { "": { version: projectionVersion } },
   };
-  const vscodePackage = {
-    version: projectionVersion,
-    bifrost: {
-      binaryVersion: projectionVersion,
-      minimumBinaryVersion: projectionVersion,
-      allowPrerelease: false,
-      archiveSha256: { test: "checksum" },
-    },
-  };
-
   const values = new Map([
     ["plugins/bifrost-agent/.claude-plugin/plugin.json", basicPlugin],
     ["plugins/bifrost-agent/.codex-plugin/plugin.json", basicPlugin],
@@ -338,8 +316,6 @@ async function createFixture(cargoVersion, projectionVersion, lineEnding) {
     ["plugins/bifrost-agent/package.json", basicPlugin],
     ["plugins/bifrost-dsh/package.json", basicPlugin],
     ["plugins/bifrost-agent/package-lock.json", packageLock],
-    ["editors/vscode/package.json", vscodePackage],
-    ["editors/vscode/package-lock.json", packageLock],
   ]);
 
   for (const relativePath of jsonProjections) {

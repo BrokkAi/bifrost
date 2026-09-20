@@ -168,6 +168,12 @@ require_archive_file brokk-bifrost-semantic-packs embedded/node-runtime-values-j
 require_archive_file brokk-bifrost-semantic-packs embedded/node-runtime-values-javascript/shards/runtime.node-process-values.deflate
 require_archive_file brokk-bifrost-semantic-packs embedded/node-runtime-values-typescript/manifest.json
 require_archive_file brokk-bifrost-semantic-packs embedded/node-runtime-values-typescript/shards/runtime.node-process-values.deflate
+require_archive_file brokk-bifrost-semantic-packs embedded/python-process-inputs/manifest.json
+require_archive_file brokk-bifrost-semantic-packs embedded/python-process-inputs/shards/runtime.python-process-inputs.deflate
+require_archive_file brokk-bifrost-semantic-packs embedded/python-os-command-declarations/manifest.json
+require_archive_file brokk-bifrost-semantic-packs embedded/python-os-command-declarations/shards/declarations.python-os-system.json
+require_archive_file brokk-bifrost-semantic-packs embedded/python-os-command-summaries/manifest.json
+require_archive_file brokk-bifrost-semantic-packs embedded/python-os-command-summaries/shards/summaries.python-os-system.json
 require_archive_file brokk-bifrost-runtime src/extension/mod.rs
 require_archive_file brokk-bifrost-runtime src/extension/workspace.rs
 

@@ -13,6 +13,9 @@ use crate::analyzer::semantic::cfg::{
     ScopeBinding, ScopeFrameId,
 };
 use crate::analyzer::semantic::service::{ProgramSemanticsLowerer, SemanticAdapterIdentity};
+use crate::analyzer::semantic::structural_identity::{
+    StructuralNodeIndex, StructuralNodeIndexOutcome,
+};
 use crate::analyzer::semantic::*;
 use crate::analyzer::semantic_model::{
     SemanticModelCallApplication, SemanticModelCallableDisposition, SemanticModelCallableKey,
@@ -26,10 +29,13 @@ use brokk_bifrost_python::bindings::{
     python_direct_scope_bindings_bounded, python_module_or_class_scope_binds_name_bounded,
 };
 use brokk_bifrost_python::imports::python_import_infos_from_node;
-use brokk_bifrost_python::syntax::{python_static_attribute_path, python_static_type_path};
+use brokk_bifrost_python::runtime_values::python_runtime_keyed_access_seed;
+use brokk_bifrost_python::syntax::{
+    python_plain_string_literal, python_static_attribute_path, python_static_type_path,
+};
 use std::sync::Arc;
 
-const ADAPTER_VERSION: &[u8] = b"python-value-semantics-v29";
+const ADAPTER_VERSION: &[u8] = b"python-value-semantics-v30";
 
 const PYTHON_UNKNOWN_ITERATION_ELEMENT: &str = "python.unknown_iteration_element";
 const PYTHON_UNKNOWN_UNPACK_ELEMENT: &str = "python.unknown_unpack_element";
@@ -125,6 +131,37 @@ impl ProgramSemanticsLowerer for PythonSemanticLowerer {
             }
         };
 
+        // Value mappings carry the structural identity of their own source
+        // occurrence, so a query anchored on an ordinary structural row can
+        // reach the executable value there. Without the index the lowering is
+        // still correct, and every such join reports itself incomplete.
+        let mut initial_work = initial_work;
+        let structural_node_index = match StructuralNodeIndex::for_source(
+            &brokk_bifrost_python::structural::PYTHON_STRUCTURAL_SPEC,
+            prepared,
+            budget.limits().nested_entries,
+            cancellation,
+        )? {
+            StructuralNodeIndexOutcome::Complete { index, work_items } => {
+                initial_work = sum_lowering_work(
+                    initial_work,
+                    SemanticWork {
+                        nested_entries: work_items,
+                        ..SemanticWork::default()
+                    },
+                );
+                Some(index)
+            }
+            StructuralNodeIndexOutcome::Exceeded { .. } => None,
+            StructuralNodeIndexOutcome::Cancelled => {
+                return Ok(SemanticOutcome::Cancelled {
+                    partial: None,
+                    work: initial_work,
+                });
+            }
+        };
+        let structural_node_index = structural_node_index.as_ref();
+
         let mut binding_inventories = HashMap::default();
         lower_procedure_batch(
             &specs,
@@ -141,6 +178,7 @@ impl ProgramSemanticsLowerer for PythonSemanticLowerer {
                     &class_constructors,
                     builtin_proofs,
                     self.overlay.as_deref(),
+                    structural_node_index,
                     &mut binding_inventories,
                     staged_budget,
                     cancellation,
@@ -991,6 +1029,7 @@ struct LoweringContext<'tree, 'targets> {
     class_constructors: &'targets HashMap<Box<str>, ProcedureId>,
     builtin_proofs: PythonBuiltinProofs,
     overlay: Option<&'targets SemanticModelOverlay>,
+    structural_node_index: Option<&'targets StructuralNodeIndex>,
     bindings: &'targets PythonLexicalScopeInventory<'tree>,
     binding_inventories: &'targets HashMap<usize, PythonLexicalScopeInventory<'tree>>,
     cleanups: Vec<CleanupRegion<'tree>>,
@@ -1006,6 +1045,7 @@ fn lower_procedure<'tree, 'targets>(
     class_constructors: &'targets HashMap<Box<str>, ProcedureId>,
     builtin_proofs: PythonBuiltinProofs,
     overlay: Option<&'targets SemanticModelOverlay>,
+    structural_node_index: Option<&'targets StructuralNodeIndex>,
     binding_inventories: &mut HashMap<usize, PythonLexicalScopeInventory<'tree>>,
     budget: &SemanticBudget,
     cancellation: &'targets CancellationToken,
@@ -1077,6 +1117,7 @@ fn lower_procedure<'tree, 'targets>(
         class_constructors,
         builtin_proofs,
         overlay,
+        structural_node_index,
         bindings,
         binding_inventories,
         cleanups: Vec::new(),
@@ -2655,6 +2696,60 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         Ok(Some((value, u128::from(index))))
     }
 
+    /// The memory location one Python subscript names.
+    ///
+    /// A plain string-literal subscript names exactly one entry of the
+    /// container, which is the same static identity an attribute access
+    /// names, so it gets a keyed property location. Reporting it as an index
+    /// whose identity is unproven loses a key the syntax states. An integer
+    /// literal keeps its arithmetic index identity, and every other subscript
+    /// stays a dynamic index.
+    fn subscript_location_kind(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        base: ValueId,
+        subscript: Node<'tree>,
+    ) -> Result<MemoryLocationKind, PythonLoweringError> {
+        if let Some(key) = python_plain_string_literal(subscript, self.prepared.source()) {
+            let key = key.to_owned();
+            // The key expression is still an operand of the access, so its
+            // own value stays scheduled exactly as the index form's does.
+            self.expression_value(builder, subscript, SemanticValueKind::Constant)?;
+            return Ok(MemoryLocationKind::Property { base, key });
+        }
+        let index = self.constant_index_value(builder, subscript)?;
+        Ok(MemoryLocationKind::Index {
+            base,
+            index: index.map(|(value, _)| value),
+            constant_index: index.map(|(_, magnitude)| magnitude),
+            identity: crate::analyzer::semantic::IndexedLocationIdentity::Element,
+        })
+    }
+
+    /// The keyed entry is structured, but the container's own `__getitem__`
+    /// or `__setitem__` can still interpret it. An activated runtime model
+    /// that publishes this container discharges the claim; nothing else does.
+    fn add_keyed_property_identity_gap(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        location: MemoryLocationId,
+    ) -> Result<(), PythonLoweringError> {
+        self.session.add_gap_with_impacts_and_discharge(
+            builder,
+            point,
+            SemanticGapSubject::MemoryLocation(location),
+            SemanticCapability::FieldMemory,
+            SemanticGapImpacts::single(SemanticGapImpact::HeapRead)
+                .with(SemanticGapImpact::HeapWrite)
+                .with(SemanticGapImpact::Aliasing),
+            SemanticGapKind::Unknown,
+            crate::analyzer::semantic::SemanticGapDischarge::RuntimeReadBehavior,
+            "subscript key is structured, but the container's keyed-access behavior is not proven",
+        )?;
+        Ok(())
+    }
+
     fn add_dynamic_index_gap(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
@@ -3866,7 +3961,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 let claims = if proven {
                     None
                 } else {
-                    Some(self.unresolved_member_read_claims(builder, node, result, scope, stack)?)
+                    Some(self.loaded_member_read_claims(builder, node, result, scope, stack)?)
                 };
                 let load = self.point(builder, node, Vec::new())?;
                 let reached_load = match claims {
@@ -3902,7 +3997,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 let claims = if proven {
                     None
                 } else {
-                    Some(self.unresolved_member_read_claims(builder, node, result, scope, stack)?)
+                    Some(self.loaded_member_read_claims(builder, node, result, scope, stack)?)
                 };
                 let access = self.point(builder, node, Vec::new())?;
                 let reached_access = match claims {
@@ -3913,25 +4008,32 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     None => EdgeTarget::normal(access),
                 };
                 let base = self.expression_value(builder, value, expression_value_kind(value))?;
-                let index = self.constant_index_value(builder, subscript)?;
-                let location = self.session.add_memory_location(
-                    builder,
-                    access,
+                let location_kind = self.subscript_location_kind(builder, base, subscript)?;
+                let keyed_property = matches!(location_kind, MemoryLocationKind::Property { .. });
+                let dynamic_index = matches!(
+                    location_kind,
                     MemoryLocationKind::Index {
-                        base,
-                        index: index.map(|(value, _)| value),
-                        constant_index: index.map(|(_, magnitude)| magnitude),
-                        identity: crate::analyzer::semantic::IndexedLocationIdentity::Element,
-                    },
-                )?;
-                if index.is_none() {
+                        constant_index: None,
+                        ..
+                    }
+                );
+                let location = self
+                    .session
+                    .add_memory_location(builder, access, location_kind)?;
+                if keyed_property {
+                    self.add_keyed_property_identity_gap(builder, access, location)?;
+                } else if dynamic_index {
                     self.add_dynamic_index_gap(builder, access, location)?;
                 }
                 self.append_effect(
                     builder,
                     access,
                     SemanticEffect::MemoryLoad {
-                        kind: MemoryAccessKind::Index,
+                        kind: if keyed_property {
+                            MemoryAccessKind::Property
+                        } else {
+                            MemoryAccessKind::Index
+                        },
                         location,
                         result,
                     },
@@ -4532,17 +4634,18 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 let subscript = required_field(target, "subscript")?;
                 let base =
                     self.expression_value(builder, value_node, expression_value_kind(value_node))?;
-                let index = self.constant_index_value(builder, subscript)?;
-                let location = self.session.add_memory_location(
-                    builder,
-                    point,
+                let location_kind = self.subscript_location_kind(builder, base, subscript)?;
+                let keyed_property = matches!(location_kind, MemoryLocationKind::Property { .. });
+                let dynamic_index = matches!(
+                    location_kind,
                     MemoryLocationKind::Index {
-                        base,
-                        index: index.map(|(value, _)| value),
-                        constant_index: index.map(|(_, magnitude)| magnitude),
-                        identity: crate::analyzer::semantic::IndexedLocationIdentity::Element,
-                    },
-                )?;
+                        constant_index: None,
+                        ..
+                    }
+                );
+                let location = self
+                    .session
+                    .add_memory_location(builder, point, location_kind)?;
                 if !self.proven_list_index(access, value_node, subscript) {
                     self.add_gap(
                         builder,
@@ -4553,14 +4656,18 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         "subscription special-method invocation requires type refinement",
                     )?;
                 }
-                if index.is_none() {
+                if !keyed_property && dynamic_index {
                     self.add_dynamic_index_gap(builder, point, location)?;
                 }
                 self.append_effect(
                     builder,
                     point,
                     SemanticEffect::MemoryStore {
-                        kind: MemoryAccessKind::Index,
+                        kind: if keyed_property {
+                            MemoryAccessKind::Property
+                        } else {
+                            MemoryAccessKind::Index
+                        },
                         location,
                         value,
                     },
@@ -6787,6 +6894,36 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         Ok(claims)
     }
 
+    /// The same two claims for a read that does perform a load.
+    ///
+    /// The value-level claim is then answerable: a reviewed runtime model that
+    /// publishes this container states what its keyed access produces, so the
+    /// claim carries the discharge that lets such a model retire it. Nothing
+    /// else retires it, and an inactive or absent model leaves it open exactly
+    /// as before.
+    fn loaded_member_read_claims(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        result: ValueId,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<ProgramPointId, PythonLoweringError> {
+        let claims = self.point(builder, node, Vec::new())?;
+        self.implicit_abort_route(builder, node, claims, scope, stack)?;
+        self.session.add_gap_with_impacts_and_discharge(
+            builder,
+            claims,
+            SemanticGapSubject::Value(result),
+            SemanticCapability::Calls,
+            SemanticGapImpacts::NONE,
+            SemanticGapKind::Unknown,
+            crate::analyzer::semantic::SemanticGapDischarge::RuntimeReadBehavior,
+            "descriptor or special-method invocation requires type refinement",
+        )?;
+        Ok(claims)
+    }
+
     fn unhandled_control_syntax(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
@@ -7031,8 +7168,28 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         node: Node<'tree>,
     ) -> Result<PointMetadata, PythonLoweringError> {
         let anchor = source_anchor(node, 0).map_err(PythonLoweringError::Invalid)?;
-        self.session
-            .add_mapping(builder, anchor, SourceMappingKind::Exact)
+        let ast_identity = self.value_structural_identity(node);
+        self.session.add_mapping_with_ast_identity(
+            builder,
+            anchor,
+            SourceMappingKind::Exact,
+            ast_identity,
+        )
+    }
+
+    /// The structural fact that represents this value's own source occurrence.
+    ///
+    /// Almost every admitted node is its own fact. A keyed process-input read
+    /// is the exception: a subscript expression has no subscript fact, so its
+    /// load is represented by the base of its access chain. Publishing that
+    /// seed identity here keeps the identity on the load itself, where local
+    /// initialization preserves it, instead of requiring the consumer to
+    /// re-derive it from the container occurrence.
+    fn value_structural_identity(&self, node: Node<'tree>) -> Option<StructuralNodeIdentity> {
+        let index = self.structural_node_index?;
+        index.identity(node).or_else(|| {
+            python_runtime_keyed_access_seed(node).and_then(|seed| index.identity(seed))
+        })
     }
 
     fn metadata(&self, point: ProgramPointId) -> Result<PointMetadata, PythonLoweringError> {

@@ -1050,6 +1050,8 @@ fn validate_keyed_read_value_wrapper(args: &[Expr], query: &Expr, analysis: &mut
     let mut index_min = None;
     let mut index_max = None;
     let mut container = None;
+    let mut runtime_label = None;
+    let mut global_label = None;
     for pair in options.chunks_exact(2) {
         let Some(label) = pair[0].as_symbol() else {
             analysis.error(
@@ -1081,39 +1083,61 @@ fn validate_keyed_read_value_wrapper(args: &[Expr], query: &Expr, analysis: &mut
         );
         match option.field() {
             QueryStepField::Runtime => {
-                if pair[1].as_symbol().or_else(|| pair[1].as_string()) != Some("node") {
-                    analysis.error(
-                        pair[1].range.clone(),
-                        "unknown-value",
-                        "runtime must be node",
-                    );
-                }
-            }
-            QueryStepField::Global => {
-                if pair[1].as_symbol().or_else(|| pair[1].as_string()) != Some("process") {
-                    analysis.error(
-                        pair[1].range.clone(),
-                        "unknown-value",
-                        "global must be process",
-                    );
-                }
-            }
-            QueryStepField::Container => {
-                if let Some(value) = pair[1].as_symbol().or_else(|| pair[1].as_string()) {
-                    if matches!(value, "env" | "argv") {
-                        container = Some((value.to_owned(), pair[1].range.clone()));
-                    } else {
-                        analysis.error(
-                            pair[1].range.clone(),
-                            "unknown-value",
-                            "container must be env or argv",
-                        );
-                    }
+                let value = pair[1].as_symbol().or_else(|| pair[1].as_string());
+                if value.is_some_and(|value| {
+                    super::schema::RuntimeKeyedReadRoot::family_labels().contains(&value)
+                }) {
+                    runtime_label = value.map(str::to_owned);
                 } else {
                     analysis.error(
                         pair[1].range.clone(),
                         "unknown-value",
-                        "container must be env or argv",
+                        format!(
+                            "runtime must be one of {}",
+                            super::schema::RuntimeKeyedReadRoot::family_labels().join(", ")
+                        ),
+                    );
+                }
+            }
+            QueryStepField::Global => {
+                let accepted = runtime_label.as_deref().map_or_else(
+                    || {
+                        super::schema::RUNTIME_KEYED_READ_ROOTS
+                            .iter()
+                            .map(|root| root.global.label())
+                            .collect::<Vec<_>>()
+                    },
+                    super::schema::RuntimeKeyedReadRoot::global_labels,
+                );
+                let value = pair[1].as_symbol().or_else(|| pair[1].as_string());
+                if value.is_some_and(|value| accepted.contains(&value)) {
+                    global_label = value.map(str::to_owned);
+                } else {
+                    analysis.error(
+                        pair[1].range.clone(),
+                        "unknown-value",
+                        format!("global must be one of {}", accepted.join(", ")),
+                    );
+                }
+            }
+            QueryStepField::Container => {
+                let accepted = match (runtime_label.as_deref(), global_label.as_deref()) {
+                    (Some(runtime), Some(global)) => {
+                        super::schema::RuntimeKeyedReadRoot::container_labels(runtime, global)
+                    }
+                    _ => super::schema::RUNTIME_KEYED_READ_ROOTS
+                        .iter()
+                        .map(|root| root.container.label())
+                        .collect::<Vec<_>>(),
+                };
+                let value = pair[1].as_symbol().or_else(|| pair[1].as_string());
+                if let Some(value) = value.filter(|value| accepted.contains(value)) {
+                    container = Some((value.to_owned(), pair[1].range.clone()));
+                } else {
+                    analysis.error(
+                        pair[1].range.clone(),
+                        "unknown-value",
+                        format!("container must be one of {}", accepted.join(", ")),
                     );
                 }
             }
@@ -1243,30 +1267,27 @@ fn validate_keyed_read_value_wrapper(args: &[Expr], query: &Expr, analysis: &mut
             );
         }
     }
-    if let Some((kind, _)) = &key_kind {
-        let requires_property = *kind == super::schema::RuntimeKeyKind::StaticProperty;
-        if container
-            .as_ref()
-            .is_some_and(|(container, _)| (container == "env") != requires_property)
-        {
+    // How a container's elements are addressed is a property of the reviewed
+    // container, so the accepted selector comes from the vocabulary table
+    // rather than from a container name spelled here.
+    if let (Some(runtime), Some(global), Some((container, range))) = (
+        runtime_label.as_deref(),
+        global_label.as_deref(),
+        container.as_ref(),
+    ) && let Some(root) =
+        super::schema::RuntimeKeyedReadRoot::for_labels(runtime, global, container)
+    {
+        let requires_property = root.key_kind == super::schema::RuntimeKeyKind::StaticProperty;
+        let selects_property = key_kind.as_ref().map_or(property, |(kind, _)| {
+            *kind == super::schema::RuntimeKeyKind::StaticProperty
+        });
+        if selects_property != requires_property {
             analysis.error(
-                container
-                    .as_ref()
-                    .expect("container was checked above")
-                    .1
-                    .clone(),
+                range.clone(),
                 "wrong-value-shape",
-                "env requires a property selector and argv requires an index selector",
+                format!("{container} requires a {} selector", root.key_kind.label()),
             );
         }
-    } else if let Some((container, range)) = &container
-        && (container == "env") != property
-    {
-        analysis.error(
-            range.clone(),
-            "wrong-value-shape",
-            "env requires a property selector and argv requires an index selector",
-        );
     }
     if let Some((container, _)) = &container
         && container == "argv"

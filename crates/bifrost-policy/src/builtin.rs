@@ -140,6 +140,12 @@ const SECURITY_POLICY_SOURCES: &[(&str, &str)] = &[
         ),
     ),
     (
+        "policies/python/process-input-to-os-system.rqlp",
+        include_str!(
+            "../policy-packs/bifrost.security/policies/python/process-input-to-os-system.rqlp"
+        ),
+    ),
+    (
         "policies/declared-storage/c-stored-request-to-sql.rqlp",
         include_str!(
             "../policy-packs/bifrost.security/policies/declared-storage/c-stored-request-to-sql.rqlp"
@@ -299,6 +305,12 @@ const SECURITY_POLICY_SOURCES: &[(&str, &str)] = &[
 
 const EFFECTS_POLICY_SOURCES: &[(&str, &str)] = &[
     (
+        "policies/go/selected-boundary-no-network-io.rqlp",
+        include_str!(
+            "../policy-packs/bifrost.effects/policies/go/selected-boundary-no-network-io.rqlp"
+        ),
+    ),
+    (
         "policies/java/selected-boundary-no-network-io.rqlp",
         include_str!(
             "../policy-packs/bifrost.effects/policies/java/selected-boundary-no-network-io.rqlp"
@@ -320,6 +332,12 @@ const EFFECTS_POLICY_SOURCES: &[(&str, &str)] = &[
         "policies/python/selected-boundary-no-network-io.rqlp",
         include_str!(
             "../policy-packs/bifrost.effects/policies/python/selected-boundary-no-network-io.rqlp"
+        ),
+    ),
+    (
+        "policies/rust/selected-boundary-no-network-io.rqlp",
+        include_str!(
+            "../policy-packs/bifrost.effects/policies/rust/selected-boundary-no-network-io.rqlp"
         ),
     ),
     (
@@ -1124,12 +1142,12 @@ mod tests {
                 .expect("security pack")
                 .policies
                 .len(),
-            28
+            29
         );
         let effects = catalog
             .pack_manifest(EFFECTS_PACK_ID)
             .expect("effects pack");
-        assert_eq!(effects.policies.len(), 6);
+        assert_eq!(effects.policies.len(), 8);
         assert_eq!(
             effects
                 .policies
@@ -1137,10 +1155,12 @@ mod tests {
                 .map(|entry| entry.id.as_str())
                 .collect::<Vec<_>>(),
             vec![
+                "bifrost.effects.go.selected-boundary-no-network-io",
                 "bifrost.effects.java.selected-boundary-no-network-io",
                 "bifrost.effects.javascript.selected-boundary-no-network-io",
                 "bifrost.effects.kotlin.selected-boundary-no-network-io",
                 "bifrost.effects.python.selected-boundary-no-network-io",
+                "bifrost.effects.rust.selected-boundary-no-network-io",
                 "bifrost.effects.scala.selected-boundary-no-network-io",
                 "bifrost.effects.typescript.selected-boundary-no-network-io",
             ]
@@ -1185,7 +1205,7 @@ mod tests {
                 ..BuiltInPolicySelection::default()
             })
             .expect("select security pack");
-        assert_eq!(security.len(), 2);
+        assert_eq!(security.len(), 3);
         assert_eq!(security[0].pack_id(), SECURITY_PACK_ID);
         assert_eq!(
             security[0].source_identity().as_str(),
@@ -1423,6 +1443,7 @@ mod tests {
             Ok(vec![
                 "bifrost.security.java.servlet-parameter-to-jdbc".to_owned(),
                 "bifrost.security.java.system-getenv-to-runtime-exec".to_owned(),
+                "bifrost.security.python.process-input-to-os-system".to_owned(),
             ])
         );
     }

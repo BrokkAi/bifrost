@@ -1661,6 +1661,22 @@ impl<'a> WorkspaceSemanticOracle<'a> {
                 (Some(target), Some(true)) => Some(target.clone()),
                 _ => None,
             };
+        // The Python analogue: a receiverless call of an imported module's
+        // function whose exact resolver proved the external member and whose
+        // activated models carry one complete summary for it. The same
+        // replacement hazard has to be absent before the boundary is upgraded.
+        let (python_modeled_function_closure, python_function_mutation_unproven) = {
+            let shape =
+                python_proven_external_function_boundary(call_language, &candidates, &boundaries)
+                    .filter(|target| active_covering_complete_summary(self, target));
+            let closure = shape
+                .filter(|target| {
+                    python_module_member_mutation_free(self.workspace.analyzer(), target, request)
+                })
+                .cloned();
+            let unproven = shape.is_some() && closure.is_none();
+            (closure, unproven)
+        };
         // When the reviewed summary is active but a member write or a
         // module-object escape may replace the member, the plan-level authored
         // closure must not close the residual arm over the write: the call may
@@ -1670,15 +1686,21 @@ impl<'a> WorkspaceSemanticOracle<'a> {
         // authored claim does not cover.
         let js_ts_member_mutation_unproven =
             js_ts_modeled_member_shape.is_some() && js_ts_modeled_member_closure.is_none();
-        if let Some(target) = &js_ts_modeled_member_closure {
+        for target in [
+            &js_ts_modeled_member_closure,
+            &python_modeled_function_closure,
+        ]
+        .into_iter()
+        .flatten()
+        {
             for boundary in &mut boundaries {
                 if boundary.unmaterialized_external_target() == Some(target) {
                     boundary.completeness = EvidenceCompleteness::Complete;
                 }
             }
         }
-        if js_ts_member_mutation_unproven {
-            boundaries.push(js_ts_member_mutation_unproven_boundary());
+        if js_ts_member_mutation_unproven || python_function_mutation_unproven {
+            boundaries.push(modeled_member_mutation_unproven_boundary());
             materialization_quality =
                 merge_dispatch_quality(materialization_quality, DispatchQuality::Truncated);
         }
@@ -1722,7 +1744,8 @@ impl<'a> WorkspaceSemanticOracle<'a> {
                         semantic_call.receiver.is_none(),
                         gap,
                     )
-                    && !(js_ts_modeled_member_closure.is_some()
+                    && !((js_ts_modeled_member_closure.is_some()
+                        || python_modeled_function_closure.is_some())
                         && gap.capability == SemanticCapability::DynamicDispatch
                         && matches!(
                             gap.kind,
@@ -2315,13 +2338,13 @@ fn workspace_hierarchy_unenumerated_boundary(
     }
 }
 
-/// #3406: the arm a modeled JS/TS member call keeps when the reviewed summary
-/// is active but a workspace member write or module-object escape means the
+/// #3406: the arm a modeled member call keeps when the reviewed summary is
+/// active but a workspace member write or module-object escape means the
 /// member value may have been replaced before the call runs. The authored
-/// `covers_overrides` claim describes implementations of the external member,
-/// not a different value written over it, so the workspace half refuses the
-/// closure with the same typed shape an unenumerated hierarchy uses (#2371).
-fn js_ts_member_mutation_unproven_boundary() -> DispatchBoundary {
+/// claim describes implementations of the external member, not a different
+/// value written over it, so the workspace half refuses the closure with the
+/// same typed shape an unenumerated hierarchy uses (#2371).
+fn modeled_member_mutation_unproven_boundary() -> DispatchBoundary {
     DispatchBoundary {
         kind: DispatchBoundaryKind::Truncated,
         external_callee_identity: None,
@@ -3847,6 +3870,92 @@ fn js_ts_module_member_mutation_free(
             target.owner_fqn(),
             target.member(),
         ) {
+            return false;
+        }
+    }
+    true
+}
+
+/// The one boundary shape the Python modeled-function discharge answers: the
+/// exact resolver proved a receiverless external module function (no workspace
+/// candidate at all) and named it through one proven external boundary.
+///
+/// The Python analogue of the JS/TS member shape above is simpler, because the
+/// call has no receiver: `os.system(...)` names a member of an imported module
+/// object, and the import binder is what proves the module. The replacement
+/// hazard is the same one, and it is proven absent the same way.
+fn python_proven_external_function_boundary<'a>(
+    call_language: SemanticLanguage,
+    candidates: &[DispatchCandidate],
+    boundaries: &'a [DispatchBoundary],
+) -> Option<&'a UnmaterializedExternalTarget> {
+    if call_language.language() != Language::Python || !candidates.is_empty() {
+        return None;
+    }
+    let [boundary] = boundaries else {
+        return None;
+    };
+    if !matches!(boundary.kind, DispatchBoundaryKind::External(Some(_)))
+        || !matches!(boundary.proof, ProofStatus::Proven)
+    {
+        return None;
+    }
+    boundary
+        .unmaterialized_external_target()
+        .filter(|target| !target.has_receiver())
+}
+
+/// Whether no workspace Python source can replace the member an import binding
+/// reads from `target`'s module before the call runs.
+///
+/// Python permits replacing an attribute of a shared module object
+/// (`os.system = fake`), and the member-minting route deliberately leaves that
+/// question open. A reviewed complete summary closes the call only while the
+/// member value at the call can still be the module's own, so every Python file
+/// in the workspace is scanned for member writes and module-object escapes
+/// before the boundary is upgraded. The scan runs once per discharged call and
+/// only after the cheaper summary check has already selected the closure.
+fn python_module_member_mutation_free(
+    analyzer: &dyn IAnalyzer,
+    target: &UnmaterializedExternalTarget,
+    request: &SemanticRequest<'_>,
+) -> bool {
+    let Ok(files) = analyzer.project().all_files_shared() else {
+        return false;
+    };
+    let max_nodes = request.budget.remaining().nested_entries;
+    for file in files.iter() {
+        if request.cancellation.is_cancelled() {
+            return false;
+        }
+        if crate::analyzer::common::language_for_file(file) != Language::Python {
+            continue;
+        }
+        let Ok(source) = file.read_to_string() else {
+            return false;
+        };
+        let mut parser = tree_sitter::Parser::new();
+        if parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .is_err()
+        {
+            return false;
+        }
+        let Some(tree) = parser.parse(&source, None) else {
+            return false;
+        };
+        if tree.root_node().has_error() {
+            return false;
+        }
+        if brokk_bifrost_python::runtime_values::python_module_member_mutation(
+            tree.root_node(),
+            &source,
+            target.owner_fqn(),
+            target.member(),
+            max_nodes,
+        )
+        .is_some()
+        {
             return false;
         }
     }

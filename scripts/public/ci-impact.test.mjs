@@ -23,7 +23,7 @@ function selected(decision) {
 }
 
 test("impact schema version tracks the exported component contract", () => {
-  assert.equal(SCHEMA_VERSION, "3");
+  assert.equal(SCHEMA_VERSION, "4");
 });
 
 test("unmapped paths conservatively select the full matrix", () => {
@@ -118,7 +118,7 @@ test("documentation mixed with component changes retains component validation", 
   assert.deepEqual(selected(decision), ["agent_plugin", "pi_package"]);
 });
 
-test("RQL changes select runtime, host, policy-pack, and editor coverage", () => {
+test("RQL changes select runtime, host, and policy-pack coverage", () => {
   const decision = classifyChangeSet({ eventName: "pull_request", changedPaths: fixture("rql") });
   assert.equal(decision.mode, "impact");
   assert.deepEqual(selected(decision), [
@@ -127,11 +127,10 @@ test("RQL changes select runtime, host, policy-pack, and editor coverage", () =>
     "policy_pack",
     "rql_runtime",
     "rust",
-    "vscode",
   ]);
 });
 
-test("flow changes select query, host, policy, editor, and Rust coverage", () => {
+test("flow changes select query, host, policy, and Rust coverage", () => {
   const decision = classifyChangeSet({
     eventName: "pull_request",
     changedPaths: ["crates/bifrost-flow/src/value_flow/client.rs"],
@@ -143,7 +142,6 @@ test("flow changes select query, host, policy, editor, and Rust coverage", () =>
     "policy_pack",
     "rql_runtime",
     "rust",
-    "vscode",
   ]);
 });
 
@@ -355,7 +353,6 @@ test("broad analyzer PRs avoid unrelated packaging and plugin lanes", () => {
       "crates/bifrost-mcp/src/mcp_extended.rs",
       "crates/bifrost-runtime/src/code_intelligence.rs",
       "docs/src/content/docs/code-querying.md",
-      "editors/vscode/syntaxes/bifrost-rql.tmLanguage.json",
       "tests/fixtures/policies/dynamic-eval.normalized.json",
       "tests/suite_bench_policy/taint_policy_adapter.rs",
       "tests/suite_cross_language/code_query_docs.rs",
@@ -370,14 +367,13 @@ test("broad analyzer PRs avoid unrelated packaging and plugin lanes", () => {
     "python",
     "rql_runtime",
     "rust",
-    "vscode",
   ]);
 });
 
-test("editor-only and plugin-only changes select only their Node checks", () => {
+test("Zed extension changes select Rust validation while plugin changes select Node checks", () => {
   assert.deepEqual(
-    selected(classifyChangeSet({ eventName: "pull_request", changedPaths: fixture("editor") })),
-    ["vscode"],
+    selected(classifyChangeSet({ eventName: "pull_request", changedPaths: ["editors/zed/src/lib.rs"] })),
+    ["rust"],
   );
   assert.deepEqual(
     selected(classifyChangeSet({ eventName: "pull_request", changedPaths: fixture("plugin") })),
@@ -393,7 +389,7 @@ test("public release contract fixtures retain their host and package checks", ()
         changedPaths: ["scripts/fixtures/policy-report/v5-one-finding.json"],
       }),
     ),
-    ["lsp_contract", "mcp_contract", "policy_pack", "rql_runtime", "rust", "vscode"],
+    ["lsp_contract", "mcp_contract", "policy_pack", "rql_runtime", "rust"],
   );
   assert.deepEqual(
     selected(
@@ -409,9 +405,9 @@ test("public release contract fixtures retain their host and package checks", ()
 test("combined paths union selected checks", () => {
   const decision = classifyChangeSet({
     eventName: "pull_request",
-    changedPaths: [...fixture("editor"), ...fixture("plugin")],
+    changedPaths: ["editors/zed/src/lib.rs", ...fixture("plugin")],
   });
-  assert.deepEqual(selected(decision), ["agent_plugin", "pi_package", "vscode"]);
+  assert.deepEqual(selected(decision), ["agent_plugin", "pi_package", "rust"]);
 });
 
 test("deleted paths use the same conservative mapping as changed paths", () => {
@@ -421,7 +417,7 @@ test("deleted paths use the same conservative mapping as changed paths", () => {
       "crates/bifrost-policy/policy-packs/bifrost.code-smells/policies/removed-rule.rqlp",
     ],
   });
-  assert.deepEqual(selected(decision), ["lsp_contract", "mcp_contract", "policy_pack", "rql_runtime", "vscode"]);
+  assert.deepEqual(selected(decision), ["lsp_contract", "mcp_contract", "policy_pack", "rql_runtime"]);
 });
 
 test("failed diffs select the full matrix rather than skipping validation", () => {

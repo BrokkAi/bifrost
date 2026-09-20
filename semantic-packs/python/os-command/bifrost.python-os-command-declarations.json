@@ -1,0 +1,85 @@
+{
+  "schema_version": 2,
+  "pack_id": "bifrost.python-os-command-declarations",
+  "version": "0.1.0",
+  "producer": {
+    "name": "bifrost-reviewed-python-models",
+    "version": "0.1.0"
+  },
+  "language": "python",
+  "ecosystem": "pypi",
+  "compatibility": {
+    "bifrost": ">=0.11.0, <1.0.0",
+    "toolchains": []
+  },
+  "provenance": {
+    "source": "Python standard library reference, os",
+    "revision": "v3.13.5"
+  },
+  "license": "Apache-2.0",
+  "completeness": "partial",
+  "safety": {
+    "generated_code_only": false,
+    "review_required": false
+  },
+  "shards": [
+    {
+      "id": "declarations.python-os-system",
+      "activation": [
+        {
+          "targets": [],
+          "configurations": []
+        }
+      ],
+      "payload": {
+        "kind": "declaration_facts",
+        "types": [
+          {
+            "id": "type.python.os",
+            "name": "os",
+            "type_kind": "module",
+            "visibility": "public",
+            "aliases": ["os"],
+            "locator": {
+              "kind": "artifact",
+              "path": "os.py",
+              "symbol": "os"
+            }
+          }
+        ],
+        "members": [
+          {
+            "id": "member.python.os.system-1",
+            "owner": "type.python.os",
+            "name": "system",
+            "member_kind": "function",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "command",
+                  "type": {
+                    "kind": "named",
+                    "name": "str"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "int"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "os.py",
+              "symbol": "os.system(command)"
+            }
+          }
+        ],
+        "relations": []
+      }
+    }
+  ]
+}

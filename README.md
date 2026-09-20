@@ -175,11 +175,12 @@ The repository is organized around the public product surfaces:
 - **Core analysis:** [`crates/`](crates/) contains the Rust workspace crates;
   [`src/`](src/) provides the top-level facade and CLI; [`schemas/`](schemas/)
   holds shared data contracts.
-- **Integrations and distribution:** [`editors/`](editors/) contains editor
-  integrations; [`plugins/`](plugins/) contains coding-agent plugins; and
-  [`npm/`](npm/), [`packaging/`](packaging/), and
-  [`bifrost_searchtools/`](bifrost_searchtools/) expose or package the
-  analyzer.
+- **Integrations and distribution:** [`editors/zed/`](editors/zed/) contains the
+  Zed extension; the VS Code extension is maintained in
+  [`BrokkAi/bifrost-lsp`](https://github.com/BrokkAi/bifrost-lsp).
+  [`plugins/`](plugins/) contains coding-agent plugins; [`npm/`](npm/),
+  [`packaging/`](packaging/), and
+  [`bifrost_searchtools/`](bifrost_searchtools/) expose or package the analyzer.
 - **Documentation and examples:** [`docs/`](docs/) is the documentation site;
   [`examples/`](examples/) contains runnable examples.
 - **Analysis data and project defaults:** [`semantic-packs/`](semantic-packs/)

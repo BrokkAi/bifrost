@@ -155,6 +155,7 @@ Analysis warnings
 Dependency models
   Coverage: complete
   Mode: default; ecosystems: python
+  Details: --verbose or --format json
 ```
 
 </details>

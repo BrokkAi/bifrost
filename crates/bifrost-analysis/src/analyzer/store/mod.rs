@@ -20933,6 +20933,52 @@ mod tests {
         );
     }
 
+    /// #3455: Go now records callable modifier metadata, and it recorded none
+    /// before. A blob persisted under the prior epoch deserializes as "nobody
+    /// read the modifiers", which is indistinguishable from a callable whose
+    /// adapter honestly never looked, so `receiver_contract_of` reports no
+    /// contract and every Go procedure summary stays inert. The salt is the
+    /// only thing that retires those rows.
+    #[test]
+    fn go_callable_modifier_metadata_epoch_invalidates_prior_parsed_blobs() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(
+            temp.path(),
+            "client.go",
+            "package shop\n\ntype Client struct{}\n\nfunc (c *Client) Send(orderID string) {}\n\nfunc Total(orderID string) int64 { return 0 }\n",
+        );
+        let state = Arc::new(parse_state(&GoAdapter, &file));
+        let oid = oid_for(state.source.as_bytes());
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let prior_epoch = epoch::go_epoch_before_callable_modifier_metadata();
+        let prior_generation = store
+            .ensure_language_epoch_value("go", &prior_epoch)
+            .unwrap();
+        store
+            .write_parsed_blob_at_generation(
+                oid,
+                "go",
+                prior_generation,
+                &GoAdapter,
+                state.as_ref(),
+            )
+            .unwrap();
+        assert!(store.contains_parsed_blob(oid, "go").unwrap());
+
+        let current_generation = store
+            .ensure_language_epoch(Language::Go, &tree_sitter_go::LANGUAGE.into())
+            .unwrap();
+
+        assert_ne!(current_generation, prior_generation);
+        assert!(!store.contains_parsed_blob(oid, "go").unwrap());
+        assert_eq!(
+            store
+                .missing_parsed_blob_keys(&[(oid, "go".to_string())])
+                .unwrap(),
+            vec![(oid, "go".to_string())]
+        );
+    }
+
     #[test]
     fn php_conditional_free_function_epoch_invalidates_prior_parsed_blobs() {
         let temp = tempfile::TempDir::new().unwrap();

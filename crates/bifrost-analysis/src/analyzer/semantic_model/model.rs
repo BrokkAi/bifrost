@@ -446,17 +446,27 @@ pub struct RuntimeValueExtension {
 pub struct RuntimeApplicability {
     #[serde(rename = "runtimeFamily")]
     pub runtime_family: String,
+    /// The exact runtime distribution the contract was reviewed against, when
+    /// the contract is a property of one build. A contract guaranteed by the
+    /// language's own standard-library specification names none, and its
+    /// activation selector then carries no artifact evidence either.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[serde(rename = "runtimeArtifact")]
-    pub runtime_artifact: String,
+    pub runtime_artifact: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[serde(rename = "runtimeArtifactDigest")]
-    pub runtime_artifact_digest: String,
+    pub runtime_artifact_digest: Option<String>,
+    /// Scope restrictions the engine cannot observe in a workspace. A reviewed
+    /// contract that applies on every platform, architecture, or module mode
+    /// states none rather than picking one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub platform: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub architecture: Option<String>,
     pub realm: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[serde(rename = "moduleMode")]
-    pub module_mode: String,
+    pub module_mode: Option<String>,
     #[serde(rename = "initializationBoundary")]
     pub initialization_boundary: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

@@ -1,0 +1,88 @@
+; A CPython process input reaching the shell command of os.system.
+;
+; Both sources are keyed reads of a reviewed standard-library container, not a
+; spelling: the read publishes an endpoint only after the import binder proves
+; the root names the `os` or `sys` module, the module scope binds that name
+; through imports alone, no enclosing function rebinds it, nothing that can run
+; before the read writes the container, and the activated process-input model
+; publishes the container. A shadowed module, a local `environ` or `argv`, an
+; unrelated module of the same name, a dynamic key, and a written container all
+; fail one of those, and each leaves a typed incomplete result rather than a
+; clean negative.
+;
+; The sink is the exact reviewed `os.system(command)` member, so a workspace
+; function that happens to be named `system` is not selected.
+(policy
+  :schema-version 1
+  :id "bifrost.security.python.process-input-to-os-system"
+  :name "Process input reaches os.system"
+  :message "A process input reached the command argument of os.system(command)"
+  :severity error
+  :description "Reports values read from the CPython process environment (os.environ) or the launch argument vector (sys.argv) that reach the command argument of os.system. The command runs in a subshell, so attacker-controlled text in it changes the executed command. Source identity is the import binder plus the reviewed process-input model, never the spelling of a name; sink identity is the exact reviewed os.system member."
+  :help-uri "https://bifrost.brokk.ai/static-analysis-policies/#built-in-security-pack"
+  :tags ["security" "python" "command-injection" "cwe-78"]
+  :analysis
+    (analysis
+      :type taint
+      :mode may
+      :call-modeling (call-modeling :unmodeled require-model)
+      :sources
+        (endpoint-set
+          :entries [
+            (source
+              :id os-environ-read
+              :display-name "os.environ keyed read"
+              :categories [input.environment io.external]
+              :selector
+                (rql
+                  :schema-version 1
+                  (language python
+                    (keyed-read-value
+                      :runtime python
+                      :global os
+                      :container environ
+                      :key-kind static-property
+                      :source-origin pristine_input
+                      (field_access :field (name "environ")))))
+              :bind matched-value
+              :labels [attacker-controlled])
+            (source
+              :id sys-argv-read
+              :display-name "sys.argv indexed read"
+              :categories [input.user-controlled io.external]
+              :selector
+                (rql
+                  :schema-version 1
+                  (language python
+                    (keyed-read-value
+                      :runtime python
+                      :global sys
+                      :container argv
+                      :key-kind static-index
+                      :source-origin pristine_input
+                      (field_access :field (name "argv")))))
+              :bind matched-value
+              :labels [attacker-controlled])])
+      :sinks
+        (endpoint-set
+          :entries [
+            (sink
+              :id os-system-command
+              :display-name "os.system command"
+              :categories [process.external]
+              :selector
+                (rql
+                  :schema-version 1
+                  (language python
+                    (call-argument :formal-index 0
+                      (resolved-call
+                        :resolves-to member.python.os.system-1
+                        :proof declared
+                        (call-bindings
+                          (call-shape
+                            (call :callee (name "system") (arity 1))))))))
+              :dangerous-operand (argument :index 0)
+              :accepts [attacker-controlled])]))
+  :classification
+    (classification
+      :fallback (classification-id :taxonomy "CWE" :id "78")))

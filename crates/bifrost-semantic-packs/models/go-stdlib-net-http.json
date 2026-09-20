@@ -1,13 +1,13 @@
 {
   "schema_version": 2,
   "pack_id": "bifrost.go.stdlib.net-http",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "producer": { "name": "bifrost", "version": "0.11.3" },
   "language": "go",
   "ecosystem": "go",
   "compatibility": { "bifrost": ">=0.11.3, <1.0.0", "toolchains": [] },
   "provenance": {
-    "source": "https://go.dev/src/net/http/server.go (http.Handle, http.HandleFunc, http.Serve, http.ListenAndServe, http.NewServeMux, http.ServeMux.Handle, http.ServeMux.HandleFunc, net/http.HandlerFunc)",
+    "source": "https://go.dev/src/net/http/server.go (http.Handle, http.HandleFunc, http.Serve, http.ListenAndServe, http.NewServeMux, http.ServeMux.Handle, http.ServeMux.HandleFunc, net/http.HandlerFunc) and https://go.dev/src/net/http/client.go (http.Get)",
     "revision": "go1.26.0"
   },
   "license": "BSD-3-Clause",
@@ -70,6 +70,15 @@
             "completeness": "complete",
             "transfers": [],
             "concurrency_effects": [{ "kind": "task_spawn", "callable": { "kind": "parameter", "ordinal": 1 } }]
+          },
+          {
+            "id": "net-http.get",
+            "target": { "path": "src/net/http/client.go", "symbol": "net/http.Get(url string)", "has_receiver": false, "parameter_count": 1 },
+            "completeness": "complete",
+            "transfers": [],
+            "declared_effects": [
+              { "id": "bifrost.network_io", "timing": "immediate", "certainty": "definite" }
+            ]
           }
         ]
       }

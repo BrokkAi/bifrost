@@ -31,7 +31,6 @@ export const CANONICAL_RELEASE_METADATA = "plugins/bifrost-agent/bifrost-release
 // archive hashes. Anything else in its update set means the tree was not
 // release-clean, which must abort before either repository is written.
 export const DERIVED_CHECKSUM_PROJECTIONS = [
-  "editors/vscode/package.json",
   "plugins/bifrost-dsh/bifrost-release.json",
 ];
 
@@ -85,9 +84,8 @@ function readCanonicalMetadata(repoRoot) {
   };
 }
 
-// canCopyReleaseChecksums in release-version.mjs gates the VS Code hash copy on
-// binaryVersion === cargoVersion. If that does not hold, sync silently leaves
-// the VS Code hashes alone and we would commit a half-synced tree. Assert it
+// release-version projects hashes only to the vendored launcher copy. It performs
+// that projection for every release-sync update, so assert the release identity
 // rather than depending on the release commit happening to be well-formed.
 function assertChecksumProjectionEnabled(repoRoot, metadata, version) {
   const cargoVersion = readCargoVersion(
@@ -121,9 +119,7 @@ function assertExactTargetSet(actual, source) {
  * This is the whole idempotency decision, and it is deliberately anchored to the
  * sidecars rather than to the repository's internal consistency. release-version
  * never reads or writes archiveSha256 on the canonical file, so its update set
- * is empty for a tree whose versions agree even when every hash is stale. At
- * aad49ea03^ that was literally true: Cargo, the agent metadata and the VS Code
- * manifest all read 0.10.3 and all carried the same superseded darwin hash.
+ * is empty for a tree whose versions agree even when every hash is stale.
  */
 export function checksumsAlreadyMatch(metadataJson, checksums) {
   const tracked = metadataJson.archiveSha256 ?? {};

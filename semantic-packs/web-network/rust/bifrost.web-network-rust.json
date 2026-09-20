@@ -1,0 +1,52 @@
+{
+  "schema_version": 2,
+  "pack_id": "bifrost.web-network-rust",
+  "version": "1.0.0",
+  "producer": { "name": "bifrost-reviewed-web-models", "version": "1.0.0" },
+  "language": "rust",
+  "ecosystem": "cargo",
+  "compatibility": {
+    "bifrost": ">=0.8.0, <1.0.0",
+    "toolchains": []
+  },
+  "provenance": {
+    "source": "Rust standard library std::net, the TcpStream::connect associated function",
+    "revision": "rust-std-1.100"
+  },
+  "license": "Apache-2.0",
+  "completeness": "complete",
+  "safety": { "generated_code_only": false, "review_required": false },
+  "shards": [
+    {
+      "id": "summaries.web-network.rust",
+      "activation": [{ "targets": [], "configurations": [] }],
+      "payload": {
+        "kind": "procedure_summaries",
+        "summaries": [
+          {
+            "id": "summary.web-network.rust.std-net-tcpstream-connect",
+            "target": {
+              "path": "library/std/src/net/tcp.rs",
+              "symbol": "std.net.TcpStream.connect",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": { "kind": "parameter", "ordinal": 0 },
+                "exit_kind": "normal",
+                "output": { "kind": "normal_return" }
+              }
+            ],
+            "effects": [],
+            "declared_effects": [
+              { "id": "bifrost.network_io", "timing": "immediate", "certainty": "definite" }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

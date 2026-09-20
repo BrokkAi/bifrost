@@ -100,6 +100,7 @@ pub mod property_reaching;
 pub mod provider;
 pub mod render;
 pub mod service;
+pub(crate) mod structural_identity;
 pub mod type_flow;
 pub mod workspace_oracle;
 

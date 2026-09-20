@@ -1,0 +1,158 @@
+{
+  "schema_version": 4,
+  "pack_id": "bifrost.python-process-inputs",
+  "version": "0.1.0",
+  "producer": {
+    "name": "bifrost-reviewed-python-models",
+    "version": "0.1.0"
+  },
+  "language": "python",
+  "ecosystem": "pypi",
+  "compatibility": {
+    "bifrost": ">=0.11.0, <1.0.0",
+    "toolchains": []
+  },
+  "provenance": {
+    "source": "Python standard library reference, os and sys",
+    "revision": "v3.13.5"
+  },
+  "license": "Apache-2.0",
+  "completeness": "partial",
+  "safety": {
+    "generated_code_only": false,
+    "review_required": false
+  },
+  "shards": [
+    {
+      "id": "runtime.python-process-inputs",
+      "activation": [
+        {
+          "targets": [],
+          "configurations": [
+            "b95b6625659ac476f274bdb3a305f20f497727137dc85aa96e50a989d57d8afd"
+          ]
+        }
+      ],
+      "payload": {
+        "kind": "declaration_facts",
+        "types": [],
+        "members": [],
+        "relations": []
+      },
+      "runtime_values": {
+        "exposures": [
+          {
+            "exposureId": "python-os-module",
+            "languages": ["python"],
+            "bindingName": "os",
+            "runtime": {
+              "runtimeFamily": "python",
+              "realm": "main",
+              "initializationBoundary": "pristine-runtime-at-entry",
+              "hostAssumptions": ["closed-workspace-no-preloads"]
+            },
+            "runtimeProfileDigest": "b95b6625659ac476f274bdb3a305f20f497727137dc85aa96e50a989d57d8afd",
+            "rootIdentity": {
+              "scheme": "csmi.runtime-global",
+              "schemeVersion": "0.1.0",
+              "descriptors": [
+                {
+                  "role": "runtime",
+                  "name": "python"
+                },
+                {
+                  "role": "global",
+                  "name": "os"
+                }
+              ]
+            },
+            "members": ["environ"],
+            "activation": "enabled",
+            "evidence": {
+              "producer": "https://github.com/python/cpython/blob/v3.13.5/Doc/library/os.rst",
+              "method": "reviewed-runtime-contract",
+              "inputsDigest": "709ea0fac5c4283df534aa0d46b97908d65ee5ffe96fddf6bd187784170359d6"
+            },
+            "coverage": {
+              "status": "complete"
+            }
+          },
+          {
+            "exposureId": "python-sys-module",
+            "languages": ["python"],
+            "bindingName": "sys",
+            "runtime": {
+              "runtimeFamily": "python",
+              "realm": "main",
+              "initializationBoundary": "pristine-runtime-at-entry",
+              "hostAssumptions": ["closed-workspace-no-preloads"]
+            },
+            "runtimeProfileDigest": "b95b6625659ac476f274bdb3a305f20f497727137dc85aa96e50a989d57d8afd",
+            "rootIdentity": {
+              "scheme": "csmi.runtime-global",
+              "schemeVersion": "0.1.0",
+              "descriptors": [
+                {
+                  "role": "runtime",
+                  "name": "python"
+                },
+                {
+                  "role": "global",
+                  "name": "sys"
+                }
+              ]
+            },
+            "members": ["argv"],
+            "activation": "enabled",
+            "evidence": {
+              "producer": "https://github.com/python/cpython/blob/v3.13.5/Doc/library/sys.rst",
+              "method": "reviewed-runtime-contract",
+              "inputsDigest": "5f94a3e3937d1b0ead710ecce7a8d0415df95187b64065f1f7452074e7333301"
+            },
+            "coverage": {
+              "status": "complete"
+            }
+          }
+        ],
+        "behaviors": [
+          {
+            "behaviorId": "python-os-environ-read",
+            "exposureId": "python-os-module",
+            "containerMember": "environ",
+            "acceptedKeys": "static-property",
+            "normalResult": "value",
+            "exceptionBehavior": "may-throw",
+            "mutationModel": "pristine-input-until-write",
+            "materialization": "eager",
+            "evidence": {
+              "producer": "https://github.com/python/cpython/blob/v3.13.5/Doc/library/os.rst",
+              "method": "reviewed-runtime-contract",
+              "inputsDigest": "709ea0fac5c4283df534aa0d46b97908d65ee5ffe96fddf6bd187784170359d6"
+            },
+            "coverage": {
+              "status": "complete"
+            }
+          },
+          {
+            "behaviorId": "python-sys-argv-read",
+            "exposureId": "python-sys-module",
+            "containerMember": "argv",
+            "acceptedKeys": "static-index",
+            "normalResult": "value",
+            "exceptionBehavior": "may-throw",
+            "mutationModel": "pristine-input-until-write",
+            "materialization": "eager",
+            "evidence": {
+              "producer": "https://github.com/python/cpython/blob/v3.13.5/Doc/library/sys.rst",
+              "method": "reviewed-runtime-contract",
+              "inputsDigest": "5f94a3e3937d1b0ead710ecce7a8d0415df95187b64065f1f7452074e7333301"
+            },
+            "coverage": {
+              "status": "complete"
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

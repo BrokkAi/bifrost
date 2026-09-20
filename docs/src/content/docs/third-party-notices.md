@@ -4,8 +4,8 @@ description: Third-party licensing and attribution for Bifrost artifacts.
 ---
 
 Bifrost's public source is licensed under Apache-2.0. Official binaries,
-packages, editor extensions, and semantic packs may also contain third-party
-components or generated data under their own terms.
+packages, and semantic packs may also contain third-party components or
+generated data under their own terms.
 
 Each release artifact must include the notices generated for its exact locked
 dependency graph. The checked-in `licenses/` and `semantic-packs/**/notices/`

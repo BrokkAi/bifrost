@@ -172,7 +172,7 @@ export function checkReleaseVersion({ repoRoot = process.cwd(), tag, githubOutpu
     throw new Error("--github-output requires --tag");
   }
 
-  const { updates } = collectProjectionUpdates(repoRoot, cargoVersion);
+  const updates = collectProjectionUpdates(repoRoot, cargoVersion);
   if (updates.length > 0) {
     throw new Error(
       `Release metadata is not synced to Cargo.toml version ${cargoVersion}:\n${updates.map(({ relativePath }) => `- ${relativePath}`).join("\n")}`,
@@ -198,7 +198,7 @@ export function syncReleaseVersion({ repoRoot = process.cwd() } = {}) {
   const version = readCargoVersion(readFile(repoRoot, "Cargo.toml"));
   validateWorkspaceVersionInheritance(repoRoot);
   validatePyprojectVersionInheritance(readFile(repoRoot, "pyproject.toml"));
-  const { updates, canCopyReleaseChecksums } = collectProjectionUpdates(repoRoot, version);
+  const updates = collectProjectionUpdates(repoRoot, version);
   for (const update of updates) {
     fs.writeFileSync(update.absolutePath, update.contents);
   }
@@ -209,18 +209,12 @@ export function syncReleaseVersion({ repoRoot = process.cwd() } = {}) {
     for (const update of updates) {
       console.log(`- ${update.relativePath}`);
     }
-    if (!canCopyReleaseChecksums) {
-      console.log(
-        "Note: editors/vscode/package.json archiveSha256 was left unchanged because plugins/bifrost-agent/bifrost-release.json does not yet match this version.",
-      );
-    }
   }
   return { updates: updates.map(({ relativePath }) => relativePath), version };
 }
 
 function collectProjectionUpdates(repoRoot, version) {
   const existingReleaseMetadata = readJson(repoRoot, "plugins/bifrost-agent/bifrost-release.json");
-  const canCopyReleaseChecksums = existingReleaseMetadata.binaryVersion === version;
 
   const agentReleaseUpdate = updateJson(
     repoRoot,
@@ -301,27 +295,6 @@ function collectProjectionUpdates(repoRoot, version) {
       }
       return source.replace(pattern, `pi install npm:@brokk/bifrost-agent@${version}`);
     }),
-    updateJson(repoRoot, "editors/vscode/package.json", (json) => {
-      json.version = version;
-      json.bifrost ??= {};
-      json.bifrost.binaryVersion = version;
-      json.bifrost.minimumBinaryVersion = sameMinorSeries(
-        existingReleaseMetadata.binaryVersion,
-        version,
-      )
-        ? (existingReleaseMetadata.minimumBinaryVersion ?? version)
-        : version;
-      json.bifrost.allowPrerelease = existingReleaseMetadata.allowPrerelease ?? false;
-      if (canCopyReleaseChecksums) {
-        json.bifrost.archiveSha256 = existingReleaseMetadata.archiveSha256;
-      }
-    }),
-    updateJson(repoRoot, "editors/vscode/package-lock.json", (json) => {
-      json.version = version;
-      json.packages ??= {};
-      json.packages[""] ??= {};
-      json.packages[""].version = version;
-    }),
     // The composite action installs a Bifrost release by tag, and consumers
     // reach it two ways: the alias repository, whose copy the release sync
     // rewrites, and the subdirectory form
@@ -352,7 +325,7 @@ function collectProjectionUpdates(repoRoot, version) {
     }),
   ].filter(Boolean);
 
-  return { updates, canCopyReleaseChecksums };
+  return updates;
 }
 
 function sameMinorSeries(left, right) {

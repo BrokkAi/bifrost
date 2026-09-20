@@ -93,7 +93,6 @@ jobs:
           for required in \
             "bifrost-agent-${RELEASE_TAG}.tar.gz" \
             "brokk-bifrost-agent-${RELEASE_VERSION}.tgz" \
-            "bifrost-vscode-${RELEASE_TAG}.vsix" \
             "bifrost-semantic-pack-${RELEASE_TAG}-x86_64-unknown-linux-gnu.tar.gz" \
             "bifrost-semantic-pack-${RELEASE_TAG}-x86_64-unknown-linux-gnu.tar.gz.sha256" \
             "bifrost-semantic-packs-${RELEASE_TAG}.tar.gz" \
@@ -104,8 +103,6 @@ jobs:
             jq -e --arg version "$RELEASE_VERSION" '.name == "@brokk/bifrost-agent" and .version == $version' >/dev/null
           tar -xOf "$asset_dir/brokk-bifrost-agent-${RELEASE_VERSION}.tgz" package/package.json |
             jq -e --arg version "$RELEASE_VERSION" '.name == "@brokk/bifrost-agent" and .version == $version' >/dev/null
-          unzip -p "$asset_dir/bifrost-vscode-${RELEASE_TAG}.vsix" extension/package.json |
-            jq -e --arg version "$RELEASE_VERSION" '.version == $version' >/dev/null
           checksums=("$asset_dir"/*.sha256)
           test "${#checksums[@]}" -gt 0
           for checksum in "${checksums[@]}"; do
@@ -350,69 +347,6 @@ jobs:
           selected="$(npm exec --prefix "$install_dir" --no -- bifrost --version)"
           echo "$selected"
           grep -F "$RELEASE_VERSION" <<< "$selected"
-
-  extensions:
-    name: VS Marketplace and Open VSX availability
-    needs: resolve
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    permissions:
-      contents: read
-    env:
-      RELEASE_VERSION: ${{ needs.resolve.outputs.version }}
-    steps:
-      - name: Verify Visual Studio Marketplace version and install archive
-        shell: bash
-        run: |
-          set -euo pipefail
-          query="$RUNNER_TEMP/marketplace-query.json"
-          jq -n '{filters: [{criteria: [{filterType: 7, value: "brokk.bifrost-vscode"}], pageNumber: 1, pageSize: 1}], flags: 914}' > "$query"
-          response="$RUNNER_TEMP/marketplace.json"
-          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
-            --retry 5 --retry-all-errors --retry-delay 2 \
-            -H 'Content-Type: application/json' -H 'Accept: application/json;api-version=7.2-preview.1' \
-            --data-binary "@$query" \
-            'https://marketplace.visualstudio.com/_apis/public/gallery/extensionquery' -o "$response"
-          jq -e --arg version "$RELEASE_VERSION" \
-            '[.results[0].extensions[0].versions[] | select(.version == $version)] | length == 1' "$response" >/dev/null
-          archive="$RUNNER_TEMP/bifrost-vscode.vsix"
-          archive_found=0
-          for attempt in $(seq 1 30); do
-            if curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
-              --retry 5 --retry-all-errors --retry-delay 2 \
-              --compressed \
-              -H 'Accept: application/octet-stream' \
-              "https://marketplace.visualstudio.com/_apis/public/gallery/publishers/brokk/vsextensions/bifrost-vscode/${RELEASE_VERSION}/vspackage" \
-              -o "$archive" && unzip -tq "$archive" >/dev/null 2>&1; then
-              archive_found=1
-              break
-            fi
-            echo "Waiting for a valid Visual Studio Marketplace archive ($attempt/30)"
-            sleep 10
-          done
-          test "$archive_found" = 1
-          echo "Visual Studio Marketplace exposes bifrost-vscode $RELEASE_VERSION and a valid VSIX archive"
-          echo "The Marketplace public API exposes no checksum endpoint; checksum comparison is not claimed here."
-
-      - name: Verify Open VSX version, download, and checksum
-        shell: bash
-        run: |
-          set -euo pipefail
-          metadata="$RUNNER_TEMP/open-vsx.json"
-          endpoint="https://open-vsx.org/api/brokk/bifrost-vscode/${RELEASE_VERSION}"
-          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
-            --retry 5 --retry-all-errors --retry-delay 2 "$endpoint" -o "$metadata"
-          jq -e --arg version "$RELEASE_VERSION" '.version == $version and (.files.download | startswith("https://"))' "$metadata" >/dev/null
-          download_url="$(jq -r '.files.download' "$metadata")"
-          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
-            --retry 5 --retry-all-errors --retry-delay 2 "$download_url" -o "$RUNNER_TEMP/bifrost-open-vsx.vsix"
-          checksum_url="${endpoint}/file/brokk.bifrost-vscode-${RELEASE_VERSION}.sha256"
-          expected="$(curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
-            --retry 5 --retry-all-errors --retry-delay 2 "$checksum_url" | tr -d '[:space:]')"
-          actual="$(sha256sum "$RUNNER_TEMP/bifrost-open-vsx.vsix" | cut -d ' ' -f 1)"
-          [[ "$expected" =~ ^[0-9a-f]{64}$ ]]
-          test "$expected" = "$actual"
-          unzip -tq "$RUNNER_TEMP/bifrost-open-vsx.vsix"
 
   mcp:
     name: published Codex and Claude MCP list_policies smoke

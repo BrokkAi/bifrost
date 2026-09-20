@@ -1185,6 +1185,102 @@
       "classification": "blocked_missing_adapter_or_identity_evidence",
       "generation_strategy": "retain_until_profile_support",
       "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/python-os-command-declarations/manifest.json",
+      "profiles": [
+        "python"
+      ],
+      "reason": "First-wave migration candidate; exportability remains pending lossless field and applicability audit.",
+      "source_model": "semantic-packs/python/os-command/bifrost.python-os-command-declarations.json"
+    },
+    {
+      "asset_role": "compiled_shard",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/python-os-command-declarations/shards/declarations.python-os-system.json",
+      "profiles": [
+        "python"
+      ],
+      "reason": "First-wave migration candidate; exportability remains pending lossless field and applicability audit.",
+      "source_model": "semantic-packs/python/os-command/bifrost.python-os-command-declarations.json"
+    },
+    {
+      "asset_role": "compiled_manifest",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/python-os-command-summaries/manifest.json",
+      "profiles": [
+        "python"
+      ],
+      "reason": "First-wave migration candidate; exportability remains pending lossless field and applicability audit.",
+      "source_model": "semantic-packs/python/os-command/bifrost.python-os-command-summaries.json"
+    },
+    {
+      "asset_role": "compiled_shard",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/python-os-command-summaries/shards/summaries.python-os-system.json",
+      "profiles": [
+        "python"
+      ],
+      "reason": "First-wave migration candidate; exportability remains pending lossless field and applicability audit.",
+      "source_model": "semantic-packs/python/os-command/bifrost.python-os-command-summaries.json"
+    },
+    {
+      "asset_role": "compiled_manifest",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/python-process-inputs/manifest.json",
+      "profiles": [
+        "python"
+      ],
+      "reason": "First-wave migration candidate; exportability remains pending lossless field and applicability audit.",
+      "source_model": "semantic-packs/python/process-inputs/bifrost.python-process-inputs.json"
+    },
+    {
+      "asset_role": "compiled_shard",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/python-process-inputs/shards/runtime.python-process-inputs.deflate",
+      "profiles": [
+        "python"
+      ],
+      "reason": "First-wave migration candidate; exportability remains pending lossless field and applicability audit.",
+      "source_model": "semantic-packs/python/process-inputs/bifrost.python-process-inputs.json"
+    },
+    {
+      "asset_role": "compiled_manifest",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
       "path": "crates/bifrost-semantic-packs/embedded/scala-case-class/manifest.json",
       "profiles": [],
       "reason": "Scala source and JVM identities have no supported standard profile adapter.",
@@ -2270,6 +2366,17 @@
       "classification": "not_a_semantic_model",
       "generation_strategy": "retain_native_artifact",
       "native_source_kind": "documentation",
+      "path": "semantic-packs/python/README-process-inputs.md",
+      "profiles": [],
+      "reason": "Documentation describes or governs native pack authoring; it is not a semantic model."
+    },
+    {
+      "asset_role": "documentation",
+      "audit_status": "not_applicable",
+      "blockers": [],
+      "classification": "not_a_semantic_model",
+      "generation_strategy": "retain_native_artifact",
+      "native_source_kind": "documentation",
       "path": "semantic-packs/python/README.md",
       "profiles": [],
       "reason": "Documentation describes or governs native pack authoring; it is not a semantic model."
@@ -2295,6 +2402,63 @@
       "path": "semantic-packs/python/notices/typeshed-stdlib-2026.8.31.txt",
       "profiles": [],
       "reason": "License or notice text is provenance material, not a semantic model."
+    },
+    {
+      "asset_role": "authored_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "authored_semantic_model",
+      "path": "semantic-packs/python/os-command/bifrost.python-os-command-declarations.json",
+      "profiles": [
+        "python"
+      ],
+      "reason": "First-wave migration candidate; exportability remains pending lossless field and applicability audit.",
+      "embedded_paths": [
+        "crates/bifrost-semantic-packs/embedded/python-os-command-declarations/manifest.json",
+        "crates/bifrost-semantic-packs/embedded/python-os-command-declarations/shards/declarations.python-os-system.json"
+      ]
+    },
+    {
+      "asset_role": "authored_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "authored_semantic_model",
+      "path": "semantic-packs/python/os-command/bifrost.python-os-command-summaries.json",
+      "profiles": [
+        "python"
+      ],
+      "reason": "First-wave migration candidate; exportability remains pending lossless field and applicability audit.",
+      "embedded_paths": [
+        "crates/bifrost-semantic-packs/embedded/python-os-command-summaries/manifest.json",
+        "crates/bifrost-semantic-packs/embedded/python-os-command-summaries/shards/summaries.python-os-system.json"
+      ]
+    },
+    {
+      "asset_role": "authored_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "authored_semantic_model",
+      "path": "semantic-packs/python/process-inputs/bifrost.python-process-inputs.json",
+      "profiles": [
+        "python"
+      ],
+      "reason": "First-wave migration candidate; exportability remains pending lossless field and applicability audit.",
+      "embedded_paths": [
+        "crates/bifrost-semantic-packs/embedded/python-process-inputs/manifest.json",
+        "crates/bifrost-semantic-packs/embedded/python-process-inputs/shards/runtime.python-process-inputs.deflate"
+      ]
     },
     {
       "asset_role": "artifact_descriptor",
@@ -2656,6 +2820,21 @@
       "path": "semantic-packs/web-network/python/bifrost.web-network-python.json",
       "profiles": [
         "python"
+      ],
+      "reason": "Reviewed network-effect model for the #3387 boundary family; exportability remains pending lossless field and applicability audit."
+    },
+    {
+      "asset_role": "authored_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "authored_semantic_model",
+      "path": "semantic-packs/web-network/rust/bifrost.web-network-rust.json",
+      "profiles": [
+        "rust"
       ],
       "reason": "Reviewed network-effect model for the #3387 boundary family; exportability remains pending lossless field and applicability audit."
     },

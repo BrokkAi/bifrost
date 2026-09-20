@@ -271,7 +271,7 @@ jobs:
             select((.path | test("^bifrost-v.*\\.(tar\\.gz|zip)(\\.sha256)?$")) or
                    (.path | test("^bifrost-semantic-pack-v.*-x86_64-unknown-linux-gnu\\.tar\\.gz(\\.sha256)?$")) or
                    (.path | test("^bifrost-semantic-packs-.*\\.(tar\\.gz|json)(\\.sha256)?$")) or
-                   (.path | test("^(bifrost-agent-.*\\.tar\\.gz|brokk-bifrost-agent-.*\\.tgz|bifrost-vscode-.*\\.vsix)$"))) |
+                   (.path | test("^(bifrost-agent-.*\\.tar\\.gz|brokk-bifrost-agent-.*\\.tgz)$"))) |
             "qualification/" + .path' qualification/release-qualification.json > "$assets"
           test -s "$assets"
           release_json="$RUNNER_TEMP/github-release.json"
@@ -593,163 +593,10 @@ jobs:
           IS_NEWEST: ${{ steps.sync.outputs.is_newest }}
         run: bash scripts/public/create-policy-scan-release.sh
 
-  attach-vscode:
-    name: verify qualified VSIX asset
-    needs: [release-context, promote-qualification, release]
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    permissions:
-      contents: read
-      actions: read
-    env:
-      RELEASE_TAG: ${{ needs.release-context.outputs.tag }}
-      GH_TOKEN: ${{ github.token }}
-    steps:
-      - name: Download qualified release bundle
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
-        with:
-          artifact-ids: ${{ needs.promote-qualification.outputs.artifact_id }}
-          repository: ${{ github.repository }}
-          run-id: ${{ needs.promote-qualification.outputs.run_id }}
-          github-token: ${{ github.token }}
-          path: qualification
-          merge-multiple: true
-
-      - name: Verify GitHub asset matches the qualified VSIX
-        shell: bash
-        run: |
-          set -euo pipefail
-          file="qualification/bifrost-vscode-${RELEASE_TAG}.vsix"
-          expected="sha256:$(sha256sum "$file" | awk '{print $1}')"
-          release_json="$RUNNER_TEMP/release.json"
-          gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" > "$release_json"
-          actual="$(jq -r --arg name "$(basename "$file")" '.assets[] | select(.name == $name) | (.digest // "")' "$release_json")"
-          test "$actual" = "$expected"
-
-  publish-vscode:
-    name: publish qualified VSIX to Visual Studio Marketplace
-    needs: [release-context, promote-qualification, attach-vscode]
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    environment: release
-    permissions:
-      contents: read
-      actions: read
-    steps:
-      - name: Checkout exact marketplace tooling
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
-        with:
-          persist-credentials: false
-          ref: ${{ needs.release-context.outputs.commit }}
-
-      - name: Set up Node
-        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
-        with:
-          node-version: 22
-          package-manager-cache: false
-
-      - name: Install marketplace tooling
-        run: npm ci
-        working-directory: editors/vscode
-
-      - name: Download qualified release bundle
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
-        with:
-          artifact-ids: ${{ needs.promote-qualification.outputs.artifact_id }}
-          repository: ${{ github.repository }}
-          run-id: ${{ needs.promote-qualification.outputs.run_id }}
-          github-token: ${{ github.token }}
-          path: qualification
-          merge-multiple: true
-
-      - name: Publish exact qualified VSIX
-        run: >-
-          npx --no-install vsce publish
-          --packagePath "${{ github.workspace }}/qualification/bifrost-vscode-${{ needs.release-context.outputs.tag }}.vsix"
-          --skip-duplicate
-        working-directory: editors/vscode
-        env:
-          VSCE_PAT: ${{ secrets.VSCE_PAT }}
-
-  publish-open-vsx:
-    name: publish qualified VSIX to Open VSX
-    needs: [release-context, promote-qualification, attach-vscode]
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    environment: release
-    permissions:
-      contents: read
-      actions: read
-    env:
-      RELEASE_VERSION: ${{ needs.release-context.outputs.version }}
-      RELEASE_TAG: ${{ needs.release-context.outputs.tag }}
-    steps:
-      - name: Checkout exact Open VSX tooling
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
-        with:
-          persist-credentials: false
-          ref: ${{ needs.release-context.outputs.commit }}
-
-      - name: Set up Node
-        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
-        with:
-          node-version: 22
-          package-manager-cache: false
-
-      - name: Install Open VSX tooling
-        run: npm ci
-        working-directory: editors/vscode
-
-      - name: Download qualified release bundle
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
-        with:
-          artifact-ids: ${{ needs.promote-qualification.outputs.artifact_id }}
-          repository: ${{ github.repository }}
-          run-id: ${{ needs.promote-qualification.outputs.run_id }}
-          github-token: ${{ github.token }}
-          path: qualification
-          merge-multiple: true
-
-      - name: Publish or verify exact qualified VSIX
-        shell: bash
-        working-directory: editors/vscode
-        env:
-          OVSX_PAT: ${{ secrets.OVSX_PAT }}
-          VSIX_PATH: ${{ github.workspace }}/qualification/bifrost-vscode-${{ needs.release-context.outputs.tag }}.vsix
-        run: |
-          set -euo pipefail
-          metadata_url="https://open-vsx.org/api/brokk/bifrost-vscode/$RELEASE_VERSION"
-          checksum_url="$metadata_url/file/brokk.bifrost-vscode-$RELEASE_VERSION.sha256"
-          local_checksum="$(sha256sum "$VSIX_PATH" | awk '{print $1}')"
-          metadata_file="$RUNNER_TEMP/open-vsx-bifrost-vscode.json"
-          status="$(curl --silent --show-error --location --proto '=https' --proto-redir '=https' \
-            --output "$metadata_file" --write-out '%{http_code}' "$metadata_url")"
-          if [[ "$status" == 200 ]]; then
-            registry_checksum="$(curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' "$checksum_url" | tr -d '[:space:]')"
-            [[ "$registry_checksum" =~ ^[0-9a-f]{64}$ ]]
-            test "$registry_checksum" = "$local_checksum"
-            exit 0
-          fi
-          test "$status" = 404
-          test -n "${OVSX_PAT:-}"
-          npx --no-install ovsx publish "$VSIX_PATH" --skip-duplicate
-          for attempt in $(seq 1 30); do
-            status="$(curl --silent --show-error --location --output "$metadata_file" --write-out '%{http_code}' "$metadata_url")"
-            if [[ "$status" == 200 ]]; then
-              registry_checksum="$(curl --fail --silent --show-error --location "$checksum_url" | tr -d '[:space:]')"
-              [[ "$registry_checksum" =~ ^[0-9a-f]{64}$ ]]
-              test "$registry_checksum" = "$local_checksum"
-              exit 0
-            fi
-            test "$status" = 404
-            sleep 10
-          done
-          exit 1
-
   post-release-smoke:
     name: start post-release smoke
-    needs: [release-context, release, publish-crate-facade, publish-wheels, publish-npm, publish-agent-plugin, publish-pi-package, publish-vscode, publish-open-vsx]
-    if: ${{ always() && needs.release.result == 'success' && needs.publish-crate-facade.result == 'success' && needs.publish-wheels.result == 'success' && needs.publish-npm.result == 'success' && needs.publish-agent-plugin.result == 'success' && needs.publish-pi-package.result == 'success' && needs.publish-vscode.result == 'success' && needs.publish-open-vsx.result == 'success' }}
+    needs: [release-context, release, publish-crate-facade, publish-wheels, publish-npm, publish-agent-plugin, publish-pi-package]
+    if: ${{ always() && needs.release.result == 'success' && needs.publish-crate-facade.result == 'success' && needs.publish-wheels.result == 'success' && needs.publish-npm.result == 'success' && needs.publish-agent-plugin.result == 'success' && needs.publish-pi-package.result == 'success' }}
     uses: ./.github/workflows/post-release-smoke.yml
     with:
       tag: ${{ needs.release-context.outputs.tag }}
@@ -765,8 +612,8 @@ jobs:
     #
     # Gated exactly like post-release-smoke: announcing a release whose npm or
     # crate publication failed is worse than announcing nothing.
-    needs: [release-context, release, publish-crate-facade, publish-wheels, publish-npm, publish-agent-plugin, publish-pi-package, publish-vscode, publish-open-vsx]
-    if: ${{ always() && needs.release.result == 'success' && needs.publish-crate-facade.result == 'success' && needs.publish-wheels.result == 'success' && needs.publish-npm.result == 'success' && needs.publish-agent-plugin.result == 'success' && needs.publish-pi-package.result == 'success' && needs.publish-vscode.result == 'success' && needs.publish-open-vsx.result == 'success' }}
+    needs: [release-context, release, publish-crate-facade, publish-wheels, publish-npm, publish-agent-plugin, publish-pi-package]
+    if: ${{ always() && needs.release.result == 'success' && needs.publish-crate-facade.result == 'success' && needs.publish-wheels.result == 'success' && needs.publish-npm.result == 'success' && needs.publish-agent-plugin.result == 'success' && needs.publish-pi-package.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     environment: release
@@ -1100,7 +947,7 @@ jobs:
   release-summary:
     name: release promotion summary
     if: ${{ always() }}
-    needs: [release-context, resolve-qualification, promote-qualification, release, publish-crate-facade, publish-wheels, publish-npm, publish-agent-plugin, publish-pi-package, publish-policy-scan-action, attach-vscode, publish-vscode, publish-open-vsx, post-release-smoke]
+    needs: [release-context, resolve-qualification, promote-qualification, release, publish-crate-facade, publish-wheels, publish-npm, publish-agent-plugin, publish-pi-package, publish-policy-scan-action, post-release-smoke]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -1122,8 +969,6 @@ jobs:
       AGENT: ${{ needs.publish-agent-plugin.result }}
       PI: ${{ needs.publish-pi-package.result }}
       POLICY_SCAN_ALIAS: ${{ needs.publish-policy-scan-action.result }}
-      VSCODE: ${{ needs.publish-vscode.result }}
-      OPEN_VSX: ${{ needs.publish-open-vsx.result }}
       POST_RELEASE_SMOKE: ${{ needs.post-release-smoke.result }}
       WORKFLOW_SOURCE_REF: ${{ github.ref_name }}
       WORKFLOW_SOURCE_SHA: ${{ github.workflow_sha }}
@@ -1145,8 +990,6 @@ jobs:
             echo "- Agent asset: \`$AGENT\`"
             echo "- Pi asset: \`$PI\`"
             echo "- Policy-scan action alias repository: \`$POLICY_SCAN_ALIAS\`"
-            echo "- Visual Studio Marketplace: \`$VSCODE\`"
-            echo "- Open VSX: \`$OPEN_VSX\`"
             echo "- Post-release smoke: \`$POST_RELEASE_SMOKE\`"
             echo
             echo "### Qualified release source (immutable)"

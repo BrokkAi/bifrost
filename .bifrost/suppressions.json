@@ -39,18 +39,6 @@
     },
     {
       "policy_id": "bifrost.performance.file-read-in-loop",
-      "finding_id": "52cc99e7a4f248010a16c16a3673bbf834cdb460c3252e9f795185d9745a5f11",
-      "path": "scripts/public/prepare-vscode-extension-manifest.mjs",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Loop iterates distinct files; one read per file is the intended operation and cannot be hoisted.",
-      "policy_hash_at_acceptance": "a1d83845a9a14d26d5c9de154727ac2cd32ca81365d1111bf966e209b4ed89c9",
-      "accepted_by": "dbakereffendi",
-      "accepted_at": "2026-08-04",
-      "expires_at": null
-    },
-    {
-      "policy_id": "bifrost.performance.file-read-in-loop",
       "finding_id": "77ad982cadebf88edcdbeda69bf61a30889fb317db6fe75d3319ee48ee1b64d4",
       "path": "tools/rename-eval/extract_pairs.py",
       "identity_stability": "strong",
@@ -105,18 +93,6 @@
       "status": "accepted",
       "reason": "Each iteration parses a distinct payload/line/file; the parse work is inherent to the loop and cannot be hoisted.",
       "policy_hash_at_acceptance": "b9a5b20ef0958dde7ee5b5065f825543b6de07fd75dbfd488c99d7a242b74695",
-      "accepted_by": "dbakereffendi",
-      "accepted_at": "2026-08-04",
-      "expires_at": null
-    },
-    {
-      "policy_id": "bifrost.performance.regex-compile-in-loop",
-      "finding_id": "0a4497c717b84ffe7abaa8274f336235ba4177c80f33ed60e4d810c6ea45fbd3",
-      "path": "scripts/public/prepare-vscode-extension-manifest.mjs",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Regex pattern depends on the loop variable, so compilation cannot be hoisted out of the loop.",
-      "policy_hash_at_acceptance": "cf97c430a496547a9ffc0731e412d5426e2d5d39effa872c433cbc7dd3c61578",
       "accepted_by": "dbakereffendi",
       "accepted_at": "2026-08-04",
       "expires_at": null

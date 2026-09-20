@@ -510,12 +510,17 @@ impl<'a> SemanticQueryContext<'a> {
     /// exhaustive absence relation. Individual workspace-only proofs remain
     /// sound without the pack, but empty seed enumeration must not hide missing
     /// capability coverage for selected Python files.
+    ///
+    /// The coverage has to be a *complete* declaration surface. A narrow
+    /// reviewed pack that models a few standard-library members publishes a
+    /// surface too, and reading the weaker predicate would let its presence
+    /// answer a question about every Python declaration.
     pub(super) fn require_python_absent_member_declaration_surface(&mut self, file: &ProjectFile) {
         let publishes_surface = self
             .active_semantic_model_snapshot
             .as_ref()
             .and_then(|snapshot| snapshot.semantic_model_overlay())
-            .is_some_and(|overlay| overlay.publishes_declaration_surface_for("python"));
+            .is_some_and(|overlay| overlay.publishes_complete_declaration_surface_for("python"));
         if !publishes_surface {
             self.push_diagnostic(
                 CodeQueryDiagnosticCode::SemanticCapabilityUnsupported,

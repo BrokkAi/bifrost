@@ -10,7 +10,6 @@ import { promisify } from "node:util";
 const execFileAsync = promisify(execFile);
 const script = path.resolve("scripts/public/export-release-metadata.mjs");
 const exportedFiles = [
-  "editors/vscode/package.json",
   "plugins/bifrost-agent/bifrost-release.json",
 ];
 
@@ -19,8 +18,7 @@ test("exports only release metadata with identity and content hashes", async () 
   const sourceRoot = path.join(temp, "source");
   const outputDir = path.join(temp, "output");
   const contentsByPath = new Map([
-    [exportedFiles[0], '{"name":"bifrost-vscode"}\n'],
-    [exportedFiles[1], '{"binaryVersion":"0.10.0"}\n'],
+    [exportedFiles[0], '{"binaryVersion":"0.10.0"}\n'],
   ]);
   for (const [relativePath, contents] of contentsByPath) {
     const filePath = path.join(sourceRoot, relativePath);
@@ -44,7 +42,6 @@ test("exports only release metadata with identity and content hashes", async () 
   ]);
 
   assert.deepEqual(await listFiles(outputDir), [
-    "editors/vscode/package.json",
     "plugins/bifrost-agent/bifrost-release.json",
     "release-metadata-export.json",
   ]);

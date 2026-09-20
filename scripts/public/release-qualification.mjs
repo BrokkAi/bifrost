@@ -98,7 +98,6 @@ export function classifyArtifact(relativePath) {
   const normalized = normalizeManifestPath(relativePath).toLowerCase();
   if (normalized.endsWith(".crate")) return "crate";
   if (normalized.endsWith(".whl")) return "wheel";
-  if (normalized.endsWith(".vsix")) return "vsix";
   if (normalized.endsWith(".sha256")) return "checksum";
   if (normalized.includes("semantic-pack")) return "semantic-pack";
   if (normalized.startsWith("agent-plugin/")) return "agent-plugin";

@@ -5,6 +5,7 @@ use brokk_bifrost_core::analyzer::model::{
     StructuredImportPath, StructuredImportPathKind, StructuredTypeIdentity, StructuredTypeName,
 };
 use brokk_bifrost_core::analyzer::parsed_file::ParsedFile;
+use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
 use brokk_bifrost_core::analyzer::tree_walk::{WalkControl, walk_named_tree_preorder};
 use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
 use brokk_bifrost_core::hash::HashSet;
@@ -303,6 +304,22 @@ pub fn go_rendered_parameter_text(node: Node<'_>, source: &str) -> String {
         .unwrap_or_else(|| "()".to_string())
 }
 
+/// The visibility a Go callable declares.
+///
+/// Go writes visibility into the identifier rather than into a modifier list,
+/// so read the declaration's own `name` node through the shared
+/// exported-identifier rule. An unexported name is visible to its declaring
+/// package and to nothing else.
+fn go_callable_declared_visibility(node: Node<'_>, source: &str) -> DeclaredVisibility {
+    match node.child_by_field_name("name") {
+        Some(name) if go_identifier_is_exported(go_node_text(name, source).trim()) => {
+            DeclaredVisibility::Public
+        }
+        Some(_) => DeclaredVisibility::PackagePrivate,
+        None => DeclaredVisibility::Unknown,
+    }
+}
+
 pub fn go_signature_metadata(
     signature: String,
     node: Node<'_>,
@@ -315,6 +332,18 @@ pub fn go_signature_metadata(
             .filter(|result| result.kind() != "parameter_list");
         let receiver_type = go_method_receiver_type_node(node);
         metadata
+            // Go has no static member modifier, and it states receiver binding
+            // in the declaration's own shape instead: a `method_declaration`
+            // carries a `receiver` field and an interface `method_elem` is
+            // dispatched on the interface value that selects it, while a
+            // package-level `function_declaration` is owned by its package and
+            // binds nothing. Recording the absent static modifier is what lets
+            // `receiver_contract_of` read that owner shape. Without it a Go
+            // declaration reported no receiver contract at all,
+            // `modeled_procedure_key_for_unit` refused to key it, no reviewed
+            // summary could name a Go workspace callable, and every call to one
+            // reported `callee_unkeyable` (#3455).
+            .with_callable_modifiers(false, false, go_callable_declared_visibility(node, source))
             .with_return_type_text(go_callable_return_type_text(node, source))
             .with_return_type_identity(
                 return_type.and_then(|result| go_structured_type_identity(result, source)),
@@ -1507,6 +1536,112 @@ fn visit_go_value_spec(
         parsed.add_signature(
             code_unit,
             go_value_signature(node, source, keyword, name, identifier_count),
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parse::parse_go;
+
+    /// Go declarations record the modifier facts the language states, so a Go
+    /// workspace callable has a receiver contract and therefore a canonical
+    /// procedure key (#3455).
+    ///
+    /// Go writes no static modifier, so the receiver contract is decided by
+    /// the declaration's own shape: a package-level function binds nothing, a
+    /// method states its receiver, and an interface method is dispatched on
+    /// the interface value. Visibility is the exported-identifier rule.
+    #[test]
+    fn callable_metadata_records_go_receiver_contracts_structurally() {
+        const SOURCE: &str = concat!(
+            "package shop\n",
+            "\n",
+            "type Client struct{}\n",
+            "\n",
+            "func (c *Client) Send(orderID string) {}\n",
+            "\n",
+            "func (c Client) describe() string { return \"client\" }\n",
+            "\n",
+            "type Sender interface {\n",
+            "\tDeliver(orderID string) error\n",
+            "}\n",
+            "\n",
+            "func Total(orderID string, lines []int64) int64 { return 0 }\n",
+            "\n",
+            "func accumulate(lines []int64) int64 { return 0 }\n",
+        );
+        let tree = parse_go(SOURCE).expect("parse the Go fixture");
+        // A real module root, so the canonical package identity is the import
+        // path rather than whatever directory the temporary file happens to
+        // sit in.
+        let root = tempfile::TempDir::new().expect("temporary Go module root");
+        std::fs::write(
+            root.path().join("go.mod"),
+            "module example.com/shop
+
+go 1.22
+",
+        )
+        .expect("write go.mod");
+        let file = ProjectFile::new(root.path().to_path_buf(), "shop.go");
+        let parsed = parse_go_file(&file, SOURCE, &tree);
+
+        let modifiers = |fq_name: &str| {
+            let (_, entries) = parsed
+                .signature_metadata
+                .iter()
+                .find(|(unit, _)| unit.fq_name() == fq_name)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "missing Go declaration {fq_name}; recorded {:?}",
+                        parsed
+                            .signature_metadata
+                            .keys()
+                            .map(CodeUnit::fq_name)
+                            .collect::<Vec<_>>()
+                    )
+                });
+            let metadata = entries
+                .first()
+                .unwrap_or_else(|| panic!("{fq_name} carries no signature metadata"));
+            assert!(
+                metadata.callable_modifiers_recorded(),
+                "{fq_name} must record that the walk read its declaration shape"
+            );
+            (
+                metadata.callable_is_static(),
+                metadata.callable_is_constructor(),
+                metadata.callable_declared_visibility(),
+                metadata.parameters().len(),
+            )
+        };
+
+        assert_eq!(
+            modifiers("example.com/shop.Total"),
+            (false, false, Some(DeclaredVisibility::Public), 2),
+            "an exported package function binds no receiver and is visible everywhere"
+        );
+        assert_eq!(
+            modifiers("example.com/shop.accumulate"),
+            (false, false, Some(DeclaredVisibility::PackagePrivate), 1),
+            "an unexported package function is visible only inside its package"
+        );
+        assert_eq!(
+            modifiers("example.com/shop.Client.Send"),
+            (false, false, Some(DeclaredVisibility::Public), 1),
+            "a pointer-receiver method states its receiver in the declaration"
+        );
+        assert_eq!(
+            modifiers("example.com/shop.Client.describe"),
+            (false, false, Some(DeclaredVisibility::PackagePrivate), 0),
+            "a value-receiver method states its receiver too"
+        );
+        assert_eq!(
+            modifiers("example.com/shop.Sender.Deliver"),
+            (false, false, Some(DeclaredVisibility::Public), 1),
+            "an interface method is dispatched on the interface value"
         );
     }
 }

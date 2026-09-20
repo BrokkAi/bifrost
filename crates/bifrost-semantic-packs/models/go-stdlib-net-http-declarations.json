@@ -1,13 +1,13 @@
 {
   "schema_version": 2,
   "pack_id": "bifrost.go.stdlib.net-http-declarations",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "producer": { "name": "bifrost", "version": "0.11.3" },
   "language": "go",
   "ecosystem": "go",
   "compatibility": { "bifrost": ">=0.11.3, <1.0.0", "toolchains": [] },
   "provenance": {
-    "source": "https://go.dev/src/net/http/server.go (http.Handle, http.HandleFunc, http.Serve, http.ListenAndServe, http.NewServeMux, http.ServeMux.Handle, http.ServeMux.HandleFunc, http.Handler, http.ServeMux, http.HandlerFunc)",
+    "source": "https://go.dev/src/net/http/server.go (http.Handle, http.HandleFunc, http.Serve, http.ListenAndServe, http.NewServeMux, http.ServeMux.Handle, http.ServeMux.HandleFunc, http.Handler, http.ServeMux, http.HandlerFunc) and https://go.dev/src/net/http/client.go (http.Get)",
     "revision": "go1.26.0"
   },
   "license": "BSD-3-Clause",
@@ -180,6 +180,31 @@
             },
             "aliases": [],
             "locator": { "kind": "artifact", "path": "src/net/http/server.go", "symbol": "net/http.ListenAndServe" }
+          },
+          {
+            "id": "member.92d3d7481e5175625aae399f53ac2de2632b30b5c18ca5c71a4cdf1074d4d11e",
+            "owner": "type.b99de246c17e589368907e55dac75ea8887ae4a75829fb0eb4d25e7f05f77238",
+            "name": "Get",
+            "member_kind": "function",
+            "visibility": "public",
+            "is_static": true,
+            "is_abstract": false,
+            "is_virtual": false,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                { "name": "url", "type": { "kind": "named", "name": "string", "arguments": [], "nullable": false }, "optional": false, "variadic": false }
+              ],
+              "returns": {
+                "kind": "tuple",
+                "elements": [
+                  { "kind": "pointer", "element": { "kind": "named", "name": "net/http.Response", "arguments": [], "nullable": false } },
+                  { "kind": "named", "name": "error", "arguments": [], "nullable": false }
+                ]
+              }
+            },
+            "aliases": [],
+            "locator": { "kind": "artifact", "path": "src/net/http/client.go", "symbol": "net/http.Get" }
           },
           {
             "id": "member.5a635450899ab0299a066f79ff594a35816eeb98b6fbb23128c69bcfafb9971e",

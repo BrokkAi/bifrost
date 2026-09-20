@@ -10,18 +10,12 @@ Requirements:
 - VS Code 1.90 or newer.
 - A supported platform for extension-managed Bifrost binary downloads, or a `bifrost` binary available through one of the launch modes below.
 
-The extension source lives in `editors/vscode`. It starts Bifrost with:
+Extension source, build, and contribution work live in
+[`BrokkAi/bifrost-lsp`](https://github.com/BrokkAi/bifrost-lsp). The extension
+starts Bifrost with:
 
 ```bash
 bifrost --root <workspace-root> --lsp
-```
-
-For extension development:
-
-```bash
-cd editors/vscode
-npm install
-npm test
 ```
 
 Use the extension setting `bifrost.serverPath` when testing a locally built Bifrost binary.

@@ -1907,15 +1907,25 @@ func caller(os opener) { _, _ = os.Open("book.xlsx") }
             AnalyzerFixture::new_for_language(Language::Go, &[("main.go", local_source)]);
         let (local_shape, local_text) =
             go_shape(&local_fixture, local_source, "os.Open(\"book.xlsx\")");
+        // The parameter binding shadows the package import, so the receiver is
+        // the workspace `opener` value and the call binds that type's own
+        // method. Since #3455 recorded Go callable modifiers the method has a
+        // receiver contract and therefore a canonical key, so it resolves to a
+        // workspace arm rather than staying an unkeyable residual. What must
+        // not happen is the call borrowing `os.Open`'s identity.
         let local = modeled_lookup(&local_fixture, &local_shape, local_text, limits, None);
-        assert_eq!(local.coverage, ModeledCallTargetCoverage::Open);
-        assert!(local.arms.is_empty(), "{local:#?}");
-        let [local_name] = local.adjudicable_workspace_names.as_slice() else {
-            panic!("one structured local-method name: {local:#?}");
+        assert_eq!(local.coverage, ModeledCallTargetCoverage::Exhaustive);
+        let [local_arm] = local.arms.as_slice() else {
+            panic!("one workspace arm for the local method: {local:#?}");
         };
-        assert_ne!(local_name.owner, "os");
-        assert_eq!(local_name.member, "Open");
-        assert!(local_name.has_receiver);
+        assert_eq!(local_arm.origin, ModeledCallTargetOrigin::WorkspaceBody);
+        assert_ne!(local_arm.key.owner, "os");
+        assert_eq!(local_arm.key.member, "Open");
+        assert!(local_arm.key.has_receiver);
+        assert!(
+            local.adjudicable_workspace_names.is_empty(),
+            "a keyed workspace target is a positive arm, not a negative-only name: {local:#?}"
+        );
         assert_eq!(
             local.call_application,
             ModeledCallApplication::BoundReceiver,

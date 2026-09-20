@@ -72,13 +72,13 @@ test("the canonical file is written directly, never through the derived allowlis
 
 test("sync output confined to the derived projections is accepted", () => {
   assert.doesNotThrow(() => assertAllowedUpdates([]));
-  assert.doesNotThrow(() => assertAllowedUpdates(["editors/vscode/package.json"]));
+  assert.doesNotThrow(() => assertAllowedUpdates(["plugins/bifrost-dsh/bifrost-release.json"]));
   assert.doesNotThrow(() => assertAllowedUpdates([...DERIVED_CHECKSUM_PROJECTIONS]));
 });
 
 test("a version edit smuggled into the sync aborts before any commit", () => {
   assert.throws(
-    () => assertAllowedUpdates(["editors/vscode/package.json", "CITATION.cff"]),
+    () => assertAllowedUpdates(["plugins/bifrost-dsh/bifrost-release.json", "CITATION.cff"]),
     /outside the checksum projection allowlist.*CITATION\.cff/su,
   );
   assert.throws(

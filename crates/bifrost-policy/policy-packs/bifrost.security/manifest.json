@@ -1,7 +1,7 @@
 {
   "schema_version": 2,
   "id": "bifrost.security",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "name": "Bifrost security",
   "description": "High-precision security policies backed by exact structural identity and value-flow evidence.",
   "policies": [
@@ -43,6 +43,26 @@
       ],
       "severity_rationale": "Attacker-controlled command text can execute unintended operating-system commands with the application's privileges.",
       "remediation": "Avoid passing untrusted text to Runtime.exec. Use a fixed executable and validate arguments against an allowlist."
+    },
+    {
+      "path": "policies/python/process-input-to-os-system.rqlp",
+      "id": "bifrost.security.python.process-input-to-os-system",
+      "authored_hash": "594c125f8e59f0a0bec935b7691da102b699143eaac7fdc1ad3b1b364d2fcf08",
+      "resolved_semantic_hash": "594c125f8e59f0a0bec935b7691da102b699143eaac7fdc1ad3b1b364d2fcf08",
+      "category": "security",
+      "supported_languages": [
+        "python"
+      ],
+      "required_capabilities": [
+        "taint",
+        "runtime-keyed-read",
+        "exact-call-target",
+        "actual-to-formal-binding",
+        "semantic-model-provenance",
+        "scoped-callable-completeness"
+      ],
+      "severity_rationale": "A command string built from the process environment or the launch arguments runs in a subshell with the application's privileges, so attacker-controlled text changes the executed command.",
+      "remediation": "Do not pass process input to os.system. Use subprocess.run with an argument list and shell=False, and validate the executable against an allowlist."
     },
     {
       "path": "policies/declared-storage/c-stored-request-to-sql.rqlp",

@@ -16,7 +16,8 @@ use crate::{
         activate_workspace_semantic_sources_in_catalog, bootstrap_semantic_model_catalog,
         install_semantic_model_catalog_bootstrap as install_shared_semantic_model_catalog_bootstrap,
         intrinsic_language_evidence, load_workspace_packs_config_at, node_runtime_evidence,
-        open_ambient_semantic_pack_catalog, workspace_pack_ecosystems,
+        open_ambient_semantic_pack_catalog, python_process_input_evidence,
+        workspace_pack_ecosystems,
     },
     analyzer::semantic::WorkspaceRelativePath,
     analyzer::semantic_model::{
@@ -475,6 +476,7 @@ fn open_session_pack_catalog(
         Ok(true) => {
             additional_evidence.extend(intrinsic_language_evidence(workspace));
             additional_evidence.extend(node_runtime_evidence(workspace));
+            additional_evidence.extend(python_process_input_evidence(workspace));
         }
         Ok(false) => {}
         Err(error) => {
@@ -553,6 +555,7 @@ fn activate_legacy_configured_semantic_models(
             let _scope = profiling::scope("semantic_pack.intrinsic_evidence");
             evidence.extend(intrinsic_language_evidence(workspace));
             evidence.extend(node_runtime_evidence(workspace));
+            evidence.extend(python_process_input_evidence(workspace));
         }
     }
     // The reviewed workspace-local route is the shared analysis helper, the

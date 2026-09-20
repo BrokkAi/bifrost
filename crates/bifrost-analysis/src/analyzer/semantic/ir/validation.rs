@@ -693,6 +693,17 @@ fn validate_procedure(
                         matches!(event.effect, SemanticEffect::MemoryLoad { .. })
                     })
                 }
+                // A claim about what produced a loaded value. The claim is
+                // published ahead of the load, because a read that abandons
+                // control never performs it, so the load is elsewhere in the
+                // procedure rather than at this point.
+                (SemanticCapability::Calls, SemanticGapSubject::Value(value)) => {
+                    procedure.points.iter().any(|point| {
+                        point.events.iter().any(|event| {
+                            matches!(event.effect, SemanticEffect::MemoryLoad { result, .. } if result == value)
+                        })
+                    })
+                }
                 _ => false,
             };
             if !valid_subject

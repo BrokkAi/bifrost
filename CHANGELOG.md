@@ -9,6 +9,54 @@ projection and its commit history does not contain every source commit.
 
 ### Added
 
+- The first Python security policy,
+  `bifrost.security.python.process-input-to-os-system`, ships in the built-in
+  `bifrost.security` pack, backed by three reviewed Python semantic packs:
+  `os.environ` and `sys.argv` keyed reads as process-input sources, and the
+  exact `os.system(command)` member with its complete procedure summary as the
+  command sink. `bifrost scan` decides the DataFlowBench tool-native
+  template-1 and template-5 pairs with zero configuration. A shadowed module
+  name, a local `environ` or `argv` name, and an unrelated `system` method are
+  excluded by the import binder and the exact member identity rather than by
+  spelling; a dynamic key, a written container, and a replaced `os.system`
+  each keep the run typed incomplete instead of reading as a clean negative.
+- Runtime keyed-read values are no longer JavaScript and TypeScript only. The
+  `keyed-read-value` RQL vocabulary accepts the reviewed `(runtime, root,
+  container)` triples from one declarative registry, and a reviewed runtime
+  record may state a contract its language's standard library guarantees
+  rather than one tied to a pinned distribution.
+- The network-effect boundary pack now ships its Rust specialization,
+  `bifrost.effects.rust.selected-boundary-no-network-io`, with a reviewed model
+  that declares `bifrost.network_io` on `std::net::TcpStream::connect` at its
+  written arity one. The Rust path resolver binds that identity from the
+  verbatim scoped path and from a `use std::net::TcpStream;` binder, so a
+  selected declaration reaching it through workspace helpers reports one
+  finding with the whole witness chain. A workspace type also spelled
+  `TcpStream` with an associated function also spelled `connect` binds the
+  workspace declaration instead, and an unresolved helper leaves the absence
+  claim unmet rather than clean. The pack ships with an empty declaration
+  selection, so an unconfigured Cargo repository carries no obligation.
+
+- The network-effect boundary policy family gained its Go row,
+  `bifrost.effects.go.selected-boundary-no-network-io`. The built-in
+  `bifrost.effects` pack is 1.2.0 and the specialization ships with an empty
+  declaration selection, so an unconfigured Go repository carries no
+  obligation. Its reviewed model extends the packs Bifrost already ships:
+  `bifrost.go.stdlib.net-http` (1.2.0) declares `bifrost.network_io` on
+  `net/http.Get` at its written arity one, and
+  `bifrost.go.stdlib.net-http-declarations` (1.2.0) publishes that exact
+  package function so the Go import binder can bind the identity rather than
+  the spelling. A workspace package function also named `Get`, called in the
+  same source shape, is not the reviewed API and leaves the boundary clean.
+- Go declarations now record callable modifier metadata. A package-level
+  function binds no receiver, a method states one in its `receiver` field, an
+  interface method is dispatched on the interface value, and visibility comes
+  from Go's exported-identifier rule. A Go workspace callable therefore has a
+  canonical procedure key, so a reviewed procedure summary can name it and an
+  effect or taint walk that reaches it no longer reports an unkeyable callee.
+  The Go extraction epoch rotates, so a warm analyzer cache re-extracts Go
+  declarations once.
+
 - The network-effect policy ships its reviewed Kotlin row, reading the shared
   Java/JVM JDK model one-way instead of a second JDK model. A Kotlin call site
   that reaches `java.net.URL.openConnection()` through a concrete receiver
@@ -128,6 +176,7 @@ projection and its commit history does not contain every source commit.
 - The Java security policy now completes environment-to-`Runtime.exec` flows
   through chained JDK static factories, while the network-effect policy ships
   its reviewed Java/JVM endpoint row.
+
 
 ### Fixed
 

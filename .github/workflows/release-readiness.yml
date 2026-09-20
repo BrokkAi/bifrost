@@ -1039,7 +1039,7 @@ jobs:
           merge-multiple: true
       - name: Prepare agent plugin release metadata
         run: >
-          node scripts/public/prepare-vscode-extension-manifest.mjs
+          node scripts/public/prepare-launcher-release-metadata.mjs
           --version "${{ needs.preflight.outputs.version }}"
           --plugin-release plugins/bifrost-agent/bifrost-release.json
           --dist dist
@@ -1266,7 +1266,7 @@ jobs:
           merge-multiple: true
       - name: Prepare Pi metadata
         run: >
-          node scripts/public/prepare-vscode-extension-manifest.mjs
+          node scripts/public/prepare-launcher-release-metadata.mjs
           --version "${{ needs.preflight.outputs.version }}"
           --plugin-release plugins/bifrost-agent/bifrost-release.json
           --dist dist
@@ -1289,58 +1289,6 @@ jobs:
         with:
           name: pi-package
           path: dist/brokk-bifrost-agent-*.tgz
-          if-no-files-found: error
-          retention-days: 14
-
-  vscode-package:
-    name: package VSIX
-    needs: [preflight, build-linux-x86-64, build]
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    steps:
-      - name: Checkout qualified source
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
-        with:
-          persist-credentials: false
-          ref: ${{ needs.preflight.outputs.commit }}
-      - name: Set up Node
-        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
-        with:
-          node-version: 22
-          package-manager-cache: false
-      - name: Download exact build artifacts
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
-        with:
-          pattern: bifrost-*
-          path: dist
-          merge-multiple: true
-      - name: Prepare VSIX metadata
-        run: >
-          node scripts/public/prepare-vscode-extension-manifest.mjs
-          --version "${{ needs.preflight.outputs.version }}"
-          --manifest editors/vscode/package.json
-          --plugin-release plugins/bifrost-agent/bifrost-release.json
-          --dist dist
-      - name: Re-vendor the DSH launcher copies
-        run: node plugins/bifrost-dsh/scripts/sync-launcher.mjs
-      - name: Install VS Code extension dependencies
-        run: npm ci --ignore-scripts
-        working-directory: editors/vscode
-      - name: Test agent plugin launcher
-        run: node --test plugins/bifrost-agent/test/launcher.test.mjs
-      - name: Validate agent plugin manifest
-        run: node scripts/public/check-codex-plugin-manifest.mjs
-      - name: Test VS Code extension
-        run: npm test
-        working-directory: editors/vscode
-      - name: Package exact VSIX
-        run: npx --no-install vsce package --out "../../dist/bifrost-vscode-${{ needs.preflight.outputs.tag }}.vsix"
-        working-directory: editors/vscode
-      - name: Upload exact VSIX
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
-        with:
-          name: vscode-package
-          path: dist/*.vsix
           if-no-files-found: error
           retention-days: 14
 
@@ -1527,7 +1475,6 @@ jobs:
       - agent-plugin-smoke
       - policy-scan-smoke
       - pi-package
-      - vscode-package
       - npm-package
     runs-on: ubuntu-latest
     timeout-minutes: 60

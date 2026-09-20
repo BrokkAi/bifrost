@@ -1,0 +1,64 @@
+{
+  "schema_version": 4,
+  "pack_id": "bifrost.python-os-command-summaries",
+  "version": "0.1.0",
+  "producer": {
+    "name": "bifrost-reviewed-python-models",
+    "version": "0.1.0"
+  },
+  "language": "python",
+  "ecosystem": "pypi",
+  "compatibility": {
+    "bifrost": ">=0.11.0, <1.0.0",
+    "toolchains": []
+  },
+  "provenance": {
+    "source": "Python standard library reference, os",
+    "revision": "v3.13.5"
+  },
+  "license": "Apache-2.0",
+  "completeness": "complete",
+  "safety": {
+    "generated_code_only": false,
+    "review_required": false
+  },
+  "shards": [
+    {
+      "id": "summaries.python-os-system",
+      "activation": [
+        {
+          "targets": [],
+          "configurations": []
+        }
+      ],
+      "payload": {
+        "kind": "procedure_summaries",
+        "summaries": [
+          {
+            "id": "python.os.system",
+            "target": {
+              "path": "os.py",
+              "symbol": "os.system(command)",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "covers_overrides": false,
+            "locations": [],
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "escape",
+                "event": "python.os.system.command",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                }
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

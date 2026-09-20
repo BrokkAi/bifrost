@@ -3,14 +3,13 @@ import { spawnSync } from "node:child_process";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
-export const SCHEMA_VERSION = "3";
+export const SCHEMA_VERSION = "4";
 
 export const COMPONENTS = Object.freeze([
   "dependency_licenses",
   "crate_package",
   "agent_plugin",
   "external_fixture",
-  "vscode",
   "pi_package",
   "csmi",
   "rust",
@@ -31,13 +30,12 @@ const RQL_COMPONENTS = new Set([
   "mcp_contract",
   "lsp_contract",
   "policy_pack",
-  "vscode",
 ]);
 const FLOW_COMPONENTS = new Set([...RQL_COMPONENTS, "rust"]);
 const MCP_COMPONENTS = new Set(["rql_runtime", "mcp_contract"]);
 const LSP_COMPONENTS = new Set(["rql_runtime", "lsp_contract"]);
 const RUNTIME_COMPONENTS = new Set(["rql_runtime", "mcp_contract", "lsp_contract"]);
-const EDITOR_COMPONENTS = new Set(["vscode"]);
+const ZED_EDITOR_COMPONENTS = new Set(["rust"]);
 const PLUGIN_COMPONENTS = new Set(["pi_package", "agent_plugin"]);
 const RUST_COMPONENTS = new Set(["rust"]);
 const PYTHON_COMPONENTS = new Set(["python"]);
@@ -164,7 +162,7 @@ function isRqlPath(path) {
       "crates/bifrost-policy/policy-packs/",
     ]) ||
     path === "crates/bifrost-runtime/tests/code_intelligence_runtime.rs" ||
-    /^(tests\/(structural_search_|policy_|builtin_policy_pack\.rs|bifrost_policy_cli\.rs)|editors\/vscode\/(src\/rql|test\/rql|syntaxes\/bifrost-rql))/u.test(
+    /^(tests\/(structural_search_|policy_|builtin_policy_pack\.rs|bifrost_policy_cli\.rs))/u.test(
       path,
     )
   );
@@ -354,8 +352,8 @@ function classifyPath(path) {
       reason: "external fixture provenance surface",
     };
   }
-  if (startsWithAny(path, ["editors/vscode/", "editors/zed/"])) {
-    return { components: EDITOR_COMPONENTS, reason: "editor-only surface" };
+  if (startsWithAny(path, ["editors/zed/"])) {
+    return { components: ZED_EDITOR_COMPONENTS, reason: "Zed extension Rust source" };
   }
   if (isPluginPath(path)) {
     return { components: PLUGIN_COMPONENTS, reason: "agent-plugin surface" };

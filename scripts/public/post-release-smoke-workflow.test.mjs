@@ -114,7 +114,6 @@ test("checks every GitHub asset and published SHA-256 sidecar", () => {
   assert.match(workflow, /\.tag_name == \$tag and \.draft == false/u);
   assert.match(workflow, /bifrost-agent-\$\{RELEASE_TAG\}\.tar\.gz/u);
   assert.match(workflow, /brokk-bifrost-agent-\$\{RELEASE_VERSION\}\.tgz/u);
-  assert.match(workflow, /bifrost-vscode-\$\{RELEASE_TAG\}\.vsix/u);
   const requiredStart = workflow.indexOf("          for required in");
   const requiredEnd = workflow.indexOf("\n          done", requiredStart);
   assert.ok(requiredStart >= 0 && requiredEnd > requiredStart, "required asset loop must be present");
@@ -138,7 +137,6 @@ test("checks every GitHub asset and published SHA-256 sidecar", () => {
         '            jq -e --arg version "$RELEASE_VERSION" \'.name == "@brokk/bifrost-agent" and .version == $version\' >/dev/null',
     ),
   );
-  assert.match(workflow, /unzip -p .*bifrost-vscode-\$\{RELEASE_TAG\}\.vsix/u);
   assert.match(workflow, /sha256sum -c/u);
   assert.match(workflow, /checksums=\("\$asset_dir"\/\*\.sha256\)/u);
   const checksumStart = workflow.indexOf('checksums=("$asset_dir"/*.sha256)');
@@ -205,8 +203,8 @@ test("checks PyPI and npm versions, archives, and integrity evidence", () => {
 
 test("selects and checks the published root binary on supported runner platforms", () => {
   const installStart = workflow.indexOf("\n  install-smoke:\n");
-  const extensionStart = workflow.indexOf("\n  extensions:\n", installStart);
-  const installJob = workflow.slice(installStart, extensionStart);
+  const mcpStart = workflow.indexOf("\n  mcp:\n", installStart);
+  const installJob = workflow.slice(installStart, mcpStart);
   assert.equal((installJob.match(/^    needs: resolve$/gmu) ?? []).length, 1);
   assert.match(
     workflow,
@@ -218,20 +216,6 @@ test("selects and checks the published root binary on supported runner platforms
   );
   assert.match(workflow, /npm exec --prefix .* bifrost --version/u);
   assert.ok(workflow.includes('grep -F "$RELEASE_VERSION"'));
-});
-
-test("checks both extension marketplaces and states the Marketplace checksum boundary", () => {
-  assert.match(workflow, /marketplace\.visualstudio\.com\/_apis\/public\/gallery\/extensionquery/u);
-  assert.match(workflow, /brokk\/vsextensions\/bifrost-vscode\/\$\{RELEASE_VERSION\}\/vspackage/u);
-  assert.match(workflow, /Marketplace public API exposes no checksum endpoint/u);
-  assert.match(workflow, /open-vsx\.org\/api\/brokk\/bifrost-vscode\/\$\{RELEASE_VERSION\}/u);
-  assert.match(workflow, /checksum_url=.*\.sha256/u);
-  assert.ok(workflow.includes('test "$expected" = "$actual"'));
-  assert.match(workflow, /unzip -tq/u);
-  assert.match(workflow, /archive_found=0/u);
-  assert.match(workflow, /Waiting for a valid Visual Studio Marketplace archive \(\$attempt\/30\)/u);
-  assert.match(workflow, /Accept: application\/octet-stream/u);
-  assert.match(workflow, /--compressed/u);
 });
 
 test("invokes published Codex and Claude MCP list_policies smoke checks", () => {

@@ -177,7 +177,6 @@ test("release selects exactly one qualified run for the tag commit and version",
     "agent-plugin-package",
     "agent-plugin-prepublish-smoke",
     "pi-package",
-    "vscode-package",
     "promotion-evidence",
   ]) {
     assert.equal(releaseJobNames.has(obsoleteJob), false, `obsolete job remains: ${obsoleteJob}`);
@@ -422,7 +421,7 @@ test("publisher dependency order and protected identities remain explicit", () =
     const publisher = jobBlock(release, name);
     assert.match(publisher, /needs:[\s\S]{0,300}(?:qualification|verify)/iu, `${name} must wait for qualification verification`);
   }
-  for (const name of ["publish-wheels", "publish-vscode", "publish-open-vsx"]) {
+  for (const name of ["publish-wheels"]) {
     assert.match(jobBlock(release, name), /environment:\s*(?:release|npm-publish)/u, `${name} must retain a protected environment`);
   }
   const languageCrates = ["cpp", "csharp", "go", "js-ts", "jvm", "php", "python", "ruby", "rust"];
@@ -480,11 +479,10 @@ test("publisher dependency order and protected identities remain explicit", () =
   assert.match(release, /publish-crate-(?:analysis|runtime|facade)/u);
 });
 
-test("qualified bytes publish directly to PyPI, npm, marketplaces, and GitHub", () => {
+test("qualified bytes publish directly to PyPI, npm, and GitHub", () => {
   assert.match(release, /gh-action-pypi-publish/u);
   assert.match(release, /gh\s+workflow\s+run\s+publish-npm\.yml/u);
   assert.match(publishNpm, /npm\s+run\s+publish-release/u);
-  assert.match(release, /(?:vsce|ovsx)\s+publish/u);
   assert.match(release, /(?:gh\s+release\s+upload|action-gh-release|upload-release-asset)/u);
   assert.match(release, /(?:qualified|qualification|bundle)/iu);
   for (const forbidden of [/--clobber/u, /--overwrite/u, /overwrite_files:\s*true/u]) {
@@ -619,14 +617,12 @@ test("an always-run summary names targets and safe retry guidance", () => {
   assert.match(release, /^  release-summary:/mu);
   assert.match(summary, /^    if: \$\{\{ always\(\) \}\}$/mu);
   assert.match(summary, /qualification/iu);
-  assert.match(summary, /crates\.io|PyPI|npm|Marketplace|Open VSX/iu);
+  assert.match(summary, /crates\.io|PyPI|npm/iu);
   assert.match(summary, /retry.*same|different checksum|qualification/isu);
   for (const target of [
     "crates.io",
     "PyPI",
     "GitHub",
-    "Visual Studio Marketplace",
-    "Open VSX",
   ]) {
     assert.ok(release.includes(target));
   }
@@ -767,7 +763,7 @@ readinessTest("release readiness gives the Linux x86 binary an independent criti
   assert.doesNotMatch(policySmoke, /continue-on-error/u);
   assert.doesNotMatch(policySmoke, /^    needs: \[preflight, build,/mu);
 
-  for (const job of ["agent-plugin-package", "pi-package", "vscode-package", "npm-package"]) {
+  for (const job of ["agent-plugin-package", "pi-package", "npm-package"]) {
     assert.match(
       jobBlock(readiness, job),
       /^    needs: \[preflight, build-linux-x86-64, build(?:, agent-plugin-package)?\]$/mu,

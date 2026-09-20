@@ -1817,13 +1817,14 @@ fn bifrost_mcp_lists_and_runs_built_in_policies() {
     );
     assert_eq!(packs[2]["id"], "bifrost.security");
     let security_policies = packs[2]["policies"].as_array().expect("security policies");
-    // The pack carries the two JVM policies plus the declared-storage family:
+    // The pack carries the two JVM policies and the Python
+    // process-input-to-os-system policy, plus the declared-storage family:
     // one stored-request-to-SQL policy and one store-requires-validation
     // policy for each of the thirteen supported languages. Those 26 are
     // opt-in, so a run activates them only when a policy-id selector names
     // them, and they defer their workspace-authored endpoint-set imports, so
     // the catalog records no resolved hash for them.
-    assert_eq!(security_policies.len(), 28);
+    assert_eq!(security_policies.len(), 29);
     let opt_in = security_policies
         .iter()
         .filter(|policy| policy["activation"] == "opt-in")
@@ -1844,6 +1845,10 @@ fn bifrost_mcp_lists_and_runs_built_in_policies() {
             .iter()
             .any(|policy| policy["id"] == "bifrost.security.python.stored-request-to-sql")
     );
+    assert!(security_policies.iter().any(|policy| {
+        policy["id"] == "bifrost.security.python.process-input-to-os-system"
+            && policy["activation"] != "opt-in"
+    }));
 
     let run = round_trip(
         &mut stdin,

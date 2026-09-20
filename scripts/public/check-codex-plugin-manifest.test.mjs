@@ -34,7 +34,6 @@ async function withRepositoryFixture(run) {
       "Cargo.toml",
       ".claude-plugin/marketplace.json",
       ".cursor-plugin/marketplace.json",
-      "editors/vscode/package.json",
       "plugins/bifrost-agent",
       "plugins/bifrost-dsh",
     ]) {

@@ -105,6 +105,43 @@ fn intrinsic_ecosystem(language: Language) -> &'static str {
     }
 }
 
+/// SHA-256 of the RFC 8785 canonical JSON of the reviewed Python
+/// process-input runtime profile the shipped pack pins.
+const REVIEWED_PYTHON_PROCESS_INPUT_PROFILE_DIGEST: &str =
+    "b95b6625659ac476f274bdb3a305f20f497727137dc85aa96e50a989d57d8afd";
+
+/// Workspace evidence for the reviewed Python process-input contract.
+///
+/// The Node runtime-values packs pin one distribution, so a workspace has to
+/// name that revision before its evidence exists. The Python contract is
+/// different in kind: the standard-library reference specifies `os.environ` as
+/// the process environment and `sys.argv` as the launch arguments for every
+/// conforming implementation, on every platform, so the reviewed record names
+/// no distribution at all. A workspace that contains Python states the profile
+/// by containing Python, and the row below carries the profile configuration
+/// and nothing else -- no package, no artifact digest -- because the reviewed
+/// record makes no claim for either to bind.
+pub fn python_process_input_evidence(
+    workspace: &WorkspaceAnalyzer,
+) -> Vec<SemanticModelActivationEvidence> {
+    workspace
+        .analyzer()
+        .languages()
+        .into_iter()
+        .filter(|language| *language == Language::Python)
+        .map(|language| SemanticModelActivationEvidence {
+            language: language.config_label().to_owned(),
+            ecosystem: intrinsic_ecosystem(language).to_owned(),
+            package: None,
+            module: None,
+            toolchain: None,
+            target: None,
+            configuration: Some(REVIEWED_PYTHON_PROCESS_INPUT_PROFILE_DIGEST.to_owned()),
+            artifact_sha256: None,
+        })
+        .collect()
+}
+
 /// Conventional workspace documents that pin the Node runtime revision.
 const NODE_RUNTIME_DECLARATION_DOCUMENTS: [&str; 2] = [".nvmrc", ".node-version"];
 /// Upper bound for one Node runtime declaration document. Real declarations are
@@ -783,6 +820,7 @@ fn workspace_activation_prelude(
     if shipped_models {
         evidence.extend(intrinsic_language_evidence(workspace));
         evidence.extend(node_runtime_evidence(workspace));
+        evidence.extend(python_process_input_evidence(workspace));
     }
     evidence.sort();
     evidence.dedup();

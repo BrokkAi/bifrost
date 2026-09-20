@@ -4042,9 +4042,13 @@
           "type": "string"
         },
         "moduleMode": {
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "platform": {
+          "description": "Scope restrictions the engine cannot observe in a workspace. A reviewed\ncontract that applies on every platform, architecture, or module mode\nstates none rather than picking one.",
           "type": [
             "string",
             "null"
@@ -4054,10 +4058,17 @@
           "type": "string"
         },
         "runtimeArtifact": {
-          "type": "string"
+          "description": "The exact runtime distribution the contract was reviewed against, when\nthe contract is a property of one build. A contract guaranteed by the\nlanguage's own standard-library specification names none, and its\nactivation selector then carries no artifact evidence either.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "runtimeArtifactDigest": {
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "runtimeFamily": {
           "type": "string"
@@ -4066,10 +4077,7 @@
       "additionalProperties": false,
       "required": [
         "runtimeFamily",
-        "runtimeArtifact",
-        "runtimeArtifactDigest",
         "realm",
-        "moduleMode",
         "initializationBoundary"
       ]
     },

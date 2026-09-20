@@ -111,10 +111,6 @@ function releaseMetadata(version, digest) {
   return `${JSON.stringify({ binaryVersion: version, minimumBinaryVersion: version, archiveSha256: { "universal-apple-darwin": digest } }, null, 2)}\n`;
 }
 
-function vscodeManifest(version) {
-  return `${JSON.stringify({ name: "bifrost-vscode", version, bifrost: { binaryVersion: version } }, null, 2)}\n`;
-}
-
 // A repository shaped like the public one: a compiled-input commit, then a
 // checksum-only correction on top of it.
 function releaseLikeRepository(dir) {
@@ -122,12 +118,12 @@ function releaseLikeRepository(dir) {
   const work = path.join(dir, "work");
   execFileSync("git", ["init", "-q", "--bare", "-b", "master", origin]);
   execFileSync("git", ["init", "-q", "-b", "master", work]);
+  git(work, "config", "commit.gpgsign", "false");
   git(work, "remote", "add", "origin", origin);
 
   const base = commit(work, "compiled input", {
     "src/main.rs": "fn main() {}\n",
     "plugins/bifrost-agent/bifrost-release.json": releaseMetadata("0.10.5", "old"),
-    "editors/vscode/package.json": vscodeManifest("0.10.5"),
   });
   const corrected = commit(work, "sync tracked launcher checksums", {
     "plugins/bifrost-agent/bifrost-release.json": releaseMetadata("0.10.5", "new"),
@@ -343,7 +339,7 @@ test("the checksum-only gate refuses a version bump hiding inside an allowlisted
   withTempDir((dir) => {
     const { work, corrected } = releaseLikeRepository(dir);
     const bumped = commit(work, "checksums, and a version", {
-      "editors/vscode/package.json": vscodeManifest("0.10.6"),
+      "plugins/bifrost-agent/bifrost-release.json": releaseMetadata("0.10.6", "new"),
     });
     const result = checksumDiffRun(work, [corrected, bumped]);
     assert.notEqual(result.status, 0);
@@ -516,7 +512,7 @@ const releaseCrateCount = Number(
   ).trim(),
 );
 
-function completeBundle(dir, { crates = releaseCrateCount, wheels = 10, vsix = 1, tgz = 2, sidecars = 7, notices = true } = {}) {
+function completeBundle(dir, { crates = releaseCrateCount, wheels = 10, tgz = 2, sidecars = 7, notices = true } = {}) {
   const bundle = path.join(dir, "qualification-bundle");
   fs.mkdirSync(bundle, { recursive: true });
   for (let index = 0; index < crates; index += 1) {
@@ -525,9 +521,6 @@ function completeBundle(dir, { crates = releaseCrateCount, wheels = 10, vsix = 1
   }
   for (let index = 0; index < wheels; index += 1) {
     fs.writeFileSync(path.join(bundle, `wheel-${index}.whl`), "");
-  }
-  for (let index = 0; index < vsix; index += 1) {
-    fs.writeFileSync(path.join(bundle, `extension-${index}.vsix`), "");
   }
   for (let index = 0; index < tgz; index += 1) {
     fs.writeFileSync(path.join(bundle, `package-${index}.tgz`), "");

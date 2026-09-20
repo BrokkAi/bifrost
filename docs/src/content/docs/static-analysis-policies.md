@@ -405,6 +405,16 @@ activated declaration surface answers, so `auditUrl.openConnection()` binds
 and Kotlin call sites do. A Scala method that merely shares the JDK method's
 name binds its own workspace declaration instead, and an unresolved Scala
 helper keeps the absence claim open.
+The Rust specialization
+(`bifrost.effects.rust.selected-boundary-no-network-io`) consumes
+`semantic-packs/web-network/rust/bifrost.web-network-rust.json`, which declares
+`std::net::TcpStream::connect` at its written arity one. Rust binds that
+identity through its own path resolver, from either spelling the language
+offers: the verbatim `std::net::TcpStream::connect(addr)`, or the one written
+segment `TcpStream::connect(addr)` that a `use std::net::TcpStream;`
+declaration expands. The owner path is the identity, so a workspace type also
+spelled `TcpStream` with an associated function also spelled `connect`, called
+at the same arity, binds the workspace declaration and carries no effect.
 
 <!-- policy-doc-test:rqlp:tests/fixtures/network-effect-boundary/policies/javascript.rqlp -->
 ```lisp
@@ -530,6 +540,7 @@ note: policy bifrost.security.dynamic-eval inferred policy schema 1 and RQL sche
 Dependency models
   Coverage: complete
   Mode: default; ecosystems: python
+  Details: --verbose or --format json
 ```
 
 </details>

@@ -133,7 +133,7 @@ scripts/public/generate-rust-third-party-notices.sh licenses/THIRD_PARTY_LICENSE
 
 The generated path is ignored by Git.
 
-The agent and editor plugin manifests also carry release metadata and must be
+The agent plugin manifests also carry release metadata and must be
 checked during release prep. Before tagging a release, edit the workspace
 version in `Cargo.toml`, set `CITATION.cff`'s `date-released` to the actual
 release date, then run:
@@ -150,8 +150,6 @@ That script updates these committed version fields:
 - `plugins/bifrost-agent/.cursor-plugin/plugin.json`
 - `plugins/bifrost-agent/plugin.json`
 - `.cursor-plugin/marketplace.json`
-- `editors/vscode/package.json`
-- `editors/vscode/package-lock.json`
 - `plugins/bifrost-agent/package.json`
 - `plugins/bifrost-agent/package-lock.json`
 - the pinned npm install command in `plugins/bifrost-agent/README.md`
@@ -163,25 +161,23 @@ instructions on the Cargo version. The Codex and Claude marketplace files are
 also part of the plugin surface, but
 currently do not carry version fields.
 
-The VS Code extension and bundled agent plugin also share the preferred,
-minimum, and prerelease compatibility fields and pin the preferred Bifrost
-release archive checksums:
+The bundled agent plugin pins the preferred, minimum, and prerelease
+compatibility fields and the preferred Bifrost release archive checksums:
 
-- `editors/vscode/package.json`
 - `plugins/bifrost-agent/bifrost-release.json`
 
 Those checksum-bearing files must match the actual release archives.
 `scripts/public/release-version.mjs sync` only copies the current
-`plugins/bifrost-agent/bifrost-release.json` checksums into the VS Code manifest
-when that release metadata is already on the same version as `Cargo.toml`. The
-`release.yml` workflow prepares checksum metadata from the built `.sha256`
-sidecars with `scripts/public/prepare-vscode-extension-manifest.mjs`, validates the
-plugin manifests, packages
-`bifrost-agent-<tag>.tar.gz`, and publishes the VSIX. A separate Pi package job
-prepares the same release metadata for the npm tarball, validates the packed
-package, and attaches it to the existing GitHub Release. If you perform those
-packaging steps manually, run the same script against the release `dist/`
-directory instead of hand-editing checksums.
+`plugins/bifrost-agent/bifrost-release.json` checksums into the retained
+release metadata when that metadata is already on the same version as
+`Cargo.toml`. The release-readiness workflow prepares checksum metadata from the
+built `.sha256` sidecars, validates the plugin manifests, and packages
+`bifrost-agent-<tag>.tar.gz`. VSIX packaging and publishing are owned by
+[`BrokkAi/bifrost-lsp`](https://github.com/BrokkAi/bifrost-lsp). A separate Pi
+package job prepares the same release metadata for the npm tarball, validates
+the packed package, and attaches it to the existing GitHub Release. If you
+perform those packaging steps manually, run the same script against the release
+`dist/` directory instead of hand-editing checksums.
 
 ### Changelog
 
@@ -331,9 +327,9 @@ To cut a release:
 
 A single `vX.Y.Z` tag starts the **Release** workflow. It resolves the tagged
 commit once, then builds and validates CLI archives, crate contents, wheels/sdist,
-agent-plugin packages, Pi packages, and the VS Code extension before opening the
-promotion gate. The GitHub Release, crates.io, PyPI, VS Code Marketplace, and
-agent-plugin release assets only run after that common evidence is green.
+and agent-plugin packages before opening the promotion gate. The GitHub Release,
+crates.io, PyPI, and agent-plugin release assets only run after that common
+evidence is green.
 
 After the **Release** workflow succeeds, `publish-npm.yml` packages each native
 archive as a platform package. It publishes the platform packages first. It
@@ -485,8 +481,7 @@ workflow run. This action reuses its validated artifacts. If a new run is
 necessary, dispatch the same tag again. Never recover a partial release from a
 different branch, commit, or tag.
 
-Registry visibility can lag after a successful upload. For example, Open VSX
-can accept a VSIX before its version API returns it. If the upload succeeded
+Registry visibility can lag after a successful upload. If the upload succeeded
 but the visibility check timed out, confirm that the public artifact has the
 expected version and checksum. Then rerun the failed job. Do not upload a
 different artifact for the same version.
@@ -494,8 +489,7 @@ different artifact for the same version.
 The npm publication workflow starts only after the parent Release workflow
 succeeds. After recovery, confirm both workflows are green. Also confirm the
 root npm package and all platform packages expose the released version. The
-release summary records completed and pending publication targets, including
-the VS Code release attachment and Marketplace publication separately.
+release summary records completed and pending publication targets.
 
 ### Readiness handoff and recovery
 

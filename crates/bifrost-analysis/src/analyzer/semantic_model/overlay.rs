@@ -646,6 +646,11 @@ pub struct SemanticModelOverlay {
     /// an absence proof (#2678). Only a language listed here has a published
     /// declaration surface to prove a miss against.
     declaration_surface_languages: Vec<String>,
+    /// The languages a declaration shard claims a *complete* surface for. A
+    /// narrow reviewed pack publishes a surface without claiming to enumerate
+    /// the language's declarations, so a consumer that needs exhaustive
+    /// coverage must ask for this list instead.
+    complete_declaration_surface_languages: Vec<String>,
     symbols: Vec<SemanticModelSymbol>,
     has_rust_generated_functions: bool,
     relations: Vec<SemanticModelRelation>,
@@ -766,6 +771,7 @@ impl SemanticModelOverlay {
                 extraction_gaps: active.extraction_gaps().to_vec(),
                 extraction_gap_by_declaration: extraction_gap_index(active.extraction_gaps()),
                 declaration_surface_languages: Vec::new(),
+                complete_declaration_surface_languages: Vec::new(),
                 symbols: Vec::new(),
                 has_rust_generated_functions: false,
                 relations: Vec::new(),
@@ -793,6 +799,7 @@ impl SemanticModelOverlay {
         let mut conditional_type_refinements = Vec::new();
         let mut deferred_yields = Vec::new();
         let mut declaration_surface_languages: Vec<String> = Vec::new();
+        let mut complete_declaration_surface_languages: Vec<String> = Vec::new();
         for shard in active.shards() {
             if cancellation.is_cancelled() {
                 return Err(SemanticModelOverlayBuildError::Cancelled);
@@ -866,10 +873,15 @@ impl SemanticModelOverlay {
                     });
                 }
             }
-            if shard.shard.payload().declaration_facts().is_some()
-                && !declaration_surface_languages.contains(&shard.manifest.language)
-            {
-                declaration_surface_languages.push(shard.manifest.language.clone());
+            if shard.shard.payload().declaration_facts().is_some() {
+                if !declaration_surface_languages.contains(&shard.manifest.language) {
+                    declaration_surface_languages.push(shard.manifest.language.clone());
+                }
+                if shard.manifest.completeness == Completeness::Complete
+                    && !complete_declaration_surface_languages.contains(&shard.manifest.language)
+                {
+                    complete_declaration_surface_languages.push(shard.manifest.language.clone());
+                }
             }
             if let Some((types, members, relations)) = shard.shard.payload().declaration_facts() {
                 // A guarded record the pinned activation coordinates exclude
@@ -1024,6 +1036,7 @@ impl SemanticModelOverlay {
             extraction_gaps: active.extraction_gaps().to_vec(),
             extraction_gap_by_declaration: extraction_gap_index(active.extraction_gaps()),
             declaration_surface_languages,
+            complete_declaration_surface_languages,
             has_rust_generated_functions: symbols
                 .iter()
                 .any(crate::analyzer::is_rust_generated_function),
@@ -1067,6 +1080,16 @@ impl SemanticModelOverlay {
     /// published surface.
     pub fn publishes_declaration_surface_for(&self, language: &str) -> bool {
         self.declaration_surface_languages
+            .iter()
+            .any(|surface| surface == language)
+    }
+
+    /// Whether an activated declaration shard claims a complete surface for
+    /// this language. A reviewed pack that models a handful of members
+    /// publishes a surface but claims no such coverage, so a consumer that
+    /// needs an exhaustive relation must not read the weaker predicate.
+    pub fn publishes_complete_declaration_surface_for(&self, language: &str) -> bool {
+        self.complete_declaration_surface_languages
             .iter()
             .any(|surface| surface == language)
     }
@@ -5605,6 +5628,7 @@ mod tests {
             extraction_gaps: Vec::new(),
             extraction_gap_by_declaration: HashMap::default(),
             declaration_surface_languages: Vec::new(),
+            complete_declaration_surface_languages: Vec::new(),
             has_rust_generated_functions: symbols
                 .iter()
                 .any(crate::analyzer::is_rust_generated_function),

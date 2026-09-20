@@ -2748,26 +2748,41 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                     })
             };
             let runtime = required_string("runtime")?;
-            if runtime != "node" {
-                return Err(QueryError::new(
-                    child_path(&entry_path, "runtime"),
-                    "runtime must be node",
-                ));
-            }
             let global = required_string("global")?;
-            if global != "process" {
-                return Err(QueryError::new(
-                    child_path(&entry_path, "global"),
-                    "global must be process",
-                ));
-            }
             let container = required_string("container")?;
-            if !matches!(container.as_str(), "env" | "argv") {
+            // The reviewed vocabulary table is the whole accepted set, so an
+            // unmodeled triple is a query error rather than an empty result.
+            let Some(root) = crate::query::schema::RuntimeKeyedReadRoot::for_labels(
+                &runtime, &global, &container,
+            ) else {
+                let (field, accepted) =
+                    if !crate::query::schema::RuntimeKeyedReadRoot::family_labels()
+                        .contains(&runtime.as_str())
+                    {
+                        (
+                            "runtime",
+                            crate::query::schema::RuntimeKeyedReadRoot::family_labels(),
+                        )
+                    } else if !crate::query::schema::RuntimeKeyedReadRoot::global_labels(&runtime)
+                        .contains(&global.as_str())
+                    {
+                        (
+                            "global",
+                            crate::query::schema::RuntimeKeyedReadRoot::global_labels(&runtime),
+                        )
+                    } else {
+                        (
+                            "container",
+                            crate::query::schema::RuntimeKeyedReadRoot::container_labels(
+                                &runtime, &global,
+                            ),
+                        )
+                    };
                 return Err(QueryError::new(
-                    child_path(&entry_path, "container"),
-                    "container must be env or argv",
+                    child_path(&entry_path, field),
+                    format!("{field} must be one of {}", accepted.join(", ")),
                 ));
-            }
+            };
             let property = object
                 .get("property")
                 .map(|value| {
@@ -2895,10 +2910,12 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                 key,
                 KeyedReadKeySelector::ExactProperty(_) | KeyedReadKeySelector::StaticProperty
             );
-            if (container == "env") != selector_is_property {
+            if (root.key_kind == crate::query::schema::RuntimeKeyKind::StaticProperty)
+                != selector_is_property
+            {
                 return Err(QueryError::new(
                     child_path(&entry_path, "container"),
-                    "env requires a property selector and argv requires an index selector",
+                    format!("{container} requires a {} selector", root.key_kind.label()),
                 ));
             }
             let pristine_input = match object.get("source_origin") {

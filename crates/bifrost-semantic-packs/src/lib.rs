@@ -161,6 +161,15 @@ const NODE_RUNTIME_VALUES_JAVASCRIPT_SHARDS: &[&[u8]] = &[include_bytes!(
 const NODE_RUNTIME_VALUES_TYPESCRIPT_SHARDS: &[&[u8]] = &[include_bytes!(
     "../embedded/node-runtime-values-typescript/shards/runtime.node-process-values.deflate"
 )];
+const PYTHON_PROCESS_INPUT_SHARDS: &[&[u8]] = &[include_bytes!(
+    "../embedded/python-process-inputs/shards/runtime.python-process-inputs.deflate"
+)];
+const PYTHON_OS_COMMAND_DECLARATION_SHARDS: &[&[u8]] = &[include_bytes!(
+    "../embedded/python-os-command-declarations/shards/declarations.python-os-system.json"
+)];
+const PYTHON_OS_COMMAND_SUMMARY_SHARDS: &[&[u8]] = &[include_bytes!(
+    "../embedded/python-os-command-summaries/shards/summaries.python-os-system.json"
+)];
 const NODE_BUFFER_JAVASCRIPT_DECLARATION_SHARDS: &[&[u8]] = &[include_bytes!(
     "../embedded/node-buffer-javascript-declarations/shards/declarations.buffer.deflate"
 )];
@@ -312,6 +321,21 @@ const BIFROST_EMBEDDED_PACK_ENTRIES: &[EmbeddedSemanticPack<'static>] = &[
         NODE_RUNTIME_VALUES_TYPESCRIPT_SHARDS,
     ),
     EmbeddedSemanticPack::new(
+        "bifrost.python-process-inputs@0.1.0",
+        include_bytes!("../embedded/python-process-inputs/manifest.json"),
+        PYTHON_PROCESS_INPUT_SHARDS,
+    ),
+    EmbeddedSemanticPack::new(
+        "bifrost.python-os-command-declarations@0.1.0",
+        include_bytes!("../embedded/python-os-command-declarations/manifest.json"),
+        PYTHON_OS_COMMAND_DECLARATION_SHARDS,
+    ),
+    EmbeddedSemanticPack::new(
+        "bifrost.python-os-command-summaries@0.1.0",
+        include_bytes!("../embedded/python-os-command-summaries/manifest.json"),
+        PYTHON_OS_COMMAND_SUMMARY_SHARDS,
+    ),
+    EmbeddedSemanticPack::new(
         "bifrost.node-buffer-javascript-declarations@0.1.0",
         include_bytes!("../embedded/node-buffer-javascript-declarations/manifest.json"),
         NODE_BUFFER_JAVASCRIPT_DECLARATION_SHARDS,
@@ -372,12 +396,12 @@ const BIFROST_EMBEDDED_PACK_ENTRIES: &[EmbeddedSemanticPack<'static>] = &[
         GO_STDLIB_NET_URL_DECLARATION_SHARDS,
     ),
     EmbeddedSemanticPack::new(
-        "bifrost.go.stdlib.net-http@1.1.0",
+        "bifrost.go.stdlib.net-http@1.2.0",
         include_bytes!("../embedded/go-stdlib-net-http/manifest.json"),
         GO_STDLIB_NET_HTTP_SHARDS,
     ),
     EmbeddedSemanticPack::new(
-        "bifrost.go.stdlib.net-http-declarations@1.1.0",
+        "bifrost.go.stdlib.net-http-declarations@1.2.0",
         include_bytes!("../embedded/go-stdlib-net-http-declarations/manifest.json"),
         GO_STDLIB_NET_HTTP_DECLARATION_SHARDS,
     ),
@@ -1778,7 +1802,7 @@ mod tests {
             .payload()
             .procedure_summaries()
             .expect("the Go net/http shard carries procedure summaries");
-        assert_eq!(summaries.len(), 7);
+        assert_eq!(summaries.len(), 8);
         for (id, has_receiver) in [
             ("net-http.handle-func", false),
             ("net-http.serve-mux.handle-func", true),
@@ -1851,7 +1875,7 @@ mod tests {
             .declaration_facts()
             .expect("the Go net/http declaration shard carries declaration facts");
         assert_eq!(types.len(), 4);
-        assert_eq!(members.len(), 7);
+        assert_eq!(members.len(), 8);
         assert!(relations.is_empty());
         assert!(types.iter().any(|fact| {
             fact.name == "net/http"
@@ -1910,6 +1934,20 @@ mod tests {
                     .signature
                     .as_ref()
                     .is_some_and(|signature| signature.parameters.len() == 2)
+        }));
+        // The network-effect boundary row (#3455) binds `net/http.Get` through
+        // the package-function route, which needs this exact declaration: one
+        // public, static, single-parameter function owned by the `net/http`
+        // module record.
+        assert!(members.iter().any(|fact| {
+            fact.name == "Get"
+                && fact.member_kind == MemberKind::Function
+                && fact.visibility == Visibility::Public
+                && fact.is_static
+                && fact
+                    .signature
+                    .as_ref()
+                    .is_some_and(|signature| signature.parameters.len() == 1)
         }));
 
         let testify = decoded
@@ -3689,24 +3727,36 @@ func calls(local *localFile) uintptr {
         assert!(arm.key.has_receiver);
         assert_eq!(arm.key.parameter_count, 0);
 
+        // The near miss is workspace code with an analyzed body, so the
+        // resolver binds `(*localFile).Fd` itself. Since #3455 recorded Go
+        // callable modifiers, that declaration has a receiver contract and
+        // therefore a canonical key, so the call resolves to its own workspace
+        // identity instead of staying an unkeyable residual. What the reviewed
+        // pack must not do is answer for it: the key names the workspace
+        // owner, never `os.File`.
         let near_miss = &lookups["local.Fd()"];
         assert_eq!(
             near_miss.coverage,
-            ModeledCallTargetCoverage::Open,
-            "the local pointer-receiver call retains its conservative residual: {near_miss:#?}"
+            ModeledCallTargetCoverage::Exhaustive,
+            "the local pointer-receiver call binds one analyzed workspace method: {near_miss:#?}"
         );
         assert_eq!(
             near_miss.call_application,
             ModeledCallApplication::BoundReceiver
         );
-        assert!(near_miss.arms.is_empty(), "{near_miss:#?}");
-        let [local_name] = near_miss.adjudicable_workspace_names.as_slice() else {
-            panic!("one structured workspace identity for the local Fd method: {near_miss:#?}");
+        let [local_arm] = near_miss.arms.as_slice() else {
+            panic!("one workspace arm for the local Fd method: {near_miss:#?}");
         };
-        assert_eq!(local_name.language, "go");
-        assert_eq!(local_name.owner, "example.com/os-model.localFile");
-        assert_eq!(local_name.member, "Fd");
-        assert!(local_name.has_receiver);
+        assert_eq!(local_arm.origin, ModeledCallTargetOrigin::WorkspaceBody);
+        assert_eq!(local_arm.key.language, "go");
+        assert_eq!(local_arm.key.owner, "example.com/os-model.localFile");
+        assert_eq!(local_arm.key.member, "Fd");
+        assert!(local_arm.key.has_receiver);
+        assert_eq!(local_arm.key.parameter_count, 0);
+        assert!(
+            near_miss.adjudicable_workspace_names.is_empty(),
+            "a keyed workspace target is a positive arm, not a negative-only name: {near_miss:#?}"
+        );
     }
 
     #[test]
@@ -4136,23 +4186,44 @@ func receiverNearMiss(d *net.Dialer, config *localListenerConfig) {
             );
         }
 
-        for (call, message) in [
-            (
-                "d.Dial(\"tcp\", \"example.test:80\")",
-                "(*net.Dialer).Dial must not inherit net.Dial's receiverless contract",
-            ),
-            (
-                "config.Listen(\"tcp\", \"127.0.0.1:0\")",
-                "a workspace receiver method must not inherit net.Listen's package contract",
-            ),
-        ] {
-            let near_miss = &lookups[call];
-            assert!(near_miss.arms.is_empty(), "{near_miss:#?}");
-            assert_ne!(
-                near_miss.coverage,
-                ModeledCallTargetCoverage::Exhaustive,
-                "{message}: {near_miss:#?}"
-            );
-        }
+        // `d` is an external `*net.Dialer`, which the reviewed pack does not
+        // model as a concrete receiver, so the call keeps its residual and
+        // must not inherit `net.Dial`'s receiverless contract.
+        let external_near_miss = &lookups["d.Dial(\"tcp\", \"example.test:80\")"];
+        assert!(
+            external_near_miss.arms.is_empty(),
+            "{external_near_miss:#?}"
+        );
+        assert_ne!(
+            external_near_miss.coverage,
+            ModeledCallTargetCoverage::Exhaustive,
+            "(*net.Dialer).Dial must not inherit net.Dial's receiverless contract: \
+             {external_near_miss:#?}"
+        );
+
+        // `config` is workspace code with an analyzed body. Since #3455
+        // recorded Go callable modifiers its method has a receiver contract
+        // and therefore a canonical key, so the call binds the workspace
+        // declaration itself. The reviewed package contract is still not
+        // inherited: the key names the workspace owner, never `net`.
+        let workspace_near_miss = &lookups["config.Listen(\"tcp\", \"127.0.0.1:0\")"];
+        assert_eq!(
+            workspace_near_miss.coverage,
+            ModeledCallTargetCoverage::Exhaustive,
+            "{workspace_near_miss:#?}"
+        );
+        let [workspace_arm] = workspace_near_miss.arms.as_slice() else {
+            panic!("one workspace arm for the local Listen method: {workspace_near_miss:#?}");
+        };
+        assert_eq!(workspace_arm.origin, ModeledCallTargetOrigin::WorkspaceBody);
+        assert_eq!(workspace_arm.key.language, "go");
+        assert_eq!(
+            workspace_arm.key.owner, "example.com/net-model.localListenerConfig",
+            "a workspace receiver method must not inherit net.Listen's package contract: \
+             {workspace_near_miss:#?}"
+        );
+        assert_eq!(workspace_arm.key.member, "Listen");
+        assert!(workspace_arm.key.has_receiver);
+        assert_eq!(workspace_arm.key.parameter_count, 2);
     }
 }

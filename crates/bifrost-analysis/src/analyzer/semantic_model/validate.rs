@@ -1527,9 +1527,7 @@ impl Validator {
     fn runtime_applicability(&mut self, path: &str, runtime: &RuntimeApplicability) {
         for (field, value) in [
             ("runtime_family", runtime.runtime_family.as_str()),
-            ("runtime_artifact", runtime.runtime_artifact.as_str()),
             ("realm", runtime.realm.as_str()),
-            ("module_mode", runtime.module_mode.as_str()),
             (
                 "initialization_boundary",
                 runtime.initialization_boundary.as_str(),
@@ -1537,22 +1535,34 @@ impl Validator {
         ] {
             self.text(&format!("{path}.{field}"), value);
         }
-        if !runtime.runtime_artifact.starts_with("pkg:")
-            || runtime
-                .runtime_artifact
-                .split_once('@')
-                .is_none_or(|(_, version)| version.is_empty())
-        {
-            self.error(
+        if let Some(module_mode) = &runtime.module_mode {
+            self.text(&format!("{path}.module_mode"), module_mode);
+        }
+        // An artifact claim is all-or-nothing: a record that names one must
+        // name its digest too, so an activation selector can bind both.
+        match (&runtime.runtime_artifact, &runtime.runtime_artifact_digest) {
+            (Some(artifact), Some(digest)) => {
+                self.text(&format!("{path}.runtime_artifact"), artifact);
+                if !artifact.starts_with("pkg:")
+                    || artifact
+                        .split_once('@')
+                        .is_none_or(|(_, version)| version.is_empty())
+                {
+                    self.error(
+                        "runtime.invalid_artifact",
+                        format!("{path}.runtime_artifact"),
+                        "runtime artifact must be an exact versioned PURL",
+                    );
+                }
+                self.runtime_digest(&format!("{path}.runtime_artifact_digest"), digest);
+            }
+            (None, None) => {}
+            _ => self.error(
                 "runtime.invalid_artifact",
                 format!("{path}.runtime_artifact"),
-                "runtime artifact must be an exact versioned PURL",
-            );
+                "a runtime artifact and its digest must be declared together",
+            ),
         }
-        self.runtime_digest(
-            &format!("{path}.runtime_artifact_digest"),
-            &runtime.runtime_artifact_digest,
-        );
         if let Some(platform) = &runtime.platform {
             self.text(&format!("{path}.platform"), platform);
         }
@@ -4396,20 +4406,32 @@ fn runtime_active_set_digest(exposure_ids: &[String]) -> String {
     format!("{:x}", digest.finalize())
 }
 
+/// Whether one activation selector binds exactly the artifact applicability a
+/// runtime record claims.
+///
+/// A record that claims no artifact is bound by a selector that carries no
+/// artifact evidence: the reviewed contract is a property of the language, so
+/// a selector naming a distribution would bind a claim the record never made.
 fn runtime_artifact_matches_selector(
     runtime: &RuntimeApplicability,
     selector: &ActivationSelector,
 ) -> bool {
-    if selector.artifact_sha256.as_deref() != Some(runtime.runtime_artifact_digest.as_str()) {
+    let (Some(artifact), Some(artifact_digest)) = (
+        runtime.runtime_artifact.as_deref(),
+        runtime.runtime_artifact_digest.as_deref(),
+    ) else {
+        return selector.artifact_sha256.is_none() && selector.package.is_none();
+    };
+    if selector.artifact_sha256.as_deref() != Some(artifact_digest) {
         return false;
     }
     let Some(package) = selector.package.as_ref() else {
         return false;
     };
-    if package.version.is_none() && package.name == runtime.runtime_artifact {
+    if package.version.is_none() && package.name == artifact {
         return true;
     }
-    let Some(raw) = runtime.runtime_artifact.strip_prefix("pkg:maven/") else {
+    let Some(raw) = artifact.strip_prefix("pkg:maven/") else {
         return false;
     };
     let Some((coordinate, version)) = raw.split_once('@') else {

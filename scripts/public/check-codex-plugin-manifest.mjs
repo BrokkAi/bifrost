@@ -340,21 +340,6 @@ assert.equal(
   false,
   `${releaseMetadataPath} must explicitly reject prerelease fallback binaries`,
 );
-const vscodeManifestPath = "editors/vscode/package.json";
-const vscodeManifest = JSON.parse(fs.readFileSync(vscodeManifestPath, "utf8"));
-assert.deepStrictEqual(
-  {
-    binaryVersion: vscodeManifest.bifrost?.binaryVersion,
-    minimumBinaryVersion: vscodeManifest.bifrost?.minimumBinaryVersion,
-    allowPrerelease: vscodeManifest.bifrost?.allowPrerelease,
-  },
-  {
-    binaryVersion: releaseMetadata.binaryVersion,
-    minimumBinaryVersion: releaseMetadata.minimumBinaryVersion,
-    allowPrerelease: releaseMetadata.allowPrerelease,
-  },
-  `${vscodeManifestPath} must use the agent launcher's binary compatibility range`,
-);
 for (const target of SUPPORTED_TARGETS) {
   const hash = releaseMetadata.archiveSha256?.[target];
   if (!/^[a-f0-9]{64}$/.test(hash ?? "")) {

@@ -191,10 +191,7 @@ impl WorkspaceSemanticOracle<'_> {
         let Some(artifact) = materialized.available_value() else {
             return Ok(materialized.map(|_| RuntimeKeyedReadResult::default()));
         };
-        if !matches!(
-            artifact.key().language().language(),
-            Language::JavaScript | Language::TypeScript
-        ) {
+        if !RUNTIME_KEYED_READ_LANGUAGES.contains(&artifact.key().language().language()) {
             return Ok(SemanticOutcome::Unsupported {
                 capability: SemanticCapability::Values,
                 partial: None,
@@ -334,27 +331,271 @@ fn loads_at_range(
     loads
 }
 
+/// Whether one lowering claim about a load is answered by the reviewed
+/// keyed-read behavior.
+///
+/// `nonthrowing` is the reviewed behavior's own claim. A container whose keyed
+/// read may raise answers the key's identity but not the load's exceptional
+/// control flow, so that claim stays open for the flow analysis to carry.
 fn gap_belongs_to_load(
     gap: &SemanticGap,
     observation: &ValueAtPoint,
     location: MemoryLocationId,
+    nonthrowing: bool,
 ) -> bool {
-    gap.discharge == crate::analyzer::semantic::SemanticGapDischarge::RuntimeReadBehavior
-        && gap.point == observation.point().id()
+    if gap.discharge != crate::analyzer::semantic::SemanticGapDischarge::RuntimeReadBehavior {
+        return false;
+    }
+    // The claim about what produced the loaded value is published ahead of the
+    // load, so it is matched by the value it names rather than by its point.
+    if gap.capability == SemanticCapability::Calls
+        && gap.subject == SemanticGapSubject::Value(observation.value().id())
+    {
+        return true;
+    }
+    gap.point == observation.point().id()
         && ((gap.subject == SemanticGapSubject::MemoryLocation(location)
             && matches!(
                 gap.capability,
                 SemanticCapability::FieldMemory | SemanticCapability::IndexMemory
             ))
-            || (gap.subject == SemanticGapSubject::Point
+            || (nonthrowing
+                && gap.subject == SemanticGapSubject::Point
                 && gap.capability == SemanticCapability::ExceptionalControlFlow))
 }
 
 use crate::analyzer::complete_value_cache::{CompleteValueAcquisition, CompleteValueCache};
 use brokk_bifrost_js_ts::syntax::{
     JsTsRuntimeAccessKey, JsTsRuntimeAccessorCoverage, JsTsRuntimeMutationEvidence,
-    JsTsRuntimeRootResolution, extract_js_ts_runtime_reads,
+    JsTsRuntimeReadFacts, JsTsRuntimeRootResolution, extract_js_ts_runtime_reads,
 };
+use brokk_bifrost_python::runtime_values::{
+    PythonRuntimeAccessKey, PythonRuntimeAccessorCoverage, PythonRuntimeMutationEvidence,
+    PythonRuntimeReadFacts, PythonRuntimeRootResolution, extract_python_runtime_reads,
+};
+
+/// What one language's bounded syntax pass proves about the root identifier of
+/// a runtime-shaped access path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeSyntaxRoot {
+    /// The path's root is the modeled runtime exposure.
+    Modeled,
+    /// A declaration in the source proves the root is something else. This is
+    /// a conclusive exclusion, not an absent answer.
+    Excluded,
+    /// The binder evidence does not decide the root.
+    Indeterminate,
+}
+
+/// One runtime-shaped keyed read, in the shape the activation join consumes.
+///
+/// Each frontend proves this with its own binder and scope facts; the join
+/// below is language neutral so one reviewed contract, one gap discharge, and
+/// one endpoint identity serve every language.
+#[derive(Debug, Clone)]
+struct RuntimeSyntaxRead {
+    root_name: String,
+    container: String,
+    /// The static key, or the typed limitation that replaces it.
+    key: Result<RuntimeAccessKey, RuntimeReadLimitation>,
+    range: Range,
+    container_range: Range,
+    candidate_anchor: Range,
+    root: RuntimeSyntaxRoot,
+    /// Something that can run before this read could intercept the access.
+    accessor_open: bool,
+    /// This module writes the container the read observes.
+    mutated: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct RuntimeSyntaxFacts {
+    reads: Vec<RuntimeSyntaxRead>,
+    /// The runtime root each write in this module reaches. A write refutes
+    /// the pristine-input claim of every read of that root.
+    writes: Vec<String>,
+    visited_nodes: usize,
+    complete: bool,
+}
+
+impl From<JsTsRuntimeReadFacts> for RuntimeSyntaxFacts {
+    fn from(facts: JsTsRuntimeReadFacts) -> Self {
+        Self {
+            reads: facts
+                .reads
+                .iter()
+                .map(|read| RuntimeSyntaxRead {
+                    root_name: read.root_name.clone(),
+                    container: read.container.clone(),
+                    key: match &read.access {
+                        JsTsRuntimeAccessKey::Property(property) => {
+                            Ok(RuntimeAccessKey::Property(property.clone()))
+                        }
+                        JsTsRuntimeAccessKey::Index(index) => {
+                            Ok(RuntimeAccessKey::Index(u128::from(*index)))
+                        }
+                        JsTsRuntimeAccessKey::Dynamic => Err(RuntimeReadLimitation::DynamicKey),
+                        JsTsRuntimeAccessKey::Unsupported => {
+                            Err(RuntimeReadLimitation::UnsupportedIndex)
+                        }
+                    },
+                    range: read.range,
+                    container_range: read.container_range,
+                    candidate_anchor: read.candidate_anchor,
+                    root: match read.lexical_resolution {
+                        JsTsRuntimeRootResolution::UnboundGlobal => RuntimeSyntaxRoot::Modeled,
+                        JsTsRuntimeRootResolution::LexicallyBound => RuntimeSyntaxRoot::Excluded,
+                        JsTsRuntimeRootResolution::ProvenGlobalAlias
+                        | JsTsRuntimeRootResolution::Unknown => RuntimeSyntaxRoot::Indeterminate,
+                    },
+                    accessor_open: read.accessor
+                        != JsTsRuntimeAccessorCoverage::NoKnownAccessorEffects,
+                    mutated: read.mutation != JsTsRuntimeMutationEvidence::NoKnownWrite,
+                })
+                .collect(),
+            // `root_name` is the canonical global root the extractor proved:
+            // direct `process` writes and the reflective `globalThis.process`
+            // routes all arrive as `process`, and a lexically bound `process`
+            // is never reported as one.
+            writes: facts
+                .writes
+                .iter()
+                .filter(|write| write.root_name == "process")
+                .map(|write| write.root_name.clone())
+                .collect(),
+            visited_nodes: facts.visited_nodes,
+            complete: facts.complete,
+        }
+    }
+}
+
+impl From<PythonRuntimeReadFacts> for RuntimeSyntaxFacts {
+    fn from(facts: PythonRuntimeReadFacts) -> Self {
+        Self {
+            reads: facts
+                .reads
+                .iter()
+                .map(|read| RuntimeSyntaxRead {
+                    root_name: read.root_name.clone(),
+                    container: read.container.clone(),
+                    key: match &read.access {
+                        PythonRuntimeAccessKey::Property(property) => {
+                            Ok(RuntimeAccessKey::Property(property.clone()))
+                        }
+                        PythonRuntimeAccessKey::Index(index) => Ok(RuntimeAccessKey::Index(*index)),
+                        PythonRuntimeAccessKey::Dynamic => Err(RuntimeReadLimitation::DynamicKey),
+                        PythonRuntimeAccessKey::Unsupported => {
+                            Err(RuntimeReadLimitation::UnsupportedIndex)
+                        }
+                    },
+                    range: read.range,
+                    container_range: read.container_range,
+                    candidate_anchor: read.candidate_anchor,
+                    root: match read.lexical_resolution {
+                        PythonRuntimeRootResolution::ImportedModule => RuntimeSyntaxRoot::Modeled,
+                        PythonRuntimeRootResolution::LexicallyBound => RuntimeSyntaxRoot::Excluded,
+                        PythonRuntimeRootResolution::Unknown => RuntimeSyntaxRoot::Indeterminate,
+                    },
+                    accessor_open: read.accessor
+                        != PythonRuntimeAccessorCoverage::NoKnownAccessorEffects,
+                    mutated: read.mutation != PythonRuntimeMutationEvidence::NoKnownWrite,
+                })
+                .collect(),
+            writes: facts
+                .writes
+                .iter()
+                .map(|write| write.root_name.clone())
+                .collect(),
+            visited_nodes: facts.visited_nodes,
+            complete: facts.complete,
+        }
+    }
+}
+
+/// Whether the evidence that selected a shard binds the artifact applicability
+/// its exposure claims.
+fn evidence_binds_runtime_artifact(
+    evidence: &crate::analyzer::semantic_model::SemanticModelActivationEvidence,
+    runtime: &crate::analyzer::semantic_model::RuntimeApplicability,
+) -> bool {
+    match (
+        runtime.runtime_artifact.as_deref(),
+        runtime.runtime_artifact_digest.as_deref(),
+    ) {
+        (Some(artifact), Some(digest)) => {
+            evidence
+                .package
+                .as_ref()
+                .is_some_and(|package| package.name == artifact)
+                && evidence.artifact_sha256.as_deref() == Some(digest)
+        }
+        _ => evidence.package.is_none() && evidence.artifact_sha256.is_none(),
+    }
+}
+
+/// The reviewed execution profiles whose keyed-read semantics this engine
+/// implements.
+///
+/// These are explicit authored analysis assumptions, never inferred from a
+/// file extension, a declaration pack, or an absent binder. The engine cannot
+/// observe a platform, an architecture, or a module mode in a workspace, so it
+/// must refuse a profile that scopes itself to one it does not implement
+/// instead of silently publishing under it.
+fn engine_implements_profile(
+    runtime: &crate::analyzer::semantic_model::RuntimeApplicability,
+) -> bool {
+    if runtime.initialization_boundary != "pristine-runtime-at-entry"
+        || runtime.realm != "main"
+        || !runtime
+            .host_assumptions
+            .iter()
+            .any(|assumption| assumption == "closed-workspace-no-preloads")
+    {
+        return false;
+    }
+    match runtime.runtime_family.as_str() {
+        // Node's `process` containers are scoped by the build that publishes
+        // them, so exactly one reviewed distribution profile is implemented.
+        "node" => {
+            runtime.module_mode.as_deref() == Some("commonjs")
+                && runtime.platform.as_deref() == Some("linux")
+                && runtime.architecture.as_deref() == Some("x64")
+        }
+        // The Python standard library specifies `os.environ` and `sys.argv`
+        // for every conforming implementation and every platform, so the
+        // reviewed contract declares no distribution scope. A record that
+        // declares one is outside what this engine implements.
+        "python" => {
+            runtime.module_mode.is_none()
+                && runtime.platform.is_none()
+                && runtime.architecture.is_none()
+        }
+        _ => false,
+    }
+}
+
+/// Languages whose frontend proves runtime keyed-read syntax evidence.
+const RUNTIME_KEYED_READ_LANGUAGES: [Language; 3] =
+    [Language::JavaScript, Language::TypeScript, Language::Python];
+
+/// Run the frontend pass that owns this language's binder and scope facts.
+fn runtime_syntax_facts(
+    language: Language,
+    root: tree_sitter::Node<'_>,
+    source: &str,
+    max_facts: usize,
+) -> RuntimeSyntaxFacts {
+    match language {
+        Language::JavaScript | Language::TypeScript => {
+            extract_js_ts_runtime_reads(root, source, max_facts).into()
+        }
+        Language::Python => extract_python_runtime_reads(root, source, max_facts).into(),
+        _ => RuntimeSyntaxFacts {
+            complete: false,
+            ..RuntimeSyntaxFacts::default()
+        },
+    }
+}
 
 pub(super) type RuntimeReadCache = CompleteValueCache<ProcedureHandle, RuntimeKeyedReadResult>;
 
@@ -488,9 +729,9 @@ impl WorkspaceSemanticOracle<'_> {
             .map_err(|error| SemanticProviderError::internal(error.to_string()))?;
         let mut parser = tree_sitter::Parser::new();
         for file in files.iter() {
-            if file == current
-                || !matches!(file.language(), Language::JavaScript | Language::TypeScript)
-            {
+            // Only a module of the same language can spell a write to this
+            // runtime root: the exposure's binder is that language's own.
+            if file == current || file.language() != current.language() {
                 continue;
             }
             if request.cancellation.is_cancelled() {
@@ -526,7 +767,8 @@ impl WorkspaceSemanticOracle<'_> {
             if tree.root_node().has_error() {
                 return Ok((WorkspaceRuntimeWriteFootprint::CoverageLimited, work));
             }
-            let facts = extract_js_ts_runtime_reads(
+            let facts = runtime_syntax_facts(
+                file.language(),
                 tree.root_node(),
                 &source,
                 request.budget.remaining().nested_entries,
@@ -542,7 +784,7 @@ impl WorkspaceSemanticOracle<'_> {
             if request.budget.charge(fact_work).is_err() || !facts.complete {
                 return Ok((WorkspaceRuntimeWriteFootprint::CoverageLimited, work));
             }
-            if facts.writes.iter().any(runtime_root_write) {
+            if !facts.writes.is_empty() {
                 footprint = WorkspaceRuntimeWriteFootprint::RuntimeRootWrite;
             }
         }
@@ -575,10 +817,8 @@ impl WorkspaceSemanticOracle<'_> {
         procedure: &ProcedureHandle,
         request: &mut SemanticRequest<'_>,
     ) -> Result<SemanticOutcome<RuntimeKeyedReadResult>, SemanticProviderError> {
-        if !matches!(
-            procedure.artifact().key().language().language(),
-            Language::JavaScript | Language::TypeScript
-        ) {
+        if !RUNTIME_KEYED_READ_LANGUAGES.contains(&procedure.artifact().key().language().language())
+        {
             return Ok(SemanticOutcome::Complete {
                 value: RuntimeKeyedReadResult::default(),
                 work: SemanticWork::default(),
@@ -730,7 +970,8 @@ impl WorkspaceSemanticOracle<'_> {
                 work,
             });
         };
-        let facts = extract_js_ts_runtime_reads(
+        let facts = runtime_syntax_facts(
+            procedure.artifact().key().language().language(),
             tree.root_node(),
             &source,
             request.budget.remaining().nested_entries,
@@ -769,35 +1010,20 @@ impl WorkspaceSemanticOracle<'_> {
             if loads.is_empty() {
                 continue;
             }
-            let key = match &read.access {
-                JsTsRuntimeAccessKey::Property(property) => {
-                    Some(RuntimeAccessKey::Property(property.clone()))
-                }
-                JsTsRuntimeAccessKey::Index(index) => {
-                    Some(RuntimeAccessKey::Index(u128::from(*index)))
-                }
-                JsTsRuntimeAccessKey::Dynamic => {
-                    result.limitations.push(RuntimeReadLimitation::DynamicKey);
-                    None
-                }
-                JsTsRuntimeAccessKey::Unsupported => {
-                    result
-                        .limitations
-                        .push(RuntimeReadLimitation::UnsupportedIndex);
-                    None
-                }
-            };
+            if let Err(limitation) = read.key {
+                result.limitations.push(limitation);
+            }
             result.candidates.push(RuntimeKeyedReadCandidate {
                 anchor: read.candidate_anchor,
                 global: read.root_name.clone(),
                 container: read.container.clone(),
-                key: key.clone(),
-                excluded: read.lexical_resolution == JsTsRuntimeRootResolution::LexicallyBound,
+                key: read.key.clone().ok(),
+                excluded: read.root == RuntimeSyntaxRoot::Excluded,
             });
-            let Some(key) = key else {
+            let Ok(key) = read.key.clone() else {
                 continue;
             };
-            if read.lexical_resolution == JsTsRuntimeRootResolution::LexicallyBound {
+            if read.root == RuntimeSyntaxRoot::Excluded {
                 continue;
             }
             // Accessor and effect hazards are scoped to the read's own
@@ -805,13 +1031,13 @@ impl WorkspaceSemanticOracle<'_> {
             // extractor's mutation evidence. An external call in a sibling
             // function must not poison this read, or a reviewed sink call
             // could never share a module with its source.
-            if read.accessor != JsTsRuntimeAccessorCoverage::NoKnownAccessorEffects {
+            if read.accessor_open {
                 result
                     .limitations
                     .push(RuntimeReadLimitation::AccessorOrProxyIncomplete);
                 continue;
             }
-            if read.lexical_resolution != JsTsRuntimeRootResolution::UnboundGlobal {
+            if read.root != RuntimeSyntaxRoot::Modeled {
                 result
                     .limitations
                     .push(RuntimeReadLimitation::LexicalBindingIndeterminate);
@@ -823,7 +1049,7 @@ impl WorkspaceSemanticOracle<'_> {
                     .push(RuntimeReadLimitation::AmbiguousOwner);
                 continue;
             }
-            if read.mutation != JsTsRuntimeMutationEvidence::NoKnownWrite {
+            if read.mutated {
                 result
                     .limitations
                     .push(RuntimeReadLimitation::MutationIncomplete);
@@ -867,28 +1093,16 @@ fn same_byte_span(left: Range, right: Range) -> bool {
     left.start_byte == right.start_byte && left.end_byte == right.end_byte
 }
 
-/// Whether one extracted write reaches the Node runtime container.
-///
-/// `root_name` is the canonical global root the extractor proved for the write
-/// site: direct `process` writes and the reflective `globalThis.process` or
-/// `global.process` routes all arrive as `process`, and a lexically bound
-/// `process` is never reported as one.
-fn runtime_root_write(write: &brokk_bifrost_js_ts::syntax::JsTsRuntimeWrite) -> bool {
-    write.root_name == "process"
-}
-
 use crate::analyzer::semantic_model::{
     RuntimeAcceptedKeys, RuntimeCoverageStatus, RuntimeExceptionBehavior,
     RuntimeExposureActivation, RuntimeMaterialization, RuntimeMutationModel,
 };
-use brokk_bifrost_js_ts::syntax::JsTsRuntimeRead;
-
 impl WorkspaceSemanticOracle<'_> {
     fn bind_runtime_read_contract(
         &self,
         procedure: &ProcedureHandle,
         file: &ProjectFile,
-        read: &JsTsRuntimeRead,
+        read: &RuntimeSyntaxRead,
         key: RuntimeAccessKey,
         load: &(ValueAtPoint, MemoryLocationId),
         result: &mut RuntimeKeyedReadResult,
@@ -934,22 +1148,22 @@ impl WorkspaceSemanticOracle<'_> {
                 {
                     continue;
                 }
-                // A host must explicitly select the complete execution profile.
-                // Catalog availability and the source language do not establish it.
-                // An exposure authored as `enabled` is intrinsically eligible
-                // within its model; it does not bypass pack activation. The
-                // pack-level `safety.review_required` gate remains the explicit
-                // user authorization, enforced by the activation resolver
-                // before this join ever runs.
+                // A host must explicitly select the complete execution
+                // profile. Catalog availability and the source language do not
+                // establish it. An exposure authored as `enabled` is
+                // intrinsically eligible within its model; it does not bypass
+                // pack activation. The pack-level `safety.review_required`
+                // gate remains the explicit user authorization, enforced by
+                // the activation resolver before this join ever runs.
+                //
+                // The evidence must bind exactly the applicability the
+                // exposure claims. A build-specific contract is selected only
+                // by its own artifact coordinates and digest; a contract the
+                // language's standard library guarantees claims no artifact,
+                // and evidence naming one would bind something it never said.
                 if shard.matched_evidence.configuration.as_deref()
                     != Some(&exposure.runtime_profile_digest)
-                    || !shard
-                        .matched_evidence
-                        .package
-                        .as_ref()
-                        .is_some_and(|package| package.name == exposure.runtime.runtime_artifact)
-                    || shard.matched_evidence.artifact_sha256.as_deref()
-                        != Some(&exposure.runtime.runtime_artifact_digest)
+                    || !evidence_binds_runtime_artifact(&shard.matched_evidence, &exposure.runtime)
                     || exposure.activation != RuntimeExposureActivation::Enabled
                 {
                     continue;
@@ -1012,7 +1226,11 @@ impl WorkspaceSemanticOracle<'_> {
                 .push(RuntimeReadLimitation::UnsupportedIndex);
             return Ok(());
         }
-        if behavior.exception_behavior != RuntimeExceptionBehavior::Nonthrowing {
+        // A reviewed behavior that may raise still observes exactly the
+        // reviewed input on the normal path: a read that abandons control
+        // produces no result at all. What it cannot do is discharge the
+        // load's exceptional-control-flow claim, which stays open below.
+        if behavior.exception_behavior == RuntimeExceptionBehavior::Unknown {
             result
                 .limitations
                 .push(RuntimeReadLimitation::ExceptionBehaviorIndeterminate);
@@ -1024,22 +1242,7 @@ impl WorkspaceSemanticOracle<'_> {
                 .push(RuntimeReadLimitation::MaterializationIncomplete);
             return Ok(());
         }
-        // These are explicit authored analysis assumptions. They are not
-        // inferred from a file extension, Node declarations, or an absent binder.
-        // The engine implements exactly one reviewed profile; an exposure
-        // naming any other realm, module mode, platform, or architecture
-        // stays incomplete rather than silently publishing.
-        if exposure.runtime.initialization_boundary != "pristine-runtime-at-entry"
-            || !exposure
-                .runtime
-                .host_assumptions
-                .iter()
-                .any(|assumption| assumption == "closed-workspace-no-preloads")
-            || exposure.runtime.realm != "main"
-            || exposure.runtime.module_mode != "commonjs"
-            || exposure.runtime.platform.as_deref() != Some("linux")
-            || exposure.runtime.architecture.as_deref() != Some("x64")
-        {
+        if !engine_implements_profile(&exposure.runtime) {
             result
                 .limitations
                 .push(RuntimeReadLimitation::MutationIncomplete);
@@ -1132,13 +1335,14 @@ impl WorkspaceSemanticOracle<'_> {
         identity.push(behavior.behavior_id.as_bytes());
         identity.push(&(read.range.start_byte as u64).to_le_bytes());
         identity.push(&(read.range.end_byte as u64).to_le_bytes());
+        let nonthrowing = behavior.exception_behavior == RuntimeExceptionBehavior::Nonthrowing;
         let discharged_gaps = procedure
             .semantics()
             .gaps()
             .iter()
             .filter(|gap| {
-                gap_belongs_to_load(gap, &load.0, load.1)
-                    || gap_belongs_to_load(gap, container, *container_location)
+                gap_belongs_to_load(gap, &load.0, load.1, nonthrowing)
+                    || gap_belongs_to_load(gap, container, *container_location, nonthrowing)
             })
             .map(|gap| gap.id)
             .collect::<Vec<_>>();

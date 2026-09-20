@@ -143,34 +143,44 @@ pub fn expand_language_labels(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeFamily {
     Node,
+    Python,
 }
 
 impl RuntimeFamily {
     pub const fn label(self) -> &'static str {
-        "node"
-    }
-    pub fn from_label(label: &str) -> Option<Self> {
-        (label == Self::Node.label()).then_some(Self::Node)
+        match self {
+            Self::Node => "node",
+            Self::Python => "python",
+        }
     }
 }
 
+/// The root binding a reviewed runtime publishes its process inputs on.
+///
+/// A root is a global object in one runtime and an imported standard-library
+/// module in another. Which it is, and how a program binds the name, is the
+/// frontend's proof; this vocabulary only names the reviewed root.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeGlobal {
     Process,
+    Os,
+    Sys,
 }
 
 impl RuntimeGlobal {
     pub const fn label(self) -> &'static str {
-        "process"
-    }
-    pub fn from_label(label: &str) -> Option<Self> {
-        (label == Self::Process.label()).then_some(Self::Process)
+        match self {
+            Self::Process => "process",
+            Self::Os => "os",
+            Self::Sys => "sys",
+        }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeContainer {
     Env,
+    Environ,
     Argv,
 }
 
@@ -178,16 +188,102 @@ impl RuntimeContainer {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Env => "env",
+            Self::Environ => "environ",
             Self::Argv => "argv",
         }
     }
-    pub fn from_label(label: &str) -> Option<Self> {
-        match label {
-            "env" => Some(Self::Env),
-            "argv" => Some(Self::Argv),
-            _ => None,
+}
+
+/// One reviewed runtime process-input container a keyed-read query may name.
+///
+/// The table is the whole accepted vocabulary for the `runtime`, `global`, and
+/// `container` fields: a triple absent from it is a query error rather than an
+/// empty result, so a policy cannot silently name a container no model
+/// publishes. `key_kind` is the way the container's elements are addressed,
+/// which is a property of the container rather than of the query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeKeyedReadRoot {
+    pub family: RuntimeFamily,
+    pub global: RuntimeGlobal,
+    pub container: RuntimeContainer,
+    pub key_kind: RuntimeKeyKind,
+}
+
+pub const RUNTIME_KEYED_READ_ROOTS: [RuntimeKeyedReadRoot; 4] = [
+    RuntimeKeyedReadRoot {
+        family: RuntimeFamily::Node,
+        global: RuntimeGlobal::Process,
+        container: RuntimeContainer::Env,
+        key_kind: RuntimeKeyKind::StaticProperty,
+    },
+    RuntimeKeyedReadRoot {
+        family: RuntimeFamily::Node,
+        global: RuntimeGlobal::Process,
+        container: RuntimeContainer::Argv,
+        key_kind: RuntimeKeyKind::StaticIndex,
+    },
+    RuntimeKeyedReadRoot {
+        family: RuntimeFamily::Python,
+        global: RuntimeGlobal::Os,
+        container: RuntimeContainer::Environ,
+        key_kind: RuntimeKeyKind::StaticProperty,
+    },
+    RuntimeKeyedReadRoot {
+        family: RuntimeFamily::Python,
+        global: RuntimeGlobal::Sys,
+        container: RuntimeContainer::Argv,
+        key_kind: RuntimeKeyKind::StaticIndex,
+    },
+];
+
+impl RuntimeKeyedReadRoot {
+    /// The reviewed row one query names, when the vocabulary has it.
+    pub fn for_labels(runtime: &str, global: &str, container: &str) -> Option<&'static Self> {
+        RUNTIME_KEYED_READ_ROOTS.iter().find(|root| {
+            root.family.label() == runtime
+                && root.global.label() == global
+                && root.container.label() == container
+        })
+    }
+
+    /// Every accepted runtime family, in table order.
+    pub fn family_labels() -> Vec<&'static str> {
+        distinct_labels(
+            RUNTIME_KEYED_READ_ROOTS
+                .iter()
+                .map(|root| root.family.label()),
+        )
+    }
+
+    /// Every root binding the named family publishes.
+    pub fn global_labels(runtime: &str) -> Vec<&'static str> {
+        distinct_labels(
+            RUNTIME_KEYED_READ_ROOTS
+                .iter()
+                .filter(move |root| root.family.label() == runtime)
+                .map(|root| root.global.label()),
+        )
+    }
+
+    /// Every container the named family and root publish.
+    pub fn container_labels(runtime: &str, global: &str) -> Vec<&'static str> {
+        distinct_labels(
+            RUNTIME_KEYED_READ_ROOTS
+                .iter()
+                .filter(move |root| root.family.label() == runtime && root.global.label() == global)
+                .map(|root| root.container.label()),
+        )
+    }
+}
+
+fn distinct_labels(labels: impl Iterator<Item = &'static str>) -> Vec<&'static str> {
+    let mut distinct: Vec<&'static str> = Vec::new();
+    for label in labels {
+        if !distinct.contains(&label) {
+            distinct.push(label);
         }
     }
+    distinct
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -442,7 +538,7 @@ impl ValueShape {
             Self::ControlExitPartitionList => "one or more control exit partitions",
             Self::JsxElementIdentity => "intrinsic, component, or unknown",
             Self::RuntimeFamily => "a supported runtime family",
-            Self::RuntimeGlobal => "a supported runtime global binding",
+            Self::RuntimeGlobal => "a supported runtime root binding",
             Self::RuntimeContainer => "a supported runtime container member",
             Self::RuntimeSourceOrigin => "a supported runtime source-origin contract",
             Self::RuntimeKeyKind => "static-property or static-index",
@@ -788,7 +884,7 @@ query_step_ops! {
     ReceiverTargets { shape: DerivedValue, label: "receiver_targets", signature: "structural_match|reference_site|call_site|expression_site|occurrence -> receiver_analysis", description: "Analyze a bounded receiver value using adapter-provided structured facts." }
     PointsTo { shape: DerivedValue, label: "points_to", signature: "structural_match|reference_site|expression_site|occurrence -> receiver_analysis", description: "Analyze bounded value provenance using adapter-provided structured facts." }
     MemberTargets { shape: DerivedValue, label: "member_targets", signature: "structural_match|reference_site|occurrence -> member_target_analysis", description: "Resolve exact static member identities together with the receiver owner and model provenance used by bounded structured receiver analysis." }
-    KeyedReadValue { shape: DerivedValue, label: "keyed_read_value", signature: "structural_match -> keyed_read_value", description: "Resolve a runtime-global keyed load to its exact executable value observation under the active runtime model, retaining incomplete and exclusion evidence.", semantic: [Procedures, ProgramPoints, ValueFlow] }
+    KeyedReadValue { shape: DerivedValue, label: "keyed_read_value", signature: "structural_match -> keyed_read_value", description: "Resolve a runtime-root keyed load to its exact executable value observation under the active runtime model, retaining incomplete and exclusion evidence.", semantic: [Procedures, ProgramPoints, ValueFlow] }
     FieldWriteValue { shape: RowLocal, label: "field_write_value", signature: "member_target_analysis -> field_write_value", description: "Project the exact right-hand expression of a simple assignment whose static member and receiver identities were proven by member_targets, optionally retaining only exact receiver/member identities." }
     ReceiverOutcome { shape: RowLocal, label: "receiver_outcome", signature: "structural_match|reference_site|call_site|expression_site|occurrence|receiver_analysis|member_target_analysis -> receiver_outcome", description: "Analyze an ordinary call or member site directly, or project an existing receiver analysis, into its mandatory terminal outcome row." }
     ReceiverEvidence { shape: RowLocal, label: "receiver_evidence", signature: "structural_match|reference_site|call_site|expression_site|occurrence|receiver_analysis -> receiver_evidence", description: "Analyze an ordinary call or member site directly, or project an existing receiver analysis, into zero or more parent-linked evidence rows." }
@@ -1483,7 +1579,7 @@ rql_forms! {
         labels: ["keyed-read-value", "keyed_read_value"],
         class: Wrapper,
         shape: Query,
-        signature: "(keyed-read-value :runtime node :global process :container env|argv [:property name | :index number | :key-kind static-property | :key-kind static-index [:index-min number] [:index-max number]] [:source-origin pristine_input] query)",
+        signature: "(keyed-read-value :runtime node|python :global process|os|sys :container env|environ|argv [:property name | :index number | :key-kind static-property | :key-kind static-index [:index-min number] [:index-max number]] [:source-origin pristine_input] query)",
         description: (QueryStepOp::KeyedReadValue),
         step: KeyedReadValue,
     }
@@ -2343,9 +2439,9 @@ json_fields! {
     Identity { label: "identity", shape: JsxElementIdentity, signature: "\"identity\": \"intrinsic\" | \"component\" | \"unknown\"", description: "Restrict JSX value rows to one semantic element identity." }
     ElementName { label: "element_name", shape: String, signature: "\"element_name\": \"name\"", description: "Restrict JSX value rows to one exact unqualified element tag name." }
     PropertyName { label: "property_name", shape: String, signature: "\"property_name\": \"name\"", description: "Restrict JSX value rows to one exact JSX attribute or object-property name." }
-    Runtime { label: "runtime", shape: RuntimeFamily, signature: "\"runtime\": \"node\"", description: "Select the modeled runtime family." }
-    Global { label: "global", shape: RuntimeGlobal, signature: "\"global\": \"process\"", description: "Select the modeled global binding." }
-    Container { label: "container", shape: RuntimeContainer, signature: "\"container\": \"env\" | \"argv\"", description: "Select the modeled container member." }
+    Runtime { label: "runtime", shape: RuntimeFamily, signature: "\"runtime\": \"node\" | \"python\"", description: "Select the modeled runtime family." }
+    Global { label: "global", shape: RuntimeGlobal, signature: "\"global\": \"process\" | \"os\" | \"sys\"", description: "Select the modeled runtime root binding: a global object, or a standard-library module a program imports." }
+    Container { label: "container", shape: RuntimeContainer, signature: "\"container\": \"env\" | \"environ\" | \"argv\"", description: "Select the modeled container member published by that runtime root." }
     Property { label: "property", shape: String, signature: "\"property\": \"name\"", description: "Select one exact static property key." }
     Index { label: "index", shape: NonNegativeInteger, signature: "\"index\": non-negative integer", description: "Select one exact non-negative array index." }
     KeyKind { label: "key_kind", shape: RuntimeKeyKind, signature: "\"key_kind\": \"static-property\" | \"static-index\"", description: "Select a family of static property or index keys without naming one exact key." }

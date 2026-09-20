@@ -281,12 +281,27 @@ lang_epoch!(
 // `ConstantString` value kind with their exact source text instead of the
 // payload-free `Constant`. Warm semantic rows hold the old kind, and the race
 // solver's exact map-key pairing must not silently misread them.
+// Salt bumped again (#3455): the Go walk now records callable modifier
+// metadata, and it recorded none before. A blob persisted under the prior
+// epoch deserializes as "nobody read the modifiers", so `receiver_contract_of`
+// reports no contract, `modeled_procedure_key_for_unit` refuses every Go
+// workspace declaration, and every Go procedure summary stays inert on a warm
+// workspace with no error raised anywhere. The same gap was bumped for
+// JavaScript and TypeScript (#2597), for PHP and Ruby (#2912), and for Python
+// (#3451).
 lang_epoch!(
     Go,
     "go",
     "treesitter/go/",
-    "go-canonical-import-path-fqn-2026-06;synthetic-file-scope-code-units-2026-07;raw-package-qualifier-2026-07;fq-interned-segments-2026-07;return-expression-list-value-identity-2026-07;go-query-assets-in-brokk-bifrost-go-2026-08;named-type-underlying-identity-2026-08;empty-interface-map-key-identity-2026-09;go-1-26-new-expression-parse-2026-09;go-constant-string-values-2026-09"
+    "go-canonical-import-path-fqn-2026-06;synthetic-file-scope-code-units-2026-07;raw-package-qualifier-2026-07;fq-interned-segments-2026-07;return-expression-list-value-identity-2026-07;go-query-assets-in-brokk-bifrost-go-2026-08;named-type-underlying-identity-2026-08;empty-interface-map-key-identity-2026-09;go-1-26-new-expression-parse-2026-09;go-constant-string-values-2026-09;go-callable-modifier-metadata-2026-09"
 );
+
+/// The Go epoch as it stood before the #3455 callable-modifier bump.
+#[cfg(test)]
+pub(super) fn go_epoch_before_callable_modifier_metadata() -> String {
+    let prior = salt_before_bump(Go::SALT, "go-callable-modifier-metadata-2026-09");
+    compute_epoch::<Go>(&tree_sitter_go::LANGUAGE.into(), prior)
+}
 // Salt bumped: out-of-line member definitions whose owner class is named with
 // no namespace segment of its own (`Class::method` under an in-effect `using
 // namespace X;` rather than an enclosing `namespace {}` block) now resolve
