@@ -1050,6 +1050,32 @@ fn resolve_csharp_in_session(
                         ClaimSubjectRole::Type,
                     )),
                 });
+                // The boundary is published under the canonical external
+                // identity rather than the receiver *variable* spelling, so a
+                // reviewed model can bind the exact member the call reaches
+                // (#3461). This is the C# half of the publication Java adopted
+                // in #3466. It is gated on the external declaration surface
+                // itself -- an indexed assembly or an activated declaration-fact
+                // pack declared the owner type *and* the member -- and
+                // workspace member lookup has already answered nothing above,
+                // so the route is external by construction. A surface that
+                // names no candidate owner, or several, keeps the receiver
+                // spelling and publishes no identity.
+                if outcome.definitions.is_empty()
+                    && let Some(canonical) = csharp.external_member_identity(
+                        analyzer.semantic_model_overlay(),
+                        &receiver_type_names,
+                        member,
+                    )
+                {
+                    outcome.reference = Some(ResolvedReferenceSite {
+                        text: canonical,
+                        // The site is unchanged: only what it is *called*
+                        // changes, so its own coordinates are carried through
+                        // rather than rebuilt from a node.
+                        ..site.clone()
+                    });
+                }
             }
             outcome
         }

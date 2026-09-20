@@ -1789,6 +1789,14 @@ fn bifrost_mcp_lists_and_runs_built_in_policies() {
     assert_eq!(catalog["schema_version"], 2);
     let packs = catalog["packs"].as_array().expect("policy packs");
     assert_eq!(packs.len(), 4);
+    assert_eq!(packs[3]["id"], "bifrost.effects");
+    assert_eq!(
+        packs[3]["policies"]
+            .as_array()
+            .expect("effects policies")
+            .len(),
+        10
+    );
     assert_eq!(packs[0]["id"], "bifrost.code-smells");
     let code_smells_policies = packs[0]["policies"]
         .as_array()

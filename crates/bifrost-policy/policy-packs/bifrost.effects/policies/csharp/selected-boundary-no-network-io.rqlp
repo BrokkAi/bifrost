@@ -1,0 +1,104 @@
+; Network-effect boundary for one explicitly selected C# declaration.
+;
+; This is the shipped specialization. Its ship-time declaration selection is
+; the empty set, so a repository that enables this policy without editing the
+; selection block below carries no purity obligation at all. Purity is never
+; inferred from a method name, a class name, a namespace prefix, a file name, a
+; comment, or an attribute.
+;
+; Activation
+; ----------
+; 1. Ship or install the reviewed C# semantic model that declares the concrete
+;    .NET network API identity with the effect `bifrost.network_io`.
+;    `semantic-packs/web-network/csharp/bifrost.web-network-csharp.json` is that
+;    reviewed model. Place it under `.bifrost/semantic-models/`. It is a `csharp`
+;    / `dotnet` model, which is the evidence row every .NET workspace publishes
+;    for its shared-framework reference assemblies, so a workspace that already
+;    resolves its dependencies activates it without further configuration.
+; 2. Replace both declaration selections in the analysis block below with the
+;    exact declaration(s) this repository protects, for example:
+;      (language csharp
+;        (enclosing-decl
+;          (inside-decl (class :name "PriceCalculator")
+;            (method :name "Total"))))
+; 3. Enable the policy: `bifrost --policy-id
+;    bifrost.effects.csharp.selected-boundary-no-network-io --fail-on error`.
+;
+; Why this API
+; ------------
+; The reviewed identity is `System.Net.Http.HttpClient.SendAsync` at its
+; written arity one. That is a receiver route: `SendAsync` is an instance
+; method, so the C# resolver must first resolve the receiver's declared type
+; through that file's own `using` tiers and the external declaration surface
+; before the identity exists at all. The written arity one is part of the
+; identity, so it is unambiguous against the `(request, cancellationToken)`,
+; `(request, completionOption)` and three-argument overloads. `HttpClient.GetAsync`
+; would bind the same way but takes a bare string or `Uri`, which makes the
+; call shape easier to imitate accidentally; `SendAsync(HttpRequestMessage)` is
+; the request-object form the reviewed model declares.
+;
+; The route is async. An awaited call reaches the declared effect in the same
+; invocation and is reported as a declared effect with its witness chain. A
+; call handed to a callback or a scheduler the analyzer cannot expand is not
+; reported as an effect and is not reported as clean either: the coverage stays
+; open and the run publishes an unmet obligation.
+;
+; The rule body is shared across languages; only the language label, the
+; activated model, and this selection block differ.
+;
+; The join
+; --------
+; `procedure-effects` projects one row per (procedure, effect id) with the
+; classification (direct or transitive), certainty, timing, coverage and a
+; bounded witness chain. Rows are keyed on the declaration domain's own
+; `procedure_id`, so the join to the selected relation is declaration-identity
+; equality.
+;
+; The absence claim
+; -----------------
+; `(exactly 0)` is an absence claim, so it is conclusive only when the effect
+; relation's coverage is exhaustive. A selected declaration that reaches an
+; unresolved helper leaves the effect set open; the run then publishes an unmet
+; obligation instead of reporting a clean verdict, and a helper chain the
+; analyzer cannot expand is never reported as an absence.
+(policy
+  :schema-version 1
+  :id "bifrost.effects.csharp.selected-boundary-no-network-io"
+  :name "Selected C# boundary reaches no network effect"
+  :message "the selected C# boundary reaches the declared network effect"
+  :severity error
+  :description "One explicitly selected C# declaration must not reach a declared network effect, directly or through workspace helpers. The effect is declared by the reviewed C# semantic model on the exact .NET API identity, never inferred from a method name, a class name, a namespace prefix, a file name, a comment, or an attribute. The ship-time selection is empty; configure the declaration-selection block before enabling this policy."
+  :help-uri "https://bifrost.brokk.ai/static-analysis-policies/#network-effect-boundary"
+  :tags ["effects" "network" "boundary" "csharp"]
+  :analysis
+    (analysis
+      :type assertion
+      ; ---------------------------------------------------------------------
+      ; Declaration-selection block. Ship-time selection: the empty set.
+      ; Replace both `(except ...)` expressions below with the exact
+      ; declaration this repository protects. The `effect` binding repeats the
+      ; same selection on purpose: `procedure-effects` derives a closure for
+      ; every declaration its input query returns, so repeating the selection
+      ; is what keeps the policy from deriving effects for declarations it did
+      ; not select. With the ship-time empty selection it derives none, the
+      ; assertion has no group to judge, and the run is vacuously clean.
+      ; ---------------------------------------------------------------------
+      (bind :name selected
+        :query (rql :schema-version 1
+          (language csharp
+            (except
+              (enclosing-decl (method))
+              (enclosing-decl (method))))))
+      (bind :name effect
+        :query (rql :schema-version 1
+          (language csharp
+            (procedure-effects
+              (except
+                (enclosing-decl (method))
+                (enclosing-decl (method)))))))
+      (join :left selected :right effect :on ((id procedure_id)))
+      (group :name selected-boundary :by (selected.id)
+        (aggregate :name network-effects :op count
+          :where ((effect.effect_id eq "bifrost.network_io")
+                  (effect.derivation eq declared))))
+      (assert :group selected-boundary :value network-effects :cardinality (exactly 0))))

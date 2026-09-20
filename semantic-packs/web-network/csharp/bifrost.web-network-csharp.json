@@ -1,0 +1,123 @@
+{
+  "schema_version": 2,
+  "pack_id": "bifrost.web-network-csharp",
+  "version": "1.0.0",
+  "producer": { "name": "bifrost-reviewed-web-models", "version": "1.0.0" },
+  "language": "csharp",
+  "ecosystem": "dotnet",
+  "compatibility": {
+    "bifrost": ">=0.8.0, <1.0.0",
+    "toolchains": []
+  },
+  "provenance": {
+    "source": ".NET System.Net.Http, the HttpClient.SendAsync(HttpRequestMessage) operation",
+    "revision": "dotnet-9.0"
+  },
+  "license": "Apache-2.0",
+  "completeness": "complete",
+  "safety": { "generated_code_only": false, "review_required": false },
+  "shards": [
+    {
+      "id": "declarations.web-network.csharp",
+      "activation": [{ "targets": [], "configurations": [] }],
+      "payload": {
+        "kind": "declaration_facts",
+        "types": [
+          {
+            "id": "type.web-network.csharp.system-net-http-httpclient",
+            "name": "System.Net.Http.HttpClient",
+            "type_kind": "class",
+            "visibility": "public",
+            "is_abstract": false,
+            "is_sealed": false,
+            "has_explicit_type_terms": false,
+            "type_parameters": [],
+            "type_parameter_constraints": [],
+            "embedded_types": [],
+            "hierarchy": [],
+            "aliases": [],
+            "extension_surfaces": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "System.Net.Http.dll",
+              "symbol": "System.Net.Http.HttpClient"
+            }
+          }
+        ],
+        "members": [
+          {
+            "id": "member.web-network.csharp.system-net-http-httpclient.sendasync",
+            "owner": "type.web-network.csharp.system-net-http-httpclient",
+            "name": "SendAsync",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": false,
+            "is_virtual": true,
+            "callable_family_complete": true,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                {
+                  "name": "request",
+                  "type": {
+                    "kind": "named",
+                    "name": "System.Net.Http.HttpRequestMessage",
+                    "arguments": [],
+                    "nullable": false
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "System.Threading.Tasks.Task",
+                "arguments": [
+                  {
+                    "kind": "named",
+                    "name": "System.Net.Http.HttpResponseMessage",
+                    "arguments": [],
+                    "nullable": false
+                  }
+                ],
+                "nullable": false
+              }
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "System.Net.Http.dll",
+              "symbol": "SendAsync(System.Net.Http.HttpRequestMessage)"
+            }
+          }
+        ],
+        "relations": []
+      }
+    },
+    {
+      "id": "summaries.web-network.csharp",
+      "activation": [{ "targets": [], "configurations": [] }],
+      "payload": {
+        "kind": "procedure_summaries",
+        "summaries": [
+          {
+            "id": "summary.web-network.csharp.system-net-http-httpclient.sendasync",
+            "target": {
+              "path": "System.Net.Http.dll",
+              "symbol": "System.Net.Http.HttpClient.SendAsync(System.Net.Http.HttpRequestMessage)",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "covers_overrides": true,
+            "locations": [],
+            "transfers": [],
+            "effects": [],
+            "declared_effects": [
+              { "id": "bifrost.network_io", "timing": "immediate", "certainty": "definite" }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

@@ -19566,6 +19566,56 @@ mod tests {
         );
     }
 
+    /// #3493: the C and C++ walk now records callable modifier metadata, and
+    /// it recorded none before. A blob persisted under the prior epoch
+    /// deserializes as "nobody read the modifiers", which is indistinguishable
+    /// from an adapter that honestly declares none, so `receiver_contract_of`
+    /// reports no contract and every C or C++ procedure summary stays inert.
+    /// The salt is the only thing that retires those rows.
+    #[test]
+    fn cpp_callable_modifier_metadata_epoch_invalidates_prior_parsed_blobs() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(
+            temp.path(),
+            "client.cpp",
+            "namespace shop {\n\
+             class Client { public: void send(int order); static int count(); };\n\
+             void Client::send(int order) { (void)order; }\n\
+             int total(int order) { return order; }\n\
+             }\n",
+        );
+        let state = Arc::new(parse_state(&CppAdapter, &file));
+        let oid = oid_for(state.source.as_bytes());
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let prior_epoch = epoch::cpp_epoch_before_callable_modifier_metadata();
+        let prior_generation = store
+            .ensure_language_epoch_value("cpp", &prior_epoch)
+            .unwrap();
+        store
+            .write_parsed_blob_at_generation(
+                oid,
+                "cpp",
+                prior_generation,
+                &CppAdapter,
+                state.as_ref(),
+            )
+            .unwrap();
+        assert!(store.contains_parsed_blob(oid, "cpp").unwrap());
+
+        let current_generation = store
+            .ensure_language_epoch(Language::Cpp, &tree_sitter_cpp::LANGUAGE.into())
+            .unwrap();
+
+        assert_ne!(current_generation, prior_generation);
+        assert!(!store.contains_parsed_blob(oid, "cpp").unwrap());
+        assert_eq!(
+            store
+                .missing_parsed_blob_keys(&[(oid, "cpp".to_string())])
+                .unwrap(),
+            vec![(oid, "cpp".to_string())]
+        );
+    }
+
     #[test]
     fn cpp_complete_sentinel_class_tail_epoch_invalidates_prior_parsed_blobs() {
         let temp = tempfile::TempDir::new().unwrap();

@@ -2787,6 +2787,19 @@
       "classification": "blocked_missing_adapter_or_identity_evidence",
       "generation_strategy": "retain_until_profile_support",
       "native_source_kind": "authored_semantic_model",
+      "path": "semantic-packs/web-network/csharp/bifrost.web-network-csharp.json",
+      "profiles": [],
+      "reason": "Reviewed network-effect model for the #3387 boundary family, binding the System.Net.Http.HttpClient.SendAsync instance member through C#'s external declaration surface; exportability remains pending lossless field and applicability audit."
+    },
+    {
+      "asset_role": "authored_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "authored_semantic_model",
       "path": "semantic-packs/web-network/javascript/bifrost.web-network-javascript.json",
       "profiles": [
         "javascript-typescript"
@@ -2822,6 +2835,19 @@
         "python"
       ],
       "reason": "Reviewed network-effect model for the #3387 boundary family; exportability remains pending lossless field and applicability audit."
+    },
+    {
+      "asset_role": "authored_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "authored_semantic_model",
+      "path": "semantic-packs/web-network/ruby/bifrost.web-network-ruby.json",
+      "profiles": [],
+      "reason": "Reviewed network-effect model for the #3387 boundary family, binding the Net::HTTP.get singleton method through Ruby's constant-path declaration identity; exportability remains pending lossless field and applicability audit."
     },
     {
       "asset_role": "authored_semantic_model",

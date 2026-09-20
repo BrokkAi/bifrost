@@ -379,7 +379,12 @@ impl TypeFlowAdapter for RubyTypeFlowAdapter {
             "nil" => "NilClass",
             "simple_symbol" | "hash_key_symbol" | "bare_symbol" => "Symbol",
             "character" => "String",
-            "constant" => return ClassSeed::Unknown(UnknownReason::OpenTypeBound),
+            // A constant read, with or without an explicit owner path, may
+            // denote any class: the IR keeps the constant object itself, not
+            // the type of the value it holds, so its class stays open.
+            "constant" | "scope_resolution" => {
+                return ClassSeed::Unknown(UnknownReason::OpenTypeBound);
+            }
             _ => return ClassSeed::NotApplicable,
         };
         open_external_seed(workspace, name)

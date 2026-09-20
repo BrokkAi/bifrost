@@ -3,7 +3,9 @@ use crate::analyzer::AnalyzerDefinitionLookup;
 use crate::analyzer::BoundedDefinitionLookup;
 use crate::analyzer::RubyMethodDispatchMode;
 use crate::analyzer::lexical_definitions::formal_parameter_slots_for_owner_bounded;
+use crate::analyzer::ruby::constant_identity::RubyOverlayConstants;
 use crate::analyzer::ruby::{RubyFieldScope, RubyNamePath, ruby_field_short_name};
+use crate::analyzer::semantic::ResolverOwnedExternalCalleeIdentity;
 use crate::analyzer::store::LimitedQueryRows;
 use crate::analyzer::tree_walk::push_named_children_reversed_as;
 use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
@@ -1575,6 +1577,79 @@ fn ruby_unresolved_receiver_outcome(
         ),
         UnindexedClaim::external_boundary(receiver_text, ClaimSubjectRole::Any),
     )
+}
+
+/// Exact external callable selected by one constant-receiver call whose owner
+/// the activated Ruby gem overlay publishes.
+///
+/// `Net::HTTP.get(uri)` writes its owner as a constant path, which
+/// [`ruby_unresolved_receiver_outcome`] already classifies as a boundary once
+/// no indexed workspace declaration answers it. That boundary can only say the
+/// written path leaves the workspace; it cannot say *which* outside
+/// declaration the call reaches. This helper answers that second question from
+/// two structured facts and nothing else: tree-sitter's `call` fields name the
+/// written constant path, member and effective argument count, and
+/// [`RubyOverlayConstants`] turns the path into a gem-pack declaration
+/// identity and proves the member is published under the owner it names.
+///
+/// The local callee spelling is not an identity, so a workspace `Net::HTTP`
+/// with its own `get` never reaches here -- it resolves inside the workspace
+/// and the boundary is never published (#3466). Conversely, a path no
+/// activated pack publishes mints nothing, and the run keeps its unmet
+/// obligation instead of a clean verdict.
+pub(super) fn exact_ruby_external_call(
+    analyzer: &dyn IAnalyzer,
+    source: &str,
+    tree: &Tree,
+    site: &ResolvedReferenceSite,
+) -> Option<(ExactExternalCallProof, ResolverOwnedExternalCalleeIdentity)> {
+    let root = tree.root_node();
+    let callee = smallest_named_node_covering(root, site.focus_start_byte, site.focus_end_byte)?;
+    if callee.kind() != "identifier" {
+        return None;
+    }
+    let call = callee.parent()?;
+    if call.kind() != "call"
+        || call
+            .child_by_field_name("method")
+            .is_none_or(|method| method.id() != callee.id())
+    {
+        return None;
+    }
+    let receiver = call.child_by_field_name("receiver")?;
+    if !matches!(receiver.kind(), "constant" | "scope_resolution") {
+        return None;
+    }
+    let owner_path = ruby_node_text(receiver, source).trim_start_matches("::");
+    if owner_path.is_empty() {
+        return None;
+    }
+    let member = ruby_node_text(callee, source);
+    if member.is_empty() {
+        return None;
+    }
+
+    let overlay = analyzer.semantic_model_overlay();
+    let constants = RubyOverlayConstants::new(overlay.as_deref());
+    let owner = constants.unique_type(owner_path)?;
+    if !constants.publishes_under(owner, member) {
+        return None;
+    }
+
+    let arguments = call.child_by_field_name("arguments")?;
+    let parameter_count = {
+        let mut cursor = arguments.walk();
+        u32::try_from(arguments.named_children(&mut cursor).count()).ok()?
+    };
+    let canonical_owner = owner.qualified_name.clone();
+    let proof = ExactExternalCallProof::ruby_bound_external_member(
+        &canonical_owner,
+        member,
+        parameter_count,
+    );
+    let identity =
+        ResolverOwnedExternalCalleeIdentity::new(Language::Ruby, canonical_owner, member);
+    Some((proof, identity))
 }
 
 /// The route the Ruby method walk took from the receiver's own owner to the

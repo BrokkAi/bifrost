@@ -1221,7 +1221,101 @@ impl CppAnalyzer {
         code_unit: &CodeUnit,
         limit: usize,
     ) -> LimitedQueryRows<SignatureMetadata> {
-        self.inner.signature_metadata_limited(code_unit, limit)
+        let mut result = self.inner.signature_metadata_limited(code_unit, limit);
+        self.reconcile_member_modifiers(code_unit, &mut result.rows);
+        result
+    }
+
+    /// Resolve facts that an out-of-line definition cannot repeat (#3509).
+    fn reconcile_member_modifiers(&self, unit: &CodeUnit, metadata: &mut [SignatureMetadata]) {
+        use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
+        use brokk_bifrost_cpp::graph::CppGraphSource;
+        use brokk_bifrost_cpp::graph::resolver::VisibilityIndex;
+
+        if !unit.is_callable()
+            || !unit.owner_is_type_scope()
+            || unit.is_synthetic()
+            || !metadata.iter().any(|entry| {
+                !entry.is_declaration_only()
+                    && entry.callable_declared_visibility() == Some(DeclaredVisibility::Unknown)
+            })
+        {
+            return;
+        }
+        let scope = AnalyzerQueryScope::new(self);
+        let token = scope.token();
+        // Read physical metadata through the inner index to avoid re-entering
+        // this overlay while comparing declaration parameter shapes.
+        let graph = CppGraphSource {
+            index: &self.inner,
+            cpp: Some(self),
+            aliases: Some(self),
+            hierarchy: Some(self),
+            workspace: self,
+            token,
+        };
+        let visibility = VisibilityIndex::build(
+            self,
+            token,
+            &graph,
+            &HashSet::from_iter([unit.source().clone()]),
+        );
+        let owner = unit.fq().parent();
+        let classes = self.visible_type_units(unit.source());
+        let mut agreed = None;
+        let mut ambiguous = false;
+        for candidate in self
+            .inner
+            .lookup_candidates_by_identifier(unit.identifier())
+        {
+            if candidate.fq() != unit.fq()
+                || !classes.iter().any(|class| {
+                    class.is_class()
+                        && Some(class.fq()) == owner.as_ref()
+                        && class.source() == candidate.source()
+                })
+                || !visibility.same_logical_callable(&graph, unit, &candidate)
+            {
+                continue;
+            }
+            for declaration in self.inner.signature_metadata(&candidate) {
+                let Some(access) = declaration.callable_declared_visibility() else {
+                    continue;
+                };
+                if !declaration.is_declaration_only() || access == DeclaredVisibility::Unknown {
+                    continue;
+                }
+                let facts = (
+                    declaration.callable_is_static(),
+                    declaration.callable_is_constructor(),
+                    access,
+                );
+                match agreed {
+                    Some(previous) if previous != facts => ambiguous = true,
+                    None => agreed = Some(facts),
+                    _ => {}
+                }
+            }
+        }
+        for entry in metadata {
+            if entry.is_declaration_only()
+                || entry.callable_declared_visibility() != Some(DeclaredVisibility::Unknown)
+            {
+                continue;
+            }
+            *entry =
+                match agreed.filter(|_| !ambiguous) {
+                    Some((is_static, is_constructor, access)) => entry
+                        .clone()
+                        .with_callable_modifiers(is_static, is_constructor, access),
+                    None => entry.clone().with_persisted_callable_modifiers(
+                        false,
+                        entry.callable_is_constructor(),
+                        Some(DeclaredVisibility::Unknown),
+                        false,
+                    ),
+                };
+        }
     }
 
     pub(crate) fn signatures_limited(
@@ -1986,8 +2080,9 @@ impl CodeUnitIndex for CppAnalyzer {
     }
 
     fn signature_metadata(&self, code_unit: &CodeUnit) -> Vec<SignatureMetadata> {
-        let metadata = self.inner.signature_metadata(code_unit);
+        let mut metadata = self.inner.signature_metadata(code_unit);
         if !metadata.is_empty() {
+            self.reconcile_member_modifiers(code_unit, &mut metadata);
             return metadata;
         }
         // #1134: a re-keyed reconciled definition carries the same signature
@@ -2002,7 +2097,9 @@ impl CodeUnitIndex for CppAnalyzer {
             .provisional_of
             .get(code_unit)
         {
-            return self.inner.signature_metadata(provisional);
+            let mut metadata = self.inner.signature_metadata(provisional);
+            self.reconcile_member_modifiers(code_unit, &mut metadata);
+            return metadata;
         }
         metadata
     }

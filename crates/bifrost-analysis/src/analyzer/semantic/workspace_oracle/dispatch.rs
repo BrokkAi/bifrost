@@ -24,7 +24,7 @@ use crate::analyzer::semantic::{
     SemanticArtifact, SemanticBudgetExceeded, SemanticCallSite, SemanticCapability, SemanticEffect,
     SemanticGap, SemanticGapImpact, SemanticGapKind, SemanticGapSubject, SemanticLanguage,
     SemanticLocator, SemanticOutcome, SemanticProviderError, SemanticRequest, SemanticRole,
-    SemanticWork, SourceAnchor, SourcePosition, SourceSpan, StableDigest,
+    SemanticValueKind, SemanticWork, SourceAnchor, SourcePosition, SourceSpan, StableDigest,
     UnmaterializedExternalTarget, ValueAtPoint, ValueFlowKind, ValueId, WorkspaceMountId,
     WorkspaceRelativePath, split_canonical_qualified_callee, unmaterialized_external_mount,
     unmaterialized_external_path,
@@ -2595,7 +2595,11 @@ fn kotlin_external_declared_callee_discharges_gap(
 /// target with proven, complete evidence; or the workspace resolver performed
 /// the demanded whole-program refinement and proved a clean result (lookup
 /// resolved, every retained candidate proven and complete, no boundary, no
-/// truncation). `Unsupported`, `Ambiguous`, and `ExceededBudget` gaps keep
+/// truncation). The second situation is decided per receiver route: only the
+/// routes whose receiver identity the source itself fixes -- a receiverless
+/// call, a Go concrete method set, a Ruby constant path -- accept a clean
+/// result, because only there is the resolver's candidate list the whole
+/// selectable set. `Unsupported`, `Ambiguous`, and `ExceededBudget` gaps keep
 /// standing: they assert something a proven target set does not answer.
 #[allow(clippy::too_many_arguments)]
 fn proven_static_target_discharges_gap(
@@ -2644,12 +2648,22 @@ fn proven_static_target_discharges_gap(
     ) && candidates
         .iter()
         .all(|candidate| candidate.target().semantics().kind() == ProcedureKind::Method);
+    // Ruby is the other receiver-call exception. `Net::HTTP.get(uri)` writes
+    // its owner as a constant path, and the adapter lowers that path as one
+    // `SemanticValueKind::Constant` value which is also the call's receiver.
+    // The written path names the receiver object itself, so the singleton
+    // method set the resolver enumerated for that exact owner is the whole set
+    // this call can select; a receiver whose class is only known at run time
+    // stays open here (#3459). Ruby reopens classes at run time, so this
+    // answers the target-set question over the resolver's own proof only: a
+    // resolved, boundary-free, complete candidate set is still required.
+    let ruby_constant_receiver = ruby_constant_receiver_selection(caller, gap);
     // Selecting a function through a type does not dispatch on the explicit
     // receiver actual's dynamic class. The resolver already chose the body.
     let type_selected_method = matches!(gap.subject, SemanticGapSubject::CallSite(id)
         if matches!(caller.semantics().proven_caller_receiver_binding(id),
             Some(CallerReceiverBinding::TypeQualified(_))));
-    (receiverless || go_concrete_method)
+    (receiverless || go_concrete_method || ruby_constant_receiver)
         && lookup_resolved
         && boundaries.is_empty()
         && materialization_quality == DispatchQuality::Complete
@@ -2657,8 +2671,34 @@ fn proven_static_target_discharges_gap(
             proven_complete(candidate)
                 && (go_concrete_method
                     || type_selected_method
+                    || ruby_constant_receiver
                     || candidate_has_free_target(candidate))
         })
+}
+
+/// Whether one Ruby call is written on a receiver the language itself fixes at
+/// compile time.
+///
+/// A Ruby constant path is not a temporary: `Net::HTTP` evaluates the one
+/// constant object the path names, so the member selected on it comes from
+/// that object's own method set rather than from a receiver class only known
+/// at run time. Other receiver spellings keep their blanket dynamic-dispatch
+/// gap, because a Ruby receiver value's class can be anything a subclass,
+/// mixin, or refinement supplies at run time.
+fn ruby_constant_receiver_selection(caller: &ProcedureHandle, gap: &SemanticGap) -> bool {
+    matches!(
+        caller.artifact().key().language(),
+        LanguageDialect::Standard(Language::Ruby)
+    ) && matches!(gap.subject, SemanticGapSubject::CallSite(id)
+    if matches!(
+        caller
+            .semantics()
+            .call_site(id)
+            .and_then(|call_site| call_site.receiver)
+            .and_then(|receiver| caller.semantics().value(receiver))
+            .map(|value| &value.kind),
+        Some(&SemanticValueKind::Constant)
+    ))
 }
 
 /// Whether a retained candidate's target is a *free* callable: one that no type

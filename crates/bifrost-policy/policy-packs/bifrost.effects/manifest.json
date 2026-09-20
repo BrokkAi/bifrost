@@ -1,10 +1,29 @@
 {
   "schema_version": 2,
   "id": "bifrost.effects",
-  "version": "1.2.0",
+  "version": "1.4.0",
   "name": "Bifrost network-effect boundaries",
   "description": "Configurable forbidden-network-effect specializations. Each policy asserts that one explicitly selected declaration reaches no declared network effect, directly or through workspace helpers. The effect is declared by a reviewed semantic model on the exact API identity; purity is never inferred from a name, a file name, a comment, or an unqualified annotation, and a repository that configures no selection carries no obligation.",
   "policies": [
+    {
+      "path": "policies/csharp/selected-boundary-no-network-io.rqlp",
+      "id": "bifrost.effects.csharp.selected-boundary-no-network-io",
+      "authored_hash": "0959cba446519d3f47b734504be76a293687f882db999e8db35a077ffe558e17",
+      "resolved_semantic_hash": "0959cba446519d3f47b734504be76a293687f882db999e8db35a077ffe558e17",
+      "category": "effects",
+      "supported_languages": [
+        "csharp"
+      ],
+      "required_capabilities": [
+        "semantic-model-declared-effects",
+        "transitive-procedure-effects",
+        "exhaustive-effect-coverage",
+        "module-identity-declaration-selection",
+        "external-api-identity"
+      ],
+      "severity_rationale": "A declaration the repository reviewed as a pure calculation reaching network I/O breaks the boundary the review relied on and can turn a local computation into an externally visible side effect.",
+      "remediation": "Move the effect to the caller, or make the selected declaration's helper chain reach no declared network effect. Configure the declaration-selection block with the exact declaration this repository protects before enabling the policy."
+    },
     {
       "path": "policies/go/selected-boundary-no-network-io.rqlp",
       "id": "bifrost.effects.go.selected-boundary-no-network-io",
@@ -89,6 +108,25 @@
       "category": "effects",
       "supported_languages": [
         "python"
+      ],
+      "required_capabilities": [
+        "semantic-model-declared-effects",
+        "transitive-procedure-effects",
+        "exhaustive-effect-coverage",
+        "module-identity-declaration-selection",
+        "external-api-identity"
+      ],
+      "severity_rationale": "A declaration the repository reviewed as a pure calculation reaching network I/O breaks the boundary the review relied on and can turn a local computation into an externally visible side effect.",
+      "remediation": "Move the effect to the caller, or make the selected declaration's helper chain reach no declared network effect. Configure the declaration-selection block with the exact declaration this repository protects before enabling the policy."
+    },
+    {
+      "path": "policies/ruby/selected-boundary-no-network-io.rqlp",
+      "id": "bifrost.effects.ruby.selected-boundary-no-network-io",
+      "authored_hash": "7af85260fc7c42cfaca8e021917a7d7dce9fc211f1e79b81f14af1879fe7a06f",
+      "resolved_semantic_hash": "7af85260fc7c42cfaca8e021917a7d7dce9fc211f1e79b81f14af1879fe7a06f",
+      "category": "effects",
+      "supported_languages": [
+        "ruby"
       ],
       "required_capabilities": [
         "semantic-model-declared-effects",

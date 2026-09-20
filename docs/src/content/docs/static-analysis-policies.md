@@ -329,6 +329,13 @@ limits in its message and description.
 
 ### Built-in network-effect boundary pack
 
+Pack version 1.4.0 contains ten policies. The C# specialization uses the reviewed
+`System.Net.Http.HttpClient.SendAsync` model at written arity one. Awaited calls
+propagate the declared network effect; unexpanded deferred callbacks and other
+arities keep the absence claim open. Parameter and explicitly typed local
+receivers bind today. Field and property receivers need further C# receiver
+typing support.
+
 The installed binary also embeds `bifrost.effects`, which is opt-in: a run that
 names no selector evaluates no built-in pack, and this pack is the one that
 carries a configured obligation rather than a repository-independent prompt.
@@ -415,6 +422,16 @@ segment `TcpStream::connect(addr)` that a `use std::net::TcpStream;`
 declaration expands. The owner path is the identity, so a workspace type also
 spelled `TcpStream` with an associated function also spelled `connect`, called
 at the same arity, binds the workspace declaration and carries no effect.
+The Ruby specialization
+(`bifrost.effects.ruby.selected-boundary-no-network-io`) consumes
+`semantic-packs/web-network/ruby/bifrost.web-network-ruby.json`, which
+publishes the `Net::HTTP` class and declares `bifrost.network_io` on its `get`
+singleton method at written arity one. Ruby writes the receiver as a constant
+path, so the resolver turns `Net::HTTP` into the declaration identity the
+activated model publishes and `Net::HTTP.get(address)` binds the reviewed API
+at its written arity instead of the member spelling. A workspace class also
+spelled `Net::HTTP` with its own `get` resolves inside the workspace and
+carries no effect, and an unresolved Ruby helper keeps the absence claim open.
 
 <!-- policy-doc-test:rqlp:tests/fixtures/network-effect-boundary/policies/javascript.rqlp -->
 ```lisp

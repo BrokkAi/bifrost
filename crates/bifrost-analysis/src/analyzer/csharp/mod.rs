@@ -83,7 +83,10 @@ use brokk_bifrost_csharp::dead_code::{
 use brokk_bifrost_csharp::test_detection::detect_csharp_test_assertion_smells;
 use cache::{CSharpMemoCaches, PersistedFqnLookup};
 use clones::build_csharp_clone_candidate_data;
-use external::{CSharpExternalDeclarationIndex, CSharpExternalMember, CSharpExternalType};
+use external::{
+    CSharpExternalDeclarationIndex, CSharpExternalDeclarations, CSharpExternalMember,
+    CSharpExternalType,
+};
 use graph_support::CSharpSource;
 
 fn limited_known_values<T>(
@@ -400,6 +403,59 @@ impl CSharpAnalyzer {
         name: &str,
     ) -> Vec<&CSharpExternalMember> {
         self.external_declaration_index().members_named(owner, name)
+    }
+
+    /// The external declaration surface C# resolution reads: this analyzer's
+    /// assembly-backed index plus the declaration facts the activated semantic
+    /// packs publish (#3461).
+    pub(crate) fn external_declarations(
+        &self,
+        packs: Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>,
+    ) -> CSharpExternalDeclarations<'_> {
+        CSharpExternalDeclarations::new(self.external_declaration_index(), packs)
+    }
+
+    /// The canonical external identity a C# member call names, or `None` when
+    /// the external declaration surface decides no single one (#3461).
+    ///
+    /// `candidate_owners` is what the C# receiver ladder already produced for
+    /// the call: the receiver's written type plus the expansion of every
+    /// `using` namespace in scope, which is the same tier walk a type spelling
+    /// takes. Only a candidate the external surface actually declares -- and
+    /// that declares the member -- can answer, so a bogus expansion such as
+    /// `System.Threading.Tasks.HttpClient` drops out on evidence rather than on
+    /// spelling. More than one surviving owner is honest ambiguity, not a
+    /// choice to make, so it publishes nothing. The owners are compared as the
+    /// identities the surface keyed on, so two spellings of one declaration are
+    /// one answer rather than an ambiguity.
+    ///
+    /// The returned identity is `<owner FQN>.<member>` -- the canonical
+    /// publication Java adopted in #3466 -- not the receiver *variable*
+    /// spelling the reference site wrote. That is what lets a reviewed summary
+    /// bind the exact member without any name matching.
+    pub(crate) fn external_member_identity(
+        &self,
+        packs: Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>,
+        candidate_owners: &[String],
+        member: &str,
+    ) -> Option<String> {
+        if member.is_empty() {
+            return None;
+        }
+        let external = self.external_declarations(packs);
+        if external.is_empty() {
+            return None;
+        }
+        let mut owners = candidate_owners
+            .iter()
+            .filter_map(|owner| external.declaring_owner(owner, member))
+            .collect::<Vec<_>>();
+        owners.sort();
+        owners.dedup();
+        let [owner] = owners.as_slice() else {
+            return None;
+        };
+        Some(format!("{owner}.{member}"))
     }
 
     pub fn using_namespaces_of(&self, token: QueryToken<'_>, file: &ProjectFile) -> Vec<String> {

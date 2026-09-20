@@ -580,6 +580,32 @@ impl ExactExternalCallProof {
         }
     }
 
+    /// A call written as `Owner::Path.member(...)` whose owner path an
+    /// activated pack publishes.
+    ///
+    /// Ruby writes the receiver as a constant path and the written value is
+    /// the owner's constant itself, so the member is bound to the receiver it
+    /// names. Ruby permits reopening a class at runtime, so the reviewed pack
+    /// proves the selected declaration, not that the language has a closed
+    /// dispatch universe.
+    pub(crate) fn ruby_bound_external_member(
+        owner: &str,
+        member: &str,
+        parameter_count: u32,
+    ) -> Self {
+        assert!(
+            !owner.is_empty(),
+            "an external receiver owner must be named"
+        );
+        assert!(!member.is_empty(), "an external member must be named");
+        Self {
+            canonical_callee: format!("{owner}.{member}").into_boxed_str(),
+            call_application: CallApplicationKind::BoundReceiver,
+            dispatch_extensibility: None,
+            parameter_count,
+        }
+    }
+
     pub(crate) fn python_imported_call(
         canonical_callee: impl Into<Box<str>>,
         parameter_count: u32,
@@ -1690,7 +1716,11 @@ pub fn resolve_call_target_batch_with_source(
     }
     if matches!(
         language_for_file(&file),
-        Language::JavaScript | Language::TypeScript | Language::Php | Language::Python
+        Language::JavaScript
+            | Language::TypeScript
+            | Language::Php
+            | Language::Python
+            | Language::Ruby
     ) {
         let scope = AnalyzerQueryScope::new(analyzer);
         let mut context = DefinitionBatchContext::new(analyzer, scope.token(), requests.len() > 1);
@@ -2645,14 +2675,30 @@ fn resolve_one_with_evidence<'a>(
             tree.as_ref(),
             &site,
         ),
-        Language::Ruby => ruby::resolve_ruby(
-            analyzer,
-            context.bounded_support(),
-            &request.file,
-            &source,
-            tree.as_ref(),
-            &site,
-        ),
+        Language::Ruby => {
+            let mut outcome = ruby::resolve_ruby(
+                analyzer,
+                context.bounded_support(),
+                &request.file,
+                &source,
+                tree.as_ref(),
+                &site,
+            );
+            if outcome.status == DefinitionLookupStatus::UnresolvableImportBoundary
+                && let Some((proof, identity)) = tree.as_ref().and_then(|tree| {
+                    ruby::exact_ruby_external_call(analyzer, source.as_ref(), tree, &site)
+                })
+            {
+                let mut reference = outcome.reference.take().unwrap_or_else(|| site.clone());
+                reference.text = proof.canonical_callee().to_owned();
+                outcome.reference = Some(reference);
+                call_application = proof.call_application();
+                dispatch_extensibility = proof.dispatch_extensibility();
+                exact_external_call = Some(proof);
+                external_callee_identity = Some(identity);
+            }
+            outcome
+        }
         Language::Kotlin => kotlin::resolve_kotlin(
             analyzer,
             context.bounded_support(),

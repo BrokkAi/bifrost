@@ -41,7 +41,7 @@ use crate::hash::{HashMap, HashSet};
 use crate::text_utils::find_line_index_for_offset;
 use std::sync::Arc;
 
-const ADAPTER_VERSION: &[u8] = b"cpp-cfg-values-v15";
+const ADAPTER_VERSION: &[u8] = b"cpp-cfg-values-v16";
 
 impl_program_semantics_provider!(CppAnalyzer, |analyzer| CppSemanticLowerer::new(analyzer));
 

@@ -1,0 +1,85 @@
+{
+  "schema_version": 2,
+  "pack_id": "bifrost.web-network-ruby",
+  "version": "1.0.0",
+  "producer": { "name": "bifrost-reviewed-web-models", "version": "1.0.0" },
+  "language": "ruby",
+  "ecosystem": "rubygems",
+  "compatibility": {
+    "bifrost": ">=0.8.0, <1.0.0",
+    "toolchains": []
+  },
+  "provenance": {
+    "source": "Ruby standard library net/http, Net::HTTP.get",
+    "revision": "ruby-3.4"
+  },
+  "license": "Apache-2.0",
+  "completeness": "complete",
+  "safety": { "generated_code_only": false, "review_required": false },
+  "shards": [
+    {
+      "id": "declarations.web-network.ruby",
+      "activation": [{ "targets": [], "configurations": [] }],
+      "payload": {
+        "kind": "declaration_facts",
+        "types": [
+          {
+            "id": "type.dc6816ffe6122e40456287755fd06087d7cf7dc2d78339a08fbb118ce07e5e58",
+            "name": "Net::HTTP",
+            "type_kind": "class",
+            "visibility": "public",
+            "hierarchy": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "net/http.rb",
+              "symbol": "Net::HTTP"
+            }
+          }
+        ],
+        "members": [
+          {
+            "id": "member.web-network.ruby.net-http.get",
+            "owner": "type.dc6816ffe6122e40456287755fd06087d7cf7dc2d78339a08fbb118ce07e5e58",
+            "name": "get",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "net/http.rb",
+              "symbol": "Net::HTTP.get"
+            }
+          }
+        ],
+        "relations": []
+      }
+    },
+    {
+      "id": "summaries.web-network.ruby",
+      "activation": [{ "targets": [], "configurations": [] }],
+      "payload": {
+        "kind": "procedure_summaries",
+        "summaries": [
+          {
+            "id": "summary.web-network.ruby.net-http-get",
+            "target": {
+              "path": "net/http.rb",
+              "symbol": "Net::HTTP.get",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "covers_overrides": true,
+            "locations": [],
+            "transfers": [],
+            "effects": [],
+            "declared_effects": [
+              { "id": "bifrost.network_io", "timing": "immediate", "certainty": "definite" }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

@@ -24,6 +24,7 @@ use brokk_bifrost_core::analyzer::structural::adapter_helpers::node_range;
 use brokk_bifrost_core::analyzer::structural::materialization::{
     GenerationKind, MaterializationRecord,
 };
+use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
 use brokk_bifrost_core::analyzer::tree_walk::{
     NodeKindIds, ParentIndex, WalkControl, children_iter, named_children_iter,
     push_children_reversed, push_named_children_reversed, walk_named_tree_preorder,
@@ -4439,15 +4440,11 @@ impl<'a> CppVisitor<'a> {
             cpp_signature_metadata(
                 normalize_cpp_whitespace(node_text(function_declarator, self.source)),
                 function_declarator,
+                cpp_callable_linkage(class_declaration, self.source, ancestry),
                 self.source,
                 ancestry,
             )
-            .with_declaration_only(false)
-            .with_callable_linkage(cpp_callable_linkage(
-                class_declaration,
-                self.source,
-                ancestry,
-            )),
+            .with_declaration_only(false),
         );
         self.parsed.add_child(class_unit.clone(), code_unit);
     }
@@ -5180,9 +5177,14 @@ impl<'a> CppVisitor<'a> {
             cpp_declarator_function_definition(declaration.declarator, ancestry).is_none();
         self.parsed.add_signature_with_metadata(
             code_unit.clone(),
-            cpp_signature_metadata(signature, declaration.declarator, self.source, ancestry)
-                .with_declaration_only(declaration_only)
-                .with_callable_linkage(linkage),
+            cpp_signature_metadata(
+                signature,
+                declaration.declarator,
+                linkage,
+                self.source,
+                ancestry,
+            )
+            .with_declaration_only(declaration_only),
         );
         if let Some(parent) = &scope.class_unit {
             self.parsed.add_child(parent.clone(), code_unit);
@@ -6300,9 +6302,14 @@ impl<'a> CppVisitor<'a> {
         };
         self.parsed.add_signature_with_metadata(
             code_unit.clone(),
-            cpp_signature_metadata(signature, function_declarator, self.source, ancestry)
-                .with_declaration_only(false)
-                .with_callable_linkage(cpp_callable_linkage(node, self.source, ancestry)),
+            cpp_signature_metadata(
+                signature,
+                function_declarator,
+                cpp_callable_linkage(node, self.source, ancestry),
+                self.source,
+                ancestry,
+            )
+            .with_declaration_only(false),
         );
         if let Some(parent) = &scope.class_unit {
             self.parsed.add_child(parent.clone(), code_unit);
@@ -7196,13 +7203,14 @@ impl<'a> CppVisitor<'a> {
         );
         self.parsed.add_signature_with_metadata(
             code_unit.clone(),
-            cpp_signature_metadata(signature, declarator, self.source, ancestry)
-                .with_declaration_only(true)
-                .with_callable_linkage(cpp_callable_linkage(
-                    declaration_node,
-                    self.source,
-                    ancestry,
-                )),
+            cpp_signature_metadata(
+                signature,
+                declarator,
+                cpp_callable_linkage(declaration_node, self.source, ancestry),
+                self.source,
+                ancestry,
+            )
+            .with_declaration_only(true),
         );
         if let Some(parent) = &scope.class_unit {
             self.parsed.add_child(parent.clone(), code_unit);
@@ -7256,14 +7264,22 @@ impl<'a> CppVisitor<'a> {
             false,
             ancestry,
         );
+        let linkage = cpp_callable_linkage(declaration_node, self.source, ancestry);
+        // Only the callable's parameters came from the reparse: the
+        // `field_declaration` this recovery reads is a real node in a real
+        // class body, so its storage class and the body's access ladder state
+        // this member's modifiers exactly as an ordinary member's do.
+        let modifiers =
+            cpp_callable_modifiers(declaration_node, None, false, self.source, ancestry);
         let metadata = SignatureMetadata::with_parameter_labels(signature_label, parameter_labels)
             .with_declaration_only(true)
             .with_callable_arity(CallableArity::exact(arity))
-            .with_callable_linkage(cpp_callable_linkage(
-                declaration_node,
-                self.source,
-                ancestry,
-            ));
+            .with_callable_linkage(linkage)
+            .with_callable_modifiers(
+                modifiers.is_static,
+                modifiers.is_constructor,
+                modifiers.visibility,
+            );
         self.parsed
             .add_signature_with_metadata(code_unit.clone(), metadata);
         self.parsed.add_child(parent.clone(), code_unit);
@@ -7300,14 +7316,20 @@ impl<'a> CppVisitor<'a> {
         let code_unit = function.code_unit_with_synthetic(self.file.clone(), true);
         self.add_declaration(code_unit.clone(), declaration_node, None, None);
         let signature_label = normalize_cpp_whitespace(node_text(declaration_node, self.source));
+        let linkage = cpp_callable_linkage(declaration_node, self.source, ancestry);
+        // The recovery already proved this member is the class's constructor:
+        // the reparsed call names the enclosing class. Everything else is read
+        // from the real `field_declaration` the recovery found it in.
+        let modifiers = cpp_callable_modifiers(declaration_node, None, true, self.source, ancestry);
         let metadata = SignatureMetadata::with_parameter_labels(signature_label, parameter_labels)
             .with_declaration_only(false)
             .with_callable_arity(CallableArity::exact(arity))
-            .with_callable_linkage(cpp_callable_linkage(
-                declaration_node,
-                self.source,
-                ancestry,
-            ));
+            .with_callable_linkage(linkage)
+            .with_callable_modifiers(
+                modifiers.is_static,
+                modifiers.is_constructor,
+                modifiers.visibility,
+            );
         self.parsed
             .add_signature_with_metadata(code_unit.clone(), metadata);
         self.parsed.add_child(parent.clone(), code_unit);
@@ -11642,14 +11664,249 @@ fn cpp_parameter_signature(parameters_node: Node<'_>, source: &str) -> String {
     }
 }
 
+/// Where a C or C++ callable declaration is written, which is what decides
+/// which modifier facts its own node is able to state.
+enum CppCallableScope<'tree> {
+    /// Written directly in a class, struct or union body. The declaration
+    /// states its own storage class, and its access is the one the body's
+    /// specifier ladder is under at that point.
+    ClassBody {
+        body: Node<'tree>,
+        default_visibility: DeclaredVisibility,
+    },
+    /// A qualified declaration written outside every class body
+    /// (`void Client::send(int) {}`). C++ forbids repeating `static` here and
+    /// writes no access specifier, and whether the qualifier names a class or
+    /// a namespace is not decidable from this file alone -- that is exactly
+    /// what [`crate::reconcile`] needs the include-visible class table for.
+    Qualified,
+    /// Namespace scope or file scope, reached by an unqualified name. C has no
+    /// member functions at all, so every C callable lands here.
+    Unqualified,
+}
+
+/// Where the declaration sits, from one upward walk of its own ancestry.
+///
+/// The walk stops as soon as something proves the declaration is outside every
+/// class body: a `namespace_definition`, because a class body never encloses
+/// one, and a `compound_statement`, because a body opens a block scope and
+/// nothing declared in it is a member of the class the enclosing definition
+/// belongs to. That is the same rule
+/// `CppVisitor::visit_anonymous_local_aggregates_in_function` applies when it
+/// drops the aggregate carrier, and it keeps this question off the O(depth)
+/// walk a deeply nested generated header would otherwise pay per callable.
+///
+/// `function_declarator` is `None` for a declaration whose callable the macro
+/// recovery reparsed out of a malformed member: there is no declarator node to
+/// ask whether the name carries a qualifier, and a recovered member is written
+/// in its class body anyway.
+fn cpp_callable_scope<'tree>(
+    declaration: Node<'tree>,
+    function_declarator: Option<Node<'tree>>,
+    ancestry: &ParentIndex<'tree>,
+) -> CppCallableScope<'tree> {
+    let mut current = Some(declaration);
+    while let Some(node) = current {
+        match node.kind() {
+            "field_declaration_list" => {
+                let default_visibility =
+                    ancestry
+                        .parent(node)
+                        .map_or(DeclaredVisibility::Unknown, |class_like| {
+                            // `struct` and `union` members default to public;
+                            // `class` members default to private.
+                            match class_like.kind() {
+                                "struct_specifier" | "union_specifier" => {
+                                    DeclaredVisibility::Public
+                                }
+                                _ => DeclaredVisibility::Private,
+                            }
+                        });
+                return CppCallableScope::ClassBody {
+                    body: node,
+                    default_visibility,
+                };
+            }
+            "namespace_definition" | "compound_statement" | "translation_unit" => break,
+            _ => {}
+        }
+        current = ancestry.parent(node);
+    }
+    if function_declarator
+        .and_then(cpp_function_declarator_name_node)
+        .is_some_and(|name| name.kind() == "qualified_identifier")
+    {
+        CppCallableScope::Qualified
+    } else {
+        CppCallableScope::Unqualified
+    }
+}
+
+/// The access one class-body member declaration is written under.
+///
+/// C++ states member access positionally: an `access_specifier` applies to
+/// every member written after it until the next one, and the members before
+/// the first one take the class keyword's default. The answer is therefore the
+/// last specifier the body writes before the member's own list-level node,
+/// read from the specifier's own keyword token rather than from its text.
+///
+/// The body's children are read forward with one cursor rather than backwards
+/// from the member: `Node::prev_sibling` re-descends from the root for each
+/// step, which is the per-edge cost #2361 keeps off this walk.
+fn cpp_member_declared_visibility<'tree>(
+    declaration: Node<'tree>,
+    body: Node<'tree>,
+    default_visibility: DeclaredVisibility,
+    ancestry: &ParentIndex<'tree>,
+) -> DeclaredVisibility {
+    let mut list_level = declaration;
+    while ancestry.parent(list_level) != Some(body) {
+        let Some(parent) = ancestry.parent(list_level) else {
+            return default_visibility;
+        };
+        list_level = parent;
+    }
+    let mut visibility = default_visibility;
+    let mut cursor = body.walk();
+    for child in body.children(&mut cursor) {
+        if child == list_level {
+            break;
+        }
+        if child.kind() == "access_specifier" {
+            visibility = match child.child(0).map(|keyword| keyword.kind()) {
+                Some("public") => DeclaredVisibility::Public,
+                Some("protected") => DeclaredVisibility::Protected,
+                Some("private") => DeclaredVisibility::Private,
+                _ => visibility,
+            };
+        }
+    }
+    visibility
+}
+
+/// Whether this declaration writes the `static` storage class specifier.
+///
+/// What `static` *means* is the scope's business: on a class-body member it is
+/// the receiver fact, and at file scope it is internal linkage, which is why
+/// both [`cpp_callable_modifiers`] and [`cpp_callable_linkage`] ask the same
+/// question and answer it differently.
+fn cpp_declares_static_storage_class(declaration: Node<'_>, source: &str) -> bool {
+    let mut cursor = declaration.walk();
+    declaration.named_children(&mut cursor).any(|child| {
+        child.kind() == "storage_class_specifier"
+            && normalize_cpp_whitespace(node_text(child, source)) == "static"
+    })
+}
+
+/// The three modifier facts [`SignatureMetadata::with_callable_modifiers`]
+/// publishes, as C and C++ state them.
+struct CppCallableModifiers {
+    is_static: bool,
+    is_constructor: bool,
+    visibility: DeclaredVisibility,
+}
+
+/// The modifier facts a C or C++ callable declaration states in its own shape.
+///
+/// C++ has no `static` keyword for receivers and no visibility keyword of the
+/// Java kind: it states both in the declaration's position. A member declared
+/// in a class body binds the object it is selected on unless that declaration
+/// writes the `static` storage class, and its access is the one the body's
+/// specifier ladder is under. A function at namespace or file scope binds
+/// nothing and has no access specifier at all, so its declared visibility is
+/// Unknown. Linkage is recorded separately and does not declare access. C has
+/// no member functions, and the `static` a C function writes is internal linkage,
+/// never a receiver fact.
+///
+/// Recording these is what lets `receiver_contract_of` answer for a C or C++
+/// declaration. Without them it reported no contract at all,
+/// `modeled_procedure_key_for_unit` refused to key any C or C++ workspace
+/// callable, no reviewed summary could name one, and every effect or taint walk
+/// that reached one reported `callee_unkeyable` (#3493). Go closed the same gap
+/// in #3455, Kotlin in #3453, Python in #3451.
+///
+/// An out-of-line member definition cannot repeat `static` or access. These
+/// are per-file facts only: the analyzer reconciles the exact overload with
+/// include-visible class declarations before exposing its receiver contract
+/// (#3509). A missing declaration leaves that contract unknown.
+fn cpp_callable_modifiers<'tree>(
+    declaration: Node<'tree>,
+    function_declarator: Option<Node<'tree>>,
+    is_constructor: bool,
+    source: &str,
+    ancestry: &ParentIndex<'tree>,
+) -> CppCallableModifiers {
+    match cpp_callable_scope(declaration, function_declarator, ancestry) {
+        CppCallableScope::ClassBody {
+            body,
+            default_visibility,
+        } => CppCallableModifiers {
+            is_static: cpp_declares_static_storage_class(declaration, source),
+            is_constructor,
+            visibility: cpp_member_declared_visibility(
+                declaration,
+                body,
+                default_visibility,
+                ancestry,
+            ),
+        },
+        CppCallableScope::Qualified => CppCallableModifiers {
+            is_static: false,
+            is_constructor,
+            visibility: DeclaredVisibility::Unknown,
+        },
+        CppCallableScope::Unqualified => CppCallableModifiers {
+            is_static: false,
+            is_constructor,
+            visibility: DeclaredVisibility::Unknown,
+        },
+    }
+}
+
+/// The persisted signature facts one C or C++ callable declaration publishes.
+///
+/// `linkage` is the caller's, not this function's: the node that carries the
+/// storage class is not always the declaration this declarator sits in -- a
+/// recovered constructor reads it from its class declaration, and a
+/// macro-wrapped declaration reads the `static` its recovery recorded -- so the
+/// visit site that knows which node states it passes the answer in. Recording
+/// it here keeps it beside the declared visibility it also decides.
 fn cpp_signature_metadata<'tree>(
     signature: String,
     function_declarator: Node<'tree>,
+    linkage: CallableLinkage,
     source: &str,
     ancestry: &ParentIndex<'tree>,
 ) -> SignatureMetadata {
     let dispatch = cpp_callable_dispatch_extensibility(function_declarator, ancestry);
-    let enrich = |metadata: SignatureMetadata| metadata.with_dispatch_extensibility(dispatch);
+    let is_constructor =
+        cpp_callable_is_structural_constructor(function_declarator, source, ancestry);
+    let modifiers = match enclosing_cpp_declaration_node(function_declarator, ancestry) {
+        Some(declaration) => cpp_callable_modifiers(
+            declaration,
+            Some(function_declarator),
+            is_constructor,
+            source,
+            ancestry,
+        ),
+        // Severe recovery left no declaration node above this declarator, so
+        // nothing is stated here beyond what the callable's own name proves.
+        None => CppCallableModifiers {
+            is_static: false,
+            is_constructor,
+            visibility: DeclaredVisibility::Unknown,
+        },
+    };
+    let enrich = |metadata: SignatureMetadata| {
+        metadata
+            .with_dispatch_extensibility(dispatch)
+            .with_callable_linkage(linkage)
+            .with_callable_modifiers(
+                modifiers.is_static,
+                modifiers.is_constructor,
+                modifiers.visibility,
+            )
+    };
     let return_type_text = cpp_callable_return_type_text(function_declarator, source, ancestry);
     let return_type_identity =
         cpp_callable_return_type_identity(function_declarator, source, ancestry);
@@ -11708,13 +11965,27 @@ fn cpp_callable_is_structural_constructor<'tree>(
     source: &str,
     ancestry: &ParentIndex<'tree>,
 ) -> bool {
-    let Some(name_node) = function_declarator
-        .child_by_field_name("declarator")
+    let Some(name_node) = cpp_function_declarator_name_node(function_declarator)
         .or_else(|| function_declarator.child_by_field_name("name"))
         .or_else(|| last_named_child(function_declarator))
     else {
         return false;
     };
+    // An out-of-line definition writes the class in the name itself
+    // (`Client::Client()`, `shop::Client::Client()`), so the qualifier's own
+    // terminal component answers without any enclosing class body.
+    if name_node.kind() == "qualified_identifier" {
+        let owner = name_node
+            .child_by_field_name("scope")
+            .and_then(|scope| canonical_cpp_qualified_component(scope, source));
+        let member = name_node
+            .child_by_field_name("name")
+            .and_then(|name| canonical_cpp_qualified_component(name, source));
+        return match (owner, member) {
+            (Some(owner), Some(member)) => owner.name == member.name,
+            _ => false,
+        };
+    }
     let Some(callable_name) = direct_identifier_name(name_node, source) else {
         return false;
     };
@@ -12208,11 +12479,7 @@ fn cpp_callable_linkage<'tree>(
         return CallableLinkage::External;
     }
 
-    let mut cursor = declaration.walk();
-    if declaration.named_children(&mut cursor).any(|child| {
-        child.kind() == "storage_class_specifier"
-            && normalize_cpp_whitespace(node_text(child, source)) == "static"
-    }) {
+    if cpp_declares_static_storage_class(declaration, source) {
         CallableLinkage::Internal
     } else {
         CallableLinkage::External
@@ -22440,5 +22707,123 @@ enum After { Value };
             render_cpp_field_signature(declaration, recovered.declarator, source),
             "ImagingObject *image;"
         );
+    }
+
+    /// The C source shapes whose callable modifiers the walk reads, and what
+    /// each one states. C has no member functions at all, so the only fact its
+    /// declarations carry is Unknown; linkage is separate. The `static`
+    /// a C function writes is internal linkage, never a receiver.
+    #[test]
+    fn callable_metadata_records_c_receiver_contracts_structurally() {
+        const SOURCE: &str = concat!(
+            "static long accumulate(const long *lines, int count) { return count; }\n",
+            "\n",
+            "long total(const long *lines, int count) { return accumulate(lines, count); }\n",
+        );
+        let parsed = parse_cpp_declarations(SOURCE, "shop.c");
+
+        assert_eq!(
+            recorded_callable_modifiers(&parsed),
+            vec![
+                "accumulate static=false constructor=false visibility=Unknown".to_string(),
+                "total static=false constructor=false visibility=Unknown".to_string(),
+            ],
+        );
+    }
+
+    /// The C++ source shapes whose callable modifiers the walk reads.
+    ///
+    /// C++ states the receiver fact in the declaration's position: a class-body
+    /// member binds the object it is selected on unless it writes `static`, and
+    /// its access is the one the body's specifier ladder is under. The
+    /// out-of-line definitions state neither -- C++ forbids them from repeating
+    /// `static` and they write no access specifier -- which is why
+    /// `Client::count` is recorded static only at the `[in class]` declaration
+    /// its `static` is actually written on.
+    #[test]
+    fn callable_metadata_records_cpp_receiver_contracts_structurally() {
+        const SOURCE: &str = concat!(
+            "namespace shop {\n",
+            "\n",
+            "class Client {\n",
+            "public:\n",
+            "    Client();\n",
+            "    void send(int order);\n",
+            "    static int count();\n",
+            "protected:\n",
+            "    virtual int audit(int n) const { return n; }\n",
+            "private:\n",
+            "    int tally(int n) { return n; }\n",
+            "};\n",
+            "\n",
+            "struct Ledger {\n",
+            "    void record(int n) { (void)n; }\n",
+            "};\n",
+            "\n",
+            "Client::Client() {}\n",
+            "void Client::send(int order) { (void)order; }\n",
+            "int Client::count() { return 0; }\n",
+            "\n",
+            "int total(int order) { return order; }\n",
+            "\n",
+            "}\n",
+        );
+        let parsed = parse_cpp_declarations(SOURCE, "shop.cpp");
+
+        assert_eq!(
+            recorded_callable_modifiers(&parsed),
+            vec![
+                "shop.Client.Client [in class] static=false constructor=true visibility=Public"
+                    .to_string(),
+                "shop.Client.Client static=false constructor=true visibility=Unknown".to_string(),
+                "shop.Client.audit static=false constructor=false visibility=Protected".to_string(),
+                "shop.Client.count [in class] static=true constructor=false visibility=Public"
+                    .to_string(),
+                "shop.Client.count static=false constructor=false visibility=Unknown".to_string(),
+                "shop.Client.send [in class] static=false constructor=false visibility=Public"
+                    .to_string(),
+                "shop.Client.send static=false constructor=false visibility=Unknown".to_string(),
+                "shop.Client.tally static=false constructor=false visibility=Private".to_string(),
+                "shop.Ledger.record static=false constructor=false visibility=Public".to_string(),
+                "shop.total static=false constructor=false visibility=Unknown".to_string(),
+            ],
+        );
+    }
+
+    /// One readable row per recorded callable signature entry.
+    ///
+    /// A member's in-class declaration and its out-of-line definition are two
+    /// code units; the walk marks the body-less in-class one synthetic, and the
+    /// row says so, because the two state different modifier facts.
+    fn recorded_callable_modifiers(parsed: &ParsedFile) -> Vec<String> {
+        let mut rows = parsed
+            .signature_metadata
+            .iter()
+            .flat_map(|(unit, entries)| {
+                entries.iter().map(move |metadata| {
+                    assert!(
+                        metadata.callable_modifiers_recorded(),
+                        "{} must record that the walk read its declaration shape",
+                        unit.fq_name()
+                    );
+                    format!(
+                        "{}{} static={} constructor={} visibility={:?}",
+                        unit.fq_name(),
+                        if unit.is_synthetic() {
+                            " [in class]"
+                        } else {
+                            ""
+                        },
+                        metadata.callable_is_static(),
+                        metadata.callable_is_constructor(),
+                        metadata
+                            .callable_declared_visibility()
+                            .expect("a recorded modifier set states a visibility"),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        rows.sort();
+        rows
     }
 }

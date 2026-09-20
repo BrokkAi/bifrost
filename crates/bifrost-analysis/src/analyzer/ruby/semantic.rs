@@ -5591,10 +5591,13 @@ fn expression_value_kind(node: Node<'_>) -> SemanticValueKind {
         "method" | "singleton_method" | "lambda" | "block" | "do_block" => {
             SemanticValueKind::Callable
         }
+        // A constant read names one compile-time constant object, and a
+        // `scope_resolution` path (`Net::HTTP`) is the same read with an
+        // explicit owner. Neither is a runtime temporary, and the dispatch
+        // discharge for a call written on a constant receiver reads this kind.
         "integer" | "float" | "rational" | "complex" | "true" | "false" | "nil" | "constant"
-        | "simple_symbol" | "hash_key_symbol" | "bare_symbol" | "character" => {
-            SemanticValueKind::Constant
-        }
+        | "scope_resolution" | "simple_symbol" | "hash_key_symbol" | "bare_symbol"
+        | "character" => SemanticValueKind::Constant,
         _ => SemanticValueKind::Temporary,
     }
 }

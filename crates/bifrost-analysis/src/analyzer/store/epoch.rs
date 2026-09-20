@@ -466,11 +466,19 @@ pub(super) fn go_epoch_before_callable_modifier_metadata() -> String {
 // against. Warm rows hold only the call's member-position occurrence (for
 // member calls) or no occurrence at the callee token at all, and the adapter
 // reported `ValueReference` as unsupported for the language.
+// Salt bumped again (#3493): the C and C++ walk now records callable modifier
+// metadata, and it recorded none before. A blob persisted under the prior epoch
+// deserializes as "nobody read the modifiers", so `receiver_contract_of`
+// reports no contract, `modeled_procedure_key_for_unit` refuses every C and C++
+// workspace declaration, and every effect or taint walk that reaches one
+// reports `callee_unkeyable` on a warm workspace with no error raised anywhere.
+// The same gap was bumped for JavaScript and TypeScript (#2597), for PHP and
+// Ruby (#2912), for Python (#3451), for Kotlin (#3453) and for Go (#3455).
 lang_epoch!(
     Cpp,
     "cpp",
     "treesitter/cpp/",
-    "synthetic-file-scope-code-units-2026-07;recovered-designator-declarations-2026-07;fielded-declarator-routing-2026-07;bare-exported-class-declarators-2026-07;function-like-exported-class-declarators-2026-07;malformed-multiple-base-exported-class-declarators-2026-07;template-alias-declarations-2026-07;structured-return-type-metadata-2026-07;class-owned-alias-identity-2026-07;templated-out-of-line-owner-identity-2026-07;macro-exported-class-field-owner-2026-07;cpp-partial-specialization-ownership-dispatch-2026-07;abstract-parameter-declarator-signatures-2026-07;cpp-template-alias-specialization-dispatch-2026-07;single-base-exported-class-identity-2026-07;callable-linkage-metadata-2026-07;callable-declaration-role-metadata-2026-07;cpp-parameter-type-qualifiers-2026-07;macro-sentinel-region-reparse-2026-07;fragmented-export-class-member-recovery-2026-07;using-directive-owner-namespace-recovery-2026-07;bare-call-global-namespace-lookup-2026-07;nested-class-out-of-line-owner-identity-2026-07;fq-interned-segments-2026-07;recovered-typedef-base-alias-identity-2026-07;inline-classlike-and-macro-prefix-declarations-2026-08;template-parameter-pack-binding-and-qualified-base-initializers-2026-08;recovered-partial-specialization-member-ownership-2026-08;macro-field-terminator-scope-2026-08;complete-sentinel-class-tail-2026-08;sentinel-class-before-member-callable-2026-08;fragmented-class-signature-error-members-2026-08;plain-fragmented-class-constraint-constructor-2026-08;plain-fragmented-class-sibling-ownership-2026-08;fragmented-export-constructor-initializer-2026-08;fragmented-export-constructor-structured-sibling-boundary-2026-08;fragmented-export-sibling-class-parent-scope-2026-08;macro-decorated-template-class-scope-2026-08;conditional-alias-physical-ranges-2026-08;macro-argument-typedef-declarator-2026-08;enum-enumerator-child-ownership-2026-08;sentinel-error-envelope-sibling-recovery-2026-08;cpp-query-assets-in-brokk-bifrost-cpp-2026-08;structural-declarator-qualifier-suffix-and-top-level-parameter-cv-2026-08;macro-fragmented-plain-class-member-signatures-2026-08;namespaced-plain-fragment-boundary-2026-08;templated-plain-fragment-prefix-and-sibling-ownership-2026-08;macro-displaced-scalar-return-callable-name-2026-08;explicit-object-callable-arity-2026-08;structured-callable-parameter-types-2026-08;macro-template-return-free-function-ownership-2026-08;abstract-reference-declarator-identity-2026-08;c-tag-scope-2026-08;c-header-projection-2026-08;temporal-macro-definition-identity-2026-08;nested-include-claims-2026-08;recovered-named-class-member-linkage-2026-09;positional-export-macro-class-names-2026-09;collapsed-namespace-head-scope-2026-09;collapsed-aggregate-definition-ranges-2026-09;lexical-container-partition-2026-09;function-macro-replacement-local-scope-2026-09;forward-declared-class-declaration-ranges-2026-09;unterminated-macro-invocation-fields-2026-09;anonymous-aggregate-members-in-both-dialects-2026-09;recovered-namespace-header-ranges-2026-09;unproven-brace-pairing-extents-2026-09;free-function-callee-value-references-2026-09"
+    "synthetic-file-scope-code-units-2026-07;recovered-designator-declarations-2026-07;fielded-declarator-routing-2026-07;bare-exported-class-declarators-2026-07;function-like-exported-class-declarators-2026-07;malformed-multiple-base-exported-class-declarators-2026-07;template-alias-declarations-2026-07;structured-return-type-metadata-2026-07;class-owned-alias-identity-2026-07;templated-out-of-line-owner-identity-2026-07;macro-exported-class-field-owner-2026-07;cpp-partial-specialization-ownership-dispatch-2026-07;abstract-parameter-declarator-signatures-2026-07;cpp-template-alias-specialization-dispatch-2026-07;single-base-exported-class-identity-2026-07;callable-linkage-metadata-2026-07;callable-declaration-role-metadata-2026-07;cpp-parameter-type-qualifiers-2026-07;macro-sentinel-region-reparse-2026-07;fragmented-export-class-member-recovery-2026-07;using-directive-owner-namespace-recovery-2026-07;bare-call-global-namespace-lookup-2026-07;nested-class-out-of-line-owner-identity-2026-07;fq-interned-segments-2026-07;recovered-typedef-base-alias-identity-2026-07;inline-classlike-and-macro-prefix-declarations-2026-08;template-parameter-pack-binding-and-qualified-base-initializers-2026-08;recovered-partial-specialization-member-ownership-2026-08;macro-field-terminator-scope-2026-08;complete-sentinel-class-tail-2026-08;sentinel-class-before-member-callable-2026-08;fragmented-class-signature-error-members-2026-08;plain-fragmented-class-constraint-constructor-2026-08;plain-fragmented-class-sibling-ownership-2026-08;fragmented-export-constructor-initializer-2026-08;fragmented-export-constructor-structured-sibling-boundary-2026-08;fragmented-export-sibling-class-parent-scope-2026-08;macro-decorated-template-class-scope-2026-08;conditional-alias-physical-ranges-2026-08;macro-argument-typedef-declarator-2026-08;enum-enumerator-child-ownership-2026-08;sentinel-error-envelope-sibling-recovery-2026-08;cpp-query-assets-in-brokk-bifrost-cpp-2026-08;structural-declarator-qualifier-suffix-and-top-level-parameter-cv-2026-08;macro-fragmented-plain-class-member-signatures-2026-08;namespaced-plain-fragment-boundary-2026-08;templated-plain-fragment-prefix-and-sibling-ownership-2026-08;macro-displaced-scalar-return-callable-name-2026-08;explicit-object-callable-arity-2026-08;structured-callable-parameter-types-2026-08;macro-template-return-free-function-ownership-2026-08;abstract-reference-declarator-identity-2026-08;c-tag-scope-2026-08;c-header-projection-2026-08;temporal-macro-definition-identity-2026-08;nested-include-claims-2026-08;recovered-named-class-member-linkage-2026-09;positional-export-macro-class-names-2026-09;collapsed-namespace-head-scope-2026-09;collapsed-aggregate-definition-ranges-2026-09;lexical-container-partition-2026-09;function-macro-replacement-local-scope-2026-09;forward-declared-class-declaration-ranges-2026-09;unterminated-macro-invocation-fields-2026-09;anonymous-aggregate-members-in-both-dialects-2026-09;recovered-namespace-header-ranges-2026-09;unproven-brace-pairing-extents-2026-09;free-function-callee-value-references-2026-09;cpp-callable-modifier-metadata-2026-09;cpp-declared-access-separate-from-linkage-2026-09"
 );
 
 /// The salt as it stood immediately before `bump` was appended.
@@ -502,6 +510,13 @@ pub(super) fn salt_before_bump<'a>(salt: &'a str, bump: &str) -> &'a str {
         "salt bump {bump} is the first registered bump, so there is no earlier salt"
     );
     &salt[..start - 1]
+}
+
+/// The C and C++ epoch as it stood before the #3493 callable-modifier bump.
+#[cfg(test)]
+pub(super) fn cpp_epoch_before_callable_modifier_metadata() -> String {
+    let prior = salt_before_bump(Cpp::SALT, "cpp-callable-modifier-metadata-2026-09");
+    compute_epoch::<Cpp>(&tree_sitter_cpp::LANGUAGE.into(), prior)
 }
 
 #[cfg(test)]
@@ -1194,11 +1209,17 @@ pub(super) fn csharp_epoch_before_structured_runnable_test_classification() -> S
 // before it deserialize as "nobody read the modifiers", so
 // `receiver_contract_of` reports no contract and every Ruby procedure summary
 // stays inert on a warm workspace with no error raised anywhere.
+// Salt bumped again (#3459): a receiver written as a constant path
+// (`Net::HTTP.get(uri)`) now lowers to the `Constant` value kind instead of
+// the payload-free `Temporary` fallback. Warm semantic rows hold the old kind,
+// and the dispatch rule that reads it -- the written path names the receiver
+// object itself -- would never see the receiver as fixed in the source and
+// would keep every such call open forever.
 lang_epoch!(
     Ruby,
     "ruby",
     "treesitter/ruby/",
-    "synthetic-file-scope-code-units-2026-07;attr-macro-accessor-identities-2026-07;fq-interned-segments-2026-07;ruby-query-assets-in-brokk-bifrost-ruby-2026-08;ruby-callable-modifier-metadata-2026-09"
+    "synthetic-file-scope-code-units-2026-07;attr-macro-accessor-identities-2026-07;fq-interned-segments-2026-07;ruby-query-assets-in-brokk-bifrost-ruby-2026-08;ruby-callable-modifier-metadata-2026-09;ruby-constant-receiver-value-kind-2026-09"
 );
 // The live grammar fingerprint does not include parser tables. Keep the exact
 // Kotlin crate release in the salt so parser-only grammar changes cannot reuse

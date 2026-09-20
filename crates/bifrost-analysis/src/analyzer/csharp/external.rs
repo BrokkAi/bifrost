@@ -15,13 +15,14 @@ use crate::analyzer::semantic_model::{
     normalize_artifact_locator_paths, read_exact_artifact_while, type_declaration_id,
 };
 use crate::analyzer::topology::DependencyScope;
-use crate::analyzer::{CSharpAnalyzerConfig, Project};
+use crate::analyzer::{CSharpAnalyzerConfig, Language, Project};
 use crate::hash::{HashMap, HashSet};
 use goblin::pe::PE;
 use semver::Version;
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use walkdir::WalkDir;
 
 const MAX_ASSEMBLY_BYTES: u64 = 256 * 1024 * 1024;
@@ -564,6 +565,116 @@ impl CSharpExternalDeclarationIndex {
             self.types.entry(ty.fqn.clone()).or_default().push(ty);
         }
     }
+}
+
+/// The external declaration surface one C# reference reads: the
+/// assembly-derived index first, then the declaration facts the activated
+/// semantic packs publish (#3461).
+///
+/// Both halves answer the same question -- does an external declaration spell
+/// this type, and does it declare this member -- so they are one lookup with
+/// one precedence, not two indexes with two vocabularies. The artifact half
+/// wins a tie: an assembly on disk is the reference set the build actually
+/// resolved, while a pack is a published claim about one. This is the same
+/// split `JvmExternalDeclarations` applies for the JVM realm (#1893, #1900).
+///
+/// The pack half is read live rather than folded into
+/// [`CSharpExternalDeclarationIndex`], which is memoized in an analyzer
+/// `OnceLock` that outlives an activation transaction. Folding pack facts into
+/// that cell would answer from a pack set the host has since replaced.
+///
+/// A miss is never a proof of absence. A caller that finds nothing keeps the
+/// boundary it already had, so a type whose pack declares no members and a type
+/// no assembly indexed are both exactly as unknown as they were before.
+pub(crate) struct CSharpExternalDeclarations<'a> {
+    artifacts: &'a CSharpExternalDeclarationIndex,
+    packs: Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>,
+}
+
+impl<'a> CSharpExternalDeclarations<'a> {
+    pub(crate) fn new(
+        artifacts: &'a CSharpExternalDeclarationIndex,
+        packs: Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>,
+    ) -> Self {
+        Self { artifacts, packs }
+    }
+
+    /// Whether no surface can answer anything, so a caller may skip the ladder.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.artifacts.is_empty() && self.packs.is_none()
+    }
+
+    /// The external type identity that declares `member`, when this surface
+    /// says `owner` names one.
+    ///
+    /// `owner` is a type name a C# reference ladder produced -- a `using`
+    /// expansion, an alias, or a written qualified name -- so it is reduced to
+    /// the metadata identity both halves are keyed by before either is asked,
+    /// and that reduced identity is what the answer carries. Returning it
+    /// rather than the written spelling is what makes a generic receiver name
+    /// the declaration a summary targets (`List`1`) instead of the
+    /// instantiation the source wrote (`List<int>`).
+    pub(crate) fn declaring_owner(&self, owner: &str, member: &str) -> Option<String> {
+        let owner = metadata_type_identity(owner);
+        (self.artifact_declares_member(&owner, member) || self.pack_declares_member(&owner, member))
+            .then_some(owner)
+    }
+
+    /// Whether an indexed assembly declares the owner type and an externally
+    /// visible member of that name on it.
+    fn artifact_declares_member(&self, owner: &str, member: &str) -> bool {
+        !self.artifacts.types_named(owner).is_empty()
+            && !self.artifacts.members_named(owner, member).is_empty()
+    }
+
+    /// Whether the activated packs declare `member` on the one C# type they
+    /// publish under `owner`.
+    ///
+    /// `symbols_named` also posts every symbol under its simple name, so only
+    /// the qualified postings count: the caller has already walked its own
+    /// using tiers to produce a qualified spelling, and a dependency type that
+    /// happens to share a short name must not answer for it. Two activated
+    /// packs claiming one qualified name is ambiguity rather than a
+    /// declaration, so neither answers. The member is then decided by
+    /// `member_present_on_owner`, which walks the owner's whole published
+    /// surface and refuses a partial or competing record.
+    fn pack_declares_member(&self, owner: &str, member: &str) -> bool {
+        let Some(overlay) = self.packs.as_ref() else {
+            return false;
+        };
+        let mut declarations = overlay
+            .symbols_named(owner)
+            .records
+            .into_iter()
+            .filter(|symbol| {
+                symbol.language == Language::CSharp.config_label()
+                    && csharp_pack_type_kind(symbol.kind)
+                    && (symbol.qualified_name == owner
+                        || symbol.aliases.iter().any(|alias| alias == owner))
+            });
+        let Some(declared) = declarations.next() else {
+            return false;
+        };
+        if declarations.next().is_some() {
+            return false;
+        }
+        overlay.member_present_on_owner(&declared.id, member)
+    }
+}
+
+/// Whether a pack symbol kind is a C# type a member can be declared on.
+///
+/// A member kind is deliberately excluded: nothing may resolve an owner
+/// spelling to a method or a field, which is what keeps `Owner.member` from
+/// naming a member of a member.
+const fn csharp_pack_type_kind(
+    kind: crate::analyzer::semantic_model::SemanticModelSymbolKind,
+) -> bool {
+    use crate::analyzer::semantic_model::SemanticModelSymbolKind as Kind;
+    matches!(
+        kind,
+        Kind::Class | Kind::Interface | Kind::Struct | Kind::Enum | Kind::Record | Kind::Delegate
+    )
 }
 
 fn project_pack_types(path: &Path, pack: &AuthoredSemanticModelPack) -> Vec<CSharpExternalType> {

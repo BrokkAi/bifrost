@@ -9,6 +9,47 @@ projection and its commit history does not contain every source commit.
 
 ### Added
 
+- C# resolution now reads an external declaration surface with two halves: the
+  decoded assembly index it always had, plus the declaration facts the
+  activated semantic packs publish, the same split the JVM realm uses. When a
+  member call on an external receiver finds no workspace declaration and that
+  surface declares exactly one candidate owner type and the member on it, the
+  boundary is published under the canonical `<owner>.<member>` identity instead
+  of the receiver variable spelling, so a reviewed summary can bind the exact
+  member. The candidate owners come from the resolver's own `using` tier walk,
+  and a surface that names no candidate or several publishes nothing.
+- The network-effect boundary policy family ships its reviewed C# row:
+  `bifrost.effects.csharp.selected-boundary-no-network-io` with the reviewed
+  `System.Net.Http.HttpClient.SendAsync` model at written arity one. The route
+  is async, so an awaited chain reports the declared effect with its witness
+  chain, while a send handed to a callback the analyzer cannot expand, and a
+  call written at another arity, are each left open rather than certified
+  clean. Like every specialization in the pack, it ships with an empty
+  declaration selection and carries no obligation until a repository configures
+  one.
+- The network-effect boundary pack ships its Ruby row,
+  `bifrost.effects.ruby.selected-boundary-no-network-io`. The built-in
+  `bifrost.effects` pack is 1.4.0 and the specialization ships with an empty
+  declaration selection, so an unconfigured Ruby repository carries no
+  obligation. Its reviewed model,
+  `semantic-packs/web-network/ruby/bifrost.web-network-ruby.json`, publishes
+  the `Net::HTTP` class and declares `bifrost.network_io` on its `get`
+  singleton method at written arity one, so `Net::HTTP.get(address)` binds the
+  reviewed declaration identity rather than the member spelling. A workspace
+  class also spelled `Net::HTTP` with its own `get` resolves inside the
+  workspace instead and carries no effect, and an unresolved helper leaves the
+  absence claim unmet rather than clean.
+- Ruby writes a receiver route as a constant path, and the resolver now
+  publishes the exact external call proof for it: `Net::HTTP.get(uri)` binds
+  the member the activated model declares under that exact owner at the written
+  arity, the reference records the canonical callee instead of the local
+  spelling, and Ruby joins the batch fast path that retains that identity. A
+  call on a receiver the source itself fixes -- a constant path -- discharges
+  the adapter's blanket dynamic-dispatch gap, because the path names the
+  receiver object rather than a class only known at run time; every other Ruby
+  receiver keeps that gap. Constant paths lower as constant values rather than
+  the payload-free temporary fallback, and the Ruby extraction epoch rotates so
+  a warm analyzer cache re-extracts declarations once.
 - The first Python security policy,
   `bifrost.security.python.process-input-to-os-system`, ships in the built-in
   `bifrost.security` pack, backed by three reviewed Python semantic packs:
@@ -39,7 +80,7 @@ projection and its commit history does not contain every source commit.
 
 - The network-effect boundary policy family gained its Go row,
   `bifrost.effects.go.selected-boundary-no-network-io`. The built-in
-  `bifrost.effects` pack is 1.2.0 and the specialization ships with an empty
+  `bifrost.effects` pack is 1.4.0 and the specialization ships with an empty
   declaration selection, so an unconfigured Go repository carries no
   obligation. Its reviewed model extends the packs Bifrost already ships:
   `bifrost.go.stdlib.net-http` (1.2.0) declares `bifrost.network_io` on
@@ -56,6 +97,19 @@ projection and its commit history does not contain every source commit.
   effect or taint walk that reaches it no longer reports an unkeyable callee.
   The Go extraction epoch rotates, so a warm analyzer cache re-extracts Go
   declarations once.
+- C and C++ declarations now record callable modifier metadata. A class-body
+  member binds the object it is selected on unless it writes the `static`
+  storage class, its declared visibility is the access the body's specifier
+  ladder is under, and a function at namespace or file scope binds nothing and
+  has unknown declared visibility; linkage remains separate metadata. C reaches only that last case: it
+  has no member functions, and the `static` a C function writes is internal
+  linkage rather than a receiver fact. Supported C and C++ workspace callables
+  therefore have canonical procedure keys, so reviewed procedure summaries can
+  name them and effect or taint walks no longer reject them solely because
+  modifier metadata was absent. The C and C++ extraction epoch rotates, so a warm analyzer cache
+  re-extracts C and C++ declarations once. Out-of-line C++ member definitions
+  recover static and access facts from exact include-visible class declarations,
+  with overloads kept distinct and missing declarations left uncertain.
 
 - The network-effect policy ships its reviewed Kotlin row, reading the shared
   Java/JVM JDK model one-way instead of a second JDK model. A Kotlin call site
