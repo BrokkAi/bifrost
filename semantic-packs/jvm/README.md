@@ -12,6 +12,34 @@ trees. Specs for other families live in sibling directories as their packs are
 authored. Every spec must name its upstream provenance source and license; a
 spec with an unknown family or a placeholder license fails validation.
 
+## Version selection
+
+A spec pins one exact artifact but serves an API surface, so its toolchain
+requirement is the compatible range that surface covers, not the build it was
+extracted from (#1884, #3465). Each range is the upstream project's own
+compatibility unit:
+
+| Pack | Extracted from | Requirement |
+| --- | --- | --- |
+| `bifrost.jdk` | Temurin 21.0.8+9 | `>=21.0.0, <22.0.0` |
+| `bifrost.kotlin-stdlib` | kotlin-stdlib 2.2.20 | `>=2.2.0, <2.3.0` |
+| `bifrost.scala-library` | scala-library 2.13.16 | `>=2.13.0, <2.14.0` |
+
+A JDK feature release keeps its exported `java.base` surface stable across its
+patch builds, and Kotlin and Scala 2 both guarantee compatibility within a
+minor line. An exact requirement instead made each pack unselectable on every
+host that did not run the one build it was extracted from: a host reporting
+`21.0.0` was rejected with `workspace toolchain jdk 21.0.0 does not satisfy the
+pack requirement =21.0.8`.
+
+The exact build stays recorded, as the pack's own version, its pinned artifact
+and container digests, and the upstream revision in `provenance`. Only the
+selection predicate widened. A requirement with no upper bound is rejected by
+`validate`, so a pack cannot answer for an API surface it was never extracted
+from, and the activation decision in a policy report names the requirement that
+admitted the workspace. `measurement_activation` stays exact: the release
+measurement runs against the artifact the spec pins.
+
 The Kotlin and Scala packs are source-semantic: they preserve authored declarations,
 signatures, companions, traits, hierarchy, and source locators. It does not
 invent Kotlin JVM facade names or compiler-generated Scala case-class members such

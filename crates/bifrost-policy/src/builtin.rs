@@ -323,6 +323,12 @@ const EFFECTS_POLICY_SOURCES: &[(&str, &str)] = &[
         ),
     ),
     (
+        "policies/scala/selected-boundary-no-network-io.rqlp",
+        include_str!(
+            "../policy-packs/bifrost.effects/policies/scala/selected-boundary-no-network-io.rqlp"
+        ),
+    ),
+    (
         "policies/typescript/selected-boundary-no-network-io.rqlp",
         include_str!(
             "../policy-packs/bifrost.effects/policies/typescript/selected-boundary-no-network-io.rqlp"
@@ -1123,7 +1129,7 @@ mod tests {
         let effects = catalog
             .pack_manifest(EFFECTS_PACK_ID)
             .expect("effects pack");
-        assert_eq!(effects.policies.len(), 5);
+        assert_eq!(effects.policies.len(), 6);
         assert_eq!(
             effects
                 .policies
@@ -1135,6 +1141,7 @@ mod tests {
                 "bifrost.effects.javascript.selected-boundary-no-network-io",
                 "bifrost.effects.kotlin.selected-boundary-no-network-io",
                 "bifrost.effects.python.selected-boundary-no-network-io",
+                "bifrost.effects.scala.selected-boundary-no-network-io",
                 "bifrost.effects.typescript.selected-boundary-no-network-io",
             ]
         );

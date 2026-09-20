@@ -1212,10 +1212,8 @@ impl ScalaAnalyzer {
         file: &ProjectFile,
         name: &str,
     ) -> (BoundaryStatus, Option<String>) {
-        let external = self.external_declarations(packs.clone());
-        let package_name = self.inner.package_name_of(file).unwrap_or_default();
-        if let Some(ty) = self.external_type_spelling(token, &external, file, &package_name, name) {
-            return (BoundaryStatus::ExternalIndexed, Some(ty.fqn().to_owned()));
+        if let Some(fqn) = self.external_type_name(token, packs.clone(), file, name) {
+            return (BoundaryStatus::ExternalIndexed, Some(fqn));
         }
         // A member spelling leaves the workspace exactly as its owner type
         // does, so the member tier runs where the type tier found nothing
@@ -1238,6 +1236,31 @@ impl ScalaAnalyzer {
         (BoundaryStatus::ExternalUnknown, None)
     }
 
+    /// The fully-qualified name of the external type a written Scala type
+    /// spelling names, or `None` when the shared surface names none (#3454).
+    ///
+    /// This is [`Self::external_type_spelling`] alone -- the same ladder the
+    /// boundary evidence and the member gate read -- exposed to callers that
+    /// need the external *type* rather than a boundary classification. The
+    /// receiver-typing path uses it for a written annotation whose workspace
+    /// resolution declined because an explicit import binds the name outside
+    /// the indexed workspace (`import java.net.URL`; `url: URL`), so the
+    /// receiver's owner is the imported type and its members are reached
+    /// through the external member route. Keeping this the one ladder means a
+    /// typed receiver and a trace row cannot disagree about a spelling.
+    pub(crate) fn external_type_name(
+        &self,
+        token: QueryToken<'_>,
+        packs: Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>,
+        file: &ProjectFile,
+        spelling: &str,
+    ) -> Option<String> {
+        let external = self.external_declarations(packs);
+        let package_name = self.inner.package_name_of(file).unwrap_or_default();
+        self.external_type_spelling(token, &external, file, &package_name, spelling)
+            .map(|ty| ty.fqn().to_owned())
+    }
+
     /// The external type a written Scala type spelling names, read through the
     /// external tiers of [`ScalaSource::simple_type_proof`]: a written
     /// qualified name, `java.lang`, the file's explicit and wildcard imports,
@@ -1254,6 +1277,22 @@ impl ScalaAnalyzer {
         package_name: &str,
         spelling: &str,
     ) -> Option<crate::analyzer::jvm::external::JvmExternalType> {
+        let imports = self.inner.import_info_of(token, file);
+        Self::external_type_spelling_in(external, package_name, spelling, &imports)
+    }
+
+    /// [`Self::external_type_spelling`] over a caller-supplied import set.
+    ///
+    /// The hierarchy walk reads the imports the parser recorded at the
+    /// declaration whose supertypes it lands (#3454), rather than re-reading
+    /// the file, so the one ladder is spelled once and both callers agree
+    /// about which declaration a spelling names.
+    fn external_type_spelling_in(
+        external: &JvmExternalDeclarations<'_>,
+        package_name: &str,
+        spelling: &str,
+        imports: &[crate::analyzer::ImportInfo],
+    ) -> Option<crate::analyzer::jvm::external::JvmExternalType> {
         if spelling.contains('.')
             && let Some(ty) = external.resolve_qualified_name(spelling, package_name)
         {
@@ -1262,8 +1301,8 @@ impl ScalaAnalyzer {
         if let Some(ty) = external.resolve_java_lang(spelling) {
             return Some(ty);
         }
-        for import in self.inner.import_info_of(token, file) {
-            let Some(path) = scala_import_path(&import) else {
+        for import in imports {
+            let Some(path) = scala_import_path(import) else {
                 continue;
             };
             if import.is_wildcard {
@@ -2180,6 +2219,15 @@ impl crate::analyzer::usages::MemberFamilyProvider for ScalaAnalyzer {
         cancellation: Option<&crate::cancellation::CancellationToken>,
     ) -> crate::analyzer::usages::MemberFamilyAnswer {
         crate::analyzer::usages::scala_member_family(self, self, member, cancellation)
+    }
+
+    fn external_member_family(
+        &self,
+        identity: &brokk_bifrost_jvm::realm::JvmExternalMemberIdentity,
+        max_visits: usize,
+        cancellation: Option<&crate::cancellation::CancellationToken>,
+    ) -> crate::analyzer::usages::ExternalMemberFamilyAnswer {
+        self.resolve_external_member_family(self, identity, max_visits, cancellation)
     }
 }
 

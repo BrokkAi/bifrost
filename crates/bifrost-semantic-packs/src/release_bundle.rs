@@ -66,7 +66,7 @@ use brokk_bifrost_analysis::analyzer::{
     PythonArtifactPackProducer, RubyGemArchivePackProducer, RustdocJsonPackProducer,
     ScalaSourceJarPackProducer, TypeScriptDeclarationPackProducer, WorkspaceAnalyzer,
 };
-use semver::{Version, VersionReq};
+use semver::{Op, Version, VersionReq};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tempfile::{NamedTempFile, tempdir};
@@ -1329,6 +1329,37 @@ fn produce_pinned_pack(
     }
 }
 
+/// A pinned spec states the compatible range its extracted API surface serves,
+/// not the exact build it was extracted from (#3465). The range must be
+/// bounded above: an open requirement such as `>=21.0.0` would let a pack
+/// extracted from one API surface answer for every later surface, which is the
+/// silent wrong-version activation #1884 exists to prevent. The exact build
+/// stays recorded as the pack's own version and pinned artifact digests.
+fn validate_bounded_requirement(
+    spec_path: &Path,
+    axis: &str,
+    name: &str,
+    requirement: &str,
+) -> Result<(), BundleError> {
+    let parsed = VersionReq::parse(requirement).map_err(|error| {
+        BundleError::new(format!(
+            "spec {} {axis} {name} requirement {requirement} is not a semantic-version requirement: {error}",
+            spec_path.display()
+        ))
+    })?;
+    if parsed
+        .comparators
+        .iter()
+        .all(|comparator| matches!(comparator.op, Op::Greater | Op::GreaterEq))
+    {
+        return Err(BundleError::new(format!(
+            "spec {} {axis} {name} requirement {requirement} has no upper bound; a pinned pack must name the API surface its extraction serves",
+            spec_path.display()
+        )));
+    }
+    Ok(())
+}
+
 fn validate_spec(spec: &PinnedPackSpec, spec_path: &Path) -> Result<(), BundleError> {
     if spec.schema_version != PACK_SPEC_SCHEMA_VERSION {
         return Err(BundleError::new(format!(
@@ -1360,6 +1391,28 @@ fn validate_spec(spec: &PinnedPackSpec, spec_path: &Path) -> Result<(), BundleEr
             "spec {} must name at least one license or notice file",
             spec_path.display()
         )));
+    }
+    for constraint in &spec.compatibility.toolchains {
+        validate_bounded_requirement(
+            spec_path,
+            "toolchain",
+            &constraint.name,
+            &constraint.requirement,
+        )?;
+    }
+    for selector in &spec.activation {
+        for (axis, coordinate) in [
+            ("package", selector.package.as_ref()),
+            ("module", selector.module.as_ref()),
+            ("toolchain", selector.toolchain.as_ref()),
+        ] {
+            let Some(coordinate) = coordinate else {
+                continue;
+            };
+            if let Some(requirement) = &coordinate.version {
+                validate_bounded_requirement(spec_path, axis, &coordinate.name, requirement)?;
+            }
+        }
     }
     if let PinnedPackKind::PythonStub { stubs } = &spec.kind {
         if stubs.is_empty() {
@@ -4759,10 +4812,16 @@ mod tests {
         );
     }
 
+    /// Every checked-in pinned spec must parse and validate through the same
+    /// release tooling that builds the published bundle, so an unbounded or
+    /// unparseable version requirement fails here rather than at release time
+    /// (#3465). `semantic-packs/python` is not listed: that directory mixes an
+    /// authored semantic-model pack with its `.spec.json`, so "every JSON file
+    /// is a pinned spec" is not true there.
     #[test]
-    fn checked_in_typescript_and_rust_specs_parse_through_release_tooling() {
+    fn checked_in_pinned_specs_parse_and_validate_through_release_tooling() {
         let semantic_packs = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../semantic-packs");
-        for ecosystem in ["typescript", "rust"] {
+        for ecosystem in ["jvm", "php", "typescript", "rust"] {
             let directory = semantic_packs.join(ecosystem);
             let mut paths = fs::read_dir(&directory)
                 .unwrap_or_else(|error| panic!("read {}: {error}", directory.display()))

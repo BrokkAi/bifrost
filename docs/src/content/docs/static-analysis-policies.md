@@ -394,6 +394,17 @@ surface for the member. A receiver the workspace declares itself stays a
 workspace call: a class with a method named `openConnection` is not the JDK
 method, and a helper the analyzer cannot expand leaves the absence claim unmet
 rather than clean.
+The Scala specialization
+(`bifrost.effects.scala.selected-boundary-no-network-io`) is again its own
+policy with its own stable ID, and its declaration-selection block is written
+in `(language scala ...)`. It activates the same JVM model rather than a Scala
+JDK model of its own: when the analyzer types a Scala receiver as
+`java.net.URL`, the member access publishes the canonical identity the
+activated declaration surface answers, so `auditUrl.openConnection()` binds
+`java.net.URL.openConnection()` at its written arity zero exactly as the Java
+and Kotlin call sites do. A Scala method that merely shares the JDK method's
+name binds its own workspace declaration instead, and an unresolved Scala
+helper keeps the absence claim open.
 
 <!-- policy-doc-test:rqlp:tests/fixtures/network-effect-boundary/policies/javascript.rqlp -->
 ```lisp

@@ -2178,6 +2178,9 @@ struct CandidateSelection {
     semantic_sha256: String,
     payload_kind: PayloadKind,
     evidence_rank: EvidenceRank,
+    /// The version requirements this candidate satisfied, so the activation
+    /// explanation can name them (#3465).
+    matched_requirements: Vec<MatchedVersionRequirement>,
     source_rank: u8,
 }
 
@@ -2341,12 +2344,17 @@ pub fn resolve_active_semantic_models(
             return SemanticModelResolutionOutcome::Unavailable(report);
         }
 
-        let Some((evidence_rank, matched_evidence)) = strict_activation_match(
+        let Some(StrictActivationMatch {
+            evidence_rank,
+            matched_evidence,
+            matched_requirements,
+        }) = strict_activation_match(
             &loaded.manifest,
             &loaded.shard,
             &evidence,
             &request.bifrost_version,
-        ) else {
+        )
+        else {
             let reason =
                 strict_activation_mismatch_reason(&loaded.manifest, &loaded.shard, &evidence);
             push_loaded_explanation(
@@ -2414,6 +2422,7 @@ pub fn resolve_active_semantic_models(
             semantic_sha256: descriptor.semantic_sha256.clone(),
             payload_kind: descriptor.payload_kind,
             evidence_rank,
+            matched_requirements,
             source_rank: source_rank(loaded.source_kind),
             active: ActiveSemanticModelShard {
                 manifest: loaded.manifest,
@@ -2473,11 +2482,27 @@ pub fn resolve_active_semantic_models(
         // A review-gated pack reaches this push only through an explicit
         // compatible enable control, so the report retains that user
         // authorization decision rather than merely implying it.
-        let reason = if selection.active.manifest.safety.review_required {
+        let mut reason = if selection.active.manifest.safety.review_required {
             "strict activation evidence and an explicit enable control selected this shard"
         } else {
             "strict activation evidence and controls selected this shard"
-        };
+        }
+        .to_owned();
+        // A pack whose requirement is a compatible range rather than an exact
+        // build has to say which range admitted this workspace, and which
+        // build the surface it serves was extracted from, so an
+        // `external_indexed` answer stays attributable to a stated
+        // requirement instead of to an unnamed match (#3465). The pack
+        // version is that extraction identity; it is the provenance the
+        // requirement no longer carries.
+        if !selection.matched_requirements.is_empty() {
+            reason.push_str("; pack version ");
+            reason.push_str(&selection.active.manifest.version);
+            for matched in &selection.matched_requirements {
+                reason.push_str("; ");
+                reason.push_str(&matched.describe());
+            }
+        }
         push_explanation(
             &mut report,
             request.limits,
@@ -2488,7 +2513,7 @@ pub fn resolve_active_semantic_models(
                 source_kind: selection.active.source_kind,
                 source_id: selection.active.source_id.clone(),
                 status: SemanticModelActivationStatus::Active,
-                reason: reason.to_owned(),
+                reason,
             },
         );
     }
@@ -3041,48 +3066,145 @@ fn semantic_pack_language(label: &str) -> &str {
     }
 }
 
+/// One version requirement a strict activation satisfied, with the workspace
+/// version that satisfied it.
+///
+/// A pack declares the compatible range its extracted API surface serves, so
+/// "this pack activated" no longer implies "the workspace runs the exact build
+/// the pack was extracted from". The activation decision must therefore name
+/// which requirement admitted the workspace (#3465). The matcher is the only
+/// place that decides this, so it is the only place that reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MatchedVersionRequirement {
+    axis: &'static str,
+    name: String,
+    requirement: String,
+    version: Version,
+}
+
+impl MatchedVersionRequirement {
+    fn describe(&self) -> String {
+        format!(
+            "matched {} {} {} against the pack requirement {}",
+            self.axis, self.name, self.version, self.requirement
+        )
+    }
+}
+
+#[derive(Debug)]
+struct StrictActivationMatch {
+    evidence_rank: EvidenceRank,
+    matched_evidence: SemanticModelActivationEvidence,
+    matched_requirements: Vec<MatchedVersionRequirement>,
+}
+
 fn strict_activation_match(
     manifest: &CompiledPackManifest,
     shard: &CompiledShard,
     evidence: &[SemanticModelActivationEvidence],
     bifrost_version: &Version,
-) -> Option<(EvidenceRank, SemanticModelActivationEvidence)> {
+) -> Option<StrictActivationMatch> {
     let bifrost = VersionReq::parse(&manifest.compatibility.bifrost).ok()?;
     if !bifrost.matches(bifrost_version) {
         return None;
     }
-    if !manifest.compatibility.toolchains.iter().all(|constraint| {
-        let Ok(requirement) = VersionReq::parse(&constraint.requirement) else {
-            return false;
-        };
-        evidence.iter().any(|row| {
-            semantic_pack_language(&row.language) == manifest.language
-                && row.ecosystem == manifest.ecosystem
-                && row.toolchain.as_ref().is_some_and(|toolchain| {
-                    toolchain.name == constraint.name
-                        && toolchain
-                            .version
-                            .as_ref()
-                            .is_some_and(|version| requirement.matches(version))
-                })
-        })
-    }) {
-        return None;
+    let scoped = |row: &&SemanticModelActivationEvidence| {
+        semantic_pack_language(&row.language) == manifest.language
+            && row.ecosystem == manifest.ecosystem
+    };
+    let mut matched_requirements = Vec::new();
+    for constraint in &manifest.compatibility.toolchains {
+        let requirement = VersionReq::parse(&constraint.requirement).ok()?;
+        let version = evidence.iter().filter(scoped).find_map(|row| {
+            let toolchain = row.toolchain.as_ref()?;
+            if toolchain.name != constraint.name {
+                return None;
+            }
+            toolchain
+                .version
+                .as_ref()
+                .filter(|version| requirement.matches(version))
+        })?;
+        push_matched_requirement(
+            &mut matched_requirements,
+            "toolchain",
+            &constraint.name,
+            &constraint.requirement,
+            version,
+        );
     }
-    shard
+    let (evidence_rank, matched_evidence, selector) = shard
         .activation()
         .iter()
         .flat_map(|selector| {
             evidence
                 .iter()
-                .filter(move |row| {
-                    semantic_pack_language(&row.language) == manifest.language
-                        && row.ecosystem == manifest.ecosystem
-                        && strict_selector_matches(selector, row)
-                })
-                .map(|row| (selector_rank(selector), row.clone()))
+                .filter(move |row| scoped(row) && strict_selector_matches(selector, row))
+                .map(move |row| (selector_rank(selector), row.clone(), selector))
         })
-        .max()
+        .max_by(|left, right| (left.0, &left.1).cmp(&(right.0, &right.1)))?;
+    for (axis, coordinate_selector, coordinate_evidence) in [
+        (
+            "package",
+            selector.package.as_ref(),
+            matched_evidence.package.as_ref(),
+        ),
+        (
+            "module",
+            selector.module.as_ref(),
+            matched_evidence.module.as_ref(),
+        ),
+        (
+            "toolchain",
+            selector.toolchain.as_ref(),
+            matched_evidence.toolchain.as_ref(),
+        ),
+    ] {
+        let (Some(coordinate_selector), Some(coordinate_evidence)) =
+            (coordinate_selector, coordinate_evidence)
+        else {
+            continue;
+        };
+        let (Some(requirement), Some(version)) =
+            (&coordinate_selector.version, &coordinate_evidence.version)
+        else {
+            continue;
+        };
+        push_matched_requirement(
+            &mut matched_requirements,
+            axis,
+            &coordinate_selector.name,
+            requirement,
+            version,
+        );
+    }
+    Some(StrictActivationMatch {
+        evidence_rank,
+        matched_evidence,
+        matched_requirements,
+    })
+}
+
+/// Record one satisfied requirement, keeping the first statement of a
+/// requirement that a manifest constraint and a shard selector both carry.
+fn push_matched_requirement(
+    matched: &mut Vec<MatchedVersionRequirement>,
+    axis: &'static str,
+    name: &str,
+    requirement: &str,
+    version: &Version,
+) {
+    if matched.iter().any(|existing| {
+        existing.axis == axis && existing.name == name && existing.requirement == requirement
+    }) {
+        return;
+    }
+    matched.push(MatchedVersionRequirement {
+        axis,
+        name: name.to_owned(),
+        requirement: requirement.to_owned(),
+        version: version.clone(),
+    });
 }
 
 fn strict_selector_matches(
@@ -3792,6 +3914,7 @@ mod active_model_set_identity_tests {
             semantic_sha256: descriptor.semantic_sha256,
             payload_kind: descriptor.payload_kind,
             evidence_rank,
+            matched_requirements: Vec::new(),
             source_rank: 0,
             active: ActiveSemanticModelShard {
                 manifest: std::sync::Arc::new(compiled.manifest),

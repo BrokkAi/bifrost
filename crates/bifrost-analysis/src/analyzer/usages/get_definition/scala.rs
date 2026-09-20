@@ -14,6 +14,7 @@ use crate::analyzer::structural::{
     HierarchyRelation, MemberDispatchTier, PrecedenceTier, RejectionReason,
 };
 use crate::analyzer::usages::applicability::{ApplicabilityOutcome, CandidateApplicability};
+use crate::analyzer::usages::reference_site::node_range;
 use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
 use crate::analyzer::{
     ForwardQueryProvider, ImportInfo, SignatureMetadata, StructuredImportPath,
@@ -8445,13 +8446,31 @@ fn resolve_scala_field(
         if !stable_members.is_empty() {
             return candidates_outcome(stable_members);
         }
-        return scala_extension_candidates(
+        let extensions = scala_extension_candidate_units(
             ctx,
             token,
             resolver,
             member,
             Some(&owner_fqn),
             call_shape.as_ref(),
+        );
+        if !extensions.is_empty() {
+            return candidates_outcome(extensions);
+        }
+        // A workspace extension method on this owner is a declaration the
+        // reference denotes, so it wins above; only when the workspace
+        // declares none is the *external* declaration surface the remaining
+        // party that can say whether the member exists (#3454).
+        if matches!(owner, ScalaReceiverOwner::Logical(_))
+            && let Some(outcome) = scala_logical_owner_external_member_outcome(
+                ctx, token, field, field_node, &owner_fqn, member,
+            )
+        {
+            return outcome;
+        }
+        return no_definition(
+            SCALA_UNSUPPORTED_RECEIVER,
+            format!("receiver for Scala extension member `{member}` is not resolved"),
         );
     }
     let extension_candidates =
@@ -8483,6 +8502,67 @@ fn scala_case_class_owner(ctx: ScalaLookupCtx<'_>, owner_fqn: &str) -> Option<Co
         [candidate] => Some(candidate.clone()),
         _ => None,
     }
+}
+
+/// The canonical external identity a Scala member access publishes when the
+/// local inference engine *typed* its receiver but the workspace indexes no
+/// member of that type (#3454).
+///
+/// `resolve_scala_field` reaches this point with a logical owner -- the
+/// declared type of a parameter or binding, such as `java.net.URL` for a
+/// `URL`-typed parameter -- after its workspace members, stable terms and
+/// extensions all answered nothing. The activated external declaration
+/// surface is then the only remaining party that can say whether the member
+/// exists. It reads only jar-indexed and pack-declared owners, never a
+/// workspace declaration, so a member it answers is outside this workspace by
+/// construction; a surface that declares nothing keeps the caller's plain
+/// unsupported-receiver miss.
+///
+/// Publishing the surface's own `<owner>.<member>` rather than the receiver
+/// *variable* spelling is what both consumers of an unmaterialized external
+/// callee read: the call-binding path takes it as the resolved reference text
+/// and the trace takes it as the boundary row, so an activated model's
+/// `declared_effects` on that exact identity can bind. This is the Scala
+/// counterpart of the member half of `java_unresolved_receiver_outcome`; the
+/// written-receiver ladder [`scala_external_member_spelling`] keeps its own
+/// lexical binding guard, which does not apply here because the type came
+/// from the binding's declaration rather than from the receiver's spelling.
+fn scala_logical_owner_external_member_outcome(
+    ctx: ScalaLookupCtx<'_>,
+    token: QueryToken<'_>,
+    field: Node<'_>,
+    member_node: Node<'_>,
+    owner_fqn: &str,
+    member: &str,
+) -> Option<DefinitionLookupOutcome> {
+    let spelling = format!("{owner_fqn}.{member}");
+    let declared = ctx.scala.resolve_member_name_with_external(
+        token,
+        ctx.analyzer.semantic_model_overlay(),
+        ctx.file,
+        &spelling,
+    );
+    let declared = declared?;
+    let canonical = declared.fqn().to_string();
+    // gated upstream: `resolve_member_name_with_external` answers only
+    // jar-indexed and pack-declared owners, and this owner's workspace
+    // members, stable terms and extensions already answered nothing above, so
+    // the route is external by construction.
+    trace::record_named_boundary(canonical.clone());
+    let mut outcome = boundary_unchecked(
+        format!(
+            "`{canonical}` names a member of a Scala type declared outside the indexed workspace"
+        ),
+        UnindexedClaim::external_boundary(canonical.clone(), ClaimSubjectRole::Member),
+    );
+    outcome.reference = Some(ResolvedReferenceSite {
+        path: ctx.file.to_string(),
+        text: canonical,
+        range: node_range(field),
+        focus_start_byte: member_node.start_byte(),
+        focus_end_byte: member_node.end_byte(),
+    });
+    Some(outcome)
 }
 
 /// What a Scala member access reports when its receiver is not a type this
@@ -11973,9 +12053,17 @@ fn scala_resolve_visible_type_annotation(
     let base = scala_type_base_text(type_text.trim()).unwrap_or(type_text);
     match resolver.resolve_owner(base, ScalaOwnerKind::Class) {
         ScalaNameResolution::Resolved(owner) => return Some(owner.fqn),
-        ScalaNameResolution::MissingExplicitImport | ScalaNameResolution::Ambiguous(_) => {
-            return None;
+        // An explicit import binds this name to a declaration the workspace
+        // does not index, so the shared external declaration surface is the
+        // only remaining party that can name the type the annotation denotes
+        // (#3454). The import is structured evidence -- `import java.net.URL`
+        // makes the annotation `URL` denote `java.net.URL` -- and the ladder
+        // that says so is the one boundary refinement reads. A surface that
+        // names nothing keeps the annotation exactly as unresolved as it was.
+        ScalaNameResolution::MissingExplicitImport => {
+            return scala_external_type_fqn(ctx, token, base);
         }
+        ScalaNameResolution::Ambiguous(_) => return None,
         ScalaNameResolution::Unresolved => {}
     }
     if scala_type_annotation_has_explicit_import(ctx, token, type_text) {
@@ -11985,6 +12073,35 @@ fn scala_resolve_visible_type_annotation(
         .and_then(|package| scala_existing_package_type_fqn(ctx.support, &package, type_text))
         .or_else(|| scala_enclosing_type_fqn(ctx, type_text, reference_byte))
         .or_else(|| scala_builtin_type_name(type_text).map(str::to_string))
+        // A written qualified name (`java.net.URL`), a `java.lang` name, a
+        // wildcard import, or a sibling in a jar-held package reaches
+        // outside the workspace with no explicit import to say so; the same
+        // external ladder names those from the spelling alone.
+        .or_else(|| scala_external_type_fqn(ctx, token, base))
+}
+
+/// The fully-qualified name of the external type a written Scala type
+/// spelling names, or `None` when the shared surface names none (#3454).
+///
+/// Used where workspace type resolution has already declined, so the
+/// spelling is one no indexed declaration answers. The answer is the owner
+/// half of the canonical external-callee identity a receiver of this type
+/// publishes, which is what lets a modeled declaration -- the reviewed JDK
+/// network model, for one -- bind through the JVM external route.
+fn scala_external_type_fqn(
+    ctx: ScalaLookupCtx<'_>,
+    token: QueryToken<'_>,
+    spelling: &str,
+) -> Option<String> {
+    if !ctx.scope_step() {
+        return None;
+    }
+    ctx.scala.external_type_name(
+        token,
+        ctx.analyzer.semantic_model_overlay(),
+        ctx.file,
+        spelling,
+    )
 }
 
 fn scala_resolve_visible_type_node(

@@ -14,8 +14,31 @@ projection and its commit history does not contain every source commit.
   that reaches `java.net.URL.openConnection()` through a concrete receiver
   binds that exact endpoint; a same-name local function never borrows the JDK
   identity, and an unresolved helper keeps the run open instead of clean.
+- The network-effect policy ships its reviewed Scala row, reading the same
+  shared Java/JVM JDK model one-way instead of a second JDK model. A Scala
+  call site whose receiver the analyzer typed as `java.net.URL` binds
+  `java.net.URL.openConnection()` at its written arity through the JVM
+  external declaration route; a workspace method that only shares the JDK
+  name binds its own declaration, and an unresolved helper keeps the run open
+  instead of clean.
 
 ### Fixed
+
+- The shipped JDK, Kotlin and Scala standard-library packs are selectable
+  again on hosts that do not run the one build each pack was extracted from.
+  Each pack now declares the compatible range its extracted API surface
+  serves - `>=21.0.0, <22.0.0` for `bifrost.jdk`, `>=2.2.0, <2.3.0` for
+  `bifrost.kotlin-stdlib`, and `>=2.13.0, <2.14.0` for
+  `bifrost.scala-library` - instead of pinning the exact build as the
+  requirement. A Temurin 21+35 host, which reports `21.0.0`, was previously
+  rejected with `workspace toolchain jdk 21.0.0 does not satisfy the pack
+  requirement =21.0.8`. The exact build stays recorded as the pack version,
+  its pinned artifact digests, and its upstream provenance revision; a
+  version outside the range is still rejected with a reason naming the
+  workspace version and the requirement; and `validate` now refuses a pinned
+  spec whose version requirement has no upper bound. A selected pack's
+  decision in a policy report's `packs.decisions` names the requirement that
+  admitted the workspace.
 
 - A Python absolute import now resolves its module in the source root that
   owns the importing file. A snapshot that vendors two distributions side by

@@ -456,6 +456,19 @@ selectors and, for rule shards, their trigger kinds. The runtime uses the keys
 to avoid reading unrelated payloads, then strictly rechecks every populated
 selector field. Missing evidence never satisfies a constraint.
 
+A version constraint states the compatible range the pack's extracted API
+surface serves, not the one build it was extracted from. A pinned spec must
+bound that range above, so a pack cannot answer for an API surface it was never
+extracted from; `validate` rejects an open requirement such as `>=21.0.0`. The
+exact build stays recorded as the pack version, the pinned artifact digests,
+and the upstream provenance revision. Because activation no longer implies that
+the workspace runs that exact build, the activation decision names both the
+build the pack carries and the requirement that admitted the workspace: a
+selected pack's reason in `packs.decisions` reads `pack version 21.0.8; matched
+toolchain jdk 21.0.0 against the pack requirement >=21.0.0, <22.0.0`. A version
+outside the range is still rejected, with a reason naming the workspace version
+and the requirement.
+
 Activation evidence is supplied as complete rows so a package, module,
 toolchain, target, configuration, and artifact digest from different resolved
 artifacts cannot be combined accidentally. Exact artifact evidence outranks

@@ -1,9 +1,15 @@
 use super::*;
 use crate::analyzer::ImportInfo;
+use crate::analyzer::jvm::external::JvmExternalDeclarations;
 use crate::analyzer::type_relations::{TypeRelation, TypeRelationKind};
 use crate::analyzer::usages::scala_graph::{ScalaNameResolver, ScalaProjectTypes};
+use crate::analyzer::usages::{
+    ExternalMemberFamilyAnswer, ExternalMemberFamilyIncompleteReason, ExternalMemberFamilyStatus,
+    JvmExternalMemberIdentity, JvmReceiverSemantics, MemberFacts,
+};
 use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
+use brokk_bifrost_jvm::scala::graph::namespace::ScalaTypeNamespaceResolution;
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -16,6 +22,21 @@ enum ScalaHierarchyPackageResolution {
     NoMatch,
     Resolved(String),
     AuthoritativeMiss,
+}
+
+/// Where one spelled Scala supertype lands when the indexed workspace declares
+/// nothing under that name (#3454).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScalaExternalRootLanding {
+    /// The spelling names the queried external root itself, so a template that
+    /// spells it sits below that root.
+    ExternalRoot,
+    /// The spelling names something else: a different external declaration, or
+    /// a name the shared surface does not answer at all.
+    Other,
+    /// More than one visible wildcard import could bind the spelling, so which
+    /// declaration it denotes cannot be told from the queried root.
+    Ambiguous,
 }
 
 impl TypeHierarchyProvider for ScalaAnalyzer {
@@ -93,9 +114,18 @@ pub(crate) struct ScalaLazyHierarchyIndex {
     /// only be a descendant of `owner` if it spells `owner`'s simple name, so
     /// this prunes ancestor resolution to the relevant candidates.
     candidates_by_supertype_simple: HashMap<String, Vec<CodeUnit>>,
+    /// The number of class candidates the pass admitted, before any hierarchy
+    /// context narrowed them. One external-root walk charges this as its base
+    /// scan, the Scala counterpart of Java's admitted-declaration count.
+    class_candidate_count: usize,
 }
 
 impl ScalaLazyHierarchyIndex {
+    /// The number of class declarations this pass indexed.
+    fn class_candidate_count(&self) -> usize {
+        self.class_candidate_count
+    }
+
     /// Every class that spells `owner` as a direct supertype, under the
     /// caller's deadline. Polled once per candidate: one candidate is one
     /// ancestor resolution, which is the whole cost of this walk.
@@ -248,6 +278,7 @@ impl ScalaAnalyzer {
         }
 
         ScalaLazyHierarchyIndex {
+            class_candidate_count: candidates.len(),
             contexts,
             types,
             types_by_fq_name,
@@ -310,57 +341,70 @@ impl ScalaAnalyzer {
         let mut ancestors = Vec::new();
         let mut seen = HashSet::default();
         for path in &context.supertype_lookup_paths {
-            let fallback_package = [code_unit.package_name().to_string()];
-            let package_prefixes = if path.package_prefixes().is_empty() {
-                fallback_package.as_slice()
-            } else {
-                path.package_prefixes()
-            };
-            let resolver = ScalaNameResolver::for_file_with_package_context(
-                self,
-                token,
-                Some(code_unit.source()),
-                package_prefixes,
-                &context.imports,
-                types,
-            );
-            let non_wildcard_imports = context
-                .imports
-                .iter()
-                .filter(|import| !import.is_wildcard)
-                .cloned()
-                .collect::<Vec<_>>();
-            let wildcard_baseline =
-                (non_wildcard_imports.len() != context.imports.len()).then(|| {
-                    ScalaNameResolver::for_file_with_package_context(
-                        self,
-                        token,
-                        Some(code_unit.source()),
-                        package_prefixes,
-                        &non_wildcard_imports,
-                        types,
-                    )
-                });
-            let Some(fqn) = self.resolve_hierarchy_supertype_path(
-                types,
-                &resolver,
-                wildcard_baseline.as_ref(),
-                path,
-                package_prefixes,
-                &context.imports,
-            ) else {
+            let Some(fqn) =
+                self.resolve_hierarchy_supertype_fqn(token, code_unit, types, context, path)
+            else {
                 continue;
             };
             if !seen.insert(fqn.clone()) {
                 continue;
             }
-            if let brokk_bifrost_jvm::scala::graph::namespace::ScalaTypeNamespaceResolution::Resolved(definition) =
+            if let ScalaTypeNamespaceResolution::Resolved(definition) =
                 types.exact_type_declaration_for_owner_context(&fqn, code_unit)
             {
                 ancestors.push(definition);
             }
         }
         ancestors
+    }
+
+    /// The workspace type name one supertype path resolves to under its owner's
+    /// package, import and lexical context.
+    ///
+    /// This is the tier ladder both the ancestor graph and the external-root
+    /// walk read (#3454), kept as one function so a descendant edge and an
+    /// external boundary cannot disagree about the same spelling.
+    fn resolve_hierarchy_supertype_fqn(
+        &self,
+        token: QueryToken<'_>,
+        code_unit: &CodeUnit,
+        types: &ScalaProjectTypes,
+        context: &ScalaHierarchyOwnerContext,
+        path: &ScalaSupertypeLookupPath,
+    ) -> Option<String> {
+        let package_prefixes = hierarchy_path_package_prefixes(path, code_unit);
+        let resolver = ScalaNameResolver::for_file_with_package_context(
+            self,
+            token,
+            Some(code_unit.source()),
+            &package_prefixes,
+            &context.imports,
+            types,
+        );
+        let non_wildcard_imports = context
+            .imports
+            .iter()
+            .filter(|import| !import.is_wildcard)
+            .cloned()
+            .collect::<Vec<_>>();
+        let wildcard_baseline = (non_wildcard_imports.len() != context.imports.len()).then(|| {
+            ScalaNameResolver::for_file_with_package_context(
+                self,
+                token,
+                Some(code_unit.source()),
+                &package_prefixes,
+                &non_wildcard_imports,
+                types,
+            )
+        });
+        self.resolve_hierarchy_supertype_path(
+            types,
+            &resolver,
+            wildcard_baseline.as_ref(),
+            path,
+            &package_prefixes,
+            &context.imports,
+        )
     }
 
     fn resolve_hierarchy_supertype_path(
@@ -430,6 +474,339 @@ impl ScalaAnalyzer {
             };
         }
         ScalaHierarchyPackageResolution::NoMatch
+    }
+
+    /// Enumerate every workspace template below one exact external root and the
+    /// members of the queried identity those templates declare (#3454).
+    ///
+    /// This is Scala's half of the shared JVM external boundary. It reads the
+    /// one reviewed JDK model the whole realm activates and answers the same
+    /// question `JavaAnalyzer::resolve_external_member_family` answers from
+    /// Java's persisted hierarchy facts, so the Scala row ships no JDK model of
+    /// its own. The effect is never read from a spelling: only the members of
+    /// templates this walk proves below the exact external root become
+    /// candidates.
+    ///
+    /// The walk uses Scala's own structured hierarchy. The lazy index's
+    /// parser-derived supertype lookup paths decide which templates could sit
+    /// below the root, the same tier ladder the ancestor graph reads decides
+    /// where each spelled supertype lands, and the closure over
+    /// workspace-to-workspace edges is iterative so a deep tree cannot recurse.
+    pub(crate) fn resolve_external_member_family(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        identity: &JvmExternalMemberIdentity,
+        max_visits: usize,
+        cancellation: Option<&crate::cancellation::CancellationToken>,
+    ) -> ExternalMemberFamilyAnswer {
+        if identity.language() != Language::Scala {
+            return ExternalMemberFamilyAnswer::unsupported();
+        }
+        if cancellation.is_some_and(crate::cancellation::CancellationToken::is_cancelled) {
+            return ExternalMemberFamilyAnswer::stopped(ExternalMemberFamilyStatus::Cancelled, 0);
+        }
+        if identity.receiver() == JvmReceiverSemantics::Static {
+            // A static JVM member is reached on the type itself, so no
+            // workspace subtype can override it.
+            return ExternalMemberFamilyAnswer {
+                status: ExternalMemberFamilyStatus::Complete,
+                candidates: Vec::new(),
+                visited: 0,
+            };
+        }
+        let _scope = crate::profiling::scope("ScalaAnalyzer::resolve_external_member_family");
+        let index = self
+            .lazy_hierarchy_index
+            .get_or_init(|| self.build_lazy_hierarchy_index());
+        let scan = index.class_candidate_count();
+        if scan > max_visits {
+            return ExternalMemberFamilyAnswer::stopped(
+                ExternalMemberFamilyStatus::BudgetExhausted,
+                0,
+            );
+        }
+        let mut visited = scan;
+        if index.types_by_fq_name.contains_key(identity.owner_fqn()) {
+            // The workspace declares the queried external name itself, so a
+            // workspace template below that name cannot be told from the
+            // external root.
+            return ExternalMemberFamilyAnswer::incomplete(
+                ExternalMemberFamilyIncompleteReason::ExternalRootUnresolved,
+                visited,
+            );
+        }
+        // A template can only sit below the root when it spells the root's
+        // simple name in an extends clause.
+        let owner_simple = identity
+            .owner_fqn()
+            .rsplit('.')
+            .next()
+            .expect("a canonical external FQN has a last segment");
+        let Some(possible) = index
+            .candidates_by_supertype_simple
+            .get(owner_simple)
+            .filter(|candidates| !candidates.is_empty())
+        else {
+            return ExternalMemberFamilyAnswer {
+                status: ExternalMemberFamilyStatus::Complete,
+                candidates: Vec::new(),
+                visited,
+            };
+        };
+
+        let query_scope = AnalyzerQueryScope::new(self);
+        let token = query_scope.token();
+        let mut direct = Vec::new();
+        let mut below: HashMap<CodeUnit, Vec<CodeUnit>> = HashMap::default();
+        for candidate in possible {
+            if cancellation.is_some_and(crate::cancellation::CancellationToken::is_cancelled) {
+                return ExternalMemberFamilyAnswer::stopped(
+                    ExternalMemberFamilyStatus::Cancelled,
+                    visited,
+                );
+            }
+            let Some(context) = index.contexts.get(candidate) else {
+                return ExternalMemberFamilyAnswer::incomplete(
+                    ExternalMemberFamilyIncompleteReason::HierarchyFactsUnavailable,
+                    visited,
+                );
+            };
+            if context.supertype_lookup_paths.len() > max_visits.saturating_sub(visited) {
+                return ExternalMemberFamilyAnswer::stopped(
+                    ExternalMemberFamilyStatus::BudgetExhausted,
+                    visited,
+                );
+            }
+            visited += context.supertype_lookup_paths.len();
+            for path in &context.supertype_lookup_paths {
+                if let Some(fqn) = self.resolve_hierarchy_supertype_fqn(
+                    token,
+                    candidate,
+                    &index.types,
+                    context,
+                    path,
+                ) {
+                    if let ScalaTypeNamespaceResolution::Resolved(ancestor) = index
+                        .types
+                        .exact_type_declaration_for_owner_context(&fqn, candidate)
+                    {
+                        let ancestor = index.reconcile_ancestor(&ancestor, candidate);
+                        below.entry(ancestor).or_default().push(candidate.clone());
+                    }
+                    continue;
+                }
+                let package_prefixes = hierarchy_path_package_prefixes(path, candidate);
+                match self.external_supertype_landing(
+                    analyzer.semantic_model_overlay(),
+                    candidate.package_name(),
+                    &package_prefixes,
+                    &context.imports,
+                    path,
+                    identity.owner_fqn(),
+                ) {
+                    ScalaExternalRootLanding::ExternalRoot => direct.push(candidate.clone()),
+                    ScalaExternalRootLanding::Other => {}
+                    ScalaExternalRootLanding::Ambiguous => {
+                        return ExternalMemberFamilyAnswer::incomplete(
+                            ExternalMemberFamilyIncompleteReason::ExternalRootUnresolved,
+                            visited,
+                        );
+                    }
+                }
+            }
+        }
+
+        let mut descendants = Vec::new();
+        let mut seen = HashSet::default();
+        let mut stack = direct;
+        while let Some(unit) = stack.pop() {
+            if cancellation.is_some_and(crate::cancellation::CancellationToken::is_cancelled) {
+                return ExternalMemberFamilyAnswer::stopped(
+                    ExternalMemberFamilyStatus::Cancelled,
+                    visited,
+                );
+            }
+            if !seen.insert(unit.clone()) {
+                continue;
+            }
+            if let Some(children) = below.get(&unit) {
+                stack.extend(children.iter().cloned());
+            }
+            descendants.push(unit);
+        }
+        descendants.sort();
+
+        let mut candidates = Vec::new();
+        for descendant in &descendants {
+            if cancellation.is_some_and(crate::cancellation::CancellationToken::is_cancelled) {
+                return ExternalMemberFamilyAnswer::stopped(
+                    ExternalMemberFamilyStatus::Cancelled,
+                    visited,
+                );
+            }
+            let children = analyzer.direct_children(descendant);
+            if children.len() > max_visits.saturating_sub(visited) {
+                return ExternalMemberFamilyAnswer::stopped(
+                    ExternalMemberFamilyStatus::BudgetExhausted,
+                    visited,
+                );
+            }
+            visited += children.len();
+            let mut matching = Vec::new();
+            for child in children {
+                if !child.is_function() || child.identifier() != identity.member() {
+                    continue;
+                }
+                let Some(facts) = MemberFacts::read(analyzer, &child) else {
+                    return ExternalMemberFamilyAnswer::incomplete(
+                        ExternalMemberFamilyIncompleteReason::MemberFactsUnavailable,
+                        visited,
+                    );
+                };
+                // `is_static` means "member of an `object`" in Scala, and an
+                // `object` extending a trait implements that trait's members,
+                // so only the universal exclusions apply here.
+                if facts.universal_exclusion().is_some() {
+                    continue;
+                }
+                let Some(arity) = facts.arity() else {
+                    return ExternalMemberFamilyAnswer::incomplete(
+                        ExternalMemberFamilyIncompleteReason::MemberFactsUnavailable,
+                        visited,
+                    );
+                };
+                if arity.accepts(identity.arity()) {
+                    matching.push(child);
+                }
+            }
+            match matching.as_slice() {
+                [] => {}
+                [only] => candidates.push(only.clone()),
+                [_, _, ..] => {
+                    return ExternalMemberFamilyAnswer::incomplete(
+                        ExternalMemberFamilyIncompleteReason::OverloadIdentityUnproven,
+                        visited,
+                    );
+                }
+            }
+        }
+        candidates.sort();
+        candidates.dedup();
+        ExternalMemberFamilyAnswer {
+            status: ExternalMemberFamilyStatus::Complete,
+            candidates,
+            visited,
+        }
+    }
+
+    /// Where one spelled supertype of a possible descendant lands once the
+    /// indexed workspace has declined to name it (#3454).
+    ///
+    /// The workspace tier ran first, so `Other` here means the spelling is
+    /// external or unanswered, and only the shared external declaration ladder
+    /// can say whether it names the queried root. That ladder is
+    /// [`Self::external_type_spelling_in`], the same one the receiver-typing
+    /// and boundary-evidence paths read, so a class extending the root and a
+    /// receiver of the root's type cannot disagree about one spelling.
+    ///
+    /// A miss is not a proof of absence: a supertype the surface does not
+    /// answer is `Other`, never an invented external root. A bare spelling a
+    /// wildcard import could bind is refused when several wildcard namespaces
+    /// are in scope, because a dependency the surface has not indexed could
+    /// still bind the name.
+    fn external_supertype_landing(
+        &self,
+        packs: Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>,
+        package_name: &str,
+        package_prefixes: &[String],
+        imports: &[ImportInfo],
+        path: &ScalaSupertypeLookupPath,
+        external_root_fqn: &str,
+    ) -> ScalaExternalRootLanding {
+        let external = self.external_declarations(packs);
+        if external.is_empty() {
+            return ScalaExternalRootLanding::Other;
+        }
+        let segments = path.segments();
+        // `_root_.a.b.C` names the root package absolutely; the shared ladder
+        // reads written qualified names, so the marker itself is not a segment.
+        let segments = if segments.first().is_some_and(|root| root == "_root_") {
+            &segments[1..]
+        } else {
+            segments
+        };
+        if segments.is_empty() {
+            return ScalaExternalRootLanding::Other;
+        }
+        let spelling = segments.join(".");
+        // An explicit import or a written qualified name settles the spelling
+        // on its own; only a bare spelling no explicit tier binds is open to
+        // several wildcard namespaces at once.
+        let explicitly_bound = imports
+            .iter()
+            .any(|import| !import.is_wildcard && import.local_name() == Some(spelling.as_str()));
+        if !spelling.contains('.')
+            && !explicitly_bound
+            && self.wildcard_supertype_binding_is_ambiguous(
+                &external,
+                package_name,
+                package_prefixes,
+                imports,
+                &spelling,
+                external_root_fqn,
+            )
+        {
+            return ScalaExternalRootLanding::Ambiguous;
+        }
+        match Self::external_type_spelling_in(&external, package_name, &spelling, imports) {
+            Some(external_type) if external_type.fqn() == external_root_fqn => {
+                ScalaExternalRootLanding::ExternalRoot
+            }
+            _ => ScalaExternalRootLanding::Other,
+        }
+    }
+
+    /// Whether more than one wildcard import in scope could bind a bare
+    /// supertype spelling (#3454).
+    ///
+    /// Scala refuses to pick between two wildcard imports that both bind one
+    /// name. The shared surface only reports what its artifacts and activated
+    /// packs declare, so a second wildcard namespace whose dependency the
+    /// surface has not indexed could still bind the name: the landing is then
+    /// unproven rather than settled by import order, the same refusal Java's
+    /// external-root walk makes.
+    fn wildcard_supertype_binding_is_ambiguous(
+        &self,
+        external: &JvmExternalDeclarations<'_>,
+        package_name: &str,
+        package_prefixes: &[String],
+        imports: &[ImportInfo],
+        spelling: &str,
+        external_root_fqn: &str,
+    ) -> bool {
+        let mut namespaces: Vec<String> = Vec::new();
+        for import in imports {
+            if !import.is_wildcard {
+                continue;
+            }
+            let Some(path) = scala_import_path(import) else {
+                continue;
+            };
+            for candidate in scala_import_path_candidates(&path, package_prefixes) {
+                if !namespaces.contains(&candidate) {
+                    namespaces.push(candidate);
+                }
+            }
+        }
+        if namespaces.len() <= 1 {
+            return false;
+        }
+        namespaces.iter().any(|namespace| {
+            format!("{namespace}.{spelling}") == external_root_fqn
+                || external
+                    .resolve_wildcard_import(namespace, spelling, package_name)
+                    .is_some()
+        })
     }
 
     fn resolve_direct_ancestor_relations(
@@ -550,6 +927,24 @@ fn hierarchy_import_claims_root(
             || (resolver.resolve(root), resolver.resolve_object(root))
                 != (baseline.resolve(root), baseline.resolve_object(root))
     })
+}
+
+/// The package scopes one supertype lookup path resolves its root against.
+///
+/// The scopes the parser established at the owner declaration travel on the
+/// path; a path that carries none falls back to the owner's own package. The
+/// ancestor graph and the external-root walk both read them here, so one
+/// spelled supertype cannot resolve against one package set for a descendant
+/// edge and another for an external boundary (#3454).
+fn hierarchy_path_package_prefixes(
+    path: &ScalaSupertypeLookupPath,
+    owner: &CodeUnit,
+) -> Vec<String> {
+    if path.package_prefixes().is_empty() {
+        vec![owner.package_name().to_string()]
+    } else {
+        path.package_prefixes().to_vec()
+    }
 }
 
 #[cfg(test)]

@@ -1955,15 +1955,18 @@ fn record_explanations(
             SemanticModelActivationStatus::Incompatible => PolicyPackDecisionStatus::Incompatible,
             _ => PolicyPackDecisionStatus::Rejected,
         };
-        let reason =
-            (status != PolicyPackDecisionStatus::Selected).then(|| explanation.reason.clone());
+        // A selection reason is not boilerplate now that a pack can declare a
+        // compatible range instead of an exact build: it names the requirement
+        // that admitted this workspace, which is what makes an
+        // `external_indexed` answer attributable to a stated version contract
+        // (#3465).
         decisions.push(PolicyPackDecision::new(
             explanation
                 .pack_id
                 .clone()
                 .unwrap_or_else(|| explanation.manifest_digest.clone()),
             status,
-            reason,
+            Some(explanation.reason.clone()),
         ));
     }
 }

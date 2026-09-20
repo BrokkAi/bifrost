@@ -849,10 +849,14 @@ fn jdk_toolchain() -> CatalogCoordinate {
 // `register_session_pack` would skip that gate entirely -- exactly the
 // bakeoff-vs-product divergence issue #2558 exists to close.
 
-/// The exact JDK release the pinned `bifrost.jdk` pack targets
-/// (`semantic-packs/jvm/temurin-jdk-21.0.8+9.json`). The installed pack's own
-/// activation selector requires this exact version, so a caller who wants a
-/// different JDK release needs a differently pinned pack, not a flag here.
+/// The exact JDK release the pinned `bifrost.jdk` pack was extracted from
+/// (`semantic-packs/jvm/temurin-jdk-21.0.8+9.json`). The pack's activation
+/// selector accepts the whole `>=21.0.0, <22.0.0` API surface that build
+/// serves (#3465), so the harness names the extraction build itself rather
+/// than an arbitrary member of the range: the measurement is about the pack
+/// whose declarations came from exactly this release. A caller who wants a
+/// different JDK feature release needs a differently pinned pack, not a flag
+/// here.
 const JDK_PACK_VERSION: &str = "21.0.8";
 
 /// Write an evidence-only JDK home: a `release` file naming the exact
