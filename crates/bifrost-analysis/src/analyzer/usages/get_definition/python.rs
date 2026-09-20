@@ -11,7 +11,7 @@ use crate::analyzer::usages::common::same_node;
 use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
 use crate::analyzer::{
     BoundedDefinitionLookup, resolve_fqn_candidates, resolve_module_code_unit,
-    usage_resolve_module_files,
+    retain_modules_for_importer, usage_resolve_module_files,
 };
 use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxSource;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
@@ -207,12 +207,19 @@ impl<'a> PythonDefinitionProvider<'a> {
     /// Resolve one module identity through the request session. The source
     /// trait intentionally exposes the path and definition lookups separately;
     /// preserve their path-first semantics while charging each lookup.
-    fn module_code_unit(&self, module: &str) -> Option<CodeUnit> {
+    ///
+    /// `importer` is the file whose import named `module`. Two sibling source
+    /// roots can spell one module name, so the root that owns the importer is
+    /// what says which of them its import means (#3475); a module no
+    /// containing root owns keeps every candidate and therefore no unique
+    /// identity, which is the honest answer for an interactive lookup.
+    fn module_code_unit(&self, importer: &ProjectFile, module: &str) -> Option<CodeUnit> {
         let path = self.session.query(|| self.python.path_module_fqn(module))?;
-        let candidates = match path {
+        let mut candidates = match path {
             Some(units) => units,
             None => self.session.query(|| self.python.definition_fqn(module))?,
         };
+        retain_modules_for_importer(importer, &mut candidates, CodeUnit::source);
         let candidate = unique_python_candidate(candidates)?;
         candidate.is_module().then_some(candidate)
     }
@@ -295,7 +302,8 @@ pub(crate) fn resolve_python_bounded(
         ));
     };
     if let Some(module_fqn) = python_import_module_fqn(file, source, node)
-        && let Some(Some(module)) = session.query(|| resolve_module_code_unit(python, &module_fqn))
+        && let Some(Some(module)) =
+            session.query(|| resolve_module_code_unit(python, Some(file), &module_fqn))
     {
         return session.finish(candidates_outcome(vec![module]));
     }
@@ -1150,6 +1158,7 @@ fn python_imported_class_candidate(
     if !python_import_binding_is_unique_bounded(support, root, name, site.start_byte(), source)? {
         return None;
     }
+    let mut importer = file.clone();
     let mut module = binding.module_specifier.clone();
     let mut imported_name = imported.clone();
     let mut visited = HashSet::default();
@@ -1158,7 +1167,7 @@ fn python_imported_class_candidate(
         if !support.scope_step() || !visited.insert((module.clone(), imported_name.clone())) {
             return None;
         }
-        let module_unit = support.module_code_unit(&module)?;
+        let module_unit = support.module_code_unit(&importer, &module)?;
         let prepared = support
             .session
             .query(|| support.python.prepared_syntax(token, module_unit.source()))??;
@@ -1192,6 +1201,7 @@ fn python_imported_class_candidate(
             {
                 return None;
             }
+            importer = module_unit.source().clone();
             module = target_binding.module_specifier.clone();
             imported_name = target_binding.imported_name.as_ref()?.clone();
             continue;
@@ -1209,16 +1219,26 @@ fn python_imported_class_candidate(
         )? {
             return None;
         }
+        // The module's own module-scope inventory has already proven one
+        // unconditional binding for this name, so the indexed lookup only has
+        // to hand back that declaration's unit. Two sibling roots can share
+        // one module FQN, so the uniqueness question is which declaration
+        // *this* module file owns, not how many the workspace spells that way.
         let fqn = format!("{}.{}", module_unit.fq_name(), imported_name);
-        let candidate = unique_python_candidate(support.fqn(&fqn))?;
+        let candidate = unique_python_candidate(
+            support
+                .fqn(&fqn)
+                .into_iter()
+                .filter(|candidate| candidate.source() == module_unit.source())
+                .collect(),
+        )?;
         if !support
             .python
             .indexed_source_matches(module_unit.source(), prepared.source())
         {
             return None;
         }
-        return (candidate.is_class() && candidate.source() == module_unit.source())
-            .then_some(candidate);
+        return candidate.is_class().then_some(candidate);
     }
 }
 
@@ -2108,7 +2128,7 @@ pub(super) fn resolve_python(
         );
     };
     if let Some(module_fqn) = python_import_module_fqn(file, source, node)
-        && let Some(module) = resolve_module_code_unit(py, &module_fqn)
+        && let Some(module) = resolve_module_code_unit(py, Some(file), &module_fqn)
     {
         return candidates_outcome(vec![module]);
     }
@@ -2170,6 +2190,7 @@ pub(super) fn resolve_python(
                 return python_fqn_outcome(
                     py,
                     support,
+                    file,
                     &format!("{module}.{attribute_text}"),
                     site.text.as_str(),
                 );
@@ -2322,7 +2343,7 @@ pub(super) fn resolve_python(
                     );
                 }
                 if let Some(module) = ctx.namespace.get(text) {
-                    return python_module_outcome(py, support, module, text);
+                    return python_module_outcome(py, support, file, module, text);
                 }
                 return no_definition(
                     "no_indexed_definition",
@@ -2330,10 +2351,10 @@ pub(super) fn resolve_python(
                 );
             }
             if let Some(module) = ctx.namespace.get(text) {
-                return python_module_outcome(py, support, module, text);
+                return python_module_outcome(py, support, file, module, text);
             }
             if let Some(fqn) = ctx.named.get(text) {
-                return python_fqn_outcome(py, support, fqn, text);
+                return python_fqn_outcome(py, support, file, fqn, text);
             }
             if let Some(candidates) = ctx.same_file.get(text)
                 && !candidates.is_empty()
@@ -2741,14 +2762,16 @@ fn python_visible_module_binding_candidates(
                     };
                     resolved = true;
                     let fqn = format!("{module_fqn}.{imported_name}");
-                    if let Some(module) = resolve_module_code_unit(py, &fqn)
+                    if let Some(module) = resolve_module_code_unit(py, Some(&context.file), &fqn)
                         && module.fq_name() == fqn
                     {
                         candidates.push(module);
                         continue;
                     }
                     let mut imported =
-                        resolve_fqn_candidates(py, &fqn, |candidate| support.fqn(candidate));
+                        resolve_fqn_candidates(py, Some(&context.file), &fqn, |candidate| {
+                            support.fqn(candidate)
+                        });
                     imported
                         .retain(|candidate| !candidate.is_module() || candidate.fq_name() == fqn);
                     candidates.extend(imported);
@@ -2756,7 +2779,9 @@ fn python_visible_module_binding_candidates(
                 if !resolved {
                     if let Some(fqn) = context.named.get(name) {
                         let imported =
-                            resolve_fqn_candidates(py, fqn, |candidate| support.fqn(candidate));
+                            resolve_fqn_candidates(py, Some(&context.file), fqn, |candidate| {
+                                support.fqn(candidate)
+                            });
                         if !imported.is_empty() {
                             candidates.extend(imported);
                             continue;
@@ -2768,7 +2793,9 @@ fn python_visible_module_binding_candidates(
                         format!("{module}.{imported_name}")
                     };
                     let mut resolved_candidates =
-                        resolve_fqn_candidates(py, &fqn, |candidate| support.fqn(candidate));
+                        resolve_fqn_candidates(py, Some(&context.file), &fqn, |candidate| {
+                            support.fqn(candidate)
+                        });
                     if resolved_candidates.is_empty() {
                         // No Python module backs the specifier because it names a
                         // CLR/JVM namespace this workspace indexes in another
@@ -2785,7 +2812,11 @@ fn python_visible_module_binding_candidates(
                     .get(name)
                     .map(String::as_str)
                     .unwrap_or(module);
-                candidates.extend(resolve_module_code_unit(py, bound_module));
+                candidates.extend(resolve_module_code_unit(
+                    py,
+                    Some(&context.file),
+                    bound_module,
+                ));
             }
             ModuleBindingEventKind::Other => {
                 if let Some(local) = context.same_file.get(name) {
@@ -2838,9 +2869,12 @@ fn python_function_import_binding_candidates(
 
     let qualified_name = resolve_python_relative_module(&context.file, &binding.qualified_name)
         .unwrap_or_else(|| binding.qualified_name.clone());
-    Some(resolve_fqn_candidates(py, &qualified_name, |candidate| {
-        support.fqn(candidate)
-    }))
+    Some(resolve_fqn_candidates(
+        py,
+        Some(&context.file),
+        &qualified_name,
+        |candidate| support.fqn(candidate),
+    ))
 }
 
 fn python_same_file_candidates_for_binding_event(
@@ -3199,7 +3233,7 @@ impl PythonDefinitionContext {
         object: &str,
     ) -> Option<CodeUnit> {
         if let Some(fqn) = self.named.get(object) {
-            return python_class_for_fqn(py, support, fqn);
+            return python_class_for_fqn(py, support, &self.file, fqn);
         }
         self.same_file
             .get(object)?
@@ -3427,10 +3461,11 @@ fn python_reference_node(node: Node<'_>) -> Option<PythonReferenceNode<'_>> {
 fn python_fqn_outcome(
     py: &PythonAnalyzer,
     support: &dyn BoundedDefinitionLookup,
+    importer: &ProjectFile,
     fqn: &str,
     raw: &str,
 ) -> DefinitionLookupOutcome {
-    let candidates = resolve_fqn_candidates(py, fqn, |name| support.fqn(name));
+    let candidates = resolve_fqn_candidates(py, Some(importer), fqn, |name| support.fqn(name));
     if !candidates.is_empty() {
         return candidates_outcome(candidates);
     }
@@ -3466,10 +3501,11 @@ fn python_cross_language_declarations(
 fn python_module_outcome(
     py: &PythonAnalyzer,
     support: &dyn BoundedDefinitionLookup,
+    importer: &ProjectFile,
     module_fq: &str,
     raw: &str,
 ) -> DefinitionLookupOutcome {
-    if let Some(module) = resolve_module_code_unit(py, module_fq) {
+    if let Some(module) = resolve_module_code_unit(py, Some(importer), module_fq) {
         return candidates_outcome(vec![module]);
     }
     // Same workspace-namespace gate as the fqn path above, plus the module path
@@ -3493,9 +3529,10 @@ fn python_module_outcome(
 fn python_class_for_fqn(
     py: &PythonAnalyzer,
     support: &dyn BoundedDefinitionLookup,
+    importer: &ProjectFile,
     fqn: &str,
 ) -> Option<CodeUnit> {
-    resolve_fqn_candidates(py, fqn, |name| support.fqn(name))
+    resolve_fqn_candidates(py, Some(importer), fqn, |name| support.fqn(name))
         .into_iter()
         .find(|unit| unit.is_class())
         .or_else(|| {
@@ -3817,7 +3854,7 @@ fn python_receiver_type_unit(
             let binding = binder.bindings.get(receiver)?;
             let imported = binding.imported_name.as_ref()?;
             let fqn = format!("{}.{}", binding.module_specifier, imported);
-            python_class_for_fqn(py, support, &fqn)
+            python_class_for_fqn(py, support, file, &fqn)
         }
         // A call receiver: `Foo().bar` (construction) or `make().bar` (the
         // called function/method's return type).

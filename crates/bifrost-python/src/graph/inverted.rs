@@ -594,7 +594,7 @@ impl PyScan<'_> {
         }
 
         let resolved: Arc<Vec<String>> = Arc::new(
-            resolve_fqn_candidates(self.python, direct, |name| {
+            resolve_fqn_candidates(self.python, None, direct, |name| {
                 self.graph.index.definitions(name).collect()
             })
             .into_iter()

@@ -220,7 +220,7 @@ pub use project::{
 };
 pub(crate) use python::{
     ModuleBindingEventKind, ModuleBindingTimeline, resolve_fqn_candidates,
-    resolve_module_code_unit, usage_resolve_module_files,
+    resolve_module_code_unit, retain_modules_for_importer, usage_resolve_module_files,
 };
 pub use python::{
     PythonAnalyzer, PythonImportBinding,

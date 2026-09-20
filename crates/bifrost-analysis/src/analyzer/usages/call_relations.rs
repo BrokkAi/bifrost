@@ -5222,6 +5222,44 @@ fun caller(holder: Holder): String = holder.value.toString()
         dispatch_kotlin_external_member("com.example.ext.Ext.wrap");
     }
 
+    #[test]
+    fn kotlin_concrete_receiver_local_binding_publishes_external_identity() {
+        let source = "package app\n\nimport com.example.ext.Ext\n\nfun caller(value: String): String {\n    val ext = Ext(value)\n    return ext.wrap(value)\n}\n";
+        let call = "ext.wrap(value)";
+        let fixture = KotlinExternalMemberFixture::new(source);
+        let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
+        let lookup = CallRelationService::dispatch_at_bounded(
+            fixture.analyzer.analyzer(),
+            scope.token(),
+            &ExactCallLocation {
+                file: ProjectFile::new(fixture.root.clone(), "App.kt"),
+                call_span: call_span(source, call),
+            },
+            Arc::from(source),
+            generous_limits(),
+            None,
+        );
+
+        assert!(
+            lookup.targets.is_empty(),
+            "an external declaration is not a workspace target: {lookup:#?}"
+        );
+        assert_eq!(
+            lookup.status,
+            Some(DefinitionLookupStatus::UnresolvableImportBoundary),
+            "the external receiver must report the import-boundary status: {lookup:#?}"
+        );
+        assert_eq!(
+            lookup.boundaries,
+            vec![CallDispatchBoundaryKind::External {
+                callee_text: Some("com.example.ext.Ext.wrap".into()),
+                normalized_static_owner: None,
+                external_callee_identity: None,
+            }],
+            "a caller-local value constructed from the imported external type must keep its package-rooted identity: {lookup:#?}"
+        );
+    }
+
     fn empty_typescript_analyzer() -> (tempfile::TempDir, TypescriptAnalyzer, ProjectFile) {
         let temp = tempfile::tempdir().expect("temp dir");
         let root = temp.path().canonicalize().expect("canonical temp dir");

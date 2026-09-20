@@ -60,18 +60,27 @@ fn python_module_components(file: &ProjectFile) -> Vec<String> {
     components
 }
 
-fn python_package_components_for_file(file: &ProjectFile) -> Vec<String> {
+/// The directory `file`'s path-derived Python module name is relative to: the
+/// analyzer's stand-in for the `sys.path` entry an absolute import of that
+/// module would be resolved against.
+///
+/// It is the nearest configured setuptools import root, else the parent of the
+/// outermost `__init__.py` package chain above the file, else the project root.
+/// The result is always a prefix of the file's own relative path, and it is
+/// what makes two same-named modules in one snapshot distinguishable:
+/// `registry/purview-registry/registry/models.py` and
+/// `registry/sql-registry/registry/models.py` are both the module
+/// `registry.models`, but they belong to different roots (#3475).
+pub fn python_import_root(file: &ProjectFile) -> PathBuf {
     let Some(parent_rel) = file.rel_path().parent() else {
-        return Vec::new();
+        return PathBuf::new();
     };
     if parent_rel.as_os_str().is_empty() {
-        return Vec::new();
+        return PathBuf::new();
     }
 
-    if let Some(import_root_rel) = python_configured_import_root(file, parent_rel)
-        && let Ok(relative_package) = parent_rel.strip_prefix(import_root_rel)
-    {
-        return path_components(relative_package);
+    if let Some(import_root_rel) = python_configured_import_root(file, parent_rel) {
+        return import_root_rel;
     }
 
     let mut effective_package_root_rel: Option<&Path> = None;
@@ -83,13 +92,22 @@ fn python_package_components_for_file(file: &ProjectFile) -> Vec<String> {
         current_rel = path.parent();
     }
 
-    let relative_package = match effective_package_root_rel {
-        Some(package_root_rel) => package_root_rel
-            .parent()
-            .and_then(|import_root_rel| parent_rel.strip_prefix(import_root_rel).ok())
-            .unwrap_or(parent_rel),
-        None => parent_rel,
+    // A package root's own parent is the import root; a file in no package at
+    // all is named from the project root.
+    effective_package_root_rel
+        .and_then(Path::parent)
+        .unwrap_or_else(|| Path::new(""))
+        .to_path_buf()
+}
+
+fn python_package_components_for_file(file: &ProjectFile) -> Vec<String> {
+    let Some(parent_rel) = file.rel_path().parent() else {
+        return Vec::new();
     };
+    let import_root_rel = python_import_root(file);
+    let relative_package = parent_rel
+        .strip_prefix(&import_root_rel)
+        .expect("a Python import root is a prefix of the paths it names modules for");
     path_components(relative_package)
 }
 

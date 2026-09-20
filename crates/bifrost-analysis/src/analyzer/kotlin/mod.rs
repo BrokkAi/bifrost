@@ -910,6 +910,14 @@ impl IAnalyzer for KotlinAnalyzer {
         Some(self)
     }
 
+    /// Kotlin answers the external-root half of the member-family capability
+    /// (workspace implementors of one exact JDK member, #2580) and reports
+    /// `unsupported` for a workspace member's own family; see the provider impl
+    /// in `analyzer/kotlin/hierarchy.rs`.
+    fn member_family_provider(&self) -> Option<&dyn crate::analyzer::usages::MemberFamilyProvider> {
+        Some(self)
+    }
+
     fn parse_errors(&self, file: &ProjectFile) -> Option<Vec<crate::analyzer::ParseError>> {
         self.inner.parse_errors(file)
     }

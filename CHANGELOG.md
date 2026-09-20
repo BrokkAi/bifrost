@@ -5,6 +5,36 @@ analysis behavior, integrations, and release artifacts. It is curated from the
 complete private release range because the public open-core repository is a
 projection and its commit history does not contain every source commit.
 
+## Unreleased
+
+### Added
+
+- The network-effect policy ships its reviewed Kotlin row, reading the shared
+  Java/JVM JDK model one-way instead of a second JDK model. A Kotlin call site
+  that reaches `java.net.URL.openConnection()` through a concrete receiver
+  binds that exact endpoint; a same-name local function never borrows the JDK
+  identity, and an unresolved helper keeps the run open instead of clean.
+
+### Fixed
+
+- A Python absolute import now resolves its module in the source root that
+  owns the importing file. A snapshot that vendors two distributions side by
+  side spells the same module twice -- Feathr's
+  `registry/purview-registry/registry/models.py` and
+  `registry/sql-registry/registry/models.py` are both `registry.models` --
+  and the analyzer previously had no unique identity for that name, so a
+  by-name import of a class in it resolved to nothing and every value the
+  class produced became an `unresolved_call` remainder. Module resolution now
+  prefers the candidate whose own import root contains the importing file, and
+  the nearest such root when more than one does. A module that no containing
+  root owns keeps every candidate, so a cross-root import still resolves and a
+  genuinely ambiguous one is still reported as ambiguous rather than decided
+  by path order. A Python class member is also matched by its owner's own file
+  rather than by the owner's qualified name alone, so two same-named classes no
+  longer lend each other their members and report each other's fields as
+  absent. The persisted Python type-flow adapter semantics move from v50 to
+  v51 because stored class-set facts change.
+
 ## [0.11.5] - 2026-09-16
 
 ### Added

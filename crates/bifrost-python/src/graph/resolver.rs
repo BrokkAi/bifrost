@@ -177,7 +177,7 @@ pub fn resolve_receiver_type(
         return None;
     }
     if raw_type.contains('.') {
-        let candidates = resolve_fqn_candidates(python, raw_type, |name| {
+        let candidates = resolve_fqn_candidates(python, Some(file), raw_type, |name| {
             graph.index.definitions(name).collect()
         })
         .into_iter()
@@ -193,10 +193,11 @@ pub fn resolve_receiver_type(
         && let Some(imported) = binding.imported_name.as_ref()
     {
         let fqn = format!("{}.{}", binding.module_specifier, imported);
-        if let Some(class) =
-            resolve_fqn_candidates(python, &fqn, |name| graph.index.definitions(name).collect())
-                .into_iter()
-                .find(CodeUnit::is_class)
+        if let Some(class) = resolve_fqn_candidates(python, Some(file), &fqn, |name| {
+            graph.index.definitions(name).collect()
+        })
+        .into_iter()
+        .find(CodeUnit::is_class)
         {
             return Some(class);
         }
@@ -253,7 +254,7 @@ fn resolve_bare_annotation_symbol(
         && let Some(imported) = binding.imported_name.as_ref()
     {
         let fqn = format!("{}.{}", binding.module_specifier, imported);
-        let mut imported_candidates = resolve_fqn_candidates(python, &fqn, |name| {
+        let mut imported_candidates = resolve_fqn_candidates(python, Some(file), &fqn, |name| {
             graph
                 .index
                 .definitions(name)
@@ -842,7 +843,7 @@ pub fn resolve_visible_named_import_candidates(
             };
             resolved_module = true;
             let fqn = format!("{module_fqn}.{imported_name}");
-            candidates.extend(resolve_fqn_candidates(python, &fqn, |name| {
+            candidates.extend(resolve_fqn_candidates(python, Some(file), &fqn, |name| {
                 graph.index.definitions(name).collect()
             }));
         }
@@ -852,7 +853,7 @@ pub fn resolve_visible_named_import_candidates(
             } else {
                 format!("{module}.{imported_name}")
             };
-            candidates.extend(resolve_fqn_candidates(python, &fqn, |name| {
+            candidates.extend(resolve_fqn_candidates(python, Some(file), &fqn, |name| {
                 graph.index.definitions(name).collect()
             }));
         }
@@ -895,7 +896,9 @@ pub fn resolve_constructor_types(
             let Some(fqn) = fqn else {
                 return Vec::new();
             };
-            resolve_fqn_candidates(python, &fqn, |name| graph.index.definitions(name).collect())
+            resolve_fqn_candidates(python, Some(file), &fqn, |name| {
+                graph.index.definitions(name).collect()
+            })
         }
         "attribute" => namespace_qualified_declarations(graph, python, file, source, function),
         _ => Vec::new(),
@@ -975,8 +978,9 @@ fn namespace_qualified_declarations(
     let Some(fqn) = namespace_constructor_fqn(&binder, source, node) else {
         return Vec::new();
     };
-    let mut candidates =
-        resolve_fqn_candidates(python, &fqn, |name| graph.index.definitions(name).collect());
+    let mut candidates = resolve_fqn_candidates(python, Some(file), &fqn, |name| {
+        graph.index.definitions(name).collect()
+    });
     candidates.sort();
     candidates.dedup();
     candidates

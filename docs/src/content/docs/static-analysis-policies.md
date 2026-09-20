@@ -381,6 +381,20 @@ classpath, so a Kotlin or Scala call site binds the same reviewed declaration
 through the JVM external identity route, and none of the three rows ships a
 second JDK model.
 
+The Kotlin specialization
+(`bifrost.effects.kotlin.selected-boundary-no-network-io`) is again a separate
+policy with its own stable ID, and it reads that same shared JVM model one-way.
+Nothing Kotlin-specific is added to the model or to the rule body: the
+specialization differs in its declaration-selection block and in the call shape
+its resolver must bind. Kotlin writes a receiver as a *value* -- `val url =
+URL(address)` and then `url.openConnection()` -- so the resolver proves the
+owner type from the receiver's value expression, a local whose initializer
+constructs the imported JDK type, and asks the same external declaration
+surface for the member. A receiver the workspace declares itself stays a
+workspace call: a class with a method named `openConnection` is not the JDK
+method, and a helper the analyzer cannot expand leaves the absence claim unmet
+rather than clean.
+
 <!-- policy-doc-test:rqlp:tests/fixtures/network-effect-boundary/policies/javascript.rqlp -->
 ```lisp
 ; Network-effect boundary for one explicitly selected JavaScript declaration.

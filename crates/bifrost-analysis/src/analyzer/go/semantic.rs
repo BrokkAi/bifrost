@@ -24,7 +24,7 @@ use crate::analyzer::tree_sitter_analyzer::{
 use crate::analyzer::{GoAnalyzer, Language, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 
-const ADAPTER_VERSION: &[u8] = b"go-value-semantics-v77";
+const ADAPTER_VERSION: &[u8] = b"go-value-semantics-v78";
 
 impl_program_semantics_provider!(GoAnalyzer, GoSemanticLowerer);
 
@@ -9333,11 +9333,11 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
                         SemanticValueKind::LanguageDefined("go.zero_value".into())
                     };
                     let zero = self.source_value(builder, *name_node, zero_kind)?;
+                    // A zero-valued declaration establishes its own storage,
+                    // even when an external type's representation is unknown.
+                    self.fresh_binding_values.insert(zero);
                     if let Some(storage) = self.value_storage_kinds.get(&target).copied() {
                         self.value_storage_kinds.insert(zero, storage);
-                        if storage.is_value_aggregate() {
-                            self.fresh_binding_values.insert(zero);
-                        }
                     }
                     if let Some(copy) = self.index_value_copies.get(&target).copied() {
                         self.index_value_copies.insert(zero, copy);
@@ -16195,6 +16195,48 @@ func run() error {
                 "the language-defined value is anchored to its declaration name"
             );
         }
+    }
+
+    #[test]
+    fn external_zero_values_establish_storage_but_initialized_bindings_copy() {
+        let procedures = lower_fixture(
+            r#"package main
+import "example.org/records"
+func run() {
+    var first, second records.Record
+    {
+        var first records.Record
+        _ = first
+    }
+    copied := first
+    _, _ = second, copied
+}
+"#,
+        );
+        let procedure = named_procedure(&procedures, "run");
+        let flows = procedure.points.iter().flat_map(|point| &point.events);
+        let mut zeros = Vec::new();
+        let mut copies = 0;
+        for event in flows {
+            if let SemanticEffect::ValueFlow { source, kind, .. } = event.effect {
+                if matches!(&procedure.values[source.index()].kind,
+                    SemanticValueKind::LanguageDefined(kind) if kind.as_ref() == "go.zero_value")
+                {
+                    assert_eq!(kind, ValueFlowKind::Local, "{event:#?}");
+                    zeros.push(source);
+                } else if matches!(kind, ValueFlowKind::Transfer(_)) {
+                    copies += 1;
+                }
+            }
+        }
+        zeros.sort_unstable();
+        zeros.dedup();
+        assert_eq!(
+            zeros.len(),
+            3,
+            "each declaration owns distinct zero storage"
+        );
+        assert_eq!(copies, 1, "an initialized binding still copies its source");
     }
 
     #[test]

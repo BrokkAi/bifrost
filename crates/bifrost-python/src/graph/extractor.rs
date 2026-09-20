@@ -585,7 +585,7 @@ impl ScanCtx<'_> {
             .filter(CodeUnit::is_module)
             .is_some_and(|owner| {
                 owner.fq_name() == module
-                    || resolve_fqn_candidates(self.python, &module, |name| {
+                    || resolve_fqn_candidates(self.python, Some(self.file), &module, |name| {
                         self.graph.index.definitions(name).collect()
                     })
                     .into_iter()
@@ -742,9 +742,10 @@ impl ScanCtx<'_> {
         })?;
         let qualified_name = resolve_python_relative_module(self.file, &binding.qualified_name)
             .unwrap_or_else(|| binding.qualified_name.clone());
-        let candidates = resolve_fqn_candidates(self.python, &qualified_name, |name| {
-            self.graph.index.definitions(name).collect()
-        });
+        let candidates =
+            resolve_fqn_candidates(self.python, Some(self.file), &qualified_name, |name| {
+                self.graph.index.definitions(name).collect()
+            });
         let imported_target = self.target_owner.as_ref().unwrap_or(self.target);
         Some(
             candidates
@@ -1420,7 +1421,7 @@ fn module_binding_attribute_target_hit<'a>(node: Node<'a>, ctx: &ScanCtx<'_>) ->
             written_fqn.push('.');
             written_fqn.push_str(segment);
         }
-        if resolve_fqn_candidates(ctx.python, &written_fqn, |name| {
+        if resolve_fqn_candidates(ctx.python, Some(ctx.file), &written_fqn, |name| {
             ctx.graph.index.definitions(name).collect()
         })
         .into_iter()
@@ -1523,7 +1524,7 @@ pub fn call_result_types(
     let callables = callable_fqns
         .into_iter()
         .flat_map(|callable_fqn| {
-            resolve_fqn_candidates(python, &callable_fqn, |name| {
+            resolve_fqn_candidates(python, Some(file), &callable_fqn, |name| {
                 graph.index.definitions(name).collect()
             })
         })
@@ -2336,8 +2337,9 @@ fn collect_imported_factory_return_types(
             continue;
         };
         let fqn = format!("{}.{}", binding.module_specifier, imported);
-        let units =
-            resolve_fqn_candidates(python, &fqn, |name| graph.index.definitions(name).collect());
+        let units = resolve_fqn_candidates(python, Some(file), &fqn, |name| {
+            graph.index.definitions(name).collect()
+        });
         for unit in units {
             if unit.is_function() {
                 if let Some(return_type) = callable_return_type_name(graph, python, &unit) {

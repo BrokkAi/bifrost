@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex};
 use crate::declarations::python_module_name;
 use crate::graph_support::{
     PythonSource, PythonUsageSource, export_index_from_file_facts, import_binder_from_imports,
-    import_bindings_from_imports,
+    import_bindings_from_imports, retain_modules_for_importer,
 };
 use crate::imports::{
     literal_importlib_modules, module_replacement_of, resolve_python_relative_module,
@@ -83,10 +83,14 @@ fn resolve_module(
     let Some(resolved_module) = resolved_module else {
         return Vec::new();
     };
-    module_index
+    let mut files = module_index
         .get(&resolved_module)
         .cloned()
-        .unwrap_or_default()
+        .unwrap_or_default();
+    // Two sibling source roots can index the same module name, so the root
+    // that owns the importing file decides which of them its import means.
+    retain_modules_for_importer(importing_file, &mut files, |file| file);
+    files
 }
 
 fn is_sys_namespace_binding(binding: &ImportBinding) -> bool {

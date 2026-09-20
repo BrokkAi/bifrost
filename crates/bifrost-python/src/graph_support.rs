@@ -21,7 +21,7 @@ use brokk_bifrost_core::hash::HashSet;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use crate::declarations::{collect_python_identifiers, parse_python_tree};
+use crate::declarations::{collect_python_identifiers, parse_python_tree, python_import_root};
 use crate::imports::{
     PythonImportDetails, python_import_details, python_import_infos_from_node,
     python_namespace_binding_module, python_namespace_binding_name, resolve_exported_fqn,
@@ -99,14 +99,74 @@ pub fn extract_type_identifiers(source: &str) -> BTreeSet<String> {
     identifiers.into_iter().collect()
 }
 
-pub fn resolve_module_code_unit(python: &dyn PythonSource, module_fq: &str) -> Option<CodeUnit> {
-    if let Some(units) = python.path_module_fqn(module_fq) {
-        return units.into_iter().find(|code_unit| code_unit.is_module());
+/// Keep only the candidates an absolute import written in `importer` can mean.
+///
+/// A Python module name is path-derived and relative to an import root, so one
+/// snapshot that vendors two distributions side by side spells the same module
+/// twice: Feathr's `registry/purview-registry/registry/models.py` and
+/// `registry/sql-registry/registry/models.py` are both `registry.models`
+/// (#3475). Python resolves an absolute import against the `sys.path` entries
+/// the importing program runs with, and the entry always on it is the root the
+/// importing file itself lives under, so that root's module is the one the
+/// import means. An enclosing root qualifies as well as the importer's own
+/// package root, which is what lets a distribution's top-level script import
+/// its own packages; when more than one qualifies, the nearest one shadows the
+/// rest the way a closer `sys.path` entry does.
+///
+/// A candidate set that no containing root owns survives whole. That leaves a
+/// genuine cross-root import resolvable and keeps the ambiguity visible to
+/// whichever caller asked for a unique identity, rather than inventing a
+/// preference the workspace does not state.
+pub fn retain_modules_for_importer<T>(
+    importer: &ProjectFile,
+    candidates: &mut Vec<T>,
+    source_of: impl Fn(&T) -> &ProjectFile,
+) {
+    if candidates.len() < 2 {
+        return;
     }
-    python
-        .definition_fqn(module_fq)
+    let owning_depth = |candidate: &T| {
+        let source = source_of(candidate);
+        debug_assert_eq!(
+            importer.root(),
+            source.root(),
+            "one workspace's Python files share one project root"
+        );
+        let root = python_import_root(source);
+        importer
+            .rel_path()
+            .starts_with(&root)
+            .then(|| root.components().count())
+    };
+    let depths = candidates.iter().map(owning_depth).collect::<Vec<_>>();
+    let Some(nearest) = depths.iter().copied().flatten().max() else {
+        return;
+    };
+    *candidates = std::mem::take(candidates)
         .into_iter()
-        .find(CodeUnit::is_module)
+        .zip(depths)
+        .filter(|(_, depth)| *depth == Some(nearest))
+        .map(|(candidate, _)| candidate)
+        .collect();
+}
+
+/// The module `module_fq` names, as written in `importer`.
+///
+/// `importer` is `None` for an FQN-level question that no import statement
+/// asked -- a dotted name looked up on its own has no import root to be
+/// resolved against. With an importer the candidates are narrowed by
+/// [`retain_modules_for_importer`] first.
+pub fn resolve_module_code_unit(
+    python: &dyn PythonSource,
+    importer: Option<&ProjectFile>,
+    module_fq: &str,
+) -> Option<CodeUnit> {
+    match python.path_module_fqn(module_fq) {
+        // A path lookup that succeeds but finds no module unit is an answer:
+        // it does not fall through to the definition lookup.
+        Some(units) => pick_module_for_importer(importer, units),
+        None => pick_module_for_importer(importer, python.definition_fqn(module_fq)),
+    }
 }
 
 /// Batched sibling of `resolve_module_code_unit`: resolves every FQN's path-symbol lookup in one
@@ -116,6 +176,7 @@ pub fn resolve_module_code_unit(python: &dyn PythonSource, module_fq: &str) -> O
 /// *not* fall through to the definition lookup.
 pub fn resolve_module_code_units_batch(
     python: &dyn PythonSource,
+    importer: Option<&ProjectFile>,
     module_fqs: &[String],
 ) -> Vec<Option<CodeUnit>> {
     let path_results = python.path_module_fqns_batch(module_fqs);
@@ -123,17 +184,28 @@ pub fn resolve_module_code_units_batch(
     let mut needs_definition_fallback = Vec::new();
     for (i, units) in path_results.into_iter().enumerate() {
         match units {
-            Some(units) => results[i] = units.into_iter().find(CodeUnit::is_module),
+            Some(units) => results[i] = pick_module_for_importer(importer, units),
             None => needs_definition_fallback.push(i),
         }
     }
     for i in needs_definition_fallback {
-        results[i] = python
-            .definition_fqn(&module_fqs[i])
-            .into_iter()
-            .find(CodeUnit::is_module);
+        results[i] = pick_module_for_importer(importer, python.definition_fqn(&module_fqs[i]));
     }
     results
+}
+
+fn pick_module_for_importer(
+    importer: Option<&ProjectFile>,
+    units: Vec<CodeUnit>,
+) -> Option<CodeUnit> {
+    let mut modules = units
+        .into_iter()
+        .filter(CodeUnit::is_module)
+        .collect::<Vec<_>>();
+    if let Some(importer) = importer {
+        retain_modules_for_importer(importer, &mut modules, CodeUnit::source);
+    }
+    modules.into_iter().next()
 }
 
 pub fn compute_export_index_of(
@@ -360,7 +432,7 @@ fn record_single_reexport_event(
     // exports, which silently mis-resolves whenever the subpackage re-exports
     // a member named after itself (issue #1762).
     let module_candidate = format!("{resolved_module}.{name}");
-    if resolve_module_code_unit(python, &module_candidate).is_some() {
+    if resolve_module_code_unit(python, Some(file), &module_candidate).is_some() {
         events.push((
             start_byte,
             exported_name,
@@ -444,7 +516,7 @@ pub fn import_bindings_from_imports(
                     // declarations so constructor and receiver inference can
                     // resolve the same names Python places in the namespace.
                     bindings.extend(
-                        public_declarations_in_module(python, &resolved_module)
+                        public_declarations_in_module(python, file, &resolved_module)
                             .into_iter()
                             .map(|declaration| {
                                 let name = declaration.identifier().to_string();
@@ -470,7 +542,7 @@ pub fn import_bindings_from_imports(
                     .map(str::to_string)
                     .unwrap_or_else(|| name.clone());
                 let module_candidate = format!("{resolved_module}.{name}");
-                if resolve_module_code_unit(python, &module_candidate).is_some() {
+                if resolve_module_code_unit(python, Some(file), &module_candidate).is_some() {
                     bindings.push((
                         local_name,
                         ImportBinding {
@@ -498,8 +570,12 @@ pub fn import_bindings_from_imports(
     bindings
 }
 
-pub fn public_declarations_in_module(python: &dyn PythonSource, module_fq: &str) -> Vec<CodeUnit> {
-    let Some(module_code_unit) = resolve_module_code_unit(python, module_fq) else {
+pub fn public_declarations_in_module(
+    python: &dyn PythonSource,
+    importer: &ProjectFile,
+    module_fq: &str,
+) -> Vec<CodeUnit> {
+    let Some(module_code_unit) = resolve_module_code_unit(python, Some(importer), module_fq) else {
         return Vec::new();
     };
     python
@@ -534,12 +610,16 @@ pub fn resolve_base_class(
     if let Some(binding) = binder.bindings.get(trimmed) {
         match binding.kind {
             ImportKind::Namespace => {
-                return resolve_module_code_unit(python, &binding.module_specifier);
+                return resolve_module_code_unit(
+                    python,
+                    Some(code_unit.source()),
+                    &binding.module_specifier,
+                );
             }
             ImportKind::Named => {
                 let imported_name = binding.imported_name.as_ref()?;
                 let fqn = format!("{}.{}", binding.module_specifier, imported_name);
-                return resolve_exported_fqn(python, &fqn)
+                return resolve_exported_fqn(python, Some(code_unit.source()), &fqn)
                     .into_iter()
                     .next()
                     .or_else(|| python.definitions(&fqn).next());

@@ -36,12 +36,14 @@ use brokk_bifrost_core::analyzer::model::{
     StructuredTypeIdentityBuilder, StructuredTypeName,
 };
 use brokk_bifrost_core::analyzer::parsed_file::ParsedFile;
+use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
 use brokk_bifrost_core::analyzer::symbol_path::strip_backtick_quotes;
 use brokk_bifrost_core::analyzer::tree_walk::{
     first_named_child_of_kind as first_named_child, has_token_child,
     named_children as named_children_of,
 };
 use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
+use brokk_bifrost_core::hash::HashSet;
 use tree_sitter::{Node, Tree};
 
 fn kotlin_segment(text: &str, kind: SegmentKind) -> SegmentId {
@@ -97,6 +99,7 @@ pub fn parse_kotlin_file(file: &ProjectFile, source: &str, tree: &Tree) -> Parse
         source,
         package_name: &package_name,
         parsed: &mut parsed,
+        singleton_owners: HashSet::default(),
     };
     visitor.walk(root);
     parsed
@@ -194,6 +197,14 @@ struct KotlinVisitor<'a> {
     source: &'a str,
     package_name: &'a str,
     parsed: &'a mut ParsedFile,
+    /// The type declarations this file writes as singletons: `object` and
+    /// `companion object`. A member of one is reached through the owner's own
+    /// name (`Registry.register()`), not through a receiver value, which is
+    /// what [`SignatureMetadata::with_callable_modifiers`] publishes as the
+    /// static flag. Kotlin gives these owners no spelling marker of their own
+    /// (unlike Scala's `$`-suffixed object names), so the walk that classifies
+    /// the declaration is the only place the fact exists.
+    singleton_owners: HashSet<CodeUnit>,
 }
 
 impl<'a> KotlinVisitor<'a> {
@@ -322,6 +333,9 @@ impl<'a> KotlinVisitor<'a> {
         };
 
         let code_unit = self.declare(CodeUnitType::Class, SegmentKind::Type, &name, node, parent);
+        // Recorded before the body is walked so every member declared inside
+        // it reads the singleton fact from its own owner unit.
+        self.singleton_owners.insert(code_unit.clone());
         // Sliced from source like a class header, so a declared supertype
         // (`object Catalog : Shelver`) survives and an anonymous companion
         // renders as written. The `Companion` identity default above is a
@@ -386,7 +400,19 @@ impl<'a> KotlinVisitor<'a> {
             parent,
         );
         let signature = kotlin_callable_header(node, self.source);
-        let metadata = kotlin_callable_signature_metadata(signature, node, self.source);
+        // A `fun` is an instance member of the type scope that owns it, except
+        // inside an `object` or `companion object`: those owners are
+        // singletons, so their members are reached through the owner's own
+        // name and bind no receiver value. Publishing the fact here is what
+        // lets a consumer decide the declared receiver contract instead of
+        // reporting "nobody looked" (#3453); the same gate is why JavaScript,
+        // TypeScript (#2597), PHP, Ruby (#2912) and Python (#3451) record it.
+        let metadata = kotlin_callable_signature_metadata(signature, node, self.source)
+            .with_callable_modifiers(
+                parent.is_some_and(|owner| self.singleton_owners.contains(owner)),
+                false,
+                kotlin_callable_declared_visibility(node, self.source),
+            );
         self.parsed.add_signature_with_metadata(code_unit, metadata);
     }
 
@@ -710,6 +736,19 @@ pub fn kotlin_declared_visibility(node: Node<'_>, source: &str) -> KotlinDeclare
         };
     }
     KotlinDeclaredVisibility::Public
+}
+
+/// The same fact in the language-neutral vocabulary the persisted callable
+/// metadata states. Kotlin's four tiers map one-to-one: it has no
+/// package-private tier, and `internal` is a module-scoped restriction rather
+/// than the compilation-unit one `Private` states.
+fn kotlin_callable_declared_visibility(node: Node<'_>, source: &str) -> DeclaredVisibility {
+    match kotlin_declared_visibility(node, source) {
+        KotlinDeclaredVisibility::Public => DeclaredVisibility::Public,
+        KotlinDeclaredVisibility::Protected => DeclaredVisibility::Protected,
+        KotlinDeclaredVisibility::Internal => DeclaredVisibility::Internal,
+        KotlinDeclaredVisibility::Private => DeclaredVisibility::Private,
+    }
 }
 
 /// Whether the declaration's `modifiers` list contains `keyword` as a modifier
@@ -1138,6 +1177,123 @@ class Widget(val value: Int) {
             metadata
                 .iter()
                 .all(SignatureMetadata::callable_is_constructor)
+        );
+    }
+
+    /// #3453: which receiver a Kotlin `fun` binds is a property of the
+    /// declaration's own shape, and the walk publishes it instead of leaving
+    /// `callable_modifiers_recorded` false. That flag is the difference between
+    /// "declares no static modifier" and "nobody read the modifiers": an
+    /// adapter that never records it makes `receiver_contract_of` report no
+    /// contract, which refuses a modeled-procedure key for every Kotlin
+    /// workspace callable and leaves every effect summary inert.
+    #[test]
+    fn callable_metadata_records_kotlin_receiver_contracts_structurally() {
+        let source = r#"package contracts
+
+fun free(value: Int): Int = value
+
+private fun hidden(value: Int): Int = value
+
+internal fun module(value: Int): Int = value
+
+fun Int.shifted(by: Int): Int = this + by
+
+interface Drawable {
+    fun draw(): String
+}
+
+class Widget {
+    fun render(target: String): String = target
+
+    companion object {
+        fun build(spec: String): String = spec
+    }
+}
+
+object Registry {
+    fun register(name: String): String = name
+}
+"#;
+        let (_, parsed) = parse(source);
+        let entry = |fq_name: &str| {
+            parsed
+                .signature_metadata
+                .iter()
+                .find(|(unit, _)| unit.fq_name() == fq_name)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "missing Kotlin declaration {fq_name}; recorded {:?}",
+                        parsed
+                            .signature_metadata
+                            .keys()
+                            .map(CodeUnit::fq_name)
+                            .collect::<Vec<_>>()
+                    )
+                })
+        };
+        let modifiers = |fq_name: &str| {
+            let (_, entries) = entry(fq_name);
+            let metadata = entries
+                .first()
+                .unwrap_or_else(|| panic!("{fq_name} carries no signature metadata"));
+            assert!(
+                metadata.callable_modifiers_recorded(),
+                "{fq_name} must record that the walk read its modifier nodes"
+            );
+            (
+                metadata.callable_is_static(),
+                metadata.callable_is_constructor(),
+                metadata.callable_declared_visibility(),
+            )
+        };
+
+        assert_eq!(
+            modifiers("contracts.free"),
+            (false, false, Some(DeclaredVisibility::Public)),
+            "a top-level function is reached by its package path, not a receiver"
+        );
+        assert_eq!(
+            modifiers("contracts.hidden"),
+            (false, false, Some(DeclaredVisibility::Private))
+        );
+        assert_eq!(
+            modifiers("contracts.module"),
+            (false, false, Some(DeclaredVisibility::Internal))
+        );
+        assert_eq!(
+            modifiers("contracts.Drawable.draw"),
+            (false, false, Some(DeclaredVisibility::Public)),
+            "an interface member is dispatched through a receiver value"
+        );
+        assert_eq!(
+            modifiers("contracts.Widget.render"),
+            (false, false, Some(DeclaredVisibility::Public)),
+            "a class member is an instance member"
+        );
+        assert_eq!(
+            modifiers("contracts.Widget.Companion.build"),
+            (true, false, Some(DeclaredVisibility::Public)),
+            "a companion object is a singleton: `Widget.build()` binds no receiver"
+        );
+        assert_eq!(
+            modifiers("contracts.Registry.register"),
+            (true, false, Some(DeclaredVisibility::Public)),
+            "an object is a singleton: `Registry.register()` binds no receiver"
+        );
+        assert_eq!(
+            modifiers("contracts.shifted"),
+            (false, false, Some(DeclaredVisibility::Public)),
+            "an extension function's receiver is the extended value, not its owner"
+        );
+        let (_, extension_entries) = entry("contracts.shifted");
+        assert!(
+            extension_entries
+                .first()
+                .expect("signature metadata")
+                .extension_receiver_type()
+                .is_some(),
+            "the extended type stays the published extension fact"
         );
     }
 

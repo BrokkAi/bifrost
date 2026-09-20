@@ -1658,11 +1658,70 @@ fn kotlin_bare_call_outcome(
             "ambiguous_kotlin_type",
             format!("`{name}` is bound to different owners by more than one Kotlin star import"),
         ),
-        KotlinTypeName::Unresolved => no_definition(
-            "no_indexed_definition",
-            format!("`{name}` is not indexed as a Kotlin callable or type"),
-        ),
+        KotlinTypeName::Unresolved => {
+            // A bare callee the workspace knows nothing about is still a
+            // construction when Kotlin's own import ladder binds the spelling
+            // to a type the shared JVM external surface declares: with
+            // `import java.net.URL`, `URL(address)` constructs `java.net.URL`
+            // (#3453). The claim names the spelling that was written rather
+            // than a canonical identity, exactly as the Java constructor path
+            // claims its type text: a source spelling proves no package root
+            // for Kotlin, so only the trace may refine it to the external
+            // declaration, and the call-binding path must keep refusing to
+            // mint an external callee identity from it (#2781).
+            if kotlin_bare_call_names_external_type(ctx, &scope, name) {
+                return gated_boundary(
+                    || !kotlin_type_leaves_the_workspace(ctx, &scope, &[name]),
+                    format!(
+                        "`{name}` appears to cross a Kotlin import boundary not indexed in this workspace"
+                    ),
+                    UnindexedClaim::external_boundary(name.to_owned(), ClaimSubjectRole::Type),
+                    "no_indexed_definition",
+                    format!("`{name}` is not indexed as a Kotlin callable or type"),
+                );
+            }
+            no_definition(
+                "no_indexed_definition",
+                format!("`{name}` is not indexed as a Kotlin callable or type"),
+            )
+        }
     }
+}
+
+/// Whether a bare callee spelling binds, through Kotlin's own import ladder, to
+/// a type the shared JVM external declaration surface declares.
+///
+/// The ladder is the same `resolve_kotlin_type_name` every other Kotlin name
+/// runs through; only the "does this fully-qualified name exist" predicate
+/// differs. The workspace already answered `Unresolved` before this is asked,
+/// so a hit here means the spelling is a dependency type the JVM realm
+/// publishes (`import java.net.URL` then `URL(address)`) rather than a name
+/// nothing declares. An explicit import stays terminal in the ladder, so an
+/// import whose target neither the workspace nor the external surface declares
+/// answers no and keeps the plain miss.
+fn kotlin_bare_call_names_external_type(
+    ctx: &KotlinCtx<'_>,
+    scope: &KotlinScope,
+    name: &str,
+) -> bool {
+    let Some(kotlin) = resolve_analyzer::<KotlinAnalyzer>(ctx.analyzer) else {
+        return false;
+    };
+    ctx.session
+        .query_optional(|| {
+            let external = kotlin.external_declarations(ctx.overlay.clone());
+            if external.is_empty() {
+                return None;
+            }
+            let package_name = scope.facts.package_name.as_str();
+            resolve_kotlin_type_name(name, &scope.as_name_scope(), |candidate| {
+                external
+                    .resolve_qualified_name(candidate, package_name)
+                    .is_some()
+            })
+            .resolved()
+        })
+        .is_some()
 }
 
 /// The declarations a constructor call `Type(...)` names.
@@ -1975,7 +2034,9 @@ fn kotlin_member_outcome(
 /// what lets the trace name the external declaration the reference landed on.
 /// This is the same seam `java_unresolved_receiver_outcome` uses, through the
 /// same [`gated_boundary`] and the same member surface; only the owner ladder
-/// is Kotlin's, so an aliased import reaches the declaration its alias names.
+/// is Kotlin's, so an aliased import reaches the declaration its alias names,
+/// and a receiver written as a *value* reaches the type its expression proves
+/// (#3453).
 ///
 /// Anything else keeps the plain unresolved-receiver miss, so a receiver of
 /// unknown type and a member no surface declares are both unchanged.
@@ -1987,7 +2048,11 @@ fn kotlin_unresolved_receiver_outcome(
     unresolved_kind: &str,
     unresolved_message: String,
 ) -> DefinitionLookupOutcome {
-    let Some(spelling) = kotlin_external_member_spelling(ctx, receiver, member) else {
+    let spelling = kotlin_external_member_spelling(ctx, receiver, member).or_else(|| {
+        kotlin_value_receiver_owner_spelling(ctx, token, receiver, 0)
+            .map(|owner| format!("{owner}.{member}"))
+    });
+    let Some(spelling) = spelling else {
         return no_definition(unresolved_kind, unresolved_message);
     };
     let declared = resolve_analyzer::<KotlinAnalyzer>(ctx.analyzer).and_then(|kotlin| {
@@ -2000,6 +2065,32 @@ fn kotlin_unresolved_receiver_outcome(
             )
         })
     });
+    if let Some(declared) = declared.as_ref() {
+        // gated upstream: `resolve_member_name_with_external` reads only the
+        // external declaration surface -- jar-indexed and pack-declared owners
+        // -- never a workspace declaration, so the member it answered is
+        // outside this workspace by construction. The workspace half was
+        // already asked in `kotlin_member_outcome`: a receiver this workspace
+        // can type returns its own member candidates before this point, so a
+        // workspace declaration of the owner type, or of a member on it,
+        // would have answered there rather than here.
+        let canonical = declared.fqn().to_owned();
+        trace::record_named_boundary(canonical.clone());
+        let mut outcome = boundary_unchecked(
+            format!(
+                "`{canonical}` names a member of a JVM type declared outside the indexed workspace"
+            ),
+            UnindexedClaim::external_boundary(canonical.clone(), ClaimSubjectRole::Member),
+        );
+        // The canonical identity is the one publication both consumers read:
+        // the call-binding path re-resolves it through the same surface, and
+        // the trace names the declaration the reference landed on rather than
+        // the receiver variable it was written through (#3466).
+        let mut reference = ctx.site.clone();
+        reference.text = canonical;
+        outcome.reference = Some(reference);
+        return outcome;
+    }
     // gated upstream is *not* claimed here: the closure below is the workspace
     // check itself. The surface reads only jar-indexed and pack-declared
     // owners, never a workspace declaration, so a name it answers is by
@@ -2036,6 +2127,109 @@ fn kotlin_external_member_spelling(
         return None;
     }
     Some(format!("{path}.{member}"))
+}
+
+/// The owner type a Kotlin receiver *value expression* proves (#3453).
+///
+/// [`kotlin_external_member_spelling`] reads a receiver that spells a type.
+/// This reads the other shape Kotlin writes: a receiver that is a value whose
+/// static type the file states but the workspace does not index -- a parameter
+/// or local whose written type names an imported dependency type, or a local
+/// whose initializer constructs one (`val url = URL(address)`). The caller
+/// turns the owner this returns into the same `Owner.member` spelling, so the
+/// external declaration surface stays the one thing that decides whether the
+/// member is declared; the value expression only says which owner to ask.
+///
+/// Nothing here reads the receiver *variable* name. The derivation walks the
+/// binding's written type or its constructor call, so a local named like a
+/// dependency type proves nothing by itself, and a receiver this ladder cannot
+/// read keeps the plain unresolved-receiver miss it had.
+fn kotlin_value_receiver_owner_spelling(
+    ctx: &KotlinCtx<'_>,
+    token: QueryToken<'_>,
+    node: Node<'_>,
+    depth: usize,
+) -> Option<String> {
+    if depth > MAX_RECEIVER_DEPTH {
+        return None;
+    }
+    match node.kind() {
+        "postfix_expression" | "parenthesized_expression" => kotlin_value_receiver_owner_spelling(
+            ctx,
+            token,
+            named_children(node).into_iter().next()?,
+            depth + 1,
+        ),
+        // `(value as URL).openConnection()`: the assertion is a written type,
+        // read exactly as a binding's written type is.
+        "as_expression" => {
+            let asserted = named_children(node).into_iter().next_back()?;
+            kotlin_type_node_spelling(ctx, asserted)
+        }
+        "simple_identifier" => {
+            let binding = kotlin_local_binding(node, ctx.source, ctx.text(node))?;
+            if let Some(spelled) = kotlin_declared_type_spelling(ctx, binding) {
+                return Some(spelled);
+            }
+            let property = binding
+                .parent()
+                .filter(|parent| parent.kind() == "property_declaration")?;
+            let initializer = named_children(property)
+                .into_iter()
+                .rev()
+                .find(|child| kotlin_is_expression_kind(child.kind()))?;
+            kotlin_constructed_owner_spelling(ctx, token, initializer, depth + 1)
+        }
+        _ => None,
+    }
+}
+
+/// The type a constructor-shaped initializer constructs, when the call names a
+/// type this workspace does not declare (#3453).
+///
+/// `val url = URL(address)` and `val url: URL = URL(address)` both leave the
+/// local's written type unstated or unindexed, and Kotlin writes a constructor
+/// call with the same syntax as any other call, so the reading is only sound
+/// while the workspace has no answer for the call: a workspace callable named
+/// `URL` returns a type the workspace knows, and its value is then a workspace
+/// fact this ladder must not guess around. The external declaration surface
+/// still has the last word, because the owner it is handed must be a type that
+/// surface declares before any member is reported.
+fn kotlin_constructed_owner_spelling(
+    ctx: &KotlinCtx<'_>,
+    token: QueryToken<'_>,
+    node: Node<'_>,
+    depth: usize,
+) -> Option<String> {
+    if depth > MAX_RECEIVER_DEPTH {
+        return None;
+    }
+    match node.kind() {
+        "postfix_expression" | "parenthesized_expression" => kotlin_constructed_owner_spelling(
+            ctx,
+            token,
+            named_children(node).into_iter().next()?,
+            depth + 1,
+        ),
+        "call_expression" => {
+            let callee = kotlin_callee(node)?;
+            let (_, path) = kotlin_receiver_name_path(ctx, callee)?;
+            if callee.kind() == "simple_identifier" {
+                let outcome = kotlin_bare_call_outcome(
+                    ctx,
+                    token,
+                    callee,
+                    ctx.text(callee),
+                    Some(kotlin_call_arity(node)),
+                );
+                if !outcome.definitions.is_empty() {
+                    return None;
+                }
+            }
+            Some(path)
+        }
+        _ => None,
+    }
 }
 
 /// The dotted name a Kotlin receiver expression spells, and the identifier its

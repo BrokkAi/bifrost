@@ -618,6 +618,13 @@ pub(super) fn kotlin_epoch_before_type_alias_type_identity() -> String {
     compute_epoch::<Kotlin>(&crate::analyzer::kotlin::language::LANGUAGE.into(), prior)
 }
 
+/// The Kotlin epoch as it stood before the #3453 callable-modifier bump.
+#[cfg(test)]
+pub(super) fn kotlin_epoch_before_callable_modifier_metadata() -> String {
+    let prior = salt_before_bump(Kotlin::SALT, "kotlin-callable-modifier-metadata-2026-09");
+    compute_epoch::<Kotlin>(&crate::analyzer::kotlin::language::LANGUAGE.into(), prior)
+}
+
 #[cfg(test)]
 pub(super) fn scala_epoch_before_type_alias_type_identity() -> String {
     let prior = salt_before_bump(Scala::SALT, "scala-type-alias-type-identity-2026-09");
@@ -1223,11 +1230,21 @@ lang_epoch!(
 // declarations.
 // Salt bumped (#3202): written constructors are source declarations, so
 // their binding signatures and dispatch targets retain source identity.
+// Salt bumped (#3453): the Kotlin declaration walk now records callable
+// modifier metadata -- the declared visibility, and whether the owning type
+// scope is an `object`/`companion object` singleton, whose members bind no
+// receiver value. Rows persisted before it deserialize as "nobody read the
+// modifiers", so `receiver_contract_of` reports no contract,
+// `modeled_procedure_key_for_unit` refuses every Kotlin workspace
+// declaration, and every Kotlin procedure summary stays inert on a warm
+// workspace with no error raised anywhere. The same gap was bumped for
+// JavaScript and TypeScript (#2597), PHP and Ruby (#2912), and Python
+// (#3451).
 lang_epoch!(
     Kotlin,
     "kotlin",
     "treesitter/kotlin/",
-    "brokk-tree-sitter-kotlin-0.4.6-2026-09;kotlin-core-indexing-2026-07;kotlin-class-parameter-default-arity-2026-07;kotlin-backtick-identifier-names-2026-07;kotlin-jvm-realm-imports-supertypes-2026-07;kotlin-signature-returns-receivers-2026-07;kotlin-companion-object-marker-2026-07;kotlin-structured-signature-types-2026-08;jvm-query-assets-in-brokk-bifrost-jvm-2026-08;kotlin-constructor-callable-metadata-2026-08;declaration-type-parameter-arity-2026-09;kotlin-type-alias-type-identity-2026-09;kotlin-call-binding-constructor-identity-2026-09"
+    "brokk-tree-sitter-kotlin-0.4.6-2026-09;kotlin-core-indexing-2026-07;kotlin-class-parameter-default-arity-2026-07;kotlin-backtick-identifier-names-2026-07;kotlin-jvm-realm-imports-supertypes-2026-07;kotlin-signature-returns-receivers-2026-07;kotlin-companion-object-marker-2026-07;kotlin-structured-signature-types-2026-08;jvm-query-assets-in-brokk-bifrost-jvm-2026-08;kotlin-constructor-callable-metadata-2026-08;declaration-type-parameter-arity-2026-09;kotlin-type-alias-type-identity-2026-09;kotlin-call-binding-constructor-identity-2026-09;kotlin-callable-modifier-metadata-2026-09"
 );
 
 #[cfg(test)]

@@ -626,7 +626,8 @@ pub fn resolve_imports_batched(
         .map(|import| primary_module_fqn(file, import))
         .collect();
     let to_resolve: Vec<String> = primary_fqns.iter().flatten().cloned().collect();
-    let mut batch_results = resolve_module_code_units_batch(python, &to_resolve).into_iter();
+    let mut batch_results =
+        resolve_module_code_units_batch(python, Some(file), &to_resolve).into_iter();
 
     imports
         .iter()
@@ -744,7 +745,7 @@ fn resolve_import_with_hint(
                     python_namespace_binding_module(import, alias.as_deref(), &module);
                 let resolved = match primary_hint {
                     Some(hint) => hint.clone(),
-                    None => resolve_module_code_unit(python, &bound_module),
+                    None => resolve_module_code_unit(python, Some(file), &bound_module),
                 };
                 if let Some(module_code_unit) = resolved {
                     return vec![(binding, module_code_unit)];
@@ -765,7 +766,7 @@ fn resolve_import_with_hint(
                     return Vec::new();
                 };
                 if wildcard {
-                    return public_declarations_in_module(python, &resolved_module)
+                    return public_declarations_in_module(python, file, &resolved_module)
                         .into_iter()
                         .map(|code_unit| (code_unit.identifier().to_string(), code_unit))
                         .collect();
@@ -775,12 +776,13 @@ fn resolve_import_with_hint(
                 let module_candidate = format!("{resolved_module}.{name}");
                 let resolved = match primary_hint {
                     Some(hint) => hint.clone(),
-                    None => resolve_module_code_unit(python, &module_candidate),
+                    None => resolve_module_code_unit(python, Some(file), &module_candidate),
                 };
                 if let Some(code_unit) = resolved {
                     return vec![(binding, code_unit)];
                 }
-                let exported = resolve_exported_name_from_module(python, &resolved_module, &name);
+                let exported =
+                    resolve_exported_name_from_module(python, Some(file), &resolved_module, &name);
                 if !exported.is_empty() {
                     return exported
                         .into_iter()
@@ -809,31 +811,43 @@ fn resolve_import_with_hint(
     Vec::new()
 }
 
-pub fn resolve_exported_fqn(python: &dyn PythonSource, fqn: &str) -> Vec<CodeUnit> {
+/// `importer`, when known, is the file whose import statement asked for `fqn`;
+/// its own import root is what decides between two same-named modules. `None`
+/// is for an FQN-level question no import statement asked.
+pub fn resolve_exported_fqn(
+    python: &dyn PythonSource,
+    importer: Option<&ProjectFile>,
+    fqn: &str,
+) -> Vec<CodeUnit> {
     let Some((module, name)) = fqn.rsplit_once('.') else {
         return Vec::new();
     };
-    resolve_exported_name_from_module(python, module, name)
+    resolve_exported_name_from_module(python, importer, module, name)
 }
 
 /// Resolve an unambiguous chain of explicit named reexports without
 /// constructing export indexes for each intermediate module. Star exports,
 /// shadowing, and every other ambiguous shape return `None` so callers can
 /// use the complete, source-order-aware export resolver below.
+///
+/// Each hop carries its own importer: the first is the file that asked, and
+/// every later one is the module whose reexport named the next specifier, so
+/// a facade chain stays inside the roots that actually wrote it.
 fn resolve_direct_named_exported_fqn(
     python: &dyn PythonSource,
+    importer: Option<&ProjectFile>,
     fqn: &str,
 ) -> Option<Vec<CodeUnit>> {
     let (module, name) = fqn.rsplit_once('.')?;
     let mut results = Vec::new();
-    let mut queue = VecDeque::from([(module.to_string(), name.to_string())]);
+    let mut queue = VecDeque::from([(importer.cloned(), module.to_string(), name.to_string())]);
     let mut visited = HashSet::default();
 
-    while let Some((module, export_name)) = queue.pop_front() {
+    while let Some((importer, module, export_name)) = queue.pop_front() {
         if !visited.insert((module.clone(), export_name.clone())) {
             continue;
         }
-        let module_unit = resolve_module_code_unit(python, &module)?;
+        let module_unit = resolve_module_code_unit(python, importer.as_ref(), &module)?;
         let file = module_unit.source();
         let local = local_export_declarations(python, file, &export_name);
         let binder = python.import_binder_of(file);
@@ -850,7 +864,11 @@ fn resolve_direct_named_exported_fqn(
             return None;
         }
         let imported_name = binding.imported_name.as_ref()?;
-        queue.push_back((binding.module_specifier.clone(), imported_name.clone()));
+        queue.push_back((
+            Some(file.clone()),
+            binding.module_specifier.clone(),
+            imported_name.clone(),
+        ));
     }
 
     results.sort_by(|left, right| {
@@ -866,15 +884,20 @@ fn resolve_direct_named_exported_fqn(
 /// can answer it. The direct reexport walk handles only proven,
 /// collision-free chains; ambiguous shapes use the ordered export index,
 /// and the exact lookup remains the final fallback for non-export symbols.
+///
+/// The first two tiers resolve a module specifier, so they take `importer`
+/// for the same reason the import resolver does. The exact lookup is a
+/// workspace-wide question about a dotted name and stays root-blind.
 pub fn resolve_fqn_candidates(
     python: &dyn PythonSource,
+    importer: Option<&ProjectFile>,
     fqn: &str,
     exact: impl FnOnce(&str) -> Vec<CodeUnit>,
 ) -> Vec<CodeUnit> {
-    if let Some(candidates) = resolve_direct_named_exported_fqn(python, fqn) {
+    if let Some(candidates) = resolve_direct_named_exported_fqn(python, importer, fqn) {
         return candidates;
     }
-    let candidates = resolve_exported_fqn(python, fqn);
+    let candidates = resolve_exported_fqn(python, importer, fqn);
     if !candidates.is_empty() {
         return candidates;
     }
@@ -883,10 +906,11 @@ pub fn resolve_fqn_candidates(
 
 fn resolve_exported_name_from_module(
     python: &dyn PythonSource,
+    importer: Option<&ProjectFile>,
     module: &str,
     name: &str,
 ) -> Vec<CodeUnit> {
-    let Some(module_unit) = resolve_module_code_unit(python, module) else {
+    let Some(module_unit) = resolve_module_code_unit(python, importer, module) else {
         return Vec::new();
     };
     resolve_exported_name(python, module_unit.source(), name)
@@ -925,7 +949,11 @@ fn resolve_exported_name(
                 ExportEntry::ReexportedModule { module_specifier } => {
                     // Terminal: the export *is* the module, so the walk stops
                     // here instead of looking the name up inside it.
-                    results.extend(resolve_module_code_unit(python, module_specifier));
+                    results.extend(resolve_module_code_unit(
+                        python,
+                        Some(&file),
+                        module_specifier,
+                    ));
                 }
                 ExportEntry::Default { local_name } => {
                     if let Some(local_name) = local_name {
@@ -989,7 +1017,7 @@ fn resolve_module_files_for_export(
     // Tree-sitter tells us the import syntax, but module-to-file resolution
     // is analyzer state. Use the prebuilt module code-unit map here instead
     // of the usage index so interactive definition lookup stays lightweight.
-    resolve_module_code_unit(python, &resolved_module)
+    resolve_module_code_unit(python, Some(importing_file), &resolved_module)
         .map(|unit| vec![unit.source().clone()])
         .unwrap_or_default()
 }

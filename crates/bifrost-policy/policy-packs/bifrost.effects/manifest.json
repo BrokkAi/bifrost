@@ -44,6 +44,25 @@
       "remediation": "Move the effect to the caller, or make the selected declaration's helper chain reach no declared network effect. Configure the declaration-selection block with the exact declaration this repository protects before enabling the policy."
     },
     {
+      "path": "policies/kotlin/selected-boundary-no-network-io.rqlp",
+      "id": "bifrost.effects.kotlin.selected-boundary-no-network-io",
+      "authored_hash": "2cd358e0221e62921bea27cfb293ffe60d80bf4e231bede43b88533fa3e97f51",
+      "resolved_semantic_hash": "2cd358e0221e62921bea27cfb293ffe60d80bf4e231bede43b88533fa3e97f51",
+      "category": "effects",
+      "supported_languages": [
+        "kotlin"
+      ],
+      "required_capabilities": [
+        "semantic-model-declared-effects",
+        "transitive-procedure-effects",
+        "exhaustive-effect-coverage",
+        "module-identity-declaration-selection",
+        "external-api-identity"
+      ],
+      "severity_rationale": "A declaration the repository reviewed as a pure calculation reaching network I/O breaks the boundary the review relied on and can turn a local computation into an externally visible side effect.",
+      "remediation": "Move the effect to the caller, or make the selected declaration's helper chain reach no declared network effect. Configure the declaration-selection block with the exact declaration this repository protects before enabling the policy."
+    },
+    {
       "path": "policies/python/selected-boundary-no-network-io.rqlp",
       "id": "bifrost.effects.python.selected-boundary-no-network-io",
       "authored_hash": "a97dc7d6d32604e0146f986f071ae42200003aed516dbb7b8fece2dbfe015943",

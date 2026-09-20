@@ -18,6 +18,7 @@ use brokk_bifrost_core::analyzer::capabilities::{
 };
 use brokk_bifrost_core::analyzer::model::{CodeUnit, ImportInfo, Range};
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
+use brokk_bifrost_core::cancellation::CancellationToken;
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 
 use crate::kotlin::graph_support::KotlinSource;
@@ -197,6 +198,248 @@ fn hierarchy_definition_key(
         unit.signature().unwrap_or("").to_ascii_lowercase(),
         format!("{:?}", unit.kind()),
     )
+}
+
+/// Why a bounded external-root hierarchy walk could not prove its descendant
+/// set complete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KotlinExternalRootHierarchyIncompleteReason {
+    HierarchyFactsUnavailable,
+    AmbiguousSupertype,
+}
+
+/// Completion status of a workspace hierarchy walk rooted at one exact
+/// external JVM type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KotlinExternalRootHierarchyStatus {
+    Complete,
+    Incomplete(KotlinExternalRootHierarchyIncompleteReason),
+    Cancelled,
+    BudgetExhausted,
+}
+
+/// Exact workspace descendants of one external Kotlin-visible JVM root.
+#[derive(Debug, Clone)]
+pub struct KotlinExternalRootHierarchyAnswer {
+    pub status: KotlinExternalRootHierarchyStatus,
+    pub descendants: Vec<CodeUnit>,
+    pub visited: usize,
+}
+
+impl KotlinExternalRootHierarchyAnswer {
+    fn stopped(status: KotlinExternalRootHierarchyStatus, visited: usize) -> Self {
+        debug_assert!(status != KotlinExternalRootHierarchyStatus::Complete);
+        Self {
+            status,
+            descendants: Vec::new(),
+            visited,
+        }
+    }
+}
+
+struct KotlinHierarchyTypeBucket {
+    winner: usize,
+    declarations: Vec<usize>,
+}
+
+/// Enumerate every workspace Kotlin type below one exact external root.
+///
+/// This is the external-root counterpart to
+/// [`build_kotlin_direct_descendant_index`]. It consumes the same persisted,
+/// AST-derived hierarchy facts, but retains an edge when Kotlin's type-name
+/// ladder resolves a raw supertype to `external_root_fqn`. The root itself is
+/// not represented by a fabricated [`CodeUnit`]. Instead, direct external edges
+/// seed an iterative walk over the ordinary workspace-to-workspace edges.
+///
+/// `external_root_fqn` is the resolver-owned canonical identity at the
+/// dispatch boundary. Scanning every admitted declaration is required even for
+/// a complete-empty answer, so `max_visits` is checked before the candidate
+/// index is built.
+pub fn build_kotlin_external_root_hierarchy<Fact>(
+    mut candidates: Vec<Fact>,
+    mut hydrate: impl FnMut(&mut [Fact]) -> bool,
+    source: &(impl KotlinSource + ?Sized),
+    token: QueryToken<'_>,
+    external_root_fqn: &str,
+    max_visits: usize,
+    cancellation: Option<&CancellationToken>,
+) -> KotlinExternalRootHierarchyAnswer
+where
+    Fact: KotlinHierarchyFact,
+{
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        return KotlinExternalRootHierarchyAnswer::stopped(
+            KotlinExternalRootHierarchyStatus::Cancelled,
+            0,
+        );
+    }
+    if candidates.len() > max_visits {
+        return KotlinExternalRootHierarchyAnswer::stopped(
+            KotlinExternalRootHierarchyStatus::BudgetExhausted,
+            0,
+        );
+    }
+    let visited = candidates.len();
+    candidates.sort_by(|left, right| left.declaration().cmp(right.declaration()));
+    let mut types_by_fq_name: HashMap<String, KotlinHierarchyTypeBucket> = HashMap::default();
+    for (index, facts) in candidates.iter().enumerate() {
+        let candidate = facts.declaration();
+        if candidate.is_synthetic() || !candidate.is_class() {
+            continue;
+        }
+        let fq_name = candidate.fq_name();
+        if let Some(bucket) = types_by_fq_name.get_mut(&fq_name) {
+            let winner = &candidates[bucket.winner];
+            if hierarchy_definition_key(candidate, facts.primary_range())
+                < hierarchy_definition_key(winner.declaration(), winner.primary_range())
+            {
+                bucket.winner = index;
+            }
+            bucket.declarations.push(index);
+        } else {
+            types_by_fq_name.insert(
+                fq_name,
+                KotlinHierarchyTypeBucket {
+                    winner: index,
+                    declarations: vec![index],
+                },
+            );
+        }
+    }
+    if types_by_fq_name.contains_key(external_root_fqn) {
+        return KotlinExternalRootHierarchyAnswer::stopped(
+            KotlinExternalRootHierarchyStatus::Incomplete(
+                KotlinExternalRootHierarchyIncompleteReason::AmbiguousSupertype,
+            ),
+            visited,
+        );
+    }
+
+    let mut workspace_edges = vec![Vec::new(); candidates.len()];
+    let mut external_descendants = Vec::new();
+    for batch_start in (0..candidates.len()).step_by(HIERARCHY_FACT_BATCH_SIZE) {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return KotlinExternalRootHierarchyAnswer::stopped(
+                KotlinExternalRootHierarchyStatus::Cancelled,
+                visited,
+            );
+        }
+        let batch_end = (batch_start + HIERARCHY_FACT_BATCH_SIZE).min(candidates.len());
+        let mut batch = candidates[batch_start..batch_end].to_vec();
+        if !hydrate(&mut batch) {
+            return KotlinExternalRootHierarchyAnswer::stopped(
+                KotlinExternalRootHierarchyStatus::Incomplete(
+                    KotlinExternalRootHierarchyIncompleteReason::HierarchyFactsUnavailable,
+                ),
+                visited,
+            );
+        }
+        for (offset, facts) in batch.iter().enumerate() {
+            let descendant_index = batch_start + offset;
+            let descendant = facts.declaration();
+            let mut type_by_fqn = |fqn: &str| {
+                types_by_fq_name
+                    .get(fqn)
+                    .map(|bucket| candidates[bucket.winner].declaration().clone())
+            };
+            let scope = KotlinNameScope {
+                package_name: descendant.package_name(),
+                imports: facts.imports(),
+                scope_owners: kotlin_scope_owners_for_with(
+                    source,
+                    token,
+                    descendant,
+                    None,
+                    &mut type_by_fqn,
+                ),
+            };
+            for raw in facts.raw_supertypes() {
+                let resolved = resolve_kotlin_type_name(raw, &scope, |candidate| {
+                    types_by_fq_name.contains_key(candidate) || candidate == external_root_fqn
+                });
+                match resolved {
+                    KotlinTypeName::Resolved(fqn) if fqn == external_root_fqn => {
+                        external_descendants.push(descendant_index);
+                    }
+                    KotlinTypeName::Resolved(fqn) => {
+                        let ancestor = same_source_hierarchy_identity(
+                            &fqn,
+                            descendant,
+                            &candidates,
+                            &types_by_fq_name,
+                        );
+                        workspace_edges[ancestor].push(descendant_index);
+                    }
+                    KotlinTypeName::Unresolved => {}
+                    KotlinTypeName::Ambiguous => {
+                        return KotlinExternalRootHierarchyAnswer::stopped(
+                            KotlinExternalRootHierarchyStatus::Incomplete(
+                                KotlinExternalRootHierarchyIncompleteReason::AmbiguousSupertype,
+                            ),
+                            visited,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    let mut seen = vec![false; candidates.len()];
+    let mut stack = external_descendants;
+    while let Some(index) = stack.pop() {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return KotlinExternalRootHierarchyAnswer::stopped(
+                KotlinExternalRootHierarchyStatus::Cancelled,
+                visited,
+            );
+        }
+        if std::mem::replace(&mut seen[index], true) {
+            continue;
+        }
+        stack.extend(workspace_edges[index].iter().copied());
+    }
+    let mut descendants = seen
+        .into_iter()
+        .enumerate()
+        .filter(|(_, seen)| *seen)
+        .map(|(index, _)| candidates[index].declaration().clone())
+        .collect::<Vec<_>>();
+    descendants.sort();
+    KotlinExternalRootHierarchyAnswer {
+        status: KotlinExternalRootHierarchyStatus::Complete,
+        descendants,
+        visited,
+    }
+}
+
+/// The candidate index the walk uses for a supertype that resolved by fully
+/// qualified name.
+///
+/// A duplicate FQN is one JVM identity declared in more than one source. When
+/// exactly one of those declarations sits in the descendant's own source, that
+/// declaration is the one the descendant's own file sees; otherwise the
+/// source-position winner stands. Java's external-root walk makes the same
+/// choice for the same reason.
+fn same_source_hierarchy_identity<Fact: KotlinHierarchyFact>(
+    fqn: &str,
+    descendant: &CodeUnit,
+    candidates: &[Fact],
+    types_by_fq_name: &HashMap<String, KotlinHierarchyTypeBucket>,
+) -> usize {
+    let bucket = &types_by_fq_name[fqn];
+    let mut same_source = bucket
+        .declarations
+        .iter()
+        .copied()
+        .filter(|index| candidates[*index].declaration().source() == descendant.source());
+    let Some(exact) = same_source.next() else {
+        return bucket.winner;
+    };
+    if same_source.next().is_none() {
+        exact
+    } else {
+        bucket.winner
+    }
 }
 
 /// Resolve one declaration's ancestors from facts already in hand.

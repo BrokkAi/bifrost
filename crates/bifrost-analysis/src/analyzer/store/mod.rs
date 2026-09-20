@@ -16387,6 +16387,55 @@ mod tests {
         );
     }
 
+    /// #3453: Kotlin now records callable modifier metadata, and it recorded
+    /// none before. A blob persisted under the prior epoch deserializes as
+    /// "nobody read the modifiers", which is indistinguishable from a callable
+    /// whose adapter honestly never looked, so `receiver_contract_of` reports
+    /// no contract and every Kotlin procedure summary stays inert. The salt is
+    /// the only thing that retires those rows.
+    #[test]
+    fn kotlin_callable_modifier_metadata_epoch_invalidates_prior_parsed_blobs() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(
+            temp.path(),
+            "Registry.kt",
+            "package example\n\nobject Registry {\n    fun register(spec: String): String = spec\n}\n\nclass Widget {\n    fun render(target: String): String = target\n}\n",
+        );
+        let state = Arc::new(parse_state(&KotlinAdapter, &file));
+        let oid = oid_for(state.source.as_bytes());
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let prior_epoch = epoch::kotlin_epoch_before_callable_modifier_metadata();
+        let prior_generation = store
+            .ensure_language_epoch_value("kotlin", &prior_epoch)
+            .unwrap();
+        store
+            .write_parsed_blob_at_generation(
+                oid,
+                "kotlin",
+                prior_generation,
+                &KotlinAdapter,
+                state.as_ref(),
+            )
+            .unwrap();
+        assert!(store.contains_parsed_blob(oid, "kotlin").unwrap());
+
+        let current_generation = store
+            .ensure_language_epoch(
+                Language::Kotlin,
+                &crate::analyzer::kotlin::language::LANGUAGE.into(),
+            )
+            .unwrap();
+
+        assert_ne!(current_generation, prior_generation);
+        assert!(!store.contains_parsed_blob(oid, "kotlin").unwrap());
+        assert_eq!(
+            store
+                .missing_parsed_blob_keys(&[(oid, "kotlin".to_string())])
+                .unwrap(),
+            vec![(oid, "kotlin".to_string())]
+        );
+    }
+
     #[test]
     fn scala_type_alias_identity_epoch_invalidates_prior_parsed_blobs() {
         let temp = tempfile::TempDir::new().unwrap();

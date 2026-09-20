@@ -2056,11 +2056,12 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
         // seeds, the classes a guard's true arm now proves about a
         // remainder, the arm-proven classes that now reach the guard's
         // reconvergence instead of ending there, and the class-body binding
-        // a member name resolves to, and the dependency class a bare
-        // import-bound base denotes.
+        // a member name resolves to, the dependency class a bare
+        // import-bound base denotes, and the source root a by-name import
+        // resolves its module in.
         AdapterSemanticsVersion::hash_bytes(
             "python-type-flow",
-            b"python-type-flow-unmodeled-guards-scoped-dynamic-writes-subscripted-annotation-outer-class-class-object-reference-imports-unmodeled-predicate-type-is-guard-exact-binding-replacement-stable-receiver-entry-implicit-tuples-closed-native-members-sequence-initializers-module-binding-reuse-comprehension-scope-closed-sequence-loads-implicit-none-returns-returned-sequence-loads-arm-proven-classes-reach-joins-class-body-member-binding-import-bound-bases-v50",
+            b"python-type-flow-unmodeled-guards-scoped-dynamic-writes-subscripted-annotation-outer-class-class-object-reference-imports-unmodeled-predicate-type-is-guard-exact-binding-replacement-stable-receiver-entry-implicit-tuples-closed-native-members-sequence-initializers-module-binding-reuse-comprehension-scope-closed-sequence-loads-implicit-none-returns-returned-sequence-loads-arm-proven-classes-reach-joins-class-body-member-binding-import-bound-bases-importing-source-root-v51",
         )
         .expect("adapter name is non-empty")
     }

@@ -1714,6 +1714,14 @@ impl<'a> WorkspaceSemanticOracle<'a> {
                         resolver_proven_external_static,
                         gap,
                     )
+                    && !kotlin_external_declared_callee_discharges_gap(
+                        call_language,
+                        lookup.status,
+                        &candidates,
+                        &boundaries,
+                        semantic_call.receiver.is_none(),
+                        gap,
+                    )
                     && !(js_ts_modeled_member_closure.is_some()
                         && gap.capability == SemanticCapability::DynamicDispatch
                         && matches!(
@@ -2166,6 +2174,16 @@ fn virtual_dispatch_implementor_targets(
         return None;
     }
     let provider = analyzer.member_family_provider()?;
+    // A provider that exists for the workspace as a whole may still state no
+    // family for *this* member's language (Kotlin publishes the external-root
+    // half only, for example). That is the documented `None`: the language
+    // states no member family, which is not an empty answer about the
+    // hierarchy and must never read as one.
+    if provider.member_family_capability(declaration)
+        == crate::analyzer::structural::resolution::MemberFamilyCapability::Unsupported
+    {
+        return None;
+    }
     let answer = provider.member_family(declaration, Some(cancellation));
     // An unproven family answers nothing about the hierarchy, so it contributes
     // no target: the call stays exactly as unresolved as it already was.
@@ -2493,6 +2511,54 @@ fn resolver_proven_external_static_dispatch_discharges_gap(
             SemanticGapKind::Unknown | SemanticGapKind::Unproven
         )
         && resolver_proven_external_static
+}
+
+/// Whether a receiverless Kotlin call the resolver proved lands on a declared
+/// external type discharges the blanket per-call dynamic-dispatch gap (#3453).
+///
+/// Kotlin writes a construction as an ordinary call -- `URL(address)` -- and
+/// the lowering cannot tell that spelling from a workspace call, because the
+/// type is declared outside the file. It therefore publishes the same blanket
+/// "a Kotlin call may select an override" gap it publishes for every call
+/// whose callee the file does not index. For the external shape the resolver
+/// actually proved, the gap's premise does not hold: the callee bound through
+/// Kotlin's import ladder to a dependency type the shared JVM surface
+/// declares, so the target is a declaration no workspace code can subclass,
+/// and a receiverless call names no receiver whose override set could select
+/// anything else. The site keeps its single proven external boundary as the
+/// residual -- the returned answer still states the body is outside the
+/// workspace -- and the covered target set is complete.
+///
+/// Every part of the shape is resolver evidence: the boundary status, the
+/// empty candidate set, the one proven boundary that named no unmaterialized
+/// target, and the receiverless call. A workspace-resolved callee never
+/// reaches this predicate (`Resolved`, not the boundary status), a Kotlin
+/// member call keeps its receiver, and any second or unproven boundary
+/// refuses the discharge, so an unproven hierarchy still opens the run.
+fn kotlin_external_declared_callee_discharges_gap(
+    language: SemanticLanguage,
+    status: Option<DefinitionLookupStatus>,
+    candidates: &[DispatchCandidate],
+    boundaries: &[DispatchBoundary],
+    receiverless: bool,
+    gap: &SemanticGap,
+) -> bool {
+    language == SemanticLanguage::Standard(Language::Kotlin)
+        && gap.capability == SemanticCapability::DynamicDispatch
+        && matches!(
+            gap.kind,
+            SemanticGapKind::Unknown | SemanticGapKind::Unproven
+        )
+        && receiverless
+        && status == Some(DefinitionLookupStatus::UnresolvableImportBoundary)
+        && candidates.is_empty()
+        && matches!(
+            boundaries,
+            [boundary]
+                if matches!(boundary.kind, DispatchBoundaryKind::External(None))
+                    && matches!(boundary.proof, ProofStatus::Proven)
+                    && boundary.unmaterialized_external_target.is_none()
+        )
 }
 
 /// Whether a statically proven target set discharges an avoidable per-call

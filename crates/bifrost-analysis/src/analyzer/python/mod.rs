@@ -71,10 +71,12 @@ use std::sync::Arc;
 use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 pub(crate) use adapter::PythonAdapter;
 use brokk_bifrost_python::declarations::python_expanded_comment_start;
-pub(crate) use brokk_bifrost_python::graph_support::resolve_module_code_unit;
 use brokk_bifrost_python::graph_support::{
     PythonSource, PythonUsageSource, compute_export_index_of, import_binder_from_imports,
     render_skeleton_recursive,
+};
+pub(crate) use brokk_bifrost_python::graph_support::{
+    resolve_module_code_unit, retain_modules_for_importer,
 };
 pub(crate) use brokk_bifrost_python::imports::resolve_fqn_candidates;
 use brokk_bifrost_python::imports::resolve_imports_batched;
@@ -193,6 +195,12 @@ impl PythonAnalyzer {
         candidates
     }
 
+    /// A Python class body is one contiguous region of one file, so a member
+    /// declaration belongs to `owner` only when it is nested in `owner`'s own
+    /// file. The qualified name alone is not enough: two sibling source roots
+    /// can spell one module, which gives two classes one qualified name
+    /// (#3475), and a name-only owner test then hands each class the other's
+    /// members and reports the other's fields as absent.
     pub(crate) fn member_candidates_for_owner_limited(
         &self,
         owner: &CodeUnit,
@@ -205,10 +213,11 @@ impl PythonAnalyzer {
             .lookup_non_module_declarations_by_identifier_limited(name, limit, continue_query);
         if candidates.complete {
             candidates.rows.retain(|candidate| {
-                candidate
-                    .fq()
-                    .parent()
-                    .is_some_and(|parent| parent == *owner.fq())
+                candidate.source() == owner.source()
+                    && candidate
+                        .fq()
+                        .parent()
+                        .is_some_and(|parent| parent == *owner.fq())
             });
         }
         candidates

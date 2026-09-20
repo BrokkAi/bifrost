@@ -1237,6 +1237,29 @@ impl crate::analyzer::usages::MemberFamilyProvider for MultiAnalyzer {
         max_visits: usize,
         cancellation: Option<&crate::cancellation::CancellationToken>,
     ) -> crate::analyzer::usages::ExternalMemberFamilyAnswer {
+        // A call site's identity carries the language of the analyzer that
+        // published the boundary, so each JVM analyzer answers for its own call
+        // sites. Both arms refuse a mixed realm the same way: one language's
+        // supertype facts alone cannot enumerate the other language's
+        // declarations, and a Kotlin class can extend a Java class (and the
+        // reverse), so neither half may be proven from one analyzer's tree.
+        if identity.language() == Language::Kotlin {
+            if let Some(language) = [Language::Java, Language::Scala]
+                .into_iter()
+                .find(|language| self.languages().contains(language))
+            {
+                return crate::analyzer::usages::ExternalMemberFamilyAnswer::incomplete(
+                    crate::analyzer::usages::ExternalMemberFamilyIncompleteReason::MixedJvmRealmUnsupported(
+                        language,
+                    ),
+                    0,
+                );
+            }
+            let Some(kotlin) = resolve_analyzer::<KotlinAnalyzer>(self) else {
+                return crate::analyzer::usages::ExternalMemberFamilyAnswer::unsupported();
+            };
+            return kotlin.resolve_external_member_family(self, identity, max_visits, cancellation);
+        }
         if identity.language() != Language::Java {
             return crate::analyzer::usages::ExternalMemberFamilyAnswer::unsupported();
         }
