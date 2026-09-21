@@ -753,6 +753,20 @@ impl<'a> ForwardScalaNameResolver<'a> {
             ScalaNameResolution::Unresolved => {}
             outcome => return outcome,
         }
+        if let Some(reference_byte) = self.reference_byte {
+            let owners = scala_enclosing_template_owner_fq_names(
+                self.scala,
+                self.scala,
+                &self.file,
+                reference_byte,
+            );
+            for tier in scala_owner_qualified_import_candidate_tiers(&owners, segments) {
+                let outcome = self.resolve_candidate_tier(tier, kind);
+                if outcome != ScalaNameResolution::Unresolved {
+                    return outcome;
+                }
+            }
+        }
         if let Some(package) = self
             .package_prefixes
             .last()
@@ -989,7 +1003,13 @@ impl<'a> ForwardScalaNameResolver<'a> {
         } else {
             path.lexical_prefixes.as_slice()
         };
-        let mut tiers = Vec::new();
+        let owners = scala_enclosing_template_owner_fq_names(
+            self.scala,
+            self.scala,
+            &self.file,
+            path.declaration_start_byte,
+        );
+        let mut tiers = scala_owner_qualified_import_candidate_tiers(&owners, &segments);
         for lexical_package in lexical_prefixes
             .iter()
             .rev()
@@ -4113,7 +4133,7 @@ fn resolve_scala_with_context(
                     .is_some_and(|binding| binding.declaration_owner.is_some())
                 {
                     if let Some(outcome) = scala_explicit_local_member_import_outcome(
-                        ctx, token, &resolver, root, identifier, text,
+                        ctx, token, &resolver, root, text,
                     ) {
                         return outcome;
                     }
@@ -4159,9 +4179,9 @@ fn resolve_scala_with_context(
                     format!("`{text}` is a local Scala value"),
                 );
             }
-            if let Some(outcome) = scala_explicit_local_member_import_outcome(
-                ctx, token, &resolver, root, identifier, text,
-            ) {
+            if let Some(outcome) =
+                scala_explicit_local_member_import_outcome(ctx, token, &resolver, root, text)
+            {
                 return outcome;
             }
             if let Some(fqn) = resolver.resolve_member(text) {
@@ -4209,6 +4229,24 @@ fn resolve_scala_with_context(
                     );
                 }
                 ScalaExactMemberResolution::NoMatch => {}
+            }
+            // Package objects expose their fields as package members, not as
+            // children of an indexed template. Use the same structured scope
+            // walk as package-level calls before considering an import boundary.
+            if let Some(unit) = resolve_in_enclosing_scopes(
+                ctx.analyzer,
+                ctx.file,
+                text,
+                identifier.start_byte(),
+                |unit| {
+                    unit.is_field()
+                        && !ctx
+                            .scala
+                            .structural_parent_of(unit)
+                            .is_some_and(|owner| owner.is_class())
+                },
+            ) {
+                return candidates_outcome(vec![unit]);
             }
             if let Some(fqn) = scala_resolve_visible_term(ctx, token, &resolver, identifier, text) {
                 return scala_fqn_outcome(support, &fqn, text);
@@ -4646,12 +4684,178 @@ fn scala_exact_bound_stable_owner(
 ) -> Option<CodeUnit> {
     let root_name = owner_segments.first()?;
     let bindings = scala_bindings_before(ctx, token, resolver, root, node.start_byte());
-    let binding = precise_scala_binding(&bindings, root_name)?;
-    let owner = binding.receiver_declaration?;
+    let owner = if let Some(binding) = precise_scala_binding(&bindings, root_name) {
+        binding.receiver_declaration?
+    } else {
+        let ScalaExactMemberResolution::Found(mut imported) =
+            scala_value_import_namespace_candidates(ctx, token, resolver, root, root_name)
+        else {
+            return None;
+        };
+        imported.retain(|unit| {
+            scala_unit_matches_owner_kind(ctx.scala, unit, ScalaOwnerKind::SingletonObject)
+        });
+        let [owner] = imported.as_slice() else {
+            return None;
+        };
+        owner.clone()
+    };
     if owner_segments.len() == 1 {
         return Some(owner);
     }
     scala_exact_nested_singleton_owner(ctx, &owner, &owner_segments[1..])
+}
+
+/// Resolve explicit imports through the value bound at the import site, not
+/// through a package with the same spelling. In `import distr.DistF`, `distr`
+/// can be a constructor parameter whose indexed type declares DistF.
+fn scala_value_import_namespace_candidates(
+    ctx: ScalaLookupCtx<'_>,
+    token: QueryToken<'_>,
+    resolver: &ScalaNameResolver<'_>,
+    root: Node<'_>,
+    name: &str,
+) -> ScalaExactMemberResolution {
+    let mut candidates = Vec::new();
+    for import in resolver
+        .visible_imports()
+        .filter(|import| !import.is_wildcard && import.local_name() == Some(name))
+    {
+        let Some(path) = import.path.as_ref() else {
+            continue;
+        };
+        let Some((member, _)) = path.segments.split_last() else {
+            continue;
+        };
+        let owner = match scala_import_value_owner(ctx, token, resolver, root, path) {
+            ScalaTypeNamespaceResolution::Resolved(owner) => owner,
+            ScalaTypeNamespaceResolution::Ambiguous(owners) => {
+                return ScalaExactMemberResolution::Ambiguous(owners);
+            }
+            ScalaTypeNamespaceResolution::AuthoritativeMiss
+            | ScalaTypeNamespaceResolution::NoMatch => continue,
+        };
+        match scala_exact_owner_namespace_children(ctx, token, &owner, member) {
+            ScalaExactMemberResolution::Found(found) => candidates.extend(found),
+            ScalaExactMemberResolution::Ambiguous(found) => {
+                return ScalaExactMemberResolution::Ambiguous(found);
+            }
+            ScalaExactMemberResolution::NoMatch => {}
+        }
+    }
+    sort_units(&mut candidates);
+    candidates.dedup();
+    if candidates.is_empty() {
+        ScalaExactMemberResolution::NoMatch
+    } else {
+        ScalaExactMemberResolution::Found(candidates)
+    }
+}
+
+/// Interpret the value at the import's lexical site. A value inherited from a
+/// trait has no local binding node here; its indexed declaration and AST type
+/// path supply the receiver instead. Later bindings cannot retarget an import.
+fn scala_import_value_owner(
+    ctx: ScalaLookupCtx<'_>,
+    token: QueryToken<'_>,
+    resolver: &ScalaNameResolver<'_>,
+    root: Node<'_>,
+    path: &StructuredImportPath,
+) -> ScalaTypeNamespaceResolution {
+    let Some((_, owner_segments)) = path.segments.split_last() else {
+        return ScalaTypeNamespaceResolution::NoMatch;
+    };
+    let Some(root_name) = owner_segments.first() else {
+        return ScalaTypeNamespaceResolution::NoMatch;
+    };
+    let mut import_resolver = ScalaNameResolver::for_file(ctx.scala, token, ctx.support, ctx.file)
+        .with_lexical_context(
+            path.lexical_prefixes.clone(),
+            path.lexical_scopes.clone(),
+            path.declaration_start_byte,
+        );
+    import_resolver.imports = Arc::new(
+        resolver
+            .imports
+            .iter()
+            .filter(|prior| {
+                prior.path.as_ref().is_some_and(|prior_path| {
+                    prior_path.declaration_start_byte < path.declaration_start_byte
+                })
+            })
+            .cloned()
+            .collect(),
+    );
+    let bindings = scala_bindings_before(
+        ctx,
+        token,
+        &import_resolver,
+        root,
+        path.declaration_start_byte,
+    );
+    let mut owners = Vec::new();
+    if bindings.is_shadowed(root_name) {
+        if let Some(binding) = precise_scala_binding(&bindings, root_name) {
+            if let Some(owner) = binding.receiver_declaration {
+                owners.push(owner);
+            } else if let Some(fqn) = binding.receiver_type {
+                owners.extend(
+                    ctx.support
+                        .fqn(&fqn)
+                        .into_iter()
+                        .filter(|unit| unit.is_class() && unit.fq_name() == fqn),
+                );
+            }
+        }
+    } else {
+        let Some(import_node) = root.named_descendant_for_byte_range(
+            path.declaration_start_byte,
+            path.declaration_start_byte,
+        ) else {
+            return ScalaTypeNamespaceResolution::NoMatch;
+        };
+        let fields = match scala_enclosing_member_value_units(ctx, token, import_node, root_name) {
+            ScalaExactMemberResolution::Found(fields) => fields,
+            ScalaExactMemberResolution::Ambiguous(fields) => {
+                return ScalaTypeNamespaceResolution::Ambiguous(fields);
+            }
+            ScalaExactMemberResolution::NoMatch => return ScalaTypeNamespaceResolution::NoMatch,
+        };
+        let [field] = fields.as_slice() else {
+            return ScalaTypeNamespaceResolution::Ambiguous(fields);
+        };
+        let Some(source) = ctx.scala.indexed_source(field.source()) else {
+            return ScalaTypeNamespaceResolution::AuthoritativeMiss;
+        };
+        let Some(facts) = scala_source_facts(&source) else {
+            return ScalaTypeNamespaceResolution::AuthoritativeMiss;
+        };
+        let field_resolver = scala_name_resolver_for_unit(ctx.scala, token, ctx.support, field);
+        for range in ctx.scala.ranges(field) {
+            let Some(type_path) = facts
+                .field_type_paths_by_range
+                .get(&(range.start_byte, range.end_byte))
+            else {
+                continue;
+            };
+            match field_resolver.resolve_owner_segments(type_path, ScalaOwnerKind::Class) {
+                ScalaNameResolution::Resolved(owner) => owners.push(owner._declaration),
+                ScalaNameResolution::Ambiguous(tied) => {
+                    return ScalaTypeNamespaceResolution::Ambiguous(scala_owner_declarations(tied));
+                }
+                ScalaNameResolution::MissingExplicitImport | ScalaNameResolution::Unresolved => {}
+            }
+        }
+    }
+    sort_units(&mut owners);
+    owners.dedup();
+    match owners.as_slice() {
+        [owner] => scala_exact_nested_singleton_owner(ctx, owner, &owner_segments[1..])
+            .map(ScalaTypeNamespaceResolution::Resolved)
+            .unwrap_or(ScalaTypeNamespaceResolution::AuthoritativeMiss),
+        [] => ScalaTypeNamespaceResolution::AuthoritativeMiss,
+        _ => ScalaTypeNamespaceResolution::Ambiguous(owners),
+    }
 }
 
 /// Candidate spellings of `segments` qualified by each enclosing owner in
@@ -4947,6 +5151,30 @@ fn resolve_scala_focused_qualified_path(
         .map(|name| (*name).to_string())
         .collect::<Vec<_>>();
     let display = prefix.join(".");
+    if !path.focus_owns_a_projection_selector() {
+        let mut imported =
+            match scala_value_import_namespace_candidates(ctx, token, resolver, root, root_name) {
+                ScalaExactMemberResolution::Found(imported) => imported,
+                ScalaExactMemberResolution::Ambiguous(owners) => {
+                    return Some(scala_ambiguous_outcome(
+                        "ambiguous_scala_explicit_import",
+                        owners,
+                        format!("`{root_name}` has multiple imported Scala owners"),
+                    ));
+                }
+                ScalaExactMemberResolution::NoMatch => Vec::new(),
+            };
+        imported.retain(|unit| {
+            scala_unit_matches_owner_kind(ctx.scala, unit, ScalaOwnerKind::SingletonObject)
+        });
+        if imported.len() > 1 {
+            return Some(scala_ambiguous_outcome(
+                "ambiguous_scala_explicit_import",
+                imported,
+                format!("`{root_name}` has multiple imported Scala objects"),
+            ));
+        }
+    }
     if let Some(exact_owner) =
         scala_exact_bound_stable_owner(ctx, token, resolver, root, node, &prefix)
     {
@@ -6745,11 +6973,16 @@ fn scala_is_declaration_name(node: Node<'_>) -> bool {
             | "enum_definition"
             | "type_definition"
             | "function_definition"
+            | "function_declaration"
+            | "full_enum_case"
+            | "simple_enum_case"
             | "parameter"
             | "type_parameters"
             | "covariant_type_parameter"
             | "contravariant_type_parameter"
             | "val_definition"
+            | "val_declaration"
+            | "var_declaration"
             | "var_definition"
     ) {
         return false;
@@ -7049,37 +7282,9 @@ fn resolve_scala_type(
     if node.kind() == "projected_type" {
         return scala_projected_type_outcome(ctx, token, resolver, node);
     }
-    let local_import = scala_enclosing_type_definition_range(node).and_then(|declaration_range| {
-        (!type_segments.is_empty()).then(|| {
-            resolver.resolve_explicit_owner_segments_in_range(
-                &type_segments,
-                scala_type_node_owner_kind(node),
-                Some(declaration_range),
-            )
-        })
-    });
-    let mut missing_local_import = false;
-    match local_import {
-        Some(ScalaNameResolution::Resolved(owner)) => {
-            return candidates_outcome(vec![owner._declaration]);
-        }
-        Some(ScalaNameResolution::MissingExplicitImport) => {
-            // Defer the boundary: a local explicit import binds the name but its
-            // declaration is not indexed — yet the enclosing lexical namespace
-            // (the enclosing class's own type, an exact owner-namespace child)
-            // may still resolve it. Run that probe first, exactly as the
-            // non-local sibling below does, and claim a boundary only if it finds
-            // nothing (#1158, restoring the symmetry with the non-local branch).
-            missing_local_import = true;
-        }
-        Some(ScalaNameResolution::Ambiguous(_)) => {
-            return no_definition(
-                "ambiguous_scala_explicit_import",
-                format!("Local Scala explicit imports expose multiple `{text}` types"),
-            );
-        }
-        Some(ScalaNameResolution::Unresolved) | None => {}
-    }
+    // Local and inherited definitions precede explicit imports (SLS 2).
+    // This ladder only admits type declarations, so an inherited alias cannot
+    // capture the imported companion used by a term such as DistF.Single.
     match scala_exact_lexical_type_namespace(ctx, token, resolver, node) {
         ScalaTypeNamespaceResolution::Resolved(declaration) => {
             return candidates_outcome(vec![declaration]);
@@ -7099,10 +7304,83 @@ fn resolve_scala_type(
         }
         ScalaTypeNamespaceResolution::NoMatch => {}
     }
+    if let Some((name, tail)) = type_segments.split_first() {
+        let mut imported =
+            match scala_value_import_namespace_candidates(ctx, token, resolver, root, name) {
+                ScalaExactMemberResolution::Found(imported) => imported,
+                ScalaExactMemberResolution::Ambiguous(owners) => {
+                    return scala_ambiguous_outcome(
+                        "ambiguous_scala_explicit_import",
+                        owners,
+                        format!("`{name}` has multiple imported Scala owners"),
+                    );
+                }
+                ScalaExactMemberResolution::NoMatch => Vec::new(),
+            };
+        imported.retain(|unit| {
+            scala_unit_matches_owner_kind(ctx.scala, unit, scala_type_node_owner_kind(node))
+        });
+        if !imported.is_empty() {
+            if tail.is_empty() {
+                return candidates_outcome(imported);
+            }
+            match scala_exact_namespace_descendant(
+                ctx,
+                imported,
+                tail,
+                scala_type_node_owner_kind(node),
+            ) {
+                ScalaTypeNamespaceResolution::Resolved(unit) => {
+                    return candidates_outcome(vec![unit]);
+                }
+                ScalaTypeNamespaceResolution::Ambiguous(units) => {
+                    return scala_ambiguous_outcome(
+                        "ambiguous_scala_type",
+                        units,
+                        format!("`{text}` has multiple imported type definitions"),
+                    );
+                }
+                ScalaTypeNamespaceResolution::AuthoritativeMiss
+                | ScalaTypeNamespaceResolution::NoMatch => {
+                    return no_definition(
+                        "no_indexed_definition",
+                        format!("`{text}` has no indexed member on its imported type"),
+                    );
+                }
+            }
+        }
+    }
+    let local_import = scala_enclosing_type_definition_range(node).and_then(|declaration_range| {
+        (!type_segments.is_empty()).then(|| {
+            resolver.resolve_explicit_owner_segments_in_range(
+                &type_segments,
+                scala_type_node_owner_kind(node),
+                Some(declaration_range),
+            )
+        })
+    });
+    let mut missing_local_import = false;
+    match local_import {
+        Some(ScalaNameResolution::Resolved(owner)) => {
+            return candidates_outcome(vec![owner._declaration]);
+        }
+        Some(ScalaNameResolution::MissingExplicitImport) => {
+            // The higher-precedence lexical type ladder already missed.
+            // Defer the boundary until the remaining local-import outcomes
+            // have been handled below.
+            missing_local_import = true;
+        }
+        Some(ScalaNameResolution::Ambiguous(_)) => {
+            return no_definition(
+                "ambiguous_scala_explicit_import",
+                format!("Local Scala explicit imports expose multiple `{text}` types"),
+            );
+        }
+        Some(ScalaNameResolution::Unresolved) | None => {}
+    }
     if missing_local_import {
-        // gated upstream: the enclosing lexical-namespace probe (Stage B) above
-        // already ran and found nothing, exactly as the non-local sibling does
-        // (#1158); only then does the deferred local-import boundary fire.
+        // The lexical namespace and value-import probes above both missed;
+        // only now can the explicit import establish an external boundary.
         return boundary_unchecked(
             format!(
                 "`{text}` is bound by a local explicit Scala import whose declaration is not indexed in this workspace"
@@ -7619,6 +7897,27 @@ fn resolve_scala_call(
                     format!("`{name}` is a local Scala value"),
                 );
             }
+            if let Some(imported) =
+                scala_explicit_local_member_import_outcome(ctx, token, resolver, root, name)
+            {
+                if imported.definitions.is_empty() {
+                    return imported;
+                }
+                let candidates = scala_filter_callable_units(
+                    ctx.scala,
+                    imported.definitions,
+                    call_shape.as_ref(),
+                    ScalaCallableSiteRole::Ordinary,
+                );
+                return if candidates.is_empty() {
+                    no_definition(
+                        "no_applicable_scala_callable",
+                        format!("`{name}` has no imported member overload matching this call"),
+                    )
+                } else {
+                    candidates_outcome(candidates)
+                };
+            }
             if let Some(fqn) = resolver.resolve_member(name) {
                 let candidates = scala_filter_callable_units(
                     ctx.scala,
@@ -7845,6 +8144,27 @@ fn resolve_scala_call(
                 }
                 // gated upstream: resolver-verdict arm (workspace check is the resolver's).
                 ScalaNameResolution::MissingExplicitImport => {
+                    match resolver
+                        .resolve_explicit_owner_segments(&[name.to_string()], ScalaOwnerKind::Class)
+                    {
+                        ScalaNameResolution::Resolved(owner) => {
+                            return scala_parser_proven_class_outcome(
+                                ctx,
+                                &owner,
+                                name,
+                                call_shape.as_ref(),
+                            );
+                        }
+                        ScalaNameResolution::Ambiguous(owners) => {
+                            return scala_ambiguous_outcome(
+                                "ambiguous_scala_type",
+                                scala_owner_declarations(owners),
+                                format!("`{name}` resolves to multiple imported Scala classes"),
+                            );
+                        }
+                        ScalaNameResolution::MissingExplicitImport
+                        | ScalaNameResolution::Unresolved => {}
+                    }
                     return boundary_unchecked(
                         format!(
                             "`{name}` is bound by an explicit Scala import whose declaration is not indexed in this workspace"
@@ -9081,62 +9401,41 @@ fn scala_explicit_local_member_import_outcome(
     token: QueryToken<'_>,
     resolver: &ScalaNameResolver<'_>,
     root: Node<'_>,
-    reference: Node<'_>,
     visible_name: &str,
 ) -> Option<DefinitionLookupOutcome> {
     let imports = resolver
         .visible_imports()
         .filter(|import| !import.is_wildcard)
-        .filter(|import| import.identifier.as_deref() == Some(visible_name))
+        .filter(|import| import.local_name() == Some(visible_name))
         .collect::<Vec<_>>();
     if imports.is_empty() {
         return None;
     }
-    let bindings = scala_bindings_before(ctx, token, resolver, root, reference.start_byte());
     let mut matched_local_import = false;
     let mut candidates = Vec::new();
     for import in imports {
         let Some(path) = import.path.as_ref() else {
             continue;
         };
-        let Some((member, owner_path)) = path.segments.split_last() else {
+        let Some((member, _)) = path.segments.split_last() else {
             continue;
         };
-        let Some(root_name) = owner_path.first() else {
-            continue;
-        };
-        if !bindings.is_shadowed(root_name) {
-            continue;
-        }
-        matched_local_import = true;
-        let Some(binding) = precise_scala_binding(&bindings, root_name) else {
-            continue;
-        };
-        let mut owners = if let Some(declaration) = binding.receiver_declaration {
-            vec![declaration]
-        } else if let Some(owner_fqn) = binding.receiver_type {
-            ctx.support
-                .fqn(&owner_fqn)
-                .into_iter()
-                .filter(|unit| unit.is_class() && unit.fq_name() == owner_fqn)
-                .collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
-        sort_units(&mut owners);
-        owners.dedup();
-        let [owner] = owners.as_slice() else {
-            if owners.len() > 1 {
-                return Some(no_definition(
+        let owner = match scala_import_value_owner(ctx, token, resolver, root, path) {
+            ScalaTypeNamespaceResolution::Resolved(owner) => owner,
+            ScalaTypeNamespaceResolution::Ambiguous(owners) => {
+                return Some(scala_ambiguous_outcome(
                     "ambiguous_scala_local_import_owner",
-                    format!("local import owner `{root_name}` has multiple physical definitions"),
+                    owners,
+                    format!("imported `{visible_name}` has multiple bound owner definitions"),
                 ));
             }
-            continue;
+            ScalaTypeNamespaceResolution::AuthoritativeMiss => {
+                matched_local_import = true;
+                continue;
+            }
+            ScalaTypeNamespaceResolution::NoMatch => continue,
         };
-        let Some(owner) = scala_exact_nested_singleton_owner(ctx, owner, &owner_path[1..]) else {
-            continue;
-        };
+        matched_local_import = true;
         match scala_exact_owner_member_candidate_units(ctx, token, &owner, member, false) {
             ScalaExactMemberResolution::Found(found) => candidates.extend(found),
             ScalaExactMemberResolution::Ambiguous(_) => {
@@ -12258,6 +12557,63 @@ fn scala_enclosing_template_units(
     owners
 }
 
+/// The innermost `template_body` enclosing `node`: the scope in which the
+/// members of the nearest enclosing class, trait, object or enum bind.
+fn scala_enclosing_template_body_range(node: Node<'_>) -> Option<(usize, usize)> {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if parent.kind() == "template_body" {
+            return Some((parent.start_byte(), parent.end_byte()));
+        }
+        current = parent.parent();
+    }
+    None
+}
+
+/// Whether an explicit Scala import binds `name` in a scope strictly nested
+/// inside the innermost template body that encloses `node`.
+///
+/// SLS 2 ranks a local or inherited definition above an explicit import, but
+/// that precedence only decides between bindings introduced in the SAME scope,
+/// which is the reading [`resolve_scala_type`] applies when it runs this ladder
+/// before import lookup. An import declared in a block or method body inside
+/// the template that declares the name introduces its binding in an inner
+/// scope, so it binds nearer the reference than the template's own member and
+/// the precedence comparison never arises. This ladder only ever answers with a
+/// member of an enclosing template, so it reports no match and lets the
+/// import-tier probes answer instead.
+///
+/// The import's own lexical scope chain is parser-derived
+/// ([`StructuredImportPath::lexical_scopes`], outermost to innermost), so the
+/// comparison is a containment test between recorded scope spans.
+fn scala_explicit_import_binds_below_enclosing_template(
+    resolver: &ScalaNameResolver<'_>,
+    node: Node<'_>,
+    name: &str,
+) -> bool {
+    let Some(body) = scala_enclosing_template_body_range(node) else {
+        return false;
+    };
+    resolver.visible_imports().any(|import| {
+        if import.is_wildcard || import.local_name() != Some(name) {
+            return false;
+        }
+        import.path.as_ref().is_some_and(|path| {
+            path.declaration_start_byte <= node.start_byte()
+                && path.lexical_scopes.last().is_some_and(|scope| {
+                    let scope = (scope.start_byte, scope.end_byte);
+                    // Strictly inside the template body, and still covering the
+                    // reference: an import in a sibling block binds nothing here.
+                    body.0 <= scope.0
+                        && scope.1 <= body.1
+                        && scope != body
+                        && scope.0 <= node.start_byte()
+                        && node.end_byte() <= scope.1
+                })
+        })
+    })
+}
+
 fn scala_exact_lexical_type_namespace(
     ctx: ScalaLookupCtx<'_>,
     token: QueryToken<'_>,
@@ -12293,6 +12649,9 @@ fn scala_exact_lexical_type_namespace(
                 }
             }
         };
+    }
+    if scala_explicit_import_binds_below_enclosing_template(resolver, lookup_node, root_name) {
+        return ScalaTypeNamespaceResolution::NoMatch;
     }
     let owners = scala_enclosing_template_units(ctx.scala, ctx.analyzer, ctx.file, node);
     // The exact type members one enclosing owner declares in its own body, in

@@ -1,5 +1,6 @@
 [package]
 name = "brokk-bifrost-jvm"
+build = "src/scala/grammar/build.rs"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -31,7 +32,10 @@ tree-sitter = "0.25.10"
 # same class as tree-sitter-cpp 0.23.4, tree-sitter-c-sharp 0.23.1,
 # tree-sitter-php 0.23.11 and tree-sitter-ruby 0.23.1.
 tree-sitter-java = "0.23.5"
-tree-sitter-scala = "=0.26.2"
+tree-sitter-language = "0.1.7"
+
+[build-dependencies]
+cc = "1.2.56"
 
 [features]
 default = []

@@ -322,7 +322,8 @@ pub fn scala_source_facts_from_tree(tree: &tree_sitter::Tree, source: &str) -> S
     let mut stack = vec![tree.root_node()];
     while let Some(node) = stack.pop() {
         match node.kind() {
-            "val_definition" | "var_definition" | "class_parameter" => {
+            "val_definition" | "var_definition" | "val_declaration" | "var_declaration"
+            | "class_parameter" => {
                 if let Some(path) = node
                     .child_by_field_name("type")
                     .map(|type_node| scala_type_lookup_segments(type_node, source))

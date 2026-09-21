@@ -1171,11 +1171,18 @@ impl<'a> ScalaVisitor<'a> {
         package_name: &str,
         parent: Option<CodeUnit>,
     ) {
-        let Some(pattern) = node.child_by_field_name("pattern") else {
-            return;
+        // Definitions bind a pattern; abstract val/var declarations expose
+        // one or more name fields instead. Both declare indexed members.
+        let names = if let Some(pattern) = node.child_by_field_name("pattern") {
+            scala_pattern_names(pattern, self.source)
+        } else {
+            let mut cursor = node.walk();
+            node.children_by_field_name("name", &mut cursor)
+                .flat_map(|name| scala_pattern_names(name, self.source))
+                .collect()
         };
 
-        for name in scala_pattern_names(pattern, self.source) {
+        for name in names {
             let short_name = if let Some(parent) = &parent {
                 format!("{}.{}", parent.short_name(), name)
             } else {
@@ -1905,7 +1912,7 @@ fn scala_parameter_label_nodes<'tree>(parameter_nodes: &[Node<'tree>]) -> Vec<No
 }
 
 fn scala_field_signature(node: Node<'_>, source: &str, name: &str) -> String {
-    let keyword = if node.kind() == "var_definition" {
+    let keyword = if matches!(node.kind(), "var_definition" | "var_declaration") {
         "var"
     } else {
         "val"
@@ -2143,6 +2150,29 @@ mod same_package_and_extension_tests {
             .expect("Scala parser");
         let tree = parser.parse(source, None).expect("Scala syntax tree");
         parse_scala_file(&file, source, &tree)
+    }
+
+    #[test]
+    fn abstract_and_initialized_fields_keep_all_declared_names() {
+        let parsed = parse(
+            "package example\ntrait Record {\n  val id: Long\n  var left, right: String\n  val version = 1\n}\n",
+        );
+        let mut fields = parsed
+            .declarations()
+            .iter()
+            .filter(|unit| unit.is_field())
+            .map(|unit| unit.fq_name().to_string())
+            .collect::<Vec<_>>();
+        fields.sort();
+        assert_eq!(
+            fields,
+            [
+                "example.Record.id",
+                "example.Record.left",
+                "example.Record.right",
+                "example.Record.version",
+            ]
+        );
     }
 
     /// The leaf-identifier `type_identifiers` family the coarse file graph

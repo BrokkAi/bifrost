@@ -385,12 +385,13 @@ version = "0.11.5"
 dependencies = [
  "brokk-bifrost-core",
  "brokk-tree-sitter-kotlin",
+ "cc",
  "regex",
  "serde",
  "serde_json",
  "tree-sitter",
  "tree-sitter-java",
- "tree-sitter-scala",
+ "tree-sitter-language",
 ]
 
 [[package]]
@@ -3323,16 +3324,6 @@ name = "tree-sitter-ruby"
 version = "0.23.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "be0484ea4ef6bb9c575b4fdabde7e31340a8d2dbc7d52b321ac83da703249f95"
-dependencies = [
- "cc",
- "tree-sitter-language",
-]
-
-[[package]]
-name = "tree-sitter-scala"
-version = "0.26.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "24e0ab4505990bfe30051761d40a7bf4033ce5a81c9eda9e20e987a5cdc84826"
 dependencies = [
  "cc",
  "tree-sitter-language",

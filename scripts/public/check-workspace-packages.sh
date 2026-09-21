@@ -13,7 +13,8 @@ temporary=$(mktemp -d "${TMPDIR:-/tmp}/bifrost-package-set.XXXXXX")
 readonly temporary
 trap 'rm -rf "$temporary"' EXIT INT TERM
 
-readonly package_target="$temporary/target"
+readonly package_target="${CARGO_TARGET_DIR:-$temporary/target}"
+readonly consumer_target="${CARGO_TARGET_DIR:-$temporary/consumer-target}"
 mkdir -p "$package_target/package"
 cd "$repo_root"
 
@@ -109,6 +110,14 @@ require_archive_file brokk-bifrost-jvm resources/treesitter/java/identifiers.scm
 require_archive_file brokk-bifrost-jvm resources/treesitter/java/imports.scm
 require_archive_file brokk-bifrost-jvm resources/treesitter/scala/definitions.scm
 require_archive_file brokk-bifrost-jvm resources/treesitter/scala/imports.scm
+# The Scala parser is vendored: archive-only consumers need the C build inputs,
+# and downstream redistributors need its license and regeneration provenance.
+for grammar_file in LICENSE README.md build.rs grammar.js tree-sitter.json \
+  queries/highlights.scm src/parser.c src/scanner.c src/grammar.json \
+  src/node-types.json src/tree_sitter/alloc.h src/tree_sitter/array.h \
+  src/tree_sitter/parser.h; do
+  require_archive_file brokk-bifrost-jvm "src/scala/grammar/$grammar_file"
+done
 require_archive_file brokk-bifrost-jvm resources/treesitter/kotlin/highlights.scm
 require_archive_file brokk-bifrost-php resources/treesitter/php/definitions.scm
 require_archive_file brokk-bifrost-php resources/treesitter/php/imports.scm
@@ -258,8 +267,8 @@ fn main() {
 }
 EOF
 
-CARGO_TARGET_DIR="$temporary/consumer-target" cargo check --quiet --manifest-path "$consumer/Cargo.toml"
-PYO3_PYTHON="${PYO3_PYTHON:-python3}" CARGO_TARGET_DIR="$temporary/consumer-target" \
+CARGO_TARGET_DIR="$consumer_target" cargo check --quiet --manifest-path "$consumer/Cargo.toml"
+PYO3_PYTHON="${PYO3_PYTHON:-python3}" CARGO_TARGET_DIR="$consumer_target" \
   cargo check --quiet --manifest-path "$consumer/Cargo.toml" --features full
 
 readonly analysis_consumer="$temporary/analysis-consumer"
@@ -291,7 +300,7 @@ fn main() {
     let _ = brokk_bifrost_analysis::Language::Java;
 }
 EOF
-CARGO_TARGET_DIR="$temporary/consumer-target" \
+CARGO_TARGET_DIR="$consumer_target" \
   cargo check --quiet --manifest-path "$analysis_consumer/Cargo.toml"
 
 readonly extension_consumer="$temporary/extension-consumer"
@@ -341,10 +350,10 @@ mkdir -p "$extension_consumer/fixture/src"
 cat > "$extension_consumer/fixture/src/lib.rs" <<'EOF'
 pub fn package_seam() -> bool { true }
 EOF
-CARGO_TARGET_DIR="$temporary/consumer-target" \
+CARGO_TARGET_DIR="$consumer_target" \
   cargo run --quiet --manifest-path "$extension_consumer/Cargo.toml" -- "$extension_consumer/fixture"
 extension_tree="$temporary/extension-tree.txt"
-CARGO_TARGET_DIR="$temporary/consumer-target" \
+CARGO_TARGET_DIR="$consumer_target" \
   cargo tree --manifest-path "$extension_consumer/Cargo.toml" > "$extension_tree"
 if grep -Eq 'brokk-bifrost-(mcp|lsp)' "$extension_tree"; then
   echo "Extension consumer unexpectedly depends on a transport host" >&2

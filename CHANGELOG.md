@@ -126,6 +126,11 @@ projection and its commit history does not contain every source commit.
 
 ### Fixed
 
+- Scala navigation resolves imports through indexed enclosing owners and typed
+  values while keeping inherited type aliases distinct from imported terms.
+  Abstract val/var fields and package-object members retain their declarations,
+  and Scala 2 calls named `export` preserve their enclosing class.
+
 - The shipped JDK, Kotlin and Scala standard-library packs are selectable
   again on hosts that do not run the one build each pack was extracted from.
   Each pack now declares the compatible range its extracted API surface

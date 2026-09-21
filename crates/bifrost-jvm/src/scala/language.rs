@@ -1,5 +1,12 @@
-/// The released tree-sitter Scala grammar.
-pub use tree_sitter_scala::LANGUAGE;
+use tree_sitter_language::LanguageFn;
+
+unsafe extern "C" {
+    fn tree_sitter_scala() -> *const ();
+}
+
+/// Scala grammar with the contextual field-selector correction described in grammar/README.md.
+// SAFETY: build.rs compiles the generated tree-sitter language function linked here.
+pub const LANGUAGE: LanguageFn = unsafe { LanguageFn::from_raw(tree_sitter_scala) };
 
 #[cfg(test)]
 mod tests {
@@ -17,6 +24,35 @@ mod tests {
             tree.root_node().to_sexp()
         );
         tree
+    }
+
+    #[test]
+    fn scala2_export_selector_preserves_enclosing_class_and_scala3_exports() {
+        let tree = parse_without_recovery(
+            r#"class Dialog {
+  var selection = 0
+  def write(): Unit = {
+    try {
+      Export.export(project, file)
+    } catch {
+      case failure: Exception => throw failure
+    }
+  }
+  def accept(): Boolean = selection == 0
+}"#,
+        );
+        let class = tree.root_node().named_child(0).expect("class");
+        let body = class.child_by_field_name("body").expect("class body");
+        let mut cursor = body.walk();
+        assert_eq!(
+            body.named_children(&mut cursor)
+                .filter(|node| node.kind() == "function_definition")
+                .count(),
+            2,
+            "both methods must belong to the class"
+        );
+        let tree = parse_without_recovery("object API { export implementation.member }");
+        assert!(tree.root_node().to_sexp().contains("(export_declaration"));
     }
 
     #[test]

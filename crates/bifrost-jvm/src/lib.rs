@@ -23,9 +23,9 @@
 //!
 //! # The grammar packages
 //!
-//! Scala uses the released `tree-sitter-scala` crate. Kotlin uses the released
-//! `brokk-tree-sitter-kotlin` crate. Both grammar crates use distinct native
-//! symbols. `brokk-bifrost-analysis` re-imports both languages for parsing and
+//! Scala uses a vendored `tree-sitter-scala` grammar with a contextual selector
+//! correction (see `scala/grammar/README.md`). Kotlin uses the released
+//! `brokk-tree-sitter-kotlin` crate. Both grammars use distinct native symbols. `brokk-bifrost-analysis` re-imports both languages for parsing and
 //! store epochs.
 //!
 //! Where analysis code would reach for an analyzer handle, the functions here

@@ -1521,13 +1521,11 @@ class Result {
     /// tree-sitter-scala loses whole template bodies to recovery on Scala 3
     /// source it cannot parse. `def be_==/(...)` -- a method name that mixes
     /// alphanumeric and operator characters, which Scala admits -- wraps the
-    /// enclosing trait's body in one ERROR node, and the soft keyword `export`
-    /// used as a member name wraps the selection it appears in. The signature
-    /// types and the selection's owner inside those subtrees are ordinary
-    /// references the inverse usage scan reports, so membership must hold them
-    /// (#2085). The declaration names beside them, and the leaves recovery
-    /// merely left lying around, must not enter, and the forward probe frontier
-    /// must not move at all.
+    /// enclosing trait's body in one ERROR node. Signature types inside that
+    /// subtree are ordinary references the inverse usage scan reports, so
+    /// membership must hold them (#2085), while declaration names stay out.
+    /// The formerly recovered `Area.export(...)` selection parses normally
+    /// after #3499: its owner and arguments must now enter both frontiers.
     #[test]
     fn scala_census_membership_backs_only_structured_references_inside_recovery() {
         let signatures = concat!(
@@ -1586,22 +1584,21 @@ class Result {
         );
         let census = census_offsets(Language::Scala, "Task.scala", selection);
         let membership = census_membership_offsets(Language::Scala, "Task.scala", selection);
-        let recovered_owner = selection
-            .find("Area.export")
-            .expect("recovered selection owner");
-        let recovery_noise =
-            selection.find("export(value").expect("recovery noise") + "export(".len();
-        assert!(
-            !census.contains(&recovered_owner),
-            "the forward census must keep excluding the ERROR subtree: {census:?}"
-        );
-        assert!(
-            membership.contains(&recovered_owner),
-            "the recovered selection owner must back inverse precision: {membership:?}"
-        );
-        assert!(
-            !membership.contains(&recovery_noise),
-            "the argument recovery read as a member name is not a reference: {membership:?}"
+        let owner = selection.find("Area.export").expect("selection owner");
+        let argument = selection.find("export(value").expect("call argument") + "export(".len();
+        for reference in [owner, argument] {
+            assert!(
+                census.contains(&reference),
+                "the parsed reference at {reference} must enter the forward census: {census:?}"
+            );
+            assert!(
+                membership.contains(&reference),
+                "the parsed reference at {reference} must back inverse precision: {membership:?}"
+            );
+        }
+        assert_eq!(
+            census, membership,
+            "a fully parsed selection must have the ordinary shared frontier"
         );
     }
 

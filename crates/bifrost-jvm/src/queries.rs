@@ -39,7 +39,7 @@ pub const KOTLIN_HIGHLIGHTS_QUERY: &str =
     include_str!("../resources/treesitter/kotlin/highlights.scm");
 
 /// Scala's released highlight query, embedded for `ScalaSupport::highlight_query`.
-pub const SCALA_HIGHLIGHTS_QUERY: &str = tree_sitter_scala::HIGHLIGHTS_QUERY;
+pub const SCALA_HIGHLIGHTS_QUERY: &str = include_str!("scala/grammar/queries/highlights.scm");
 
 /// Compile-time embedded `.scm` query files as `(relative_path, contents)`.
 pub const JVM_QUERY_ASSETS: &[(&str, &str)] = &[
