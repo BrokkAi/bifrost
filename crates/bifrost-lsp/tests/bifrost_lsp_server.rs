@@ -3818,7 +3818,7 @@ fn bifrost_lsp_server_watched_delete_removes_workspace_symbol() {
         "method": "initialize",
         "params": {"processId": null, "rootUri": uri_for(&root), "capabilities": {}}
     }));
-    let initialize = server.read_message();
+    let initialize = server.read_response_for_id(1);
     assert_eq!(initialize["id"], 1);
     server.notify_value(json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}));
 
@@ -3828,7 +3828,7 @@ fn bifrost_lsp_server_watched_delete_removes_workspace_symbol() {
         "method": "workspace/symbol",
         "params": {"query": "removedLater"}
     }));
-    let before = server.read_message();
+    let before = server.read_response_for_id(2);
     let before_symbols = before["result"]
         .as_array()
         .unwrap_or_else(|| panic!("expected workspace symbols, got {before}"));
@@ -3854,7 +3854,7 @@ fn bifrost_lsp_server_watched_delete_removes_workspace_symbol() {
         "method": "workspace/symbol",
         "params": {"query": "removedLater"}
     }));
-    let after = server.read_message();
+    let after = server.read_response_for_id(3);
     let after_symbols = after["result"]
         .as_array()
         .unwrap_or_else(|| panic!("expected workspace symbols, got {after}"));
