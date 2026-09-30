@@ -1036,9 +1036,9 @@ fn generate_jdk_production(
 
 fn exact_jdk_version(spec: &PinnedPackSpec) -> Result<JdkVersion, BundleError> {
     let selector = spec
-        .activation
-        .iter()
-        .find_map(|selector| selector.toolchain.as_ref())
+        .measurement_activation
+        .toolchain
+        .as_ref()
         .ok_or_else(|| {
             BundleError::new(format!(
                 "JDK spec {}@{} requires an exact toolchain selector",
@@ -3939,7 +3939,13 @@ mod tests {
                     requirement: format!("={version}"),
                 }],
             },
-            activation: vec![activation.clone()],
+            activation: vec![ActivationSelector {
+                toolchain: Some(NameSelector {
+                    name: "jdk".to_owned(),
+                    version: Some(">=21.0.0, <22.0.0".to_owned()),
+                }),
+                ..activation.clone()
+            }],
             provenance: Provenance {
                 source: "fixture".to_owned(),
                 revision: Some("fixture-v1".to_owned()),
