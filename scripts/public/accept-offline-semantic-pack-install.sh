@@ -144,7 +144,8 @@ connection.close()
 PY
 run_scan incompatible
 
-node - "$scratch" <<'NODE'
+policy_manifest="$(dirname "$0")/../../crates/bifrost-policy/policy-packs/bifrost.security/manifest.json"
+node - "$scratch" "$policy_manifest" <<'NODE'
 const fs = require("node:fs");
 const path = require("node:path");
 const root = process.argv[2];
@@ -157,7 +158,13 @@ if (!run) throw new Error("staged binary omitted the Java getenv-to-exec policy 
 if (!report.packs.decisions.some((decision) => decision.pack.startsWith("bifrost.jdk@") && decision.status === "selected")) {
   throw new Error("the installed curated JDK pack was not selected from exact Linux toolchain evidence");
 }
-if (run.policy_hash !== "e6124423292a84eb827aafd80379d40c788b9759fad5eab9ed046b4a9eeb234e") {
+const manifest = JSON.parse(fs.readFileSync(process.argv[3], "utf8"));
+const policies = manifest.policies.filter((policy) => policy.id === run.policy_id);
+if (manifest.id !== "bifrost.security" || policies.length !== 1 ||
+    !/^[0-9a-f]{64}$/.test(policies[0].resolved_semantic_hash)) {
+  throw new Error("release manifest omitted a unique, exact Java getenv-to-exec policy identity");
+}
+if (run.policy_hash !== policies[0].resolved_semantic_hash) {
   throw new Error(`unexpected Java getenv-to-exec policy hash: ${run.policy_hash}`);
 }
 
