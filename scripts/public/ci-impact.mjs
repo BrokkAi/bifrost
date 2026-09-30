@@ -383,6 +383,10 @@ function fullDecision(reason, changedPaths) {
   };
 }
 
+function isVersionRcRef(ref) {
+  return /^refs\/heads\/(?:[^/]+\/)*v[0-9]+\.[0-9]+\.[0-9]+-rc$/u.test(ref);
+}
+
 export function classifyChangeSet(input) {
   return classifyComponents(input);
 }
@@ -390,6 +394,12 @@ export function classifyChangeSet(input) {
 function classifyComponents({ eventName, ref = "", changedPaths = [], diffFailed = false }) {
   if (eventName === "merge_group") {
     return fullDecision("merge queue requires the full matrix", changedPaths);
+  }
+  if (eventName === "workflow_dispatch" && isVersionRcRef(ref)) {
+    return fullDecision("release-candidate manual dispatch requires the full matrix", changedPaths);
+  }
+  if (eventName === "push" && isVersionRcRef(ref)) {
+    return fullDecision("release-candidate push requires the full matrix", changedPaths);
   }
   if (eventName === "push" && ref === "refs/heads/master") {
     return fullDecision("master push requires the full matrix", changedPaths);

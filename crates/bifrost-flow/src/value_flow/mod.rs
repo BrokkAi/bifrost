@@ -10,6 +10,7 @@ mod plan;
 mod planned;
 mod provider;
 mod result;
+mod source_derivation;
 
 /// Languages whose production semantic adapters have source-backed parity
 /// across the direct solver, JSON CodeQuery, and RQL public routes.
@@ -74,4 +75,11 @@ pub use provider::{
 };
 pub use result::{
     ValueFlowMayStatus, ValueFlowMeeting, ValueFlowSinkOutcome, ValueFlowSummaryResult,
+};
+pub use source_derivation::{
+    NormalResultTransferPartition, SourceDependencyIdentity, SourceDerivationError,
+    SourceDerivationFile, SourceDerivationFrontier, SourceDerivationInput, SourceDerivationLimits,
+    SourceDerivationResult, SourceDerivationWork, SourceEntrypointRange, SourceEntrypointStatus,
+    SourceReadCoverage, TransferEvidence, TransferPartitionSource, TransferPartitionStatus,
+    derive_source_normal_result,
 };

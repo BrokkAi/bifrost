@@ -131,6 +131,9 @@ labelled_enum! {
         ReceiverContractMismatch => "receiver_contract_mismatch",
         CallKindMismatch => "call_kind_mismatch",
         ShapeUnknown => "shape_unknown",
+        PrimitiveTypeMismatch => "primitive_type_mismatch",
+        LessSpecificPrimitiveOverload => "less_specific_primitive_overload",
+        RequiresBoxing => "requires_boxing",
     }
 }
 

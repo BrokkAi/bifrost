@@ -15,8 +15,10 @@
 
 use crate::analyzer::SemanticDiagnosticDomain;
 use crate::analyzer::semantic_model::{
-    SemanticModelCompleteness, SemanticModelOverlay, SemanticModelOverlayDisposition,
-    SemanticModelSymbol, SemanticModelSymbolKind, TypeIdentity, type_declaration_id,
+    SemanticModelArgumentBinding, SemanticModelCallApplication, SemanticModelCompleteness,
+    SemanticModelMemberTargetDisposition, SemanticModelOverlay, SemanticModelOverlayDisposition,
+    SemanticModelSymbol, SemanticModelSymbolKind, TypeIdentity, TypeRef,
+    bind_semantic_model_arguments, type_declaration_id,
 };
 
 /// The ecosystem every Ruby declaration identity is minted under, in the gem
@@ -96,6 +98,77 @@ impl<'a> RubyOverlayConstants<'a> {
         (matched.disposition == SemanticModelOverlayDisposition::Unique)
             .then(|| matched.records.first().copied())
             .flatten()
+    }
+
+    /// Select a callable from the activated declaration surface, retaining
+    /// conflicts and partial records instead of using a same-name member.
+    pub(crate) fn callable(
+        &self,
+        owner: &SemanticModelSymbol,
+        name: &str,
+        argument_count: usize,
+    ) -> Option<&'a SemanticModelSymbol> {
+        let matched = self.overlay?.member_target_on_owner(&owner.id, name);
+        if matched.disposition != SemanticModelMemberTargetDisposition::Unique {
+            return None;
+        }
+        let [member] = matched.records.as_slice() else {
+            return None;
+        };
+        if !matches!(
+            member.kind,
+            SemanticModelSymbolKind::Method | SemanticModelSymbolKind::Constructor
+        ) {
+            return None;
+        }
+        if member.owner_id.as_deref() != Some(owner.id.as_str()) {
+            return None;
+        }
+        if let Some(signature) = member.structured_signature()
+            && !matches!(
+                bind_semantic_model_arguments(
+                    signature,
+                    &SemanticModelCallApplication::positional(u32::try_from(argument_count).ok()?)
+                ),
+                SemanticModelArgumentBinding::Exact { .. }
+            )
+        {
+            return None;
+        }
+        Some(*member)
+    }
+
+    /// An applicable callable produces its declared result type. Neither
+    /// constructors nor separately named factories imply their result owner.
+    pub(crate) fn declared_result(
+        &self,
+        member: &SemanticModelSymbol,
+    ) -> Option<&'a SemanticModelSymbol> {
+        let result = match member.structured_signature()?.returns.as_ref()? {
+            TypeRef::Declared {
+                id,
+                arguments,
+                nullable: false,
+            } if arguments.is_empty() => {
+                let matched = self.overlay?.symbols_with_id(id);
+                if matched.disposition != SemanticModelOverlayDisposition::Unique {
+                    return None;
+                }
+                *matched.records.first()?
+            }
+            TypeRef::Named {
+                name,
+                arguments,
+                nullable: false,
+            } if arguments.is_empty() => self.unique_type(name)?,
+            _ => return None,
+        };
+        (result.language == "ruby"
+            && result.kind == SemanticModelSymbolKind::Class
+            && result.id == Self::declaration_id(&result.qualified_name)
+            && result.provenance.completeness == SemanticModelCompleteness::Complete
+            && !result.provenance.ambiguous)
+            .then_some(result)
     }
 
     /// Whether more than one activated pack claims `constant_path`.

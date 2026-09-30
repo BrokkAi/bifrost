@@ -54,8 +54,8 @@ use std::path::{Path, PathBuf};
 use brokk_bifrost_analysis::analyzer::semantic_model::{
     ActivationSelector, AuthoredPayload, AuthoredProcedureSummary, AuthoredProcedureTarget,
     AuthoredSemanticModelPack, AuthoredShard, AuthoredSummaryTransfer, Compatibility,
-    CompilerOptions, Completeness, NameSelector, Producer, Provenance, Safety, SourceFormat,
-    VersionConstraint, compile_source,
+    CompilerOptions, Completeness, MemberFact, NameSelector, Producer, Provenance, RelationFact,
+    Safety, SourceFormat, TypeFact, VersionConstraint, compile_source,
 };
 use serde::{Deserialize, Serialize};
 
@@ -68,6 +68,17 @@ pub const GOLDEN_PACK_AUDIT_FORMAT: &str = "bifrost_golden_pack_audit/v1";
 
 /// The audit report's file name, written beside the pack.
 pub const GOLDEN_AUDIT_FILE_NAME: &str = "rejects.json";
+
+/// The file name, beside a candidate directory's candidate `*.json` files,
+/// that carries the realm's reviewed declaration surface.
+///
+/// A candidate records a summary claim on a target symbol. The published
+/// callable identity a call site resolves (#3484) is proof of a declaration,
+/// not of a summary claim, so a realm whose call sites have no materialized
+/// declaration needs those facts beside its summaries. The file is the
+/// realm's authored declaration surface, carried verbatim into a
+/// `declaration_facts` shard of the generated pack.
+pub const GOLDEN_DECLARATIONS_FILE_NAME: &str = "declarations.json";
 
 /// The producer name recorded in the generated pack.
 const PRODUCER_NAME: &str = "bifrost-golden-foundry";
@@ -180,7 +191,7 @@ pub const PYTHON_REALM: GoldenRealm = GoldenRealm {
 pub const RUST_REALM: GoldenRealm = GoldenRealm {
     pack_id: "bifrost.rust-std-golden-summaries",
     language: "rust",
-    content_version: "0.1.0",
+    content_version: "0.2.0",
     ecosystem: "cargo",
     toolchain: None,
     targets: &[],
@@ -269,6 +280,20 @@ struct GoldenCandidate {
     confidence: String,
     #[allow(dead_code)]
     citations: String,
+}
+
+/// One realm's reviewed declaration surface, as the candidate directory's
+/// [`GOLDEN_DECLARATIONS_FILE_NAME`] file spells it. Its fields are the
+/// declaration-fact records themselves, so the file is the authored review,
+/// not a summary of one.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GoldenDeclarations {
+    types: Vec<TypeFact>,
+    #[serde(default)]
+    members: Vec<MemberFact>,
+    #[serde(default)]
+    relations: Vec<RelationFact>,
 }
 
 /// The generated golden pack: its identity, that it is byte-pinned by the JDK
@@ -403,13 +428,15 @@ impl std::error::Error for GoldenPackError {}
 
 /// Read every `*.json` candidate file under `candidates_dir`, drop the
 /// duplicate-target candidates, and produce the pack source plus the audit
-/// report for one realm.
+/// report for one realm. A [`GOLDEN_DECLARATIONS_FILE_NAME`] file beside them
+/// is the realm's reviewed declaration surface and ships as a second shard.
 pub fn convert_golden_candidates(
     candidates_dir: &Path,
     realm: GoldenRealm,
 ) -> Result<GoldenConversion, GoldenPackError> {
     let candidates = read_candidates(candidates_dir)?;
-    build_conversion(candidates, realm)
+    let declarations = read_declarations(candidates_dir)?;
+    build_conversion(candidates, declarations, realm)
 }
 
 /// Write the generated pack source and the audit report under `output_root`.
@@ -450,7 +477,8 @@ pub fn write_golden_packs(
 }
 
 /// Read the candidate files in a stable order. Files are read in sorted name
-/// order; entry order within a file is preserved.
+/// order; entry order within a file is preserved. The declarations file is
+/// read separately, so it is skipped here.
 fn read_candidates(candidates_dir: &Path) -> Result<Vec<GoldenCandidate>, GoldenPackError> {
     let mut files = Vec::new();
     let read_dir = fs::read_dir(candidates_dir).map_err(|error| GoldenPackError::ReadDir {
@@ -471,6 +499,9 @@ fn read_candidates(candidates_dir: &Path) -> Result<Vec<GoldenCandidate>, Golden
 
     let mut all = Vec::new();
     for path in files {
+        if path.file_name().and_then(|name| name.to_str()) == Some(GOLDEN_DECLARATIONS_FILE_NAME) {
+            continue;
+        }
         let bytes = fs::read(&path).map_err(|error| GoldenPackError::ReadFile {
             path: path.clone(),
             message: error.to_string(),
@@ -485,8 +516,31 @@ fn read_candidates(candidates_dir: &Path) -> Result<Vec<GoldenCandidate>, Golden
     Ok(all)
 }
 
+/// Read the realm's reviewed declaration surface, when the candidate directory
+/// carries one. A missing file is the realm that publishes summaries only.
+fn read_declarations(candidates_dir: &Path) -> Result<Option<GoldenDeclarations>, GoldenPackError> {
+    let path = candidates_dir.join(GOLDEN_DECLARATIONS_FILE_NAME);
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(GoldenPackError::ReadFile {
+                path,
+                message: error.to_string(),
+            });
+        }
+    };
+    let parsed: GoldenDeclarations =
+        serde_json::from_slice(&bytes).map_err(|error| GoldenPackError::Parse {
+            path: path.clone(),
+            message: error.to_string(),
+        })?;
+    Ok(Some(parsed))
+}
+
 fn build_conversion(
     candidates: Vec<GoldenCandidate>,
+    declarations: Option<GoldenDeclarations>,
     realm: GoldenRealm,
 ) -> Result<GoldenConversion, GoldenPackError> {
     let candidates_total = candidates.len();
@@ -540,7 +594,7 @@ fn build_conversion(
         Completeness::Partial
     };
 
-    let pack = build_pack(summaries, completeness, realm);
+    let pack = build_pack(summaries, completeness, declarations, realm);
     let source_json = serialize_pack(&pack);
     compile_check(&source_json, realm)?;
 
@@ -643,11 +697,13 @@ fn build_summary(candidate: GoldenCandidate, realm: GoldenRealm) -> AuthoredProc
         normal_result_count: None,
         locations: Vec::new(),
         transfers: candidate.transfers,
+        transfer_partitions: Vec::new(),
         effects: Vec::new(),
         concurrency_effects: Vec::new(),
         declared_effects: Vec::new(),
         preconditions: None,
         result_contracts: Vec::new(),
+        result_use_obligations: Vec::new(),
         conditional_result_refinements: Vec::new(),
         conditional_indirect_writes: Vec::new(),
         normal_return_refinements: Vec::new(),
@@ -786,8 +842,38 @@ fn shipped_has_receiver(target: &AuthoredProcedureTarget, realm: GoldenRealm) ->
 fn build_pack(
     summaries: Vec<AuthoredProcedureSummary>,
     completeness: Completeness,
+    declarations: Option<GoldenDeclarations>,
     realm: GoldenRealm,
 ) -> AuthoredSemanticModelPack {
+    // The summaries shard is first. Consumers and the shipping gate read the
+    // claimed transforms from the pack's first shard, and the declaration
+    // surface is provenance for how a call site reaches them.
+    let mut shards = vec![AuthoredShard {
+        id: format!("summaries.{}", realm.ecosystem),
+        activation: realm_activation(realm),
+        payload: AuthoredPayload::ProcedureSummaries { summaries },
+        runtime_values: None,
+        runtime_contracts: None,
+        collection_flows: None,
+        deferred_yields: None,
+        conditional_type_refinements: None,
+    }];
+    if let Some(declarations) = declarations {
+        shards.push(AuthoredShard {
+            id: format!("declarations.{}", realm.ecosystem),
+            activation: realm_activation(realm),
+            payload: AuthoredPayload::DeclarationFacts {
+                types: declarations.types,
+                members: declarations.members,
+                relations: declarations.relations,
+            },
+            runtime_values: None,
+            runtime_contracts: None,
+            collection_flows: None,
+            deferred_yields: None,
+            conditional_type_refinements: None,
+        });
+    }
     AuthoredSemanticModelPack {
         schema_version: 2,
         pack_id: realm.pack_id.to_owned(),
@@ -822,31 +908,28 @@ fn build_pack(
         },
         carried_sources: Vec::new(),
         cpp_portability: None,
-        shards: vec![AuthoredShard {
-            id: format!("summaries.{}", realm.ecosystem),
-            activation: vec![ActivationSelector {
-                package: None,
-                module: None,
-                toolchain: realm.toolchain.map(|pin| NameSelector {
-                    name: pin.name.to_owned(),
-                    version: Some(pin.requirement.to_owned()),
-                }),
-                targets: realm
-                    .targets
-                    .iter()
-                    .map(|value| (*value).to_owned())
-                    .collect(),
-                configurations: Vec::new(),
-                artifact_sha256: None,
-            }],
-            payload: AuthoredPayload::ProcedureSummaries { summaries },
-            runtime_values: None,
-            runtime_contracts: None,
-            collection_flows: None,
-            deferred_yields: None,
-            conditional_type_refinements: None,
-        }],
+        python_correspondence: None,
+        shards,
     }
+}
+
+/// The activation selector every shard of one realm's pack carries.
+fn realm_activation(realm: GoldenRealm) -> Vec<ActivationSelector> {
+    vec![ActivationSelector {
+        package: None,
+        module: None,
+        toolchain: realm.toolchain.map(|pin| NameSelector {
+            name: pin.name.to_owned(),
+            version: Some(pin.requirement.to_owned()),
+        }),
+        targets: realm
+            .targets
+            .iter()
+            .map(|value| (*value).to_owned())
+            .collect(),
+        configurations: Vec::new(),
+        artifact_sha256: None,
+    }]
 }
 
 fn assert_ids_unique(

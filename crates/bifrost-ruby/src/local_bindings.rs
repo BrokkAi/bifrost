@@ -283,12 +283,53 @@ impl<'source, 'request, B: LocalBindingBudget> LocalBindingCollector<'source, 'r
         Ok(())
     }
 
+    fn collect_write(&mut self, node: Node<'_>) -> Result<(), B::Error> {
+        match node.kind() {
+            "assignment" | "operator_assignment" => {
+                if let Some(left) = node.child_by_field_name("left") {
+                    self.collect_assignment(left)?;
+                }
+            }
+            "for" => {
+                if let Some(pattern) = node.child_by_field_name("pattern") {
+                    self.collect_assignment(pattern)?;
+                }
+            }
+            "rescue" => {
+                if let Some(variable) = node.child_by_field_name("variable") {
+                    self.collect_assignment(variable)?;
+                }
+            }
+            "match_pattern" | "test_pattern" | "in_clause" => {
+                if let Some(pattern) = node.child_by_field_name("pattern") {
+                    self.collect_pattern(pattern)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     fn finish(self) -> LocalBindingCollection {
         LocalBindingCollection {
             timeline: self.timeline,
             has_parameter_defaults: self.has_parameter_defaults,
         }
     }
+}
+
+/// Collect only the local targets written by one assignment, pattern match,
+/// loop binding, or rescue binding. Descendant statements are not traversed.
+/// Control-flow clients own execution order while sharing binding semantics.
+pub fn collect_local_write<B: LocalBindingBudget>(
+    source: &str,
+    node: Node<'_>,
+    budget: &mut B,
+) -> Result<LocalBindingTimeline, B::Error> {
+    let mut collector = LocalBindingCollector::new(source, budget);
+    collector.visit()?;
+    collector.collect_write(node)?;
+    Ok(collector.finish().timeline)
 }
 
 /// The parameter list of `callable`, which for a `lambda` node hangs off the
@@ -339,29 +380,7 @@ pub fn collect_local_bindings<B: LocalBindingBudget>(
     }
     while let Some(node) = stack.pop() {
         collector.visit()?;
-        match node.kind() {
-            "assignment" | "operator_assignment" => {
-                if let Some(left) = node.child_by_field_name("left") {
-                    collector.collect_assignment(left)?;
-                }
-            }
-            "for" => {
-                if let Some(pattern) = node.child_by_field_name("pattern") {
-                    collector.collect_assignment(pattern)?;
-                }
-            }
-            "rescue" => {
-                if let Some(variable) = node.child_by_field_name("variable") {
-                    collector.collect_assignment(variable)?;
-                }
-            }
-            "match_pattern" | "test_pattern" | "in_clause" => {
-                if let Some(pattern) = node.child_by_field_name("pattern") {
-                    collector.collect_pattern(pattern)?;
-                }
-            }
-            _ => {}
-        }
+        collector.collect_write(node)?;
         for child in named_children(node).into_iter().rev() {
             if child.id() != body.id()
                 && matches!(

@@ -19,7 +19,7 @@ use crate::analyzer::tree_sitter_analyzer::{
 use crate::analyzer::{JavaAnalyzer, Language, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 
-const ADAPTER_VERSION: &[u8] = b"java-value-semantics-v10";
+const ADAPTER_VERSION: &[u8] = b"java-value-semantics-v25";
 
 impl_program_semantics_provider!(JavaAnalyzer, JavaSemanticLowerer);
 
@@ -104,6 +104,8 @@ impl ProgramSemanticsLowerer for JavaSemanticLowerer {
                     spec.callable.id(),
                     NestedProcedureTarget {
                         id: spec.id,
+                        captures: spec.captures.clone(),
+                        captures_incomplete: spec.captures_incomplete,
                         receiver_capture_destination: spec
                             .captures_receiver
                             .then_some(RECEIVER_CAPTURE_DESTINATION),
@@ -166,8 +168,9 @@ fn java_capabilities() -> SemanticCapabilities {
         SemanticCapability::DeferredExecution,
         // Java is the only adapter that publishes guard facts today (#2443).
         // `Partial` rather than `Complete` states the exact limit: every
-        // decision the lowerer reaches gets a row, but only constant, null and
-        // constant-equality conditions are normalized and everything else is
+        // decision the lowerer reaches gets a row, but only constant, null,
+        // constant-equality, primitive ordered-literal and primitive
+        // self-comparison conditions are normalized and everything else is
         // recorded `Opaque`.
         SemanticCapability::GuardFacts,
     ] {
@@ -178,6 +181,7 @@ fn java_capabilities() -> SemanticCapabilities {
 
 mod control;
 mod inventory;
+mod numeric;
 mod syntax;
 #[cfg(test)]
 mod tests;
@@ -322,7 +326,7 @@ struct LoweringContext<'tree, 'targets> {
     implicit_field_values: HashMap<Box<str>, ValueId>,
     receiver: Option<ValueId>,
     captured_receiver: Option<ValueId>,
-    procedure_targets: &'targets HashMap<usize, NestedProcedureTarget>,
+    procedure_targets: &'targets HashMap<usize, NestedProcedureTarget<'tree>>,
     cleanups: Vec<CleanupRegion<'tree>>,
 }
 
@@ -332,4 +336,15 @@ struct LocalBinding {
     scope_start: usize,
     scope_end: usize,
     value: ValueId,
+}
+
+fn java_capture_destination(
+    captures_receiver: bool,
+    index: usize,
+) -> Result<MemoryLocationId, JavaLoweringError> {
+    let index = index
+        .checked_add(usize::from(captures_receiver))
+        .and_then(|index| u32::try_from(index).ok())
+        .ok_or_else(|| JavaLoweringError::Invalid("too many Java captures".into()))?;
+    Ok(MemoryLocationId::new(index))
 }

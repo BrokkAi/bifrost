@@ -1,0 +1,24 @@
+; A Java catch body is structurally empty, including comment-only bodies.
+; Recovered or unavailable syntax remains unknown. This does not claim that
+; the catch is reachable or that its exception type can be thrown.
+(policy
+  :schema-version 1
+  :id "bifrost.correctness.empty-failure-handler"
+  :name "Empty failure handler"
+  :message "this catch body contains no failure-handling statements"
+  :severity warning
+  :description "An exact Java catch clause has no non-comment body statements. This is a structural review finding: it does not establish that the catch is reachable or that its exception type can be thrown. Recovered or unavailable syntax is inconclusive. Review whether the exception needs handling or propagation; comments do not count as handling. No automatic fix is supplied."
+  :help-uri "https://bifrost.brokk.ai/static-analysis-policies/#built-in-code-smell-pack"
+  :tags ["correctness" "java" "exceptions"]
+  :analysis (analysis
+    :type assertion
+    (bind :name handler
+      :query (rql :schema-version 1
+        (filter :where ((verdict eq empty)
+                        (proof eq exact)
+                        (coverage eq exhaustive))
+          (failure-handler-state
+            (language java (catch))))))
+    (group :name by-handler :by (handler.id)
+      (aggregate :name empty-handlers :op count))
+    (assert :group by-handler :value empty-handlers :cardinality (exactly 0))))

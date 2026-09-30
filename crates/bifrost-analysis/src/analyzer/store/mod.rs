@@ -19617,6 +19617,91 @@ mod tests {
     }
 
     #[test]
+    fn cpp_source_member_prototype_units_epoch_invalidates_prior_parsed_blobs() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(
+            temp.path(),
+            "client.h",
+            "namespace shop {\n\
+             class Client { public: void send(int order); static int count(); };\n\
+             }\n",
+        );
+        let state = Arc::new(parse_state(&CppAdapter, &file));
+        let oid = oid_for(state.source.as_bytes());
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let prior_epoch = epoch::cpp_epoch_before_source_member_prototype_units();
+        let prior_generation = store
+            .ensure_language_epoch_value("cpp", &prior_epoch)
+            .unwrap();
+        store
+            .write_parsed_blob_at_generation(
+                oid,
+                "cpp",
+                prior_generation,
+                &CppAdapter,
+                state.as_ref(),
+            )
+            .unwrap();
+        assert!(store.contains_parsed_blob(oid, "cpp").unwrap());
+
+        let current_generation = store
+            .ensure_language_epoch(Language::Cpp, &tree_sitter_cpp::LANGUAGE.into())
+            .unwrap();
+
+        assert_ne!(current_generation, prior_generation);
+        assert!(!store.contains_parsed_blob(oid, "cpp").unwrap());
+        assert_eq!(
+            store
+                .missing_parsed_blob_keys(&[(oid, "cpp".to_string())])
+                .unwrap(),
+            vec![(oid, "cpp".to_string())]
+        );
+    }
+
+    #[test]
+    fn cpp_namespace_recovery_ancestry_epoch_invalidates_prior_parsed_blobs() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(
+            temp.path(),
+            "recovered_namespace.cpp",
+            "#define APP_IF_ACTIVE if (active) {\n\
+             namespace app { namespace detail {\n\
+             bool check(bool active) { APP_IF_ACTIVE return true; }\n\
+             class Tail {}; } }\n",
+        );
+        let state = Arc::new(parse_state(&CppAdapter, &file));
+        let oid = oid_for(state.source.as_bytes());
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let prior_epoch = epoch::cpp_epoch_before_namespace_recovery_ancestry_authority();
+        let prior_generation = store
+            .ensure_language_epoch_value("cpp", &prior_epoch)
+            .unwrap();
+        store
+            .write_parsed_blob_at_generation(
+                oid,
+                "cpp",
+                prior_generation,
+                &CppAdapter,
+                state.as_ref(),
+            )
+            .unwrap();
+        assert!(store.contains_parsed_blob(oid, "cpp").unwrap());
+
+        let current_generation = store
+            .ensure_language_epoch(Language::Cpp, &tree_sitter_cpp::LANGUAGE.into())
+            .unwrap();
+
+        assert_ne!(current_generation, prior_generation);
+        assert!(!store.contains_parsed_blob(oid, "cpp").unwrap());
+        assert_eq!(
+            store
+                .missing_parsed_blob_keys(&[(oid, "cpp".to_string())])
+                .unwrap(),
+            vec![(oid, "cpp".to_string())]
+        );
+    }
+
+    #[test]
     fn cpp_complete_sentinel_class_tail_epoch_invalidates_prior_parsed_blobs() {
         let temp = tempfile::TempDir::new().unwrap();
         let file = write_file(

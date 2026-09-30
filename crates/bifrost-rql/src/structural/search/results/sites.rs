@@ -1,6 +1,8 @@
 use super::*;
+use schemars::JsonSchema;
 
-#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CodeQueryReferenceSite {
     pub path: String,
     pub language: &'static str,
@@ -21,7 +23,8 @@ pub struct CodeQueryReferenceSite {
 /// equality of two `ast_id`s *is* the correlation join between a capture and
 /// the occurrence at that node. `id` additionally distinguishes the role, so a
 /// node classified twice yields two addressable rows.
-#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CodeQueryOccurrence {
     pub id: String,
     pub ast_id: String,
@@ -44,9 +47,11 @@ pub struct CodeQueryOccurrence {
 /// What a reference-class occurrence resolves to. A non-reference row is
 /// always `none`, and a reference row never is: `unresolved` carries the exact
 /// resolver status so an empty target is never mistaken for "not attempted".
-#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(tag = "target_kind", rename_all = "snake_case")]
 pub enum CodeQueryOccurrenceTarget {
+    #[cfg_attr(feature = "query-result-fixtures", default)]
     None,
     Resolved {
         units: Vec<CodeQueryDeclaration>,
@@ -64,7 +69,8 @@ pub enum CodeQueryOccurrenceTarget {
     NotDerived,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CodeQueryCallSite {
     pub path: String,
     pub language: &'static str,
@@ -77,10 +83,12 @@ pub struct CodeQueryCallSite {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub receiver: Option<CodeQueryRange>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[schemars(default)]
     pub arguments: Vec<CodeQueryCallArgument>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CodeQueryCallArgument {
     pub range: CodeQueryRange,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -92,12 +100,15 @@ pub struct CodeQueryCallArgument {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub formal_name: Option<String>,
     #[serde(skip_serializing_if = "is_false")]
+    #[schemars(default)]
     pub variadic: bool,
     #[serde(skip_serializing_if = "is_false")]
+    #[schemars(default)]
     pub spread: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CodeQueryExpressionSite {
     pub path: String,
     pub language: &'static str,
@@ -118,7 +129,8 @@ pub struct CodeQueryExpressionSite {
 /// The row's `range` and `ast_id` belong to the normalized operand itself,
 /// not to the enclosing attribute. This is the terminal contract consumed by
 /// `matched-value` policies.
-#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CodeQueryJsxAttributeValue {
     pub id: String,
     pub ast_id: String,
@@ -143,7 +155,8 @@ pub struct CodeQueryJsxAttributeValue {
     pub attribute_target: Option<CodeQueryDeclaration>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CodeQueryReceiverAnalysis {
     pub site_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -158,8 +171,10 @@ pub struct CodeQueryReceiverAnalysis {
     pub capture: Option<String>,
     pub outcome: &'static str,
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[schemars(default)]
     pub values: Vec<CodeQueryReceiverValue>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[schemars(default)]
     pub member_targets: Vec<CodeQueryDeclaration>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<&'static str>,
@@ -167,7 +182,8 @@ pub struct CodeQueryReceiverAnalysis {
     pub limit: Option<&'static str>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CodeQueryMemberTarget {
     pub id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -208,7 +224,8 @@ pub struct CodeQueryMemberTarget {
     pub semantic_model: Option<Box<crate::analyzer::semantic_model::SemanticModelProvenance>>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CodeQueryMemberTargetAnalysis {
     pub site_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -226,6 +243,7 @@ pub struct CodeQueryMemberTargetAnalysis {
     pub capture: Option<String>,
     pub outcome: &'static str,
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[schemars(default)]
     pub member_targets: Vec<CodeQueryMemberTarget>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<&'static str>,
@@ -237,7 +255,8 @@ pub struct CodeQueryMemberTargetAnalysis {
 /// Exact value written by one proven static-member assignment. The primary
 /// range and text belong to the RHS expression; the other ranges retain the
 /// write relation without changing policy `matched-value` semantics.
-#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CodeQueryFieldWriteValue {
     pub id: String,
     pub write_site_id: String,
@@ -264,7 +283,8 @@ pub struct CodeQueryFieldWriteValue {
 /// One exact activation-aware runtime keyed read. Endpoint rows carry the
 /// oracle's proof and completeness independently; a terminal row retains
 /// typed exclusion or incompleteness when no endpoint can be published.
-#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CodeQueryRuntimeKeyedReadValue {
     pub id: String,
     pub path: String,
@@ -292,6 +312,7 @@ pub struct CodeQueryRuntimeKeyedReadValue {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub behavior_id: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[schemars(default)]
     pub limitations: Vec<&'static str>,
     pub conclusive_exclusion: bool,
     pub terminal: bool,
@@ -300,7 +321,8 @@ pub struct CodeQueryRuntimeKeyedReadValue {
 /// The mandatory terminal row for one receiver/value analysis site. Evidence
 /// rows may be empty, but this row always states why and whether that absence
 /// is exhaustive.
-#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CodeQueryReceiverOutcome {
     pub id: String,
     pub site_id: String,
@@ -329,7 +351,8 @@ pub struct CodeQueryReceiverOutcome {
 /// projected from the production resolver's own candidate trace. The row
 /// exists even when the file records no trace for the occurrence, so an empty
 /// candidate relation can never masquerade as a proven-empty selection.
-#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CodeQueryMemberSelection {
     pub id: String,
     /// The occurrence's content-scoped AST identity; joins selection rows to
@@ -367,7 +390,8 @@ pub struct CodeQueryMemberSelection {
 ///
 /// The site's argument-shape coverage is deliberately not repeated here: it is
 /// the `call_shape` row's field, joined on the same `site_ast_id`.
-#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CodeQueryOverloadSelection {
     pub id: String,
     /// The occurrence's content-scoped AST identity, shared with the
@@ -402,7 +426,8 @@ pub struct CodeQueryOverloadSelection {
 /// and the site's `overload_selection` summary says `unresolved`. A row that is
 /// `selected` with an `unknown` verdict is a third state again -- the seam bound
 /// something no applicability check measured.
-#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CodeQueryCallableApplicability {
     pub id: String,
     /// The exact `site_ast_id` of the occurrence, and of the
@@ -442,7 +467,8 @@ pub struct CodeQueryCallableApplicability {
 /// over-budget, or cancelled dispatch is never exhaustive, so a policy
 /// completeness gate turns an exact-set assertion over such a site unreliable
 /// instead of clean.
-#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CodeQueryDispatchOutcome {
     pub id: String,
     pub site_id: String,
@@ -486,7 +512,8 @@ pub struct CodeQueryDispatchOutcome {
 /// exhaustive set, and `may_dispatch` otherwise. The three fields are kept
 /// separate so an assertion can read either the conjunction or the exact axis
 /// that made an arm open.
-#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CodeQueryDispatchTarget {
     pub id: String,
     pub site_id: String,
@@ -532,7 +559,8 @@ pub struct CodeQueryDispatchTarget {
 /// are honest failures that carry no family id. `coverage` is `exhaustive`
 /// only for the two complete answers, so an exact-set assertion over an
 /// unproven member turns unreliable rather than clean.
-#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CodeQueryMemberFamily {
     pub id: String,
     /// The member's structured canonical identity digest -- the same recipe
@@ -585,7 +613,8 @@ pub struct CodeQueryMemberFamily {
 /// override chain, for example. It differs when they do not, as when the
 /// overriding member also implements a second interface that declares the same
 /// contract.
-#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CodeQueryMemberFamilyEdge {
     pub id: String,
     /// The source member's canonical identity digest.
@@ -624,7 +653,8 @@ pub struct CodeQueryMemberFamilyEdge {
 
 /// One typed receiver value retained for a site. Nested factory returns are
 /// flattened into a parent-linked chain instead of nested presentation data.
-#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CodeQueryReceiverEvidence {
     pub id: String,
     pub site_id: String,
@@ -656,7 +686,8 @@ pub struct CodeQueryReceiverEvidence {
 /// The mandatory structured call-shape outcome row for one exact call site.
 /// Group and argument rows may be empty, but this row always states the
 /// call kind and how much of the shape the analyzer could see.
-#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CodeQueryCallShape {
     pub id: String,
     pub site_id: String,
@@ -675,7 +706,8 @@ pub struct CodeQueryCallShape {
 }
 
 /// One ordered argument-list group of a call shape.
-#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CodeQueryCallArgumentGroup {
     pub id: String,
     pub site_id: String,
@@ -687,7 +719,8 @@ pub struct CodeQueryCallArgumentGroup {
 }
 
 /// One ordered argument inside one argument-list group.
-#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CodeQueryCallShapeArgument {
     pub id: String,
     pub group_id: String,
@@ -718,7 +751,8 @@ pub struct CodeQueryCallShapeArgument {
 /// `mapping` is this row's own certainty and `coverage` is the whole call's
 /// partition coverage, repeated on every row so one row alone is enough to
 /// reject an exact-set claim over the call's arguments.
-#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CodeQueryCallBinding {
     pub id: String,
     /// The owning `call_shape` row's site identity.
@@ -914,7 +948,8 @@ pub struct CodeQueryCallBinding {
 ///
 /// `coverage` is repeated on every row of the site, so one row alone is enough
 /// to reject an "this call performs no such effect" claim.
-#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CodeQueryCallEffect {
     pub id: String,
     /// The owning `call_shape` row's site identity.
@@ -986,7 +1021,8 @@ pub struct CodeQueryCallEffect {
 /// directly by `result_success_predicate`. At least one row exists per call
 /// shape; terminal rows carry no ordinals or predicates and state why no
 /// contract was established.
-#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CodeQueryCallResultContract {
     pub id: String,
     pub site_id: String,
@@ -1068,9 +1104,42 @@ pub struct CodeQueryCallResultContract {
     pub possible_success_guard_edges: Vec<crate::analyzer::semantic::ControlEdgeLocator>,
 }
 
+/// One exact Java call result-use obligation, or an explicit terminal row
+/// stating why the relation cannot close for this call.
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct CodeQueryCallResultObligation {
+    pub id: String,
+    pub site_id: String,
+    pub site_ast_id: String,
+    pub path: String,
+    pub language: &'static str,
+    pub range: CodeQueryRange,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result_ordinal: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub obligation_kind: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_predicate: Option<&'static str>,
+    pub result_use: &'static str,
+    pub coverage: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pack_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary_id: Option<String>,
+    pub arm_count: usize,
+    pub modeled_arm_count: usize,
+    pub terminal: bool,
+}
+
 /// One exact operation on a protected result, anchored at the operation rather
 /// than at the call that acquired the result.
-#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CodeQueryResultContractUse {
     pub id: String,
     pub acquisition_id: String,
@@ -1115,7 +1184,8 @@ pub struct CodeQueryResultContractUse {
 }
 
 /// One source-backed pointer operation with its local scalar nilness fact.
-#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CodeQueryNilnessOperation {
     pub id: String,
     pub procedure_id: String,
@@ -1137,7 +1207,8 @@ pub struct CodeQueryNilnessOperation {
 
 /// One structured switch with the coverage conclusion justified by its
 /// adapter-published selector and case facts.
-#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CodeQuerySwitchCoverage {
     pub id: String,
     pub procedure_id: String,
@@ -1161,11 +1232,42 @@ pub struct CodeQuerySwitchCoverage {
     pub reason: Option<&'static str>,
 }
 
+/// One source-backed assignment relation and its proof/coverage conclusion.
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct CodeQueryAssignmentRelation {
+    pub id: String,
+    pub procedure_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assignment_point_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_value_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rhs_value_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ast_id: Option<String>,
+    pub path: String,
+    pub language: &'static str,
+    pub range: CodeQueryRange,
+    pub relation_kind: &'static str,
+    pub storage_kind: &'static str,
+    pub verdict: &'static str,
+    pub proof: &'static str,
+    pub coverage: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<&'static str>,
+    /// Every first replacement established on a modeled continuation.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[schemars(default)]
+    pub replacement_events: Vec<CodeQueryStateEventRef>,
+}
+
 /// One same-location ordinary-access pair in a bounded concurrent task slice.
 /// The row retains both defects and structured safe explanations. Built-in
 /// policies select only `conflict`, `proven`, and `exhaustive` rows whose
 /// ordering is `unordered` and whose protection is `unprotected`.
-#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CodeQueryConcurrentAccessConflict {
     pub id: String,
     pub root_procedure_id: String,
@@ -1201,10 +1303,12 @@ pub struct CodeQueryConcurrentAccessConflict {
     pub proof: &'static str,
     pub coverage: &'static str,
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[schemars(default)]
     pub reasons: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CodeQueryDetachedTaskTransfer {
     pub id: String,
     pub procedure_id: String,
@@ -1231,7 +1335,8 @@ pub struct CodeQueryDetachedTaskTransfer {
 }
 
 /// One structured value consumed inside an exact reviewed failure arm.
-#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CodeQueryResultContractFailureUse {
     pub id: String,
     pub acquisition_id: String,
@@ -1296,7 +1401,8 @@ pub struct CodeQueryResultContractFailureUse {
 /// At least one row exists per procedure, so zero rows is never a claim that a
 /// procedure is effect-free. `coverage` states whether an absence of rows for a
 /// given effect is a proof or only a silence.
-#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CodeQueryProcedureEffect {
     pub id: String,
     /// Equal to the `declaration` domain's `id` for the same procedure.
@@ -1376,7 +1482,8 @@ pub struct CodeQueryProcedureEffect {
 /// fields are absent when the language records no arity, and
 /// `receiver_contract` is absent when the adapter never inspected modifiers,
 /// because "not static" and "nobody looked" are different answers.
-#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CodeQueryCallableSignature {
     pub id: String,
     /// The declaration id plus this row's exact byte span.
@@ -1425,7 +1532,8 @@ pub struct CodeQueryCallableSignature {
 /// anchors a parameter only inside the rendered signature label; that anchor is
 /// published as `label_start_byte`/`label_end_byte` under its own name so it is
 /// never mistaken for a file offset.
-#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CodeQuerySignatureParameter {
     pub id: String,
     pub signature_id: String,
@@ -1456,7 +1564,8 @@ pub struct CodeQuerySignatureParameter {
 /// application and its source anchor while still being unable to prove a
 /// lexical import or semantic port. The status fields make that boundary
 /// explicit rather than turning the row into a false negative.
-#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CodeQueryDecoratedParameter {
     pub id: String,
     pub parameter_id: String,
@@ -1492,7 +1601,7 @@ pub struct CodeQueryDecoratedParameter {
     pub terminal: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(tag = "receiver_value_kind", rename_all = "snake_case")]
 pub enum CodeQueryReceiverValue {
     AllocationSite {

@@ -24,8 +24,9 @@ use std::sync::{Arc, Mutex};
 
 use crate::declarations::python_module_name;
 use crate::graph_support::{
-    PythonSource, PythonUsageSource, export_index_from_file_facts, import_binder_from_imports,
-    import_bindings_from_imports, retain_modules_for_importer,
+    PythonModuleSpellings, PythonSource, PythonUsageSource, export_index_from_file_facts,
+    import_binder_from_imports, import_bindings_from_imports, python_module_file_under_source_root,
+    retain_modules_for_importer,
 };
 use crate::imports::{
     literal_importlib_modules, module_replacement_of, resolve_python_relative_module,
@@ -35,6 +36,7 @@ use crate::imports::{
 #[derive(Debug, Default)]
 pub struct PythonUsageIndex {
     module_index: HashMap<String, Vec<ProjectFile>>,
+    module_spellings: Arc<PythonModuleSpellings>,
     exports_by_file: HashMap<ProjectFile, Arc<ExportIndex>>,
     reexport_edges: HashMap<(ProjectFile, String), Vec<(ProjectFile, String)>>,
     star_reexports: HashMap<ProjectFile, Vec<ProjectFile>>,
@@ -72,6 +74,7 @@ pub enum ModuleBindingEventKind {
 /// module index.
 fn resolve_module(
     module_index: &HashMap<String, Vec<ProjectFile>>,
+    module_spellings: &PythonModuleSpellings,
     importing_file: &ProjectFile,
     module_specifier: &str,
 ) -> Vec<ProjectFile> {
@@ -90,6 +93,15 @@ fn resolve_module(
     // Two sibling source roots can index the same module name, so the root
     // that owns the importing file decides which of them its import means.
     retain_modules_for_importer(importing_file, &mut files, |file| file);
+    if files.is_empty() {
+        // No module name in the index spells the specifier, because it is
+        // written against a source root the workspace does not state (#3506).
+        files.extend(python_module_file_under_source_root(
+            module_spellings,
+            importing_file,
+            &resolved_module,
+        ));
+    }
     files
 }
 
@@ -125,6 +137,7 @@ impl PythonUsageIndex {
         files.sort();
         files.dedup();
 
+        let module_spellings = python.module_spellings();
         let mut module_index: HashMap<String, Vec<ProjectFile>> = HashMap::default();
         let mut exports_by_file: HashMap<ProjectFile, Arc<ExportIndex>> = HashMap::default();
         let mut binders_by_file: HashMap<ProjectFile, Arc<ImportBinder>> = HashMap::default();
@@ -204,7 +217,8 @@ impl PythonUsageIndex {
 
         let mut raw_replacements: HashMap<ProjectFile, ProjectFile> = HashMap::default();
         for (file, target_module) in replacement_modules {
-            let mut targets = resolve_module(&module_index, &file, &target_module);
+            let mut targets =
+                resolve_module(&module_index, &module_spellings, &file, &target_module);
             if targets.len() != 1 {
                 continue;
             }
@@ -246,9 +260,12 @@ impl PythonUsageIndex {
                         let Some(imported_name) = binding.imported_name.as_ref() else {
                             continue;
                         };
-                        for resolved_file in
-                            resolve_module(&module_index, file, &binding.module_specifier)
-                        {
+                        for resolved_file in resolve_module(
+                            &module_index,
+                            &module_spellings,
+                            file,
+                            &binding.module_specifier,
+                        ) {
                             reexport_edges
                                 .entry((resolved_file, imported_name.clone()))
                                 .or_default()
@@ -262,7 +279,9 @@ impl PythonUsageIndex {
                         module_specifier,
                         imported_name,
                     } => {
-                        for resolved_file in resolve_module(&module_index, file, module_specifier) {
+                        for resolved_file in
+                            resolve_module(&module_index, &module_spellings, file, module_specifier)
+                        {
                             reexport_edges
                                 .entry((resolved_file, imported_name.clone()))
                                 .or_default()
@@ -272,7 +291,12 @@ impl PythonUsageIndex {
                 }
             }
             for star in &exports.reexport_stars {
-                for resolved_file in resolve_module(&module_index, file, &star.module_specifier) {
+                for resolved_file in resolve_module(
+                    &module_index,
+                    &module_spellings,
+                    file,
+                    &star.module_specifier,
+                ) {
                     star_reexports
                         .entry(resolved_file)
                         .or_default()
@@ -283,6 +307,7 @@ impl PythonUsageIndex {
 
         let importer_reverse = build_importer_reverse(
             &module_index,
+            &module_spellings,
             &files,
             &import_bindings_by_file,
             &exports_by_file,
@@ -291,7 +316,9 @@ impl PythonUsageIndex {
             HashMap::default();
         for (importer, modules) in literal_importlib_modules_by_file {
             for module in modules {
-                for target_file in resolve_module(&module_index, &importer, &module) {
+                for target_file in
+                    resolve_module(&module_index, &module_spellings, &importer, &module)
+                {
                     literal_importlib_importers
                         .entry(target_file.clone())
                         .or_default()
@@ -306,6 +333,7 @@ impl PythonUsageIndex {
 
         Self {
             module_index,
+            module_spellings,
             exports_by_file,
             reexport_edges,
             star_reexports,
@@ -410,7 +438,12 @@ impl PythonUsageIndex {
         importing_file: &ProjectFile,
         module_specifier: &str,
     ) -> Vec<ProjectFile> {
-        resolve_module(&self.module_index, importing_file, module_specifier)
+        resolve_module(
+            &self.module_index,
+            &self.module_spellings,
+            importing_file,
+            module_specifier,
+        )
     }
 
     pub fn module_binding_timeline(
@@ -492,6 +525,7 @@ fn canonical_module_replacement(
 
 fn build_importer_reverse(
     module_index: &HashMap<String, Vec<ProjectFile>>,
+    module_spellings: &PythonModuleSpellings,
     files: &[ProjectFile],
     bindings_by_file: &HashMap<ProjectFile, Vec<(String, ImportBinding)>>,
     exports_by_file: &HashMap<ProjectFile, Arc<ExportIndex>>,
@@ -506,7 +540,8 @@ fn build_importer_reverse(
                 .namespace_imported_module
                 .as_deref()
                 .unwrap_or(&binding.module_specifier);
-            for target_file in resolve_module(module_index, file, imported_module) {
+            for target_file in resolve_module(module_index, module_spellings, file, imported_module)
+            {
                 // A glob `from m import *` binds every export of the target file
                 // as a named edge, mirroring the graph it replaces.
                 if matches!(binding.kind, ImportKind::Glob) {

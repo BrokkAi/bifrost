@@ -7,15 +7,16 @@ use super::artifact::{
     CompiledNormalReturnTypeRefinement, CompiledOperationPrecondition, CompiledPackManifest,
     CompiledPayload, CompiledPredicateProofEffect, CompiledProcedureSummary,
     CompiledProcedureTarget, CompiledResultContract, CompiledResultMemberContract,
-    CompiledResultPredicate, CompiledSemanticModelPack, CompiledShard, CompiledShardArtifact,
-    CompiledShardDescriptor, CompiledSummaryEffect, CompiledSummaryExitKind, CompiledSummaryInput,
-    CompiledSummaryLocation, CompiledSummaryLocationKind, CompiledSummaryMoveInvalidation,
-    CompiledSummaryOutput, CompiledSummaryTransfer, CompiledSummaryValuePreservation,
-    CompiledSummaryValueTransfer, CompiledSummaryValueTransferKind,
-    CompiledSummaryValueTransferLimitation, CompiledSummaryValueTransferLimitationKind,
-    CompiledSummaryValueTransferOperation, CompiledSyncMapOperation, CompiledTaskSpawnCondition,
-    DecodeLimits, canonical_json, content_digest, manifest_content_digest,
-    manifest_semantic_digest, routing_keys, semantic_digest, shard_inventory, stored_digest,
+    CompiledResultPredicate, CompiledResultUseObligation, CompiledSemanticModelPack, CompiledShard,
+    CompiledShardArtifact, CompiledShardDescriptor, CompiledSummaryEffect, CompiledSummaryExitKind,
+    CompiledSummaryInput, CompiledSummaryLocation, CompiledSummaryLocationKind,
+    CompiledSummaryMoveInvalidation, CompiledSummaryOutput, CompiledSummaryTransfer,
+    CompiledSummaryValuePreservation, CompiledSummaryValueTransfer,
+    CompiledSummaryValueTransferKind, CompiledSummaryValueTransferLimitation,
+    CompiledSummaryValueTransferLimitationKind, CompiledSummaryValueTransferOperation,
+    CompiledSyncMapOperation, CompiledTaskSpawnCondition, DecodeLimits, canonical_json,
+    content_digest, manifest_content_digest, manifest_semantic_digest, routing_keys,
+    semantic_digest, shard_inventory, stored_digest,
 };
 use super::model::*;
 use super::source::{SourceFormat, parse_source};
@@ -121,6 +122,7 @@ pub fn compile_pack(
             deferred_yields: shard.deferred_yields.clone(),
             conditional_type_refinements: shard.conditional_type_refinements.clone(),
             cpp_portability: normalized.cpp_portability.clone(),
+            python_correspondence: normalized.python_correspondence.clone(),
             payload: compile_payload(&normalized.pack_id, &shard.payload)
                 .map_err(artifact_diagnostic)?,
         };
@@ -198,6 +200,7 @@ pub fn compile_pack(
         completeness: normalized.completeness,
         safety: normalized.safety,
         cpp_portability: normalized.cpp_portability,
+        python_correspondence: normalized.python_correspondence,
         carried_sources: normalized.carried_sources,
         semantic_sha256: String::new(),
         content_sha256: String::new(),
@@ -384,6 +387,8 @@ pub(crate) fn normalize(mut pack: AuthoredSemanticModelPack) -> AuthoredSemantic
                     }
                     summary.result_contracts.sort();
                     summary.result_contracts.dedup();
+                    summary.result_use_obligations.sort();
+                    summary.result_use_obligations.dedup();
                     summary.conditional_result_refinements.sort();
                     summary.conditional_result_refinements.dedup();
                     summary.conditional_indirect_writes.sort();
@@ -414,6 +419,10 @@ pub(crate) fn normalize(mut pack: AuthoredSemanticModelPack) -> AuthoredSemantic
     pack.shards.sort_by(|left, right| left.id.cmp(&right.id));
     if let Some(evidence) = &mut pack.cpp_portability {
         evidence.normalize();
+    }
+    if let Some(evidence) = &mut pack.python_correspondence {
+        evidence.symbols.sort_by_cached_key(canonical_sort_key);
+        evidence.mappings.sort_by_cached_key(canonical_sort_key);
     }
     pack
 }
@@ -533,6 +542,7 @@ fn compile_procedure_summary(
                     .map(compile_summary_value_transfer),
             })
             .collect(),
+        transfer_partitions: summary.transfer_partitions.clone(),
         effects: summary.effects.iter().map(compile_summary_effect).collect(),
         concurrency_effects: summary
             .concurrency_effects
@@ -586,6 +596,15 @@ fn compile_procedure_summary(
                             .collect(),
                     })
                     .collect(),
+            })
+            .collect(),
+        result_use_obligations: summary
+            .result_use_obligations
+            .iter()
+            .map(|obligation| CompiledResultUseObligation {
+                result_ordinal: obligation.result_ordinal,
+                kind: obligation.kind,
+                failure_predicate: obligation.failure_predicate.map(compile_result_predicate),
             })
             .collect(),
         conditional_result_refinements: summary

@@ -13,6 +13,7 @@ use crate::analyzer::{
     BoundedDefinitionLookup, resolve_fqn_candidates, resolve_module_code_unit,
     retain_modules_for_importer, usage_resolve_module_files,
 };
+use crate::path_utils::rel_path_string;
 use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxSource;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path;
@@ -21,6 +22,7 @@ use brokk_bifrost_python::bindings::{
     python_direct_scope_bindings_bounded, python_module_or_class_scope_binds_name_bounded,
     python_type_parameter_binds_name_at, python_unambiguous_module_class_binding_bounded,
 };
+use brokk_bifrost_python::declarations::python_module_name;
 use brokk_bifrost_python::diagnostics::is_python_builtin_or_constant;
 use brokk_bifrost_python::graph::resolver::annotation_reference_candidates_at_focus;
 use brokk_bifrost_python::graph_support::PythonSource;
@@ -2227,26 +2229,15 @@ pub(super) fn resolve_python(
                 object_text,
                 Some(attribute_text),
             ) {
-                return gated_boundary(
-                    || {
-                        python_import_binding_is_workspace_internal(
-                            py,
-                            token,
-                            support,
-                            file,
-                            object_text,
-                            Some(attribute_text),
-                        )
-                    },
-                    format!(
-                        "`{object_text}.{attribute_text}` crosses a Python import boundary through `{import_target}` that is not indexed in this workspace"
-                    ),
-                    UnindexedClaim::external_boundary(import_target, ClaimSubjectRole::Module),
-                    "no_indexed_definition",
-                    format!(
-                        "`{}` did not resolve to an indexed Python definition",
-                        site.text
-                    ),
+                return python_import_binding_outcome(
+                    py,
+                    token,
+                    support,
+                    file,
+                    object_text,
+                    Some(attribute_text),
+                    &import_target,
+                    site.text.as_str(),
                 );
             }
             no_definition(
@@ -2322,18 +2313,15 @@ pub(super) fn resolve_python(
                 if let Some(import_target) =
                     python_unresolved_import_boundary(py, file, analyzer, token, text, None)
                 {
-                    return gated_boundary(
-                        || {
-                            python_import_binding_is_workspace_internal(
-                                py, token, support, file, text, None,
-                            )
-                        },
-                        format!(
-                            "`{text}` crosses a Python import boundary through `{import_target}` that is not indexed in this workspace"
-                        ),
-                        UnindexedClaim::external_boundary(import_target, ClaimSubjectRole::Module),
-                        "no_indexed_definition",
-                        format!("`{text}` did not resolve to an indexed Python definition"),
+                    return python_import_binding_outcome(
+                        py,
+                        token,
+                        support,
+                        file,
+                        text,
+                        None,
+                        &import_target,
+                        text,
                     );
                 }
                 if is_python_builtin_or_constant(text) {
@@ -2374,18 +2362,15 @@ pub(super) fn resolve_python(
             if let Some(import_target) =
                 python_unresolved_import_boundary(py, file, analyzer, token, text, None)
             {
-                return gated_boundary(
-                    || {
-                        python_import_binding_is_workspace_internal(
-                            py, token, support, file, text, None,
-                        )
-                    },
-                    format!(
-                        "`{text}` crosses a Python import boundary through `{import_target}` that is not indexed in this workspace"
-                    ),
-                    UnindexedClaim::external_boundary(import_target, ClaimSubjectRole::Module),
-                    "no_indexed_definition",
-                    format!("`{text}` did not resolve to an indexed Python definition"),
+                return python_import_binding_outcome(
+                    py,
+                    token,
+                    support,
+                    file,
+                    text,
+                    None,
+                    &import_target,
+                    text,
                 );
             }
             no_definition(
@@ -3480,7 +3465,7 @@ fn python_fqn_outcome(
     // `python_crosses_unindexed_boundary` is `!python_workspace_module_exists`,
     // so its negation is the workspace-internal gate.
     gated_boundary(
-        || !python_crosses_unindexed_boundary(support, fqn),
+        || !python_crosses_unindexed_boundary(py, support, fqn),
         format!(
             "`{raw}` resolves to `{fqn}`, which is outside this partial Python workspace analysis"
         ),
@@ -3514,8 +3499,8 @@ fn python_module_outcome(
     // module (#1174).
     gated_boundary(
         || {
-            !python_crosses_unindexed_boundary(support, module_fq)
-                || python_workspace_module_exists(support, module_fq)
+            !python_crosses_unindexed_boundary(py, support, module_fq)
+                || python_workspace_module_exists(py, support, module_fq)
         },
         format!(
             "`{raw}` resolves to module `{module_fq}`, which is outside this partial Python workspace analysis"
@@ -3785,7 +3770,11 @@ impl PythonMemberAttribution {
     }
 }
 
-fn python_crosses_unindexed_boundary(support: &dyn BoundedDefinitionLookup, fqn: &str) -> bool {
+fn python_crosses_unindexed_boundary(
+    py: &PythonAnalyzer,
+    support: &dyn BoundedDefinitionLookup,
+    fqn: &str,
+) -> bool {
     // Python module paths are `.`-joined and identifiers never contain a
     // literal `.`, so re-tokenizing `fqn` with the shared structured splitter
     // and rejoining every part but the last with `.` reproduces
@@ -3794,7 +3783,7 @@ fn python_crosses_unindexed_boundary(support: &dyn BoundedDefinitionLookup, fqn:
     // rejects).
     let segments = parse_symbol_path(Language::Python, fqn);
     let module = segments[..segments.len().saturating_sub(1)].join(".");
-    !python_workspace_module_exists(support, &module)
+    !python_workspace_module_exists(py, support, &module)
 }
 
 /// Whether the workspace declares `module` as a package/namespace or as a
@@ -3804,12 +3793,98 @@ fn python_crosses_unindexed_boundary(support: &dyn BoundedDefinitionLookup, fqn:
 /// Python boundary claim, and a namespace that only C#/Java/Scala declares (a
 /// pythonnet CLR namespace, say) is still *inside* the workspace. Answering it
 /// Python-only made the claim wrong about workspace-internal targets (#1174).
-fn python_workspace_module_exists(support: &dyn BoundedDefinitionLookup, module: &str) -> bool {
+fn python_workspace_module_exists(
+    py: &PythonAnalyzer,
+    support: &dyn BoundedDefinitionLookup,
+    module: &str,
+) -> bool {
     if module.is_empty() {
         return false;
     }
     support.package_exists_in_any_language(module)
         || !support.fqn_in_any_language(module).is_empty()
+        // A module the index holds only under a longer path-derived name is
+        // inside the workspace too: `core.lib.common` is indexed as
+        // `dependency.core.lib.common` because the import is written against
+        // the `dependency/` source root (#3506). The resolvers resolve that
+        // root, so reaching a boundary gate with one of these means the
+        // spelling stayed ambiguous -- a resolution gap, never externality.
+        || !python_source_root_spellings(py, module).is_empty()
+}
+
+/// The names and paths this workspace indexes `module` under when `module` is
+/// written against a source root below the project root.
+///
+/// This is diagnostic evidence, not a binding decision. A tail match says the
+/// file would be the module *if* its implied root were on the importing
+/// program's path, and only the workspace's own structure -- a packaging
+/// manifest declaring that root, or a complete package chain from it -- makes
+/// that true; a candidate that fails that test is still the spelling the
+/// workspace indexes the file under, which the gap has to name (#3506).
+///
+/// Empty for every module the index spells exactly and for every genuinely
+/// external one, so it is only ever consulted after the exact lookups fail.
+fn python_source_root_spellings(py: &PythonAnalyzer, module: &str) -> Vec<String> {
+    let mut names = py
+        .module_spellings()
+        .suffix_candidates(module)
+        .into_iter()
+        .map(|candidate| {
+            format!(
+                "{} ({})",
+                python_module_name(&candidate.file),
+                rel_path_string(&candidate.file)
+            )
+        })
+        .collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// The outcome for a reference whose import binding named a module, when that
+/// binding resolved to nothing.
+///
+/// A module the workspace indexes only under a longer path-derived name is
+/// inside the workspace, so the honest failure names the spelling gap instead
+/// of claiming the import left the workspace: the two want different actions
+/// from a caller, and only one of them is true (#3506). The resolvers try the
+/// source roots first, so reaching this with a spelling gap means the specifier
+/// named more than one workspace module, or the imported member is absent from
+/// the module it did name.
+#[allow(clippy::too_many_arguments)]
+fn python_import_binding_outcome(
+    py: &PythonAnalyzer,
+    token: QueryToken<'_>,
+    support: &dyn BoundedDefinitionLookup,
+    file: &ProjectFile,
+    local: &str,
+    attribute: Option<&str>,
+    import_target: &str,
+    reference: &str,
+) -> DefinitionLookupOutcome {
+    let spellings = python_source_root_spellings(py, import_target);
+    if !spellings.is_empty() {
+        return no_definition(
+            "python_source_root_resolution_gap",
+            format!(
+                "`{reference}` is imported from `{import_target}`, which this workspace indexes under a source root below the project root as {spellings:?}; the module is inside the workspace, so this is a resolution gap rather than an import that left it"
+            ),
+        );
+    }
+    let subject = match attribute {
+        Some(attribute) => format!("{local}.{attribute}"),
+        None => local.to_string(),
+    };
+    gated_boundary(
+        || python_import_binding_is_workspace_internal(py, token, support, file, local, attribute),
+        format!(
+            "`{subject}` crosses a Python import boundary through `{import_target}` that is not indexed in this workspace"
+        ),
+        UnindexedClaim::external_boundary(import_target, ClaimSubjectRole::Module),
+        "no_indexed_definition",
+        format!("`{reference}` did not resolve to an indexed Python definition"),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4109,7 +4184,7 @@ fn python_import_binding_is_workspace_internal(
         .namespace_imported_module
         .as_deref()
         .unwrap_or(binding.module_specifier.as_str());
-    python_workspace_module_exists(support, module)
+    python_workspace_module_exists(py, support, module)
 }
 
 fn python_name_shadowed_at(

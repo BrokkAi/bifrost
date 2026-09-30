@@ -371,6 +371,28 @@ fn declares_the_same_parameters(
             })
 }
 
+/// Whether two published entries declare the same parameter list, whatever the
+/// parameters are named.
+///
+/// Parameter labels are a naming choice, not part of the declared shape. A
+/// prototype may leave a parameter unnamed -- the adapter then publishes the
+/// type spelling -- while the definition beside it names the same parameter,
+/// and a C++ out-of-line definition never repeats a default argument. A
+/// declaration and its definition are therefore one signature even when their
+/// labels differ, while two same-arity overloads normally differ in exactly
+/// the declared type spelling this comparison keeps.
+fn declares_compatible_parameters(
+    left: &CallableSignatureReport,
+    right: &CallableSignatureReport,
+) -> bool {
+    left.parameters.len() == right.parameters.len()
+        && left
+            .parameters
+            .iter()
+            .zip(&right.parameters)
+            .all(|(left, right)| left.declared_type == right.declared_type)
+}
+
 /// The receiver contract every published entry declares, when they all declare
 /// the same one. Which overload a call selects cannot change whether the
 /// callable is instance-bound, so an unselected overload set still answers
@@ -383,6 +405,44 @@ fn agreed_receiver_contract(reports: &[CallableSignatureReport]) -> Option<Recei
     contracts
         .all(|contract| contract == Some(first))
         .then_some(first)
+}
+
+/// The one callable identity every published entry of a declaration agrees on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgreedCallableIdentity {
+    /// What must be bound in receiver position. Every entry decided it and all
+    /// entries decided the same thing.
+    pub receiver_contract: ReceiverContract,
+    /// The declared parameter count every entry shares.
+    pub parameter_count: usize,
+}
+
+/// The one callable identity every published entry of a declaration agrees on,
+/// or `None` when the entries do not describe one callable.
+///
+/// A declaration can carry several persisted entries without being an overload
+/// set: an in-class member prototype and the out-of-line definition that
+/// completes it inside one translation unit are two occurrence rows of one
+/// callable (#3508), which is also how an adapter that keeps a callable's
+/// declaration sites in one unit presents them. Which entries those are is
+/// decided by their published shape, exactly as
+/// [`declares_compatible_parameters`] decides it; entries that disagree on the
+/// parameter list, or that do not all decide the receiver contract, describe
+/// no single identity and this answers `None`.
+pub fn agreed_callable_identity(
+    reports: &[CallableSignatureReport],
+) -> Option<AgreedCallableIdentity> {
+    let first = reports.first()?;
+    if !reports
+        .iter()
+        .all(|report| declares_compatible_parameters(first, report))
+    {
+        return None;
+    }
+    Some(AgreedCallableIdentity {
+        receiver_contract: agreed_receiver_contract(reports)?,
+        parameter_count: first.signature.parameter_count,
+    })
 }
 
 #[cfg(test)]

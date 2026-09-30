@@ -242,6 +242,22 @@ fn validate_wrapper(
                     for (part, label) in parts.iter().zip(["field", "op", "value"]) {
                         analysis.path(format!("{predicate_path}.{label}"), part.range.clone());
                     }
+                    if let Some(operand) = parts.get(2) {
+                        let literals: &[Expr] =
+                            if parts.get(1).and_then(Expr::as_symbol) == Some("in") {
+                                operand.as_sequence().unwrap_or(&[])
+                            } else {
+                                std::slice::from_ref(operand)
+                            };
+                        for literal in literals {
+                            if let Some((head, range, _)) = list_head(literal)
+                                && head == super::super::schema::ROW_ENUM_LITERAL.label
+                            {
+                                let form = &super::super::schema::ROW_ENUM_LITERAL;
+                                analysis.add_help(range, form.signature, form.description);
+                            }
+                        }
+                    }
                     if let Some(members) = parts.get(2).and_then(|value| value.as_list()) {
                         for (member_index, member) in members.iter().enumerate() {
                             analysis.path(
@@ -715,6 +731,10 @@ fn validate_wrapper(
         | RqlForm::StateEventsOf
         | RqlForm::FlowRelationsOf
         | RqlForm::ControlRelations
+        | RqlForm::AssignmentRelations
+        | RqlForm::LoopRelations
+        | RqlForm::StatementReachability
+        | RqlForm::BranchRelations
         | RqlForm::RewritePathsOf => {
             validate_constrained_option_wrapper(form, args, query, analysis);
         }
@@ -737,6 +757,7 @@ fn validate_wrapper(
         | RqlForm::SourceSetOf
         | RqlForm::TopologyEdgesOf
         | RqlForm::GuardsOf
+        | RqlForm::FailureHandlerState
         | RqlForm::SegmentTarget
         | RqlForm::FieldWriteValue
         | RqlForm::ReceiverOutcome
@@ -749,6 +770,7 @@ fn validate_wrapper(
         | RqlForm::CallEffects
         | RqlForm::ResultContractCalls
         | RqlForm::CallResultContracts
+        | RqlForm::CallResultObligations
         | RqlForm::ResultContractUses
         | RqlForm::ResultContractOperationUses
         | RqlForm::NilnessOperations
@@ -2711,6 +2733,8 @@ fn validate_property_value(
         | super::schema::ValueShape::RewriteDomainList
         | super::schema::ValueShape::RewriteOutcomeList
         | super::schema::ValueShape::ControlRelationKindList
+        | super::schema::ValueShape::AssignmentRelationKindList
+        | super::schema::ValueShape::BranchRelationKindList
         | super::schema::ValueShape::ControlExitPartitionList
         | super::schema::ValueShape::ScopeFilter
         | super::schema::ValueShape::BindingFilter

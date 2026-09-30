@@ -926,7 +926,9 @@ fn guard_transfers(
                 }
                 GuardPredicate::ConstantBoolean { .. }
                 | GuardPredicate::ConstantEquality { .. }
-                | GuardPredicate::OrderedIntegerComparison { .. } => continue,
+                | GuardPredicate::OrderedIntegerComparison { .. }
+                | GuardPredicate::OrderedFloatComparison { .. }
+                | GuardPredicate::NanComparison { .. } => continue,
             };
             let Some(binding) = binding else {
                 continue;
@@ -3107,6 +3109,8 @@ fn seed_procedure(
             | SemanticValueKind::Address
             | SemanticValueKind::Null
             | SemanticValueKind::UnsignedInteger(_)
+            | SemanticValueKind::SignedInteger(_)
+            | SemanticValueKind::FloatingPoint { .. }
             | SemanticValueKind::Exception
             | SemanticValueKind::Callable => {
                 if callee_values.contains(&value.id) {

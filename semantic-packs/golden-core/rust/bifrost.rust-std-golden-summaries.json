@@ -1,7 +1,7 @@
 {
   "schema_version": 2,
   "pack_id": "bifrost.rust-std-golden-summaries",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "producer": {
     "name": "bifrost-golden-foundry",
     "version": "0.9.0"
@@ -251,6 +251,540 @@
             "effects": []
           }
         ]
+      }
+    },
+    {
+      "id": "declarations.cargo",
+      "activation": [
+        {
+          "targets": [],
+          "configurations": []
+        }
+      ],
+      "payload": {
+        "kind": "declaration_facts",
+        "types": [
+          {
+            "id": "type.golden-rust.std",
+            "name": "std",
+            "type_kind": "module",
+            "visibility": "public",
+            "is_abstract": false,
+            "is_sealed": false,
+            "has_explicit_type_terms": false,
+            "type_parameters": [],
+            "type_parameter_constraints": [],
+            "embedded_types": [],
+            "hierarchy": [],
+            "aliases": [],
+            "extension_surfaces": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/lib.rs",
+              "symbol": "std"
+            }
+          },
+          {
+            "id": "type.golden-rust.std-ffi",
+            "name": "std.ffi",
+            "type_kind": "module",
+            "visibility": "public",
+            "is_abstract": false,
+            "is_sealed": false,
+            "has_explicit_type_terms": false,
+            "type_parameters": [],
+            "type_parameter_constraints": [],
+            "embedded_types": [],
+            "hierarchy": [],
+            "aliases": [],
+            "extension_surfaces": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/ffi/mod.rs",
+              "symbol": "std.ffi"
+            }
+          },
+          {
+            "id": "type.golden-rust.std-ffi-cstring",
+            "name": "std.ffi.CString",
+            "type_kind": "struct",
+            "visibility": "public",
+            "is_abstract": false,
+            "is_sealed": false,
+            "has_explicit_type_terms": false,
+            "type_parameters": [],
+            "type_parameter_constraints": [],
+            "embedded_types": [],
+            "hierarchy": [],
+            "aliases": [],
+            "extension_surfaces": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "library/alloc/src/ffi/c_str.rs",
+              "symbol": "std.ffi.CString"
+            }
+          },
+          {
+            "id": "type.golden-rust.std-ffi-osstr",
+            "name": "std.ffi.OsStr",
+            "type_kind": "struct",
+            "visibility": "public",
+            "is_abstract": false,
+            "is_sealed": false,
+            "has_explicit_type_terms": false,
+            "type_parameters": [],
+            "type_parameter_constraints": [],
+            "embedded_types": [],
+            "hierarchy": [],
+            "aliases": [],
+            "extension_surfaces": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/ffi/os_str.rs",
+              "symbol": "std.ffi.OsStr"
+            }
+          },
+          {
+            "id": "type.golden-rust.std-ffi-osstring",
+            "name": "std.ffi.OsString",
+            "type_kind": "struct",
+            "visibility": "public",
+            "is_abstract": false,
+            "is_sealed": false,
+            "has_explicit_type_terms": false,
+            "type_parameters": [],
+            "type_parameter_constraints": [],
+            "embedded_types": [],
+            "hierarchy": [],
+            "aliases": [],
+            "extension_surfaces": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/ffi/os_str.rs",
+              "symbol": "std.ffi.OsString"
+            }
+          },
+          {
+            "id": "type.golden-rust.std-path",
+            "name": "std.path",
+            "type_kind": "module",
+            "visibility": "public",
+            "is_abstract": false,
+            "is_sealed": false,
+            "has_explicit_type_terms": false,
+            "type_parameters": [],
+            "type_parameter_constraints": [],
+            "embedded_types": [],
+            "hierarchy": [],
+            "aliases": [],
+            "extension_surfaces": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/path.rs",
+              "symbol": "std.path"
+            }
+          },
+          {
+            "id": "type.golden-rust.std-path-path",
+            "name": "std.path.Path",
+            "type_kind": "struct",
+            "visibility": "public",
+            "is_abstract": false,
+            "is_sealed": false,
+            "has_explicit_type_terms": false,
+            "type_parameters": [],
+            "type_parameter_constraints": [],
+            "embedded_types": [],
+            "hierarchy": [],
+            "aliases": [],
+            "extension_surfaces": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/path.rs",
+              "symbol": "std.path.Path"
+            }
+          },
+          {
+            "id": "type.golden-rust.std-path-pathbuf",
+            "name": "std.path.PathBuf",
+            "type_kind": "struct",
+            "visibility": "public",
+            "is_abstract": false,
+            "is_sealed": false,
+            "has_explicit_type_terms": false,
+            "type_parameters": [],
+            "type_parameter_constraints": [],
+            "embedded_types": [],
+            "hierarchy": [],
+            "aliases": [],
+            "extension_surfaces": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/path.rs",
+              "symbol": "std.path.PathBuf"
+            }
+          },
+          {
+            "id": "type.golden-rust.std-str",
+            "name": "std.str",
+            "type_kind": "module",
+            "visibility": "public",
+            "is_abstract": false,
+            "is_sealed": false,
+            "has_explicit_type_terms": false,
+            "type_parameters": [],
+            "type_parameter_constraints": [],
+            "embedded_types": [],
+            "hierarchy": [],
+            "aliases": [],
+            "extension_surfaces": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "library/core/src/str/mod.rs",
+              "symbol": "std.str"
+            }
+          },
+          {
+            "id": "type.golden-rust.std-string",
+            "name": "std.string",
+            "type_kind": "module",
+            "visibility": "public",
+            "is_abstract": false,
+            "is_sealed": false,
+            "has_explicit_type_terms": false,
+            "type_parameters": [],
+            "type_parameter_constraints": [],
+            "embedded_types": [],
+            "hierarchy": [],
+            "aliases": [],
+            "extension_surfaces": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "library/alloc/src/string.rs",
+              "symbol": "std.string"
+            }
+          },
+          {
+            "id": "type.golden-rust.std-string-string",
+            "name": "std.string.String",
+            "type_kind": "struct",
+            "visibility": "public",
+            "is_abstract": false,
+            "is_sealed": false,
+            "has_explicit_type_terms": false,
+            "type_parameters": [],
+            "type_parameter_constraints": [],
+            "embedded_types": [],
+            "hierarchy": [],
+            "aliases": [],
+            "extension_surfaces": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "library/alloc/src/string.rs",
+              "symbol": "std.string.String"
+            }
+          }
+        ],
+        "members": [
+          {
+            "id": "member.golden-rust.std-ffi-cstring.new",
+            "owner": "type.golden-rust.std-ffi-cstring",
+            "name": "new",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "is_abstract": false,
+            "is_virtual": false,
+            "callable_family_complete": true,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                {
+                  "name": "t",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": false
+                }
+              ]
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "library/alloc/src/ffi/c_str.rs",
+              "symbol": "std.ffi.CString.new"
+            }
+          },
+          {
+            "id": "member.golden-rust.std-ffi-osstr.new",
+            "owner": "type.golden-rust.std-ffi-osstr",
+            "name": "new",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "is_abstract": false,
+            "is_virtual": false,
+            "callable_family_complete": true,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                {
+                  "name": "s",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": false
+                }
+              ]
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/ffi/os_str.rs",
+              "symbol": "std.ffi.OsStr.new"
+            }
+          },
+          {
+            "id": "member.golden-rust.std-ffi-osstring.from",
+            "owner": "type.golden-rust.std-ffi-osstring",
+            "name": "from",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "is_abstract": false,
+            "is_virtual": false,
+            "callable_family_complete": true,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                {
+                  "name": "s",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": false
+                }
+              ]
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/ffi/os_str.rs",
+              "symbol": "std.ffi.OsString.from"
+            }
+          },
+          {
+            "id": "member.golden-rust.std-path-path.new",
+            "owner": "type.golden-rust.std-path-path",
+            "name": "new",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "is_abstract": false,
+            "is_virtual": false,
+            "callable_family_complete": true,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                {
+                  "name": "s",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": false
+                }
+              ]
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/path.rs",
+              "symbol": "std.path.Path.new"
+            }
+          },
+          {
+            "id": "member.golden-rust.std-path-pathbuf.from",
+            "owner": "type.golden-rust.std-path-pathbuf",
+            "name": "from",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "is_abstract": false,
+            "is_virtual": false,
+            "callable_family_complete": true,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                {
+                  "name": "s",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": false
+                }
+              ]
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/path.rs",
+              "symbol": "std.path.PathBuf.from"
+            }
+          },
+          {
+            "id": "member.golden-rust.std-str.from_utf8",
+            "owner": "type.golden-rust.std-str",
+            "name": "from_utf8",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "is_abstract": false,
+            "is_virtual": false,
+            "callable_family_complete": true,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                {
+                  "name": "v",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": false
+                }
+              ]
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "library/core/src/str/converts.rs",
+              "symbol": "std.str.from_utf8"
+            }
+          },
+          {
+            "id": "member.golden-rust.std-string-string.from",
+            "owner": "type.golden-rust.std-string-string",
+            "name": "from",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "is_abstract": false,
+            "is_virtual": false,
+            "callable_family_complete": true,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                {
+                  "name": "t",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": false
+                }
+              ]
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "library/alloc/src/string.rs",
+              "symbol": "std.string.String.from"
+            }
+          },
+          {
+            "id": "member.golden-rust.std-string-string.from_utf8",
+            "owner": "type.golden-rust.std-string-string",
+            "name": "from_utf8",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "is_abstract": false,
+            "is_virtual": false,
+            "callable_family_complete": true,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                {
+                  "name": "v",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": false
+                }
+              ]
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "library/alloc/src/string.rs",
+              "symbol": "std.string.String.from_utf8"
+            }
+          },
+          {
+            "id": "member.golden-rust.std-string-string.from_utf8_lossy",
+            "owner": "type.golden-rust.std-string-string",
+            "name": "from_utf8_lossy",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "is_abstract": false,
+            "is_virtual": false,
+            "callable_family_complete": true,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                {
+                  "name": "v",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": false
+                }
+              ]
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "library/alloc/src/string.rs",
+              "symbol": "std.string.String.from_utf8_lossy"
+            }
+          }
+        ],
+        "relations": []
       }
     }
   ]

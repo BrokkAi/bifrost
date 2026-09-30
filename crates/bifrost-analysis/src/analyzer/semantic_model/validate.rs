@@ -61,6 +61,12 @@ pub(crate) fn validate_pack_locally(
     validate_pack_internal(pack, limits, false)
 }
 
+pub(crate) fn validate_csmi_profile_evidence(pack: &AuthoredSemanticModelPack) -> Vec<Diagnostic> {
+    let mut diagnostics = super::csmi::python::validate_profile_evidence(pack);
+    diagnostics.extend(super::csmi::python::validate_native_identities(pack));
+    diagnostics
+}
+
 fn validate_pack_internal(
     pack: &AuthoredSemanticModelPack,
     limits: ValidationLimits,
@@ -88,6 +94,11 @@ fn validate_pack_internal(
     validator
         .diagnostics
         .extend(super::csmi::python::validate_native_identities(pack));
+    if validate_references {
+        validator
+            .diagnostics
+            .extend(super::csmi::python::validate_profile_evidence(pack));
+    }
     validator
         .diagnostics
         .sort_by(|left, right| (&left.path, &left.code).cmp(&(&right.path, &right.code)));
@@ -1942,14 +1953,20 @@ impl Validator {
         //
         // A declared effect (#2437) is metadata about the procedure, not a
         // modeled port, so it deliberately does not satisfy this rule. Result
-        // contracts, conditional-result refinements, and conditional indirect
+        // contracts, result-use obligations, conditional-result refinements,
+        // and conditional indirect
         // writes do: they are substantive relations among modeled ports even
         // when the summary moves no values.
         if summary.transfers.is_empty()
+            && !summary
+                .transfer_partitions
+                .iter()
+                .any(|partition| partition.status == TransferPartitionStatus::Complete)
             && summary.effects.is_empty()
             && summary.concurrency_effects.is_empty()
             && summary.preconditions.is_none()
             && summary.result_contracts.is_empty()
+            && summary.result_use_obligations.is_empty()
             && summary.conditional_result_refinements.is_empty()
             && summary.conditional_indirect_writes.is_empty()
             && summary.normal_return_refinements.is_empty()
@@ -1961,7 +1978,7 @@ impl Validator {
             self.error(
                 "summary.empty",
                 path,
-                "a partial procedure summary must declare at least one transfer, effect, concurrency effect, operation precondition review, result contract, conditional-result refinement, conditional indirect write, normal-return refinement, or absent normal continuation",
+                "a partial procedure summary must declare at least one transfer, transfer partition, effect, concurrency effect, operation precondition review, result contract, result-use obligation, conditional-result refinement, conditional indirect write, normal-return refinement, or absent normal continuation",
             );
         }
 
@@ -2000,6 +2017,13 @@ impl Validator {
                     "summary.normal_continuation_conflict",
                     format!("{path}.result_contracts"),
                     "normal_continuation_absent conflicts with result contracts on a normal return",
+                );
+            }
+            if !summary.result_use_obligations.is_empty() {
+                self.error(
+                    "summary.normal_continuation_conflict",
+                    format!("{path}.result_use_obligations"),
+                    "normal_continuation_absent conflicts with obligations on a normal result",
                 );
             }
             if !summary.conditional_result_refinements.is_empty() {
@@ -2043,16 +2067,18 @@ impl Validator {
         self.operation_preconditions(path, &summary.preconditions, &summary.target);
         if summary.normal_result_count.is_none()
             && (!summary.result_contracts.is_empty()
+                || !summary.result_use_obligations.is_empty()
                 || !summary.conditional_result_refinements.is_empty()
                 || !summary.conditional_indirect_writes.is_empty())
         {
             self.error(
                 "summary.result_count_required",
                 format!("{path}.normal_result_count"),
-                "normal_result_count is required when result contracts, conditional-result refinements, or conditional indirect writes are non-empty",
+                "normal_result_count is required when result contracts, result-use obligations, conditional-result refinements, or conditional indirect writes are non-empty",
             );
         }
         self.result_contracts(path, summary.normal_result_count, &summary.result_contracts);
+        self.result_use_obligations(path, summary);
         self.conditional_result_refinements(
             path,
             &summary.target,
@@ -2094,6 +2120,89 @@ impl Validator {
                         "location `{}` was already declared at {first_path}.id",
                         location.id
                     ),
+                );
+            }
+        }
+
+        let mut partition_scopes = HashSet::new();
+        for (index, partition) in summary.transfer_partitions.iter().enumerate() {
+            let partition_path = format!("{path}.transfer_partitions[{index}]");
+            if !partition_scopes.insert((partition.source.clone(), partition.normal_result)) {
+                self.error(
+                    "summary.duplicate_transfer_partition",
+                    partition_path.clone(),
+                    "duplicate source/result transfer partition",
+                );
+            }
+            if summary
+                .normal_result_count
+                .is_none_or(|count| partition.normal_result >= count)
+            {
+                self.error(
+                    "summary.transfer_partition_result",
+                    format!("{partition_path}.normal_result"),
+                    "partition must name a declared normal-result port",
+                );
+            }
+            match &partition.source {
+                TransferPartitionSource::AllInputs => {}
+                TransferPartitionSource::InputReceiver if !summary.target.has_receiver => {
+                    self.error(
+                        "summary.transfer_partition_receiver",
+                        format!("{partition_path}.source"),
+                        "partition names an absent input receiver",
+                    );
+                }
+                TransferPartitionSource::InputParameter { ordinal }
+                    if *ordinal >= summary.target.parameter_count =>
+                {
+                    self.error(
+                        "summary.transfer_partition_parameter",
+                        format!("{partition_path}.source"),
+                        "partition names an absent input parameter",
+                    );
+                }
+                TransferPartitionSource::InputCapture { symbol }
+                    if !locations
+                        .get(symbol.as_str())
+                        .is_some_and(|(kind, _)| *kind == AuthoredSummaryLocationKind::Capture) =>
+                {
+                    self.error(
+                        "summary.transfer_partition_capture",
+                        format!("{partition_path}.source"),
+                        "partition names an undeclared input capture",
+                    );
+                }
+                _ => {}
+            }
+            if partition.status == TransferPartitionStatus::Complete
+                && !partition.limitations.is_empty()
+            {
+                self.error(
+                    "summary.transfer_partition_complete_with_limitation",
+                    format!("{partition_path}.limitations"),
+                    "complete partition cannot carry limitations",
+                );
+            }
+            if partition.status == TransferPartitionStatus::Partial
+                && partition.limitations.is_empty()
+            {
+                self.error(
+                    "summary.transfer_partition_partial_without_limitation",
+                    format!("{partition_path}.limitations"),
+                    "partial partition requires a typed limitation",
+                );
+            }
+            for (limitation_index, limitation) in partition.limitations.iter().enumerate() {
+                self.text(
+                    &format!("{partition_path}.limitations[{limitation_index}].kind"),
+                    &limitation.kind,
+                );
+            }
+            for (provenance_index, provenance) in partition.provenance.iter().enumerate() {
+                self.text(
+                    &format!("{partition_path}.provenance[{provenance_index}]"),
+                    provenance,
                 );
             }
         }
@@ -2816,6 +2925,85 @@ impl Validator {
                 }
             } else {
                 seen.insert(&precondition.input, (precondition.predicate, index));
+            }
+        }
+    }
+
+    fn result_use_obligations(&mut self, path: &str, summary: &AuthoredProcedureSummary) {
+        let obligations = &summary.result_use_obligations;
+        if obligations.is_empty() {
+            return;
+        }
+        if self.schema_version < RESULT_USE_OBLIGATIONS_MIN_SCHEMA_VERSION {
+            self.error(
+                "summary.result_use_obligations_schema",
+                format!("{path}.result_use_obligations"),
+                format!(
+                    "result-use obligations require schema version {RESULT_USE_OBLIGATIONS_MIN_SCHEMA_VERSION}"
+                ),
+            );
+        }
+        if obligations.len() > MAX_PROCEDURE_SUMMARY_RESULT_USE_OBLIGATIONS {
+            self.error(
+                "limit.summary_result_use_obligations",
+                format!("{path}.result_use_obligations"),
+                format!(
+                    "summary declares more than {MAX_PROCEDURE_SUMMARY_RESULT_USE_OBLIGATIONS} result-use obligations"
+                ),
+            );
+        }
+        let mut seen = HashSet::new();
+        for (index, obligation) in obligations.iter().enumerate() {
+            let obligation_path = format!("{path}.result_use_obligations[{index}]");
+            let ordinal = obligation.result_ordinal;
+            if ordinal > MAX_PROCEDURE_SUMMARY_ORDINAL {
+                self.error(
+                    "summary.invalid_result_ordinal",
+                    format!("{obligation_path}.result_ordinal"),
+                    format!("result ordinal exceeds {MAX_PROCEDURE_SUMMARY_ORDINAL}"),
+                );
+            }
+            if summary
+                .normal_result_count
+                .is_some_and(|count| ordinal >= count)
+            {
+                self.error(
+                    "summary.result_ordinal_out_of_range",
+                    format!("{obligation_path}.result_ordinal"),
+                    format!(
+                        "result ordinal {ordinal} is outside normal_result_count {}",
+                        summary.normal_result_count.expect("checked as some")
+                    ),
+                );
+            }
+            if !seen.insert(ordinal) {
+                self.error(
+                    "summary.duplicate_result_use_obligation",
+                    format!("{obligation_path}.result_ordinal"),
+                    format!("normal result {ordinal} already has a result-use obligation"),
+                );
+            }
+            if obligation.kind == ResultUseObligationKind::PureTransformationValue
+                && !summary.ordinary_heap_unchanged
+            {
+                self.error(
+                    "summary.pure_result_has_unreviewed_heap_effects",
+                    format!("{obligation_path}.kind"),
+                    "a pure-transformation result requires ordinary_heap_unchanged",
+                );
+            }
+            match (obligation.kind, obligation.failure_predicate) {
+                (ResultUseObligationKind::PureTransformationValue, Some(_)) => self.error(
+                    "summary.pure_result_has_failure_predicate",
+                    format!("{obligation_path}.failure_predicate"),
+                    "a pure-transformation result has no failure-status predicate",
+                ),
+                (ResultUseObligationKind::FallibleStatus, None) => self.error(
+                    "summary.fallible_status_needs_failure_predicate",
+                    format!("{obligation_path}.failure_predicate"),
+                    "a fallible status needs a reviewed failure predicate",
+                ),
+                _ => {}
             }
         }
     }
@@ -4224,6 +4412,7 @@ impl Validator {
                 path: value,
                 symbol,
                 identity,
+                ..
             } => {
                 self.locator_path(&format!("{path}.path"), value);
                 self.text(&format!("{path}.symbol"), symbol);
@@ -4743,7 +4932,24 @@ fn native_contract_model(pack: &AuthoredSemanticModelPack) -> super::csmi::CsmiS
                 declaration["callable"] = shape;
             }
             declarations.push(declaration);
-            completeness.push(json!({"family":"declaration-aspects","scope":{"symbol":member.id,"aspect":"callable-shape"},"status":if member.callable_family_complete {"complete"} else {"partial"}}));
+            let (status, limitations) = match &member.locator {
+                Locator::Interchange {
+                    callable_shape_evidence: Some(evidence),
+                    ..
+                } => (
+                    evidence.statement.status,
+                    evidence.statement.limitations.clone(),
+                ),
+                _ => (
+                    if member.callable_family_complete {
+                        super::csmi::CsmiCoverageStatus::Complete
+                    } else {
+                        super::csmi::CsmiCoverageStatus::Partial
+                    },
+                    Vec::new(),
+                ),
+            };
+            completeness.push(json!({"family":"declaration-aspects","scope":{"symbol":member.id,"aspect":"callable-shape"},"status":status,"limitations":limitations}));
         }
     }
     let mut facts = Vec::new();

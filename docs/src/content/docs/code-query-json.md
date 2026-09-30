@@ -33,7 +33,7 @@ The `match` object is the root pattern. It must constrain at least one of `kind`
 | `where` | string array or array of non-empty string arrays | Optional project-relative globs. A flat list uses OR; nested lists use AND between groups and OR within each group. Absolute paths or globs inside the active workspace are normalized by MCP and CLI entrypoints. |
 | `languages` | string array | Optional language labels such as `python` or `cpp`, or fixed families `jvm` (`java`, `kotlin`, `scala`) and `js-ts` (`javascript`, `typescript`). Empty means every structural adapter. |
 | `inside` | pattern | Require the root match to be lexically inside a matching ancestor. |
-| `inside_decl` | pattern | Require containment in a matching ancestor without crossing a nested callable declaration. |
+| `inside_decl` | pattern | Require containment in a matching ancestor without crossing a nested callable declaration. A Rust impl member can also match the resolved type declaration that owns the impl. |
 | `not_inside` | pattern | Reject the root match when a matching ancestor exists. |
 | `steps` | step array | Ordered typed transformations applied after structural matching. At most `16`. |
 | `limit` | integer | Maximum terminal results after pipeline deduplication. Defaults to `100`; valid range is `1` through `1000`. |

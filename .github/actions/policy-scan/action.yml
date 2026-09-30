@@ -19,7 +19,7 @@ inputs:
       install and uses a release or debug `bifrost` binary from the checkout,
       otherwise the `bifrost` already on PATH.
     required: false
-    default: v0.11.5
+    default: v0.12.0
   policy-packs:
     description: Space-separated built-in pack IDs to run.
     required: false
@@ -85,6 +85,9 @@ outputs:
   exit-code:
     description: Raw bifrost policy exit code (0, 1, or 2).
     value: ${{ steps.run.outputs.exit-code }}
+  stderr-capture-code:
+    description: Status of stderr log creation and streaming capture (0 means retained successfully).
+    value: ${{ steps.run.outputs.stderr-capture-code }}
   sarif-file:
     description: Path of the SARIF report, relative to the checkout.
     value: ${{ steps.run.outputs.sarif-file }}
@@ -222,24 +225,42 @@ runs:
         for p in ${POLICY_FILES}; do args+=(--policy-file "${p}"); done
         if [ -n "${DIFF_BASE}" ]; then args+=(--diff-base "${DIFF_BASE}"); fi
         if [ "${POLICY_TIMINGS:-false}" = true ]; then args+=(--policy-timings); fi
+        stderr_file="${SARIF_FILE}.stderr.log"
+        stderr_path="${WORKDIR}/${stderr_file}"
+        # Publish the deterministic log path before starting the analyzer so
+        # later always() steps can attempt retention after cancellation.
+        echo "stderr-file=${stderr_path}" >> "${GITHUB_OUTPUT}"
         set +e
-        if [ "${POLICY_TIMINGS:-false}" = true ]; then
-          # Capture stderr without a pipeline so the analyzer status is exact.
-          "${BIFROST_BIN}" "${args[@]}" 2> "${SARIF_FILE}.stderr.log"
-          code=$?
-          cat "${SARIF_FILE}.stderr.log" >&2
-          echo "stderr-file=${WORKDIR}/${SARIF_FILE}.stderr.log" >> "${GITHUB_OUTPUT}"
+        if : > "${stderr_file}"; then
+          # Save the original stdout, route analyzer stderr through tee, and
+          # restore analyzer stdout directly to the runner. PIPESTATUS records
+          # both the exact analyzer result and tee's complete drain/write result.
+          exec 3>&1
+          "${BIFROST_BIN}" "${args[@]}" 4>&1 1>&3 2>&4 4>&- | tee -a "${stderr_file}" >&2
+          pipeline_status=("${PIPESTATUS[@]}")
+          exec 3>&-
+          code=${pipeline_status[0]}
+          stderr_capture_code=${pipeline_status[1]}
         else
+          # A capture-file setup failure must not prevent the policy gate from
+          # running or hide its status; stderr still streams directly to the log.
+          echo "::error::Unable to create the Bifrost policy stderr log at ${stderr_path}; streaming stderr without file retention."
           "${BIFROST_BIN}" "${args[@]}"
           code=$?
+          stderr_capture_code=1
         fi
         set -e
         echo "exit-code=${code}" >> "${GITHUB_OUTPUT}"
+        echo "stderr-capture-code=${stderr_capture_code}" >> "${GITHUB_OUTPUT}"
         echo "sarif-file=${WORKDIR}/${SARIF_FILE}" >> "${GITHUB_OUTPUT}"
         if [ -f "${SARIF_FILE}" ]; then
           echo "has-sarif=true" >> "${GITHUB_OUTPUT}"
         else
           echo "has-sarif=false" >> "${GITHUB_OUTPUT}"
+        fi
+        if [ "${stderr_capture_code}" -ne 0 ]; then
+          echo "::error::Bifrost policy stderr capture or drain failed with status ${stderr_capture_code}; analyzer exit status was ${code}."
+          exit 1
         fi
 
     # Save after the analyzer exits, even when its policy gate will fail. Never
@@ -251,14 +272,16 @@ runs:
         path: ${{ steps.analyzer-cache-identity.outputs.cache-path }}
         key: ${{ steps.analyzer-cache.outputs.cache-primary-key }}
 
-    - name: Retain SARIF report
-      if: always() && inputs.artifact-name != '' && steps.run.outputs.has-sarif == 'true'
+    - name: Retain SARIF report and diagnostics
+      if: always() && inputs.artifact-name != ''
       uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
       with:
         name: ${{ inputs.artifact-name }}
+        # Resolve paths from inputs so the partial stderr log remains eligible
+        # even when cancellation prevents the Run policies outputs from settling.
         path: |
-          ${{ steps.run.outputs.sarif-file }}
-          ${{ steps.run.outputs.stderr-file }}
+          ${{ inputs.working-directory }}/${{ inputs.sarif-file }}
+          ${{ inputs.working-directory }}/${{ inputs.sarif-file }}.stderr.log
         if-no-files-found: error
 
     - name: Summarize policy execution

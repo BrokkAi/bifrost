@@ -2688,6 +2688,53 @@ pub(super) fn selected_site_quality(
                 ProofStatus::Proven,
                 control_relation_completeness(value.completeness, &value.uncovered_relations),
             ),
+            CodeQueryResultValue::BranchRelation { value } => (
+                ProofStatus::Proven,
+                if value.verdict == "open" {
+                    EvidenceCompleteness::Partial(format!(
+                        "branch relation is open: {:?}",
+                        value.reason
+                    ).into())
+                } else {
+                    EvidenceCompleteness::Complete
+                },
+            ),
+            CodeQueryResultValue::LoopRelation { value } => (
+                ProofStatus::Proven,
+                if value.verdict == "open" {
+                    EvidenceCompleteness::Partial(
+                        format!("loop relation is open: {:?}", value.reasons).into(),
+                    )
+                } else {
+                    EvidenceCompleteness::Complete
+                },
+            ),
+            CodeQueryResultValue::StatementReachability { value } => (
+                ProofStatus::Proven,
+                if value.verdict == "open" {
+                    EvidenceCompleteness::Partial(
+                        format!("statement reachability is open: {:?}", value.reason).into(),
+                    )
+                } else {
+                    EvidenceCompleteness::Complete
+                },
+            ),
+            CodeQueryResultValue::FailureHandlerState { value } => (
+                if value.proof == "exact" {
+                    ProofStatus::Proven
+                } else {
+                    ProofStatus::Unproven(
+                        format!("failure handler proof is {}", value.proof).into(),
+                    )
+                },
+                if value.coverage == "exhaustive" {
+                    EvidenceCompleteness::Complete
+                } else {
+                    EvidenceCompleteness::Partial(
+                        format!("failure handler is incomplete: {:?}", value.reason).into(),
+                    )
+                },
+            ),
             // A guard row carries the IR evidence of the decision it records,
             // so an unproven or partial lowering makes the selector's evidence
             // unproven or partial rather than silently clean (#2443).
@@ -2890,6 +2937,20 @@ pub(super) fn selected_site_quality(
                     )
                 },
             ),
+            CodeQueryResultValue::CallResultObligation { value } => (
+                if !value.terminal && value.coverage == "exhaustive" {
+                    ProofStatus::Proven
+                } else {
+                    ProofStatus::Unproven("reviewed result obligation is not established".into())
+                },
+                if value.coverage == "exhaustive" {
+                    EvidenceCompleteness::Complete
+                } else {
+                    EvidenceCompleteness::Partial(
+                        format!("result-obligation coverage is {}: {:?}", value.coverage, value.reason).into(),
+                    )
+                },
+            ),
             CodeQueryResultValue::ProcedureEffect { value } => (
                 ProofStatus::Proven,
                 if value.coverage == "exhaustive" {
@@ -2993,6 +3054,28 @@ pub(super) fn selected_site_quality(
                     )
                 } else {
                     EvidenceCompleteness::Complete
+                },
+            ),
+            CodeQueryResultValue::AssignmentRelation { value } => (
+                if value.proof == "exact" {
+                    ProofStatus::Proven
+                } else {
+                    ProofStatus::Unproven(
+                        value
+                            .reason
+                            .unwrap_or("assignment relation proof is open")
+                            .into(),
+                    )
+                },
+                if value.coverage == "exhaustive" {
+                    EvidenceCompleteness::Complete
+                } else {
+                    EvidenceCompleteness::Partial(
+                        value
+                            .reason
+                            .unwrap_or("assignment relation coverage is open")
+                            .into(),
+                    )
                 },
             ),
             CodeQueryResultValue::ConcurrentAccessConflict { value } => (

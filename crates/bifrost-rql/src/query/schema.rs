@@ -38,8 +38,22 @@ use brokk_bifrost_core::schema_version::{
 use std::sync::OnceLock;
 
 use super::ir::{
-    CandidateOutcomeLabel, FailureUseConsumer, FailureUseProvenance, JsxElementIdentity,
-    MAX_CAPTURE_LENGTH, MAX_KWARG_NAME_LENGTH, SCHEMA_VERSION, UNATTRIBUTED_TIER_LABEL,
+    AssignmentRelationKind, CandidateOutcomeLabel, FailureUseConsumer, FailureUseProvenance,
+    JsxElementIdentity, MAX_CAPTURE_LENGTH, MAX_KWARG_NAME_LENGTH, SCHEMA_VERSION,
+    UNATTRIBUTED_TIER_LABEL,
+};
+
+/// Metadata for an explicitly typed row literal, shared by lowering and help.
+pub(crate) struct RowLiteralForm {
+    pub label: &'static str,
+    pub signature: &'static str,
+    pub description: &'static str,
+}
+
+pub(crate) const ROW_ENUM_LITERAL: RowLiteralForm = RowLiteralForm {
+    label: "enum",
+    signature: "(enum LABEL)",
+    description: "A constrained-enum row literal. Use this explicit form for labels such as true or false that otherwise denote Boolean literals.",
 };
 
 /// The single RQL schema version. The pre-1.0 lineage (versions 2 through 13,
@@ -432,6 +446,8 @@ pub enum ValueShape {
     RewriteDomainList,
     RewriteOutcomeList,
     ControlRelationKindList,
+    AssignmentRelationKindList,
+    BranchRelationKindList,
     ControlExitPartitionList,
     JsxElementIdentity,
     RuntimeFamily,
@@ -535,6 +551,10 @@ impl ValueShape {
             Self::RewriteDomainList => "one or more rewrite domains",
             Self::RewriteOutcomeList => "converged, cycle, or exceeded-budget",
             Self::ControlRelationKindList => "one or more control relations",
+            Self::AssignmentRelationKindList => {
+                "self_assignment, failed_swap, or overwritten_unread"
+            }
+            Self::BranchRelationKindList => "one or more branch relations",
             Self::ControlExitPartitionList => "one or more control exit partitions",
             Self::JsxElementIdentity => "intrinsic, component, or unknown",
             Self::RuntimeFamily => "a supported runtime family",
@@ -865,7 +885,7 @@ query_step_ops! {
     AbsentMember { shape: DerivedValue, label: "absent_member", signature: "procedure -> absent_member_finding", description: "Report member accesses whose receiver class set is fully known and contains an independently admitted class that does not declare the member, with the site that introduced the class. A class inferred only by guarding an unmodeled producer is insufficient.", semantic: [Procedures, Dispatch, ValueFlow] }
     Taint { shape: DerivedValue, label: "taint", signature: "procedure -> taint_finding", description: "Project findings retained by one host-registered production taint result for the exact procedure root.", semantic: [Procedures, Taint] }
     Witness { shape: DerivedValue, label: "witness", signature: "typestate_finding|flow_endpoint|absent_member_finding -> typestate_witness|flow_witness|absent_member_witness", description: "Project bounded retained evidence from each typestate finding, reached flow endpoint, or absent-member finding without rerunning analysis." }
-    FileOf { shape: RowLocal, label: "file_of", signature: "structural_match|declaration|procedure|program_point|control_edge|typestate_finding|typestate_witness|flow_endpoint|flow_witness|class_set_row|absent_member_finding|absent_member_witness|taint_finding|reference_site|call_site|expression_site|jsx_attribute_value|receiver_analysis|member_target_analysis|receiver_outcome|receiver_evidence|field_write_value|call_shape|call_argument_group|call_argument|call_binding|call_effect|call_result_contract|result_contract_use|result_contract_failure_use|procedure_effect|callable_signature|signature_parameter|decorated_parameter|callable_applicability|overload_selection|dispatch_outcome|dispatch_target|member_family|member_family_edge|state_event -> file", description: "Map structural matches, declarations, procedures, program points, control edges, typestate findings, typestate witnesses, flow endpoints, flow witnesses, class-set rows, absent-member findings, absent-member witnesses, taint findings, reference sites, call sites, expression sites, exact JSX attribute operands, receiver analyses, member-target analyses, receiver outcomes, receiver evidence, exact field-write operands, call-shape rows, call-result-contract rows, typed result-contract operation and failure-use rows, callable-signature rows, decorated-parameter rows, callable-applicability rows, overload-selection rows, dispatch rows, method-family rows, or state-event rows to their workspace files." }
+    FileOf { shape: RowLocal, label: "file_of", signature: "structural_match|declaration|procedure|program_point|control_edge|branch_relation|failure_handler_state|typestate_finding|typestate_witness|flow_endpoint|flow_witness|class_set_row|absent_member_finding|absent_member_witness|taint_finding|reference_site|call_site|expression_site|jsx_attribute_value|receiver_analysis|member_target_analysis|receiver_outcome|receiver_evidence|field_write_value|call_shape|call_argument_group|call_argument|call_binding|call_effect|call_result_contract|call_result_obligation|result_contract_use|result_contract_failure_use|procedure_effect|callable_signature|signature_parameter|decorated_parameter|callable_applicability|overload_selection|dispatch_outcome|dispatch_target|member_family|member_family_edge|state_event -> file", description: "Map structural matches, declarations, procedures, program points, control edges, typestate findings, typestate witnesses, flow endpoints, flow witnesses, class-set rows, absent-member findings, absent-member witnesses, taint findings, reference sites, call sites, expression sites, exact JSX attribute operands, receiver analyses, member-target analyses, receiver outcomes, receiver evidence, exact field-write operands, call-shape rows, call-result-contract rows, reviewed result-obligation rows, typed result-contract operation and failure-use rows, callable-signature rows, decorated-parameter rows, callable-applicability rows, overload-selection rows, dispatch rows, method-family rows, failure-handler state rows, or state-event rows to their workspace files." }
     ImportsOf { shape: RowLocal, label: "imports_of", signature: "file -> file", description: "Traverse one direct project-local import edge forward." }
     ImportersOf { shape: DerivedValue, label: "importers_of", signature: "file -> file", description: "Traverse one direct project-local import edge backward." }
     Supertypes { shape: DerivedValue, label: "supertypes", signature: "declaration -> declaration", description: "Traverse indexed supertypes from supported type declarations." }
@@ -895,11 +915,13 @@ query_step_ops! {
     CallEffects { shape: RowLocal, label: "call_effects", signature: "call_shape -> call_effect", description: "Project the direct effect rows of each call shape: one row per (dispatch arm, declared effect) for every callee an active semantic-model pack declares effects for, carrying the effect id, the pack-authored timing, additive canonical execution timing, the certainty meet of the declaration and the dispatch proof, and the pack provenance. At least one row per call shape, so an unresolved, unmodeled or unsupported dispatch states that instead of answering empty. The callee set and its proof are the dispatch oracle's own answer; nothing is re-derived here.", semantic: [Procedures] }
     ResultContractCalls { shape: Batched, label: "result_contract_calls", signature: "call_shape -> call_shape", description: "Retain call shapes whose exhaustively resolved canonical dispatch arms unanimously select an activated semantic-model summary with at least one reviewed result contract. This lightweight positive candidate discovery uses structural call shapes, exact definition resolution (including Go package, bound-receiver, and conservative method-expression applicability), and activated model keys without materializing procedure semantics: conclusively unmodeled calls are omitted, while conflicts or interrupted dispatch make the query incomplete." }
     CallResultContracts { shape: Batched, label: "call_result_contracts", signature: "call_shape -> call_result_contract", description: "Project reviewed validity contracts for a call's normal results from the unique activated semantic-model summary for every possible dispatch arm. A positive row identifies the protected result ordinal and either a predicate over a separate condition result or a direct result-success predicate, derives only the exact normalized success-guard edges needed to instantiate that contract, counts reviewed member contracts, and reports whether every modeled arm declares a fresh allocation at that indexed result. It does not inspect resource-sensitive uses. At least one row per call shape; unresolved dispatch or conflicting models produce an explicit terminal row and incomplete query rather than an empty answer.", semantic: [Procedures, Dispatch, ProgramPoints, ControlEdges] }
+    CallResultObligations { shape: Batched, label: "call_result_obligations", signature: "call_shape -> call_result_obligation", description: "Project exact Java result-use and reviewed return-use obligations from the selected JDK artifact. A positive row requires exact discarded-result syntax, a resolver-owned call, an applicable reviewed model on every feasible dispatch arm, and no unaccounted dynamic target. Missing source, artifact, model, or dispatch proof produces an explicit incomplete terminal row.", semantic: [Procedures, Dispatch] }
     ResultContractUses { shape: Batched, label: "result_contract_uses", signature: "call_result_contract -> call_result_contract", description: "Summarize operation-sensitive uses of each positive call-result-contract row while preserving acquisition identity. This optional enrichment counts every exact structured operation, reports the lower bound of reviewed required operations proved unguarded, and carries aggregate use-validation coverage. Terminal rows pass through unchanged; incomplete structured use evidence makes only this relation incomplete.", semantic: [Procedures, Dispatch, ProgramPoints, ControlEdges] }
     ResultContractOperationUses { shape: Batched, label: "result_contract_operation_uses", signature: "call_result_contract -> result_contract_use", description: "Project one typed row per structured operation on a protected result. Intrinsic dereference, field, and index operations are required uses. Receiver calls use exact complete member operation contracts. Exact positional call arguments use complete possible-target procedure-entry preconditions and carry parameter_ordinal. Missing, conflicting, expanded, or ambiguous operation evidence stays open. Each row is anchored at the operation and carries its acquisition identity, exact applicability, timing, required predicate, and guarded, unguarded, not_applicable, or unknown verdict.", semantic: [Procedures, Dispatch, ProgramPoints, ControlEdges] }
     ResultContractFailureUses { shape: Batched, label: "result_contract_failure_uses", signature: "call_result_contract -> result_contract_failure_use", description: "Project structured values returned or passed to calls inside the exact failure arm of a reviewed conditional result contract. Each row compares the operand's exact reaching binding/value provenance with the paired condition result and classifies condition_result, distinct_zero_binding, distinct_binding, independent, or unknown. Exact normalized failure-edge confinement and complete structured identity are required for closed proof; ambiguity remains an open unknown row.", semantic: [Procedures, Dispatch, ProgramPoints, ControlEdges] }
     NilnessOperations { shape: RowLocal, label: "nilness_operations", signature: "procedure -> nilness_operation", description: "Project source-backed pointer operations with their procedure-local scalar nilness fact. Explicit dereferences and implicit pointer field loads or stores are intrinsic operations; receiver calls are included only when exhaustive reviewed models require a non-null receiver. Unsupported identity or scalar evidence stays explicit and open rather than becoming a finding.", semantic: [Procedures, Dispatch, ProgramPoints, ControlEdges] }
     SwitchCoverage { shape: RowLocal, label: "switch_coverage", signature: "procedure -> switch_coverage", description: "Project one source-backed coverage verdict for each switch. An explicit default is exhaustive; an exact Boolean expression selector is exhaustive only with both literal cases and non-exhaustive when a complete literal case set omits either value. Expressionless switches without default, type switches, open selector domains, and nonliteral case sets remain unknown.", semantic: [Procedures, ProgramPoints, ControlEdges, SwitchFacts] }
+    AssignmentRelations { shape: RowLocal, label: "assignment_relations", signature: "procedure -> assignment_relation", description: "Project source-backed assignment relation rows for C, Java, JavaScript, TypeScript, and Python by joining prepared syntax to exact local-binding, same-evaluation, and reaching-definition evidence. The default selects self-assignment; failed-swap is opt-in and requires crossed exact bindings and ordered writes. Unsupported candidates, dialects, and selected relations report incomplete coverage rather than certifying absence.", semantic: [Procedures, ProgramPoints, ControlEdges] }
     DetachedTaskTransfers { shape: RowLocal, label: "detached_task_transfers", signature: "procedure -> detached_task_transfer", description: "Project receiver, argument, and exact local closure-capture values copied into calls whose semantic invocation mode is detached and whose execution timing is different_task. Each row carries stable value identity and an exact abstract-object identity when the heap oracle proves one closed candidate; absent, ambiguous, open, or unproven object sets remain explicit open terminal rows.", semantic: [Procedures, ProgramPoints] }
     ProcedureEffects { shape: RowLocal, label: "procedure_effects", signature: "declaration -> procedure_effect", description: "Summarize the effects of each procedure over its reachable call graph: one row per (procedure, effect id), classified direct or transitive, with the hop count, the certainty and timing carried along the attributing chain, a bounded witness chain of call-site identities, and the coverage that says whether an absent effect is proven absent or merely unseen. At least one row per declaration. The walk is a bounded deterministic fixpoint over the same dispatch answers call_effects publishes.", semantic: [Procedures] }
     CallBindings { shape: RowLocal, label: "call_bindings", signature: "call_shape -> call_binding", description: "Project the normalized actual-to-formal binding rows of each call shape: one row per written actual, carrying the call-shape argument identity it binds, the formal ordinal and name it was bound to, the binding kind, this row's mapping status, and the whole call's partition coverage. Beside them, a row for each fact no written actual accounts for: the receiver the call is made against, an argument the language supplies with no syntax, and a formal that no actual passed but whose declaration carries a default. Coverage describes the written actuals alone. Exact receiver rows carry a stable declaring-type identity. Selector proof is separate from runtime dispatch: it is derived for exact dispatch or for a resolver-proven receiverless external static target whose unique complete model supplies exact formals. It can also be authored-summary proof when a unique complete exact-member summary explicitly covers the sole unresolved override residual; full activated provenance is retained. Workspace arms, ambiguous overloads, partial or conflicting models, unproven owner identity, instance boundaries without a contract, other boundary kinds, and truncation remain inexact. The semantic dispatch identity, proof, completeness, and candidate coverage are still carried unchanged from the bounded dispatch answer. A source declaration is only an optional materialized view. At least one row per call shape, so an unreadable shape, an unresolved or ambiguous callee, unrecorded formals, or a call that binds nothing each state that instead of answering empty. The callee is the one the production definition resolver binds; no overload is re-decided here.", semantic: [Procedures, Dispatch] }
@@ -933,6 +955,10 @@ query_step_ops! {
     FlowRelationsOf { shape: RowLocal, label: "flow_relations_of", signature: "state_event|procedure -> flow_relation", description: "Derive the flow relations between the state events of each procedure: reaching-definition, dominance, and same-evaluation, each with exact or may certainty. Seeded from a state event, only the relations incident to that event are returned. Budget exhaustion emits no rows and an explicit incomplete diagnostic; it is never reported as an absent relation.", semantic: [Procedures, ProgramPoints, ControlEdges] }
     FlowSource { shape: RowLocal, label: "flow_source", signature: "flow_relation -> state_event", description: "Project each flow relation to its source state event: the establishment or kill end." }
     FlowTarget { shape: RowLocal, label: "flow_target", signature: "flow_relation -> state_event", description: "Project each flow relation to its target state event: the read end." }
+    FailureHandlerState { shape: RowLocal, label: "failure_handler_state", signature: "structural_match -> failure_handler_state", description: "Classify the exact Java catch body from prepared syntax. Empty and nonempty verdicts are structural facts with exact proof and exhaustive coverage. Recovered or unavailable syntax produces an explicit unknown row and incomplete coverage; this step makes no reachability claim." }
+    BranchRelations { shape: RowLocal, label: "branch_relations", signature: "structural_match -> branch_relation", description: "Compare ordered arms of one structural if fact using exact parsed syntax and lexical binding identities. Rows state proven, distinct, or open with an explicit reason. Relation filtering applies before completeness is assessed, so unrelated open relations do not taint a selected family." }
+    LoopRelations { shape: RowLocal, label: "loop_relations", signature: "procedure -> loop_relation", description: "For an exact Java source loop, prove whether its reachable body can reach its own repeat edge before exiting. Rows preserve source and control gaps as open rather than claiming a nonrepeating body.", semantic: [Procedures, ProgramPoints, ControlEdges] }
+    StatementReachability { shape: RowLocal, label: "statement_reachability", signature: "procedure -> statement_reachability", description: "Enumerate exact Java statement syntax and its producer-authored CFG entries. A statement is unreachable only when every entry is outside complete bounded entry reachability; source, control, and budget gaps remain open.", semantic: [Procedures, ProgramPoints, ControlEdges] }
     ControlRelations { shape: RowLocal, label: "control_relations", signature: "procedure -> control_relation", description: "Derive the control relations of each procedure from the shared control-flow algorithms over the production semantic IR: dominance, postdominance, control dependence, entry reachability, and loop membership between the procedure's own program points, joined by the same stable ids the program_point and control_edge rows publish. Every row states the exit partition its claim was computed against, so a backward claim can never be read as a claim about a partition that was not computed. Budget exhaustion or cancellation emits no row for the affected relation and an explicit incomplete diagnostic; it is never reported as an absent relation.", semantic: [Procedures, ProgramPoints, ControlEdges] }
     GuardsOf { shape: RowLocal, label: "guards_of", signature: "procedure -> guard", description: "Return the normalized branch conditions the language adapter recorded for each procedure: which decision point each guard sits on, what its condition was normalized to -- a compile-time constant, a null comparison, a comparison against a constant, or an explicitly opaque condition -- and the stable ids of the true and false successor edges and target points. A constant condition is published even when lowering folded its dead arm away, which is the only place that evidence survives. An empty answer means the adapter records no guard facts for this language, which its own guard_facts capability states.", semantic: [Procedures, ProgramPoints, ControlEdges] }
     TargetOf { shape: DerivedValue, label: "target_of", signature: "file -> build_target", description: "Return the build target each file compiles into, as the workspace's own build files declare it. Ownership comes from build evidence alone: a file no read build file claims produces no row, and a build model this workspace cannot read produces an explicit incomplete diagnostic rather than an empty answer that reads as \"no target\"." }
@@ -1128,11 +1154,13 @@ macro_rules! rql_forms {
                     | Self::CallEffects
                     | Self::ResultContractCalls
                     | Self::CallResultContracts
+                    | Self::CallResultObligations
                     | Self::ResultContractUses
                     | Self::ResultContractOperationUses
                     | Self::ResultContractFailureUses
                     | Self::NilnessOperations
                     | Self::SwitchCoverage
+                    | Self::AssignmentRelations
                     | Self::DetachedTaskTransfers
                     | Self::ProcedureEffects
                     | Self::CallableSignature
@@ -1179,6 +1207,10 @@ macro_rules! rql_forms {
                     | Self::FlowSource
                     | Self::FlowTarget
                     | Self::ControlRelations
+                    | Self::FailureHandlerState
+                    | Self::BranchRelations
+                    | Self::LoopRelations
+                    | Self::StatementReachability
                     | Self::TargetOf
                     | Self::SourceSetOf
                     | Self::TopologyEdgesOf
@@ -1257,7 +1289,7 @@ rql_forms! {
         class: Wrapper,
         shape: Pattern,
         signature: "(inside-decl container-pattern query)",
-        description: "Require the root match to be inside a matching container without crossing a callable declaration.",
+        description: "Require the root match to be inside a matching container without crossing a callable declaration; Rust impl members can also match their resolved owning type.",
     }
     NotInside {
         labels: ["not-inside"],
@@ -1687,6 +1719,14 @@ rql_forms! {
         description: (QueryStepOp::CallResultContracts),
         step: CallResultContracts,
     }
+    CallResultObligations {
+        labels: ["call-result-obligations", "call_result_obligations"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(call-result-obligations query)",
+        description: (QueryStepOp::CallResultObligations),
+        step: CallResultObligations,
+    }
     ResultContractUses {
         labels: ["result-contract-uses", "result_contract_uses"],
         class: Wrapper,
@@ -1726,6 +1766,14 @@ rql_forms! {
         signature: "(switch-coverage query)",
         description: (QueryStepOp::SwitchCoverage),
         step: SwitchCoverage,
+    }
+    AssignmentRelations {
+        labels: ["assignment-relations", "assignment_relations"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(assignment-relations [:relation [self-assignment|failed-swap ...]] query)",
+        description: (QueryStepOp::AssignmentRelations),
+        step: AssignmentRelations,
     }
     DetachedTaskTransfers {
         labels: ["detached-task-transfers", "detached_task_transfers"],
@@ -2080,6 +2128,38 @@ rql_forms! {
         description: (QueryStepOp::FlowTarget),
         step: FlowTarget,
     }
+    FailureHandlerState {
+        labels: ["failure-handler-state", "failure_handler_state"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(failure-handler-state query)",
+        description: (QueryStepOp::FailureHandlerState),
+        step: FailureHandlerState,
+    }
+    BranchRelations {
+        labels: ["branch-relations", "branch_relations"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(branch-relations [:relation [identical-bodies|repeated-condition|contradictory-condition|subsumed-condition ...]] query)",
+        description: (QueryStepOp::BranchRelations),
+        step: BranchRelations,
+    }
+    LoopRelations {
+        labels: ["loop-relations", "loop_relations"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(loop-relations query)",
+        description: (QueryStepOp::LoopRelations),
+        step: LoopRelations,
+    }
+    StatementReachability {
+        labels: ["statement-reachability", "statement_reachability"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(statement-reachability query)",
+        description: (QueryStepOp::StatementReachability),
+        step: StatementReachability,
+    }
     ControlRelations {
         labels: ["control-relations", "control_relations"],
         class: Wrapper,
@@ -2407,7 +2487,7 @@ json_fields! {
     Intersect { label: "intersect", shape: QueryList, signature: "\"intersect\": [{ query }, { query }, ...]", description: "Keep compatible typed endpoints reached by every branch." }
     Except { label: "except", shape: QueryList, signature: "\"except\": [{ query }, { query }, ...]", description: "Keep first-branch endpoints absent from every later branch." }
     Inside { label: "inside", shape: Pattern, signature: "\"inside\": { pattern }", description: "Require the root match to be inside a matching container." }
-    InsideDecl { label: "inside_decl", shape: Pattern, signature: "\"inside_decl\": { pattern }", description: "Require the root match to be inside a matching container without crossing a callable declaration." }
+    InsideDecl { label: "inside_decl", shape: Pattern, signature: "\"inside_decl\": { pattern }", description: "Require the root match to be inside a matching container without crossing a callable declaration; Rust impl members can also match their resolved owning type." }
     NotInside { label: "not_inside", shape: Pattern, signature: "\"not_inside\": { pattern }", description: "Exclude root matches inside a matching container." }
     Steps { label: "steps", shape: QuerySteps, signature: "\"steps\": [{ \"op\": \"file_of\" }, ...]", description: "Apply ordered typed transformations to structural matches." }
     Limit { label: "limit", shape: PositiveInteger, signature: "\"limit\": positive integer", description: "Set the maximum number of matches returned." }
@@ -2483,7 +2563,9 @@ json_fields! {
     FlowCertainties { label: "certainty", shape: FlowCertaintyList, signature: "\"certainty\": [\"exact\", \"may\"]", description: "Restrict flow-relation rows to one or more certainties." }
     FailureUseProvenances { label: "provenance", shape: FailureUseProvenanceList, signature: "\"provenance\": [\"condition_result\", ...]", description: "Restrict failure-use rows to one or more structured provenance classes." }
     FailureUseConsumers { label: "consumer", shape: FailureUseConsumerList, signature: "\"consumer\": [\"return\", \"returned_call_argument\", \"call_argument\"]", description: "Restrict failure-use rows to one or more structured consumer classes." }
+    BranchRelations { label: "branch_relation", shape: BranchRelationKindList, signature: "\"branch_relation\": [\"identical_bodies\", ...]", description: "Restrict branch-relation rows to one or more relation families." }
     ControlRelations { label: "control_relation", shape: ControlRelationKindList, signature: "\"control_relation\": [\"dominates\", ...]", description: "Restrict control-relation rows to one or more relations." }
+    AssignmentRelations { label: "assignment_relation", shape: AssignmentRelationKindList, signature: "\"assignment_relation\": [\"self_assignment\", \"failed_swap\", \"overwritten_unread\"]", description: "Select assignment obligations before deriving coverage. With no selection, only self-assignment is derived. Overwritten-unread supports Java, JavaScript, and TypeScript ordinary locals." }
     ControlExitPartitions { label: "exit_partition", shape: ControlExitPartitionList, signature: "\"exit_partition\": [\"normal_and_exceptional\"]", description: "Restrict control-relation rows to one or more exit partitions the claim was computed against." }
     ResolvesTo { label: "resolves_to", shape: CallIdentity, signature: "\"resolves_to\": { \"stable\" | \"qualified\" | \"workspace_declaration\" | \"active_semantic_model\": \"identity\" }", description: "Select one callable stable identity, qualified locator, or resolved typed identity." }
     CallProof { label: "call_proof", shape: CallProof, signature: "\"call_proof\": \"exact\" | \"declared\"", description: "Require exact selector proof or a complete declared semantic-model callable." }
@@ -2744,6 +2826,12 @@ pub fn flow_state_option_for_rql_label(op: QueryStepOp, label: &str) -> Option<Q
         .find(|option| option.accepts_rql_label(label))
 }
 
+/// Options of the `branch-relations` step.
+pub const BRANCH_RELATION_STEP_OPTIONS: &[QueryStepOption] = &[QueryStepOption::optional(
+    QueryStepField::BranchRelations,
+    &[":relation", ":relations"],
+)];
+
 /// Options of the `control-relations` step (#2443).
 pub const CONTROL_RELATION_STEP_OPTIONS: &[QueryStepOption] = &[
     QueryStepOption::optional(
@@ -2755,6 +2843,11 @@ pub const CONTROL_RELATION_STEP_OPTIONS: &[QueryStepOption] = &[
         &[":exit-partition", ":exit_partition", ":exit-partitions"],
     ),
 ];
+
+pub const ASSIGNMENT_RELATION_STEP_OPTIONS: &[QueryStepOption] = &[QueryStepOption::optional(
+    QueryStepField::AssignmentRelations,
+    &[":relation", ":relations"],
+)];
 
 /// Options of the `rewrite-paths-of` step (#1480).
 pub const REWRITE_PATH_STEP_OPTIONS: &[QueryStepOption] = &[
@@ -2933,6 +3026,8 @@ impl QueryStepOp {
             Self::FlowRelationsOf => FLOW_RELATION_STEP_OPTIONS,
             Self::ResultContractFailureUses => RESULT_CONTRACT_FAILURE_USE_STEP_OPTIONS,
             Self::ControlRelations => CONTROL_RELATION_STEP_OPTIONS,
+            Self::AssignmentRelations => ASSIGNMENT_RELATION_STEP_OPTIONS,
+            Self::BranchRelations => BRANCH_RELATION_STEP_OPTIONS,
             Self::RewritePathsOf => REWRITE_PATH_STEP_OPTIONS,
             _ => &[],
         }
@@ -3098,6 +3193,20 @@ pub fn constrained_step_option_labels(field: QueryStepField) -> Vec<&'static str
     if !rewrite_path.is_empty() {
         return rewrite_path;
     }
+    if field == QueryStepField::AssignmentRelations {
+        return [
+            AssignmentRelationKind::SelfAssignment,
+            AssignmentRelationKind::FailedSwap,
+            AssignmentRelationKind::OverwrittenUnread,
+        ]
+        .iter()
+        .map(|kind| kind.label())
+        .collect();
+    }
+    let branch = branch_relation_filter_labels(field);
+    if !branch.is_empty() {
+        return branch;
+    }
     control_relation_filter_labels(field)
 }
 
@@ -3112,6 +3221,17 @@ pub fn failure_use_filter_labels(field: QueryStepField) -> Vec<&'static str> {
             .map(|value| value.label())
             .collect(),
         _ => Vec::new(),
+    }
+}
+
+pub fn branch_relation_filter_labels(field: QueryStepField) -> Vec<&'static str> {
+    if field == QueryStepField::BranchRelations {
+        super::ir::BranchRelationKind::ALL
+            .iter()
+            .map(|kind| kind.label())
+            .collect()
+    } else {
+        Vec::new()
     }
 }
 

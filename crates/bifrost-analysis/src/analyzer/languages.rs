@@ -12,7 +12,9 @@
 
 use crate::analyzer::common::language_for_target;
 use crate::analyzer::store::LimitedQueryRows;
-use crate::analyzer::usages::get_definition::{BoundedResolution, DefinitionLookupOutcome};
+use crate::analyzer::usages::get_definition::{
+    BoundedResolution, DefinitionLookupOutcome, ExactExternalCallProof,
+};
 use crate::analyzer::usages::get_type::TypeLookupOutcome;
 use crate::analyzer::usages::inverted_edges::{
     JsTsScopedUsageEdges, UsageEdgeWeights, UsageEdges, UsageNodeKey,
@@ -68,9 +70,27 @@ pub(crate) struct LocalDeclarationBindingScope<'tree> {
     pub visibility: LocalDeclarationVisibility,
 }
 
+/// AST-level helper that returns the identifier introduced by one pattern node.
+pub(crate) type PatternBindingNameProvider =
+    for<'tree> fn(tree_sitter::Node<'tree>) -> Option<tree_sitter::Node<'tree>>;
+
 pub(crate) trait LanguageSupport: Send + Sync {
     /// The `Language` variant this support serves. Must equal the registry match key.
     fn language(&self) -> Language;
+
+    /// Classify one prepared syntax node as an executable statement owned by
+    /// this language. `None` means either that the node is not a statement or
+    /// that the language does not expose statement-entry assessment.
+    fn executable_statement_kind(&self, _node: tree_sitter::Node<'_>) -> Option<&'static str> {
+        None
+    }
+
+    /// The AST-level helper for extracting one pattern node's binding identifier.
+    /// Shared analysis uses this for pattern bindings the generic lexical environment
+    /// does not model.
+    fn pattern_binding_name_provider(&self) -> Option<PatternBindingNameProvider> {
+        None
+    }
 
     /// The module represented by the file itself, when this language has one.
     /// Use the same constructor as the storage adapter's path module projection.
@@ -174,6 +194,26 @@ pub(crate) trait LanguageSupport: Send + Sync {
         false
     }
 
+    /// Whether the call whose source mapping spans `call` in `source` provably
+    /// cannot throw an exception the catch parameter whose name spans
+    /// `catch_parameter` catches.
+    ///
+    /// The workspace oracle uses this to drop a lowered catch binding from
+    /// that call's thrown value, so the parameter keeps the origins of the
+    /// throws that can reach it. The default is `false`, which keeps every
+    /// binding. An implementation must answer `true` only from the language's
+    /// own exception typing rules, never from spelling.
+    fn call_cannot_reach_catch_parameter(
+        &self,
+        _analyzer: &dyn IAnalyzer,
+        _file: &ProjectFile,
+        _source: &Arc<str>,
+        _call: std::ops::Range<usize>,
+        _catch_parameter: std::ops::Range<usize>,
+    ) -> bool {
+        false
+    }
+
     /// Rendered signatures this language's analyzer holds for `unit`, visiting at most
     /// `limit` rows. `None` means the workspace does not analyze this language, or the
     /// language keeps no direct signature projection.
@@ -264,12 +304,19 @@ pub(crate) trait LanguageSupport: Send + Sync {
     /// Expand a source-level callee spelling to the external identity that semantic
     /// models publish, when this language can prove the expansion from structured
     /// language evidence. The default offers no expansion.
+    ///
+    /// The call site's parsed file and exact source are handed over for the same
+    /// reason [`Self::single_segment_external_owner`] receives them: a language
+    /// may have to ask a scope question about the evidence it expands from --
+    /// Rust's import binder expands only while the path it binds has a root the
+    /// workspace does not claim (#3484).
     fn expand_imported_external_callee(
         &self,
         _analyzer: &dyn IAnalyzer,
         _file: &ProjectFile,
         _callee_text: &str,
-    ) -> Option<String> {
+        _site: Option<&ExternalCalleeSite<'_>>,
+    ) -> Option<ImportedExternalCallee> {
         None
     }
 
@@ -324,6 +371,24 @@ pub(crate) trait LanguageSupport: Send + Sync {
     /// prefix, TypeScript's `$static` static-member marker).
     fn display_symbol_name(&self, symbol: &str) -> String {
         symbol.to_string()
+    }
+
+    /// The decoration [`Self::display_symbol_name`] removes, expressed as a change to
+    /// the *structured* name instead of an edit to its rendering. `None` when `fq`
+    /// carries no decoration for this language to remove, which is the common case and
+    /// costs the caller nothing.
+    ///
+    /// A rendering cannot answer this question. [`FqName::render_native`] appends
+    /// exactly one `$` for each [`SegmentKind::Companion`] segment, and a Scala object's
+    /// own name may end in `$` too -- `object ConstellationNode$` is legal Scala and
+    /// Constellation-Labs/constellation writes it -- so the rendered name ends in two
+    /// `$`, one decoration and one the source wrote. Reading that string back with
+    /// `trim_end_matches('$')` removed both and printed
+    /// `org.constellation.ConstellationNode`, a spelling no declaration answers (#3505).
+    /// Changing a segment's *kind* leaves every segment's text intact, so only the
+    /// renderer's own suffix disappears.
+    fn undecorated_fq_name(&self, _fq: &FqName) -> Option<FqName> {
+        None
     }
 
     /// How a declaration's identifier is written at its declaration site, which is what
@@ -902,6 +967,54 @@ pub(crate) struct ExternalCalleeSite<'a> {
     pub(crate) callee_start_byte: usize,
     /// File-wide evidence shared by every callee site classified in this file.
     pub(crate) file_evidence: &'a ExternalCalleeFileEvidence,
+}
+
+/// What [`LanguageSupport::expand_imported_external_callee`] proved about one
+/// imported callee spelling.
+///
+/// The published text and the structured evidence are two spellings of one
+/// callee, not two independent facts. A language that only expanded a spelling
+/// publishes [`Self::text`]. A language whose resolver selected the callable
+/// itself publishes [`Self::proven`], and the exact call proof and the
+/// owner/member identity then travel together to the call boundary: a summary
+/// is behavior attached to a callable, so text alone must not stand for the
+/// declaration the summary describes (#3484).
+pub(crate) struct ImportedExternalCallee {
+    /// The canonical callee text the boundary publishes, written with the
+    /// language's own separator.
+    pub(crate) canonical_callee: String,
+    /// The exact declaration-side proof of the selected callable and its
+    /// written call shape.
+    pub(crate) exact_external_call: Option<ExactExternalCallProof>,
+    /// The resolver-owned owner/member identity that exact proof names.
+    pub(crate) external_callee_identity:
+        Option<crate::analyzer::semantic::ResolverOwnedExternalCalleeIdentity>,
+}
+
+impl ImportedExternalCallee {
+    /// An expansion whose language proved the callee text but no exact
+    /// declaration-side call shape.
+    pub(crate) fn text(canonical_callee: impl Into<String>) -> Self {
+        Self {
+            canonical_callee: canonical_callee.into(),
+            exact_external_call: None,
+            external_callee_identity: None,
+        }
+    }
+
+    /// An expansion whose language selected the callable itself. The proof and
+    /// the identity are two spellings of what it selected, so they are stored
+    /// and published together.
+    pub(crate) fn proven(
+        proof: ExactExternalCallProof,
+        identity: crate::analyzer::semantic::ResolverOwnedExternalCalleeIdentity,
+    ) -> Self {
+        Self {
+            canonical_callee: proof.canonical_callee().to_owned(),
+            exact_external_call: Some(proof),
+            external_callee_identity: Some(identity),
+        }
+    }
 }
 
 /// The file-wide proofs [`LanguageSupport::single_segment_external_owner`]

@@ -474,12 +474,46 @@ pub(super) fn go_epoch_before_callable_modifier_metadata() -> String {
 // reports `callee_unkeyable` on a warm workspace with no error raised anywhere.
 // The same gap was bumped for JavaScript and TypeScript (#2597), for PHP and
 // Ruby (#2912), for Python (#3451), for Kotlin (#3453) and for Go (#3455).
+// Salt bumped again (#3508): an in-class member prototype is a real source
+// declaration, so it now keeps the ordinary code-unit identity instead of the
+// synthetic one the walk minted for a class-body declaration. Warm rows hold
+// the synthetic identity, which is a different `CodeUnit` (equality includes
+// the flag), refuses `modeled_procedure_key_for_unit` on identity grounds, and
+// keeps the prototype's occurrences in a unit no definition can join.
+// Salt bumped again (#3507): the persisted `dispatch_extensibility` answer the
+// extractor records for a C++ callable changed, so a warm row holds the older
+// answer. A class-body member of a class that writes a base clause now records
+// `open`, because a base may declare a virtual member of the same name, and a
+// qualified out-of-line definition records no answer of its own and takes the
+// include-visible class body's instead of answering from its own subtree. The
+// query-time discharge in the dispatch oracle persists nothing and does not
+// move this salt.
+// Salt bumped again (#3633): a namespace the brace stack restored for a
+// collapsed head now stops owning declarations at the close the stack paired
+// with its `{`, and a parsed namespace whose own `{` and `}` are real tokens is
+// kept when a recovered path is empty. Declarations after such a close lose
+// the restored prefix (simdjson's `basictests.cpp` published
+// `type_tests::validate_tests`), so a warm row holds the older qualified name
+// and Module ownership.
 lang_epoch!(
     Cpp,
     "cpp",
     "treesitter/cpp/",
-    "synthetic-file-scope-code-units-2026-07;recovered-designator-declarations-2026-07;fielded-declarator-routing-2026-07;bare-exported-class-declarators-2026-07;function-like-exported-class-declarators-2026-07;malformed-multiple-base-exported-class-declarators-2026-07;template-alias-declarations-2026-07;structured-return-type-metadata-2026-07;class-owned-alias-identity-2026-07;templated-out-of-line-owner-identity-2026-07;macro-exported-class-field-owner-2026-07;cpp-partial-specialization-ownership-dispatch-2026-07;abstract-parameter-declarator-signatures-2026-07;cpp-template-alias-specialization-dispatch-2026-07;single-base-exported-class-identity-2026-07;callable-linkage-metadata-2026-07;callable-declaration-role-metadata-2026-07;cpp-parameter-type-qualifiers-2026-07;macro-sentinel-region-reparse-2026-07;fragmented-export-class-member-recovery-2026-07;using-directive-owner-namespace-recovery-2026-07;bare-call-global-namespace-lookup-2026-07;nested-class-out-of-line-owner-identity-2026-07;fq-interned-segments-2026-07;recovered-typedef-base-alias-identity-2026-07;inline-classlike-and-macro-prefix-declarations-2026-08;template-parameter-pack-binding-and-qualified-base-initializers-2026-08;recovered-partial-specialization-member-ownership-2026-08;macro-field-terminator-scope-2026-08;complete-sentinel-class-tail-2026-08;sentinel-class-before-member-callable-2026-08;fragmented-class-signature-error-members-2026-08;plain-fragmented-class-constraint-constructor-2026-08;plain-fragmented-class-sibling-ownership-2026-08;fragmented-export-constructor-initializer-2026-08;fragmented-export-constructor-structured-sibling-boundary-2026-08;fragmented-export-sibling-class-parent-scope-2026-08;macro-decorated-template-class-scope-2026-08;conditional-alias-physical-ranges-2026-08;macro-argument-typedef-declarator-2026-08;enum-enumerator-child-ownership-2026-08;sentinel-error-envelope-sibling-recovery-2026-08;cpp-query-assets-in-brokk-bifrost-cpp-2026-08;structural-declarator-qualifier-suffix-and-top-level-parameter-cv-2026-08;macro-fragmented-plain-class-member-signatures-2026-08;namespaced-plain-fragment-boundary-2026-08;templated-plain-fragment-prefix-and-sibling-ownership-2026-08;macro-displaced-scalar-return-callable-name-2026-08;explicit-object-callable-arity-2026-08;structured-callable-parameter-types-2026-08;macro-template-return-free-function-ownership-2026-08;abstract-reference-declarator-identity-2026-08;c-tag-scope-2026-08;c-header-projection-2026-08;temporal-macro-definition-identity-2026-08;nested-include-claims-2026-08;recovered-named-class-member-linkage-2026-09;positional-export-macro-class-names-2026-09;collapsed-namespace-head-scope-2026-09;collapsed-aggregate-definition-ranges-2026-09;lexical-container-partition-2026-09;function-macro-replacement-local-scope-2026-09;forward-declared-class-declaration-ranges-2026-09;unterminated-macro-invocation-fields-2026-09;anonymous-aggregate-members-in-both-dialects-2026-09;recovered-namespace-header-ranges-2026-09;unproven-brace-pairing-extents-2026-09;free-function-callee-value-references-2026-09;cpp-callable-modifier-metadata-2026-09;cpp-declared-access-separate-from-linkage-2026-09"
+    "synthetic-file-scope-code-units-2026-07;recovered-designator-declarations-2026-07;fielded-declarator-routing-2026-07;bare-exported-class-declarators-2026-07;function-like-exported-class-declarators-2026-07;malformed-multiple-base-exported-class-declarators-2026-07;template-alias-declarations-2026-07;structured-return-type-metadata-2026-07;class-owned-alias-identity-2026-07;templated-out-of-line-owner-identity-2026-07;macro-exported-class-field-owner-2026-07;cpp-partial-specialization-ownership-dispatch-2026-07;abstract-parameter-declarator-signatures-2026-07;cpp-template-alias-specialization-dispatch-2026-07;single-base-exported-class-identity-2026-07;callable-linkage-metadata-2026-07;callable-declaration-role-metadata-2026-07;cpp-parameter-type-qualifiers-2026-07;macro-sentinel-region-reparse-2026-07;fragmented-export-class-member-recovery-2026-07;using-directive-owner-namespace-recovery-2026-07;bare-call-global-namespace-lookup-2026-07;nested-class-out-of-line-owner-identity-2026-07;fq-interned-segments-2026-07;recovered-typedef-base-alias-identity-2026-07;inline-classlike-and-macro-prefix-declarations-2026-08;template-parameter-pack-binding-and-qualified-base-initializers-2026-08;recovered-partial-specialization-member-ownership-2026-08;macro-field-terminator-scope-2026-08;complete-sentinel-class-tail-2026-08;sentinel-class-before-member-callable-2026-08;fragmented-class-signature-error-members-2026-08;plain-fragmented-class-constraint-constructor-2026-08;plain-fragmented-class-sibling-ownership-2026-08;fragmented-export-constructor-initializer-2026-08;fragmented-export-constructor-structured-sibling-boundary-2026-08;fragmented-export-sibling-class-parent-scope-2026-08;macro-decorated-template-class-scope-2026-08;conditional-alias-physical-ranges-2026-08;macro-argument-typedef-declarator-2026-08;enum-enumerator-child-ownership-2026-08;sentinel-error-envelope-sibling-recovery-2026-08;cpp-query-assets-in-brokk-bifrost-cpp-2026-08;structural-declarator-qualifier-suffix-and-top-level-parameter-cv-2026-08;macro-fragmented-plain-class-member-signatures-2026-08;namespaced-plain-fragment-boundary-2026-08;templated-plain-fragment-prefix-and-sibling-ownership-2026-08;macro-displaced-scalar-return-callable-name-2026-08;explicit-object-callable-arity-2026-08;structured-callable-parameter-types-2026-08;macro-template-return-free-function-ownership-2026-08;abstract-reference-declarator-identity-2026-08;c-tag-scope-2026-08;c-header-projection-2026-08;temporal-macro-definition-identity-2026-08;nested-include-claims-2026-08;recovered-named-class-member-linkage-2026-09;positional-export-macro-class-names-2026-09;collapsed-namespace-head-scope-2026-09;collapsed-aggregate-definition-ranges-2026-09;lexical-container-partition-2026-09;function-macro-replacement-local-scope-2026-09;forward-declared-class-declaration-ranges-2026-09;unterminated-macro-invocation-fields-2026-09;anonymous-aggregate-members-in-both-dialects-2026-09;recovered-namespace-header-ranges-2026-09;unproven-brace-pairing-extents-2026-09;free-function-callee-value-references-2026-09;cpp-callable-modifier-metadata-2026-09;cpp-declared-access-separate-from-linkage-2026-09;cpp-source-member-prototype-units-2026-09;cpp-member-dispatch-extensibility-2026-09;namespace-recovery-ancestry-authority-2026-09"
 );
+
+/// The C and C++ epoch as it stood before the #3508 source member-prototype bump.
+#[cfg(test)]
+pub(super) fn cpp_epoch_before_source_member_prototype_units() -> String {
+    let prior = salt_before_bump(Cpp::SALT, "cpp-source-member-prototype-units-2026-09");
+    compute_epoch::<Cpp>(&tree_sitter_cpp::LANGUAGE.into(), prior)
+}
+
+#[cfg(test)]
+pub(super) fn cpp_epoch_before_namespace_recovery_ancestry_authority() -> String {
+    let prior = salt_before_bump(Cpp::SALT, "namespace-recovery-ancestry-authority-2026-09");
+    compute_epoch::<Cpp>(&tree_sitter_cpp::LANGUAGE.into(), prior)
+}
 
 /// The salt as it stood immediately before `bump` was appended.
 ///
@@ -819,11 +853,16 @@ pub(super) fn javascript_epoch_before_private_name_assignment_declarations() -> 
 // and, where an alias and a module-scope `const` share one name, holds only one
 // of the two declarations. Only TypeScript's salt moves: the JavaScript grammar
 // spells no `type_alias_declaration`.
+// Salt bumped again (#3502): the Brokk TypeScript grammar repairs import-type
+// member arguments, keyword property names, and abstract-override fields.
+// These precedence and external-scanner changes can alter declaration ranges
+// without changing the grammar's node-kind or field inventory, so the live
+// grammar fingerprint alone cannot retire rows parsed through ERROR recovery.
 lang_epoch!(
     TypeScript,
     "typescript",
     "treesitter/typescript/",
-    "synthetic-file-scope-code-units-2026-07;anonymous-default-export-units-2026-07;fq-interned-segments-2026-07;js-ts-drift-parity-2026-07;js-ts-query-assets-in-brokk-bifrost-js-ts-2026-08;ts-overload-declaration-only-metadata-2026-08;program-scope-plain-value-identities-2026-08;ts-inline-return-type-members-2026-08;js-ts-callable-modifier-metadata-2026-08;structured-rule-tester-test-detection-2026-08;structured-js-ts-test-classification-2026-08;ts-type-alias-type-identity-2026-09;js-ts-augmented-template-operand-flows-3386"
+    "synthetic-file-scope-code-units-2026-07;anonymous-default-export-units-2026-07;fq-interned-segments-2026-07;js-ts-drift-parity-2026-07;js-ts-query-assets-in-brokk-bifrost-js-ts-2026-08;ts-overload-declaration-only-metadata-2026-08;program-scope-plain-value-identities-2026-08;ts-inline-return-type-members-2026-08;js-ts-callable-modifier-metadata-2026-08;structured-rule-tester-test-detection-2026-08;structured-js-ts-test-classification-2026-08;ts-type-alias-type-identity-2026-09;js-ts-augmented-template-operand-flows-3386;ts-grammar-declaration-correctness-3502"
 );
 
 #[cfg(test)]

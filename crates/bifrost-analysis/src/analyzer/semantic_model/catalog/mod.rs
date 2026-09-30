@@ -88,7 +88,19 @@ pub const CATALOG_SCHEMA_VERSION: i64 = db::CURRENT_CATALOG_VERSION;
 /// an interface-table edge, so a source archive answers the members an
 /// inherited interface declares (#3466). Warm generated packs lose every one
 /// of those edges.
-pub const GENERATED_PRODUCTION_CACHE_VERSION: u32 = 29;
+/// 30: the C++ header producer publishes each file-scope declaration under a
+/// module owner for its declaring header instead of dropping it as
+/// `cpp.member_owner_unavailable` (#3535). Warm generated packs omit every
+/// file-scope function, so a C call could never bind one.
+/// 31: reviewed zero-argument `String.trim` and `String.strip` source-JDK
+/// methods have complete callable families. Warm generated JDK packs still
+/// mark both families incomplete and cannot prove exact calls (#3649).
+/// 32: the reviewed static `Files.deleteIfExists(Path)` source-JDK method has
+/// a complete callable family. Warm generated packs cannot prove that exact
+/// overload for the ignored-status rule (#3649).
+/// 33: Java functional-interface inputs retain sealed declarations and do not
+/// classify static interface methods as abstract (#3702).
+pub const GENERATED_PRODUCTION_CACHE_VERSION: u32 = 33;
 pub const SEMANTIC_PACK_CACHE_ROOT_ENV: &str = "BIFROST_SEMANTIC_PACK_CACHE_ROOT";
 
 /// Resolve the generated catalog used when no explicit catalog is configured.
@@ -254,7 +266,7 @@ impl From<SessionPackSourceKind> for CatalogPackSourceKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CatalogCoordinate {
     pub name: String,
     pub version: Option<Version>,
@@ -945,6 +957,7 @@ pub struct SemanticPackCatalog {
     rejected_manifests: Mutex<HashSet<String>>,
     decoded_manifests: Mutex<DecodedManifestMemo>,
     verified_manifest_inventories: Mutex<HashSet<String>>,
+    validated_python_profile_packs: Mutex<HashSet<String>>,
     manifest_decodes: AtomicU64,
     manifest_inventory_validations: AtomicU64,
     lookup_hits: AtomicU64,
@@ -1131,6 +1144,7 @@ impl SemanticPackCatalog {
                 bytes: 0,
             }),
             verified_manifest_inventories: Mutex::new(HashSet::new()),
+            validated_python_profile_packs: Mutex::new(HashSet::new()),
             manifest_decodes: AtomicU64::new(0),
             manifest_inventory_validations: AtomicU64::new(0),
             lookup_hits: AtomicU64::new(0),
@@ -1240,6 +1254,80 @@ impl SemanticPackCatalog {
             &self.options.decode_limits,
         )
         .map_err(|error| CatalogError::Artifact(error.to_string()))
+    }
+
+    /// A verified row may predate the Python profile evidence check. Recheck
+    /// every stored shard once per opened catalog before the first PyPI load;
+    /// the manifest digest and content-addressed objects bind later loads to
+    /// the exact pack that passed this check.
+    fn validate_stored_python_profile_pack(
+        &self,
+        manifest: &CompiledPackManifest,
+    ) -> Result<(), CatalogError> {
+        if manifest.language != "python"
+            || !manifest.shards.iter().any(|descriptor| {
+                descriptor
+                    .routing_keys
+                    .iter()
+                    .any(|key| key.starts_with("package:pkg:pypi/"))
+            })
+        {
+            return Ok(());
+        }
+        let mut checked = self
+            .validated_python_profile_packs
+            .lock()
+            .expect("Python profile validation mutex poisoned");
+        if checked.contains(&manifest.content_sha256) {
+            return Ok(());
+        }
+        let connection = self
+            .connection
+            .lock()
+            .expect("semantic-pack catalog connection mutex poisoned");
+        let mut decoded = Vec::with_capacity(manifest.shards.len());
+        for descriptor in &manifest.shards {
+            self.sql_statements.fetch_add(1, Ordering::Relaxed);
+            let (relative_path, stored_size) = connection
+                .query_row(
+                    "SELECT o.relative_path, o.stored_size
+                     FROM catalog_packs AS p
+                     JOIN catalog_pack_shards AS ps
+                       ON ps.manifest_digest = p.manifest_digest
+                     JOIN catalog_objects AS o
+                       ON o.stored_digest = ps.stored_digest
+                     WHERE p.state = 'verified'
+                       AND p.manifest_digest = ?1
+                       AND ps.shard_id = ?2
+                       AND ps.stored_digest = ?3",
+                    params![
+                        &manifest.content_sha256,
+                        &descriptor.shard_id,
+                        &descriptor.stored_sha256
+                    ],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?)),
+                )
+                .optional()
+                .map_err(|error| CatalogError::sqlite("load Python profile shard", error))?
+                .ok_or(CatalogError::Unavailable)?;
+            self.object_reads.fetch_add(1, Ordering::Relaxed);
+            let bytes = storage::read(
+                &self.root,
+                &relative_path,
+                &descriptor.stored_sha256,
+                stored_size,
+            )?;
+            decoded.push(self.decode_stored_shard(manifest, descriptor, &bytes)?);
+        }
+        let authored = super::artifact::authored_pack_from_decoded_shards(manifest, &decoded);
+        let diagnostics = super::validate::validate_csmi_profile_evidence(&authored);
+        if !diagnostics.is_empty() {
+            return Err(CatalogError::Integrity(format!(
+                "stored Python pack has inconsistent full-pack evidence: {diagnostics:?}"
+            )));
+        }
+        checked.insert(manifest.content_sha256.clone());
+        Ok(())
     }
 
     /// Decode one stored manifest, reusing the decode of an equal digest.
@@ -3801,6 +3889,7 @@ impl SemanticPackCatalog {
         // with 44 shards used to ship its multi-megabyte manifest bytes out of
         // SQLite once per loaded shard (#3101).
         let manifest = self.stored_manifest(&candidate.manifest_digest)?;
+        self.validate_stored_python_profile_pack(&manifest)?;
         let connection = self
             .connection
             .lock()
@@ -4207,7 +4296,12 @@ fn durable_selector_rows_on(
           AND s.shard_id = ps.shard_id
          JOIN catalog_sources AS source
            ON source.manifest_digest = p.manifest_digest
+         LEFT JOIN catalog_generated_productions AS generated
+           ON source.source_kind = 'generated'
+          AND generated.manifest_digest = source.manifest_digest
+          AND source.source_id = 'production:' || generated.production_digest
          WHERE p.state = 'verified'
+           AND (generated.production_digest IS NULL OR generated.generated_cache_version = ?10)
            AND p.language = ?1
            AND p.ecosystem = ?2
            AND (?3 IS NULL OR s.package_name IS NULL OR s.package_name = ?3)
@@ -4275,7 +4369,8 @@ fn durable_selector_rows_on(
                 query.target.as_deref(),
                 query.configuration.as_deref(),
                 query.artifact_sha256.as_deref(),
-                i64::try_from(max_rows).unwrap_or(i64::MAX)
+                i64::try_from(max_rows).unwrap_or(i64::MAX),
+                GENERATED_PRODUCTION_CACHE_VERSION,
             ],
             |row| {
                 Ok(DurableSelectorRow {
@@ -4318,6 +4413,7 @@ fn validate_pack(
         .map_err(|error| CatalogError::Artifact(error.to_string()))?;
 
     let mut shards = Vec::with_capacity(pack.shards.len());
+    let mut python_shards = Vec::new();
     let mut matched = HashSet::with_capacity(pack.shards.len());
     for descriptor in &manifest.shards {
         let mut artifacts = pack
@@ -4339,11 +4435,25 @@ fn validate_pack(
         let decoded =
             decode_validated_shard_for_manifest(&manifest, descriptor, &artifact.bytes, limits)
                 .map_err(|error| CatalogError::Artifact(error.to_string()))?;
+        let selectors = decoded.activation.clone();
+        if manifest.language == "python" {
+            python_shards.push(decoded);
+        }
         shards.push(ValidatedShard {
             descriptor: descriptor.clone(),
             bytes: artifact.bytes.clone(),
-            selectors: decoded.activation.clone(),
+            selectors,
         });
+    }
+    if manifest.language == "python" {
+        let authored =
+            super::artifact::authored_pack_from_decoded_shards(&manifest, &python_shards);
+        let diagnostics = super::validate::validate_csmi_profile_evidence(&authored);
+        if !diagnostics.is_empty() {
+            return Err(CatalogError::Integrity(format!(
+                "Python compiled pack has inconsistent full-pack evidence: {diagnostics:?}"
+            )));
+        }
     }
     Ok(ValidatedPack { manifest, shards })
 }
@@ -4903,10 +5013,11 @@ fn insert_generated_production(
     validate_generated_pack_identity(key, manifest)?;
     transaction
         .execute(
-            "INSERT OR IGNORE INTO catalog_generated_productions(
+            "INSERT INTO catalog_generated_productions(
                production_digest, input_digest, producer_name, producer_version,
-               schema_version, manifest_digest, created_at
-             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+               schema_version, manifest_digest, created_at, generated_cache_version
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(production_digest) DO NOTHING",
             params![
                 &key.production_digest,
                 &key.input_digest,
@@ -4915,6 +5026,7 @@ fn insert_generated_production(
                 key.schema_version,
                 &manifest.content_sha256,
                 now,
+                GENERATED_PRODUCTION_CACHE_VERSION,
             ],
         )
         .map_err(|error| CatalogError::sqlite("insert generated production", error))?;
@@ -5439,6 +5551,177 @@ fn completeness_name(completeness: &super::Completeness) -> &'static str {
 }
 
 #[cfg(test)]
+mod python_profile_reopen_tests {
+    use super::{
+        CatalogCandidate, CatalogCandidateLocation, CatalogOpenMode, CatalogOptions,
+        CatalogPackSourceKind, DurablePackSource, DurablePackSourceKind, SemanticPackCatalog,
+        insert_manifest, insert_object, insert_shard, storage,
+    };
+    use crate::analyzer::semantic_model::csmi::{
+        CSMI_PYTHON_PROFILE_ID, CSMI_PYTHON_PROFILE_SCHEMA, CSMI_PYTHON_PROFILE_VERSION,
+        CsmiVocabularySupport, import_logical_csmi_pack,
+    };
+    use crate::analyzer::semantic_model::{CompilerOptions, CompressionPolicy, PayloadKind};
+    use rusqlite::TransactionBehavior;
+
+    #[test]
+    fn old_verified_python_pack_revalidates_all_shards_before_first_load() {
+        let source = include_bytes!("../csmi/fixtures/python-distribution-beautifulsoup4.json");
+        let portable =
+            crate::analyzer::semantic_model::csmi::tests::logical_pack_from_semantic(source);
+        let support = CsmiVocabularySupport::support(
+            CSMI_PYTHON_PROFILE_ID,
+            CSMI_PYTHON_PROFILE_VERSION,
+            CSMI_PYTHON_PROFILE_SCHEMA,
+        );
+        let imported =
+            import_logical_csmi_pack(&portable, &support, &CompilerOptions::default()).unwrap();
+        let mut old_pack = imported
+            .compile(&CompilerOptions {
+                compression: CompressionPolicy::AlwaysRaw,
+                ..CompilerOptions::default()
+            })
+            .unwrap();
+        let valid_pack = old_pack.clone();
+        crate::analyzer::semantic_model::csmi::tests::rewrite_raw_declaration_shard(
+            &mut old_pack,
+            |types, _| {
+                for fact in types {
+                    if let crate::analyzer::semantic_model::Locator::Interchange {
+                        profile_evidence,
+                        ..
+                    } = &mut fact.locator
+                    {
+                        *profile_evidence = None;
+                    }
+                }
+            },
+        );
+        let root = tempfile::tempdir().unwrap();
+        let catalog = SemanticPackCatalog::open(
+            root.path(),
+            CatalogOpenMode::ReadWrite,
+            CatalogOptions::default(),
+        )
+        .unwrap();
+        catalog
+            .install(
+                &valid_pack,
+                &DurablePackSource {
+                    kind: DurablePackSourceKind::Installed,
+                    source_id: "valid-python-distribution".to_owned(),
+                },
+            )
+            .unwrap();
+        assert!(
+            catalog
+                .install(
+                    &old_pack,
+                    &DurablePackSource {
+                        kind: DurablePackSourceKind::Installed,
+                        source_id: "rejected-by-current-admission".to_owned(),
+                    },
+                )
+                .is_err()
+        );
+        // Recreate only the rows an older validator would have marked
+        // verified. Every object and manifest digest is internally valid.
+        let published = old_pack
+            .shards
+            .iter()
+            .map(|shard| {
+                storage::publish(root.path(), &shard.descriptor.stored_sha256, &shard.bytes)
+                    .map(|(path, _)| path)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let now = crate::cache_db::now_unix_seconds();
+        {
+            let mut connection = catalog.connection.lock().unwrap();
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            insert_manifest(
+                &transaction,
+                &old_pack.manifest,
+                &old_pack.manifest_bytes,
+                now,
+            )
+            .unwrap();
+            for (ordinal, (shard, path)) in old_pack.shards.iter().zip(&published).enumerate() {
+                insert_object(&transaction, &shard.descriptor, path, now).unwrap();
+                insert_shard(
+                    &transaction,
+                    &old_pack.manifest.content_sha256,
+                    ordinal,
+                    &shard.descriptor,
+                )
+                .unwrap();
+            }
+            transaction.commit().unwrap();
+        }
+        drop(catalog);
+        let reopened = SemanticPackCatalog::open(
+            root.path(),
+            CatalogOpenMode::ReadOnly,
+            CatalogOptions::default(),
+        )
+        .unwrap();
+        let valid_descriptor = valid_pack
+            .manifest
+            .shards
+            .iter()
+            .find(|descriptor| descriptor.payload_kind == PayloadKind::ProcedureSummaries)
+            .unwrap()
+            .clone();
+        let valid_candidate = CatalogCandidate {
+            manifest_digest: valid_pack.manifest.content_sha256.clone(),
+            shard_id: valid_descriptor.shard_id.clone(),
+            descriptor: valid_descriptor,
+            completeness: valid_pack.manifest.completeness,
+            source_kind: CatalogPackSourceKind::Installed,
+            source_id: "valid-python-distribution".to_owned(),
+            location: CatalogCandidateLocation::Durable,
+        };
+        reopened.load_durable(&valid_candidate).unwrap();
+        assert!(
+            reopened
+                .validated_python_profile_packs
+                .lock()
+                .unwrap()
+                .contains(&valid_candidate.manifest_digest)
+        );
+        let descriptor = old_pack
+            .manifest
+            .shards
+            .iter()
+            .find(|descriptor| descriptor.payload_kind == PayloadKind::ProcedureSummaries)
+            .unwrap()
+            .clone();
+        let candidate = CatalogCandidate {
+            manifest_digest: old_pack.manifest.content_sha256.clone(),
+            shard_id: descriptor.shard_id.clone(),
+            descriptor,
+            completeness: old_pack.manifest.completeness,
+            source_kind: CatalogPackSourceKind::Installed,
+            source_id: "old-verified-row".to_owned(),
+            location: CatalogCandidateLocation::Durable,
+        };
+        for _ in 0..2 {
+            let error = reopened.load_durable(&candidate).unwrap_err();
+            assert!(format!("{error:?}").contains("python.profile_evidence_count"));
+            assert!(
+                !reopened
+                    .validated_python_profile_packs
+                    .lock()
+                    .unwrap()
+                    .contains(&candidate.manifest_digest)
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod generated_production_cache_version_tests {
     use std::ffi::OsString;
     use std::path::Path;
@@ -5467,6 +5750,145 @@ mod generated_production_cache_version_tests {
         );
 
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn migrated_catalog_preserves_old_epochs_and_reuses_the_new_production() {
+        use super::{
+            CatalogCoordinate, CatalogOpenMode, CatalogOptions, GeneratedProductionKey,
+            SemanticPackCatalog, SemanticPackSelectorQuery,
+        };
+        use crate::analyzer::semantic_model::{CompilerOptions, SourceFormat, compile_source};
+
+        let source = serde_json::json!({
+            "schema_version": 2,
+            "pack_id": "fixture.generated",
+            "version": "1.0.0",
+            "producer": {"name": "fixture-producer", "version": "1.0.0"},
+            "language": "java", "ecosystem": "jvm",
+            "compatibility": {"bifrost": ">=0.8.0, <1.0.0", "toolchains": []},
+            "provenance": {"source": "fixture"}, "license": "Apache-2.0",
+            "completeness": "complete",
+            "safety": {"generated_code_only": false, "review_required": false},
+            "shards": [{
+                "id": "declarations", "activation": [{"package": {"name": "fixture", "version": "=1.0.0"}}],
+                "payload": {"kind": "declaration_facts", "types": [{
+                    "id": "fixture.type", "name": "fixture.Type", "type_kind": "class", "visibility": "public",
+                    "locator": {"kind": "artifact", "path": "fixture.jar", "symbol": "fixture/Type.class"}
+                }], "members": [], "relations": []}
+            }]
+        });
+        let old_pack = compile_source(
+            SourceFormat::Json,
+            &serde_json::to_vec(&source).unwrap(),
+            &CompilerOptions::default(),
+        )
+        .unwrap();
+        let mut revised = source;
+        revised["completeness"] = serde_json::json!("partial");
+        let new_pack = compile_source(
+            SourceFormat::Json,
+            &serde_json::to_vec(&revised).unwrap(),
+            &CompilerOptions::default(),
+        )
+        .unwrap();
+        let key =
+            GeneratedProductionKey::new("a".repeat(64), "fixture-producer", "1.0.0", 2).unwrap();
+        let mut old_key = key.clone();
+        old_key.production_digest = generated_production_digest_for_cache_version(
+            key.input_digest(),
+            key.producer_name(),
+            key.producer_version(),
+            key.schema_version(),
+            super::GENERATED_PRODUCTION_CACHE_VERSION - 1,
+        );
+        let root = tempfile::tempdir().unwrap();
+        let catalog = SemanticPackCatalog::open(
+            root.path(),
+            CatalogOpenMode::ReadWrite,
+            CatalogOptions::default(),
+        )
+        .unwrap();
+        catalog.install_generated(&old_key, &old_pack).unwrap();
+        let retained_key =
+            GeneratedProductionKey::new("b".repeat(64), "fixture-producer", "1.0.0", 2).unwrap();
+        catalog.install_generated(&retained_key, &old_pack).unwrap();
+        // Recreate schema 8, with both an old and a still-current digest.
+        catalog.connection.lock().unwrap().execute_batch(
+            "CREATE UNIQUE INDEX catalog_generated_productions_identity ON catalog_generated_productions(input_digest, producer_name, producer_version, schema_version);
+             ALTER TABLE catalog_generated_productions DROP COLUMN generated_cache_version;
+             PRAGMA user_version = 8;"
+        ).unwrap();
+        drop(catalog);
+
+        let catalog = SemanticPackCatalog::open(
+            root.path(),
+            CatalogOpenMode::ReadWrite,
+            CatalogOptions::default(),
+        )
+        .unwrap();
+        let query = SemanticPackSelectorQuery {
+            language: "java".to_owned(),
+            ecosystem: "jvm".to_owned(),
+            package: Some(CatalogCoordinate {
+                name: "fixture".to_owned(),
+                version: Some(semver::Version::new(1, 0, 0)),
+            }),
+            module: None,
+            toolchain: None,
+            target: None,
+            configuration: None,
+            artifact_sha256: None,
+            bifrost_version: semver::Version::new(0, 12, 0),
+        };
+        assert!(
+            catalog
+                .generated_production(&retained_key)
+                .unwrap()
+                .is_some()
+        );
+        let candidates = catalog.candidates_bounded(&query, 1).unwrap();
+        assert_eq!(candidates.len(), 1, "{candidates:?}");
+        assert_eq!(candidates[0].source_id(), retained_key.source_id());
+        let installed = catalog
+            .install_generated(&key, &new_pack)
+            .expect("new epoch coexists after migration");
+        assert_eq!(
+            catalog.generated_production(&key).unwrap().unwrap(),
+            installed.production
+        );
+        assert!(
+            catalog.install_generated(&key, &old_pack).is_err(),
+            "one exact production key cannot change its output"
+        );
+        let historical_manifest: String = catalog.connection.lock().unwrap().query_row(
+            "SELECT manifest_digest FROM catalog_generated_productions WHERE production_digest = ?1",
+            [old_key.production_digest()], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(historical_manifest, old_pack.manifest.content_sha256);
+        let sources: std::collections::BTreeSet<_> = catalog
+            .candidates(&query)
+            .unwrap()
+            .iter()
+            .map(|candidate| candidate.source_id().to_owned())
+            .collect();
+        assert_eq!(
+            sources,
+            [key.source_id(), retained_key.source_id()]
+                .into_iter()
+                .collect()
+        );
+        drop(catalog);
+        let reopened = SemanticPackCatalog::open(
+            root.path(),
+            CatalogOpenMode::ReadOnly,
+            CatalogOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            reopened.generated_production(&key).unwrap().unwrap(),
+            installed.production
+        );
     }
 
     #[test]

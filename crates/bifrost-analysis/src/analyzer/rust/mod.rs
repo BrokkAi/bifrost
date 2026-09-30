@@ -28,13 +28,15 @@ use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::languages::{
     BoundedReceiverQuery, DeadCodeBulkEdges, DeadCodeBulkPreflight, DeadCodeBulkProof,
     DeadCodeRouting, DeadCodeSupport, EdgePassId, EdgeSiteScanCtx, EdgeWeightScanCtx,
-    LanguageEdgePass, LanguageEdgeSites, LanguageEdgeWeights, LanguageSupport,
-    StructuralReceiverResolver, fqn_bulk_nodes,
+    ExternalCalleeSite, ImportedExternalCallee, LanguageEdgePass, LanguageEdgeSites,
+    LanguageEdgeWeights, LanguageSupport, StructuralReceiverResolver, fqn_bulk_nodes,
 };
+use crate::analyzer::semantic::ResolverOwnedExternalCalleeIdentity;
 use crate::analyzer::store::LimitedQueryRows;
 use crate::analyzer::type_relations::TypeRelation;
 use crate::analyzer::usages::get_definition::{
-    BoundedResolution, DefinitionLookupOutcome, resolve_rust_bounded,
+    BoundedResolution, DefinitionLookupOutcome, ExactExternalCallProof, resolve_rust_bounded,
+    rust_call_written_arity, rust_import_binder_external_callee,
 };
 use crate::analyzer::usages::get_type::{TypeLookupOutcome, resolve_rust_type_bounded};
 use crate::analyzer::usages::rust_graph::{
@@ -44,9 +46,9 @@ use crate::analyzer::usages::workspace_graph::UsageEcosystem;
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CloneSmell, CloneSmellWeights, CodeUnit,
     ForwardQueryProvider, IAnalyzer, ImportAnalysisProvider, Language, PoolSafeMemo, Project,
-    ProjectFile, Range, SignatureMetadata, TestAssertionSmell, TestAssertionWeights,
-    TestDetectionProvider, TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider,
-    resolve_analyzer,
+    ProjectFile, Range, SignatureMetadata, StructuredImportPath, TestAssertionSmell,
+    TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer, TypeAliasProvider,
+    TypeHierarchyProvider, resolve_analyzer,
 };
 use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 use crate::hash::{HashMap, HashSet};
@@ -1454,45 +1456,113 @@ pub(crate) struct RustSupport;
 /// to. Nothing here parses source text or reconstructs a path from the raw
 /// `use` snippet.
 ///
+/// The binder has to be a proof, not a spelling. Its leading segment must name
+/// no workspace declaration in the scope that holds the `use`, which is the
+/// question the Rust resolver answers for a written-out scoped path (see
+/// [`rust_import_binder_external_callee`]). A workspace `std` module therefore
+/// leaves the call it shadows unresolved instead of letting the binder's text
+/// borrow a sysroot summary (#3484). The check needs the parsed file and the
+/// exact source snapshot the call site was classified against; without them no
+/// binder expands.
+///
 /// A callee whose owner is already multi-segment carries its own qualification
 /// and is left alone. A single-segment import (`use foo;`, `extern crate foo;`)
-/// adds no qualification and is skipped. Two binders that disagree on the same
-/// local name answer nothing rather than picking one; in Rust that only happens
-/// across mutually exclusive `#[cfg]` alternatives, where no single expansion
-/// is provable.
+/// adds no qualification and is skipped. Every other binder of that local name
+/// has to prove this one identity: a binder that proves a different owner
+/// answers nothing rather than picking one, and so does a binder that proves
+/// nothing at all, whether because a workspace declaration or boundary owns the
+/// path or because it is one of two mutually exclusive `#[cfg]` alternatives
+/// (see `a_rust_cfg_disjoint_owner_binding_proves_no_external_identity`).
+/// Nothing is published from an owner name the file itself leaves open.
+///
+/// A binder is read where its `use` declaration is in scope, not wherever the
+/// file happens to spell the name: see
+/// [`rust_import_binder_visible_at_byte`].
 fn expand_rust_imported_external_callee(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     callee_text: &str,
-) -> Option<String> {
+    site: Option<&ExternalCalleeSite<'_>>,
+) -> Option<ImportedExternalCallee> {
     let (owner, member) = callee_text.rsplit_once("::")?;
     let owner = owner.trim();
     let member = member.trim();
     if owner.is_empty() || member.is_empty() || owner.contains("::") {
         return None;
     }
+    let site = site?;
+    // The declared callable this binder proves has to accept the written call,
+    // so the expansion reads the call's written argument count from the same
+    // parsed tree the callee reference came from. A callee whose call does not
+    // parse is not proof of anything.
+    let parameter_count = rust_call_written_arity(site.tree, site.callee_start_byte)?;
     let provider = analyzer.import_analysis_provider_for_file(file)?;
     let scope = AnalyzerQueryScope::new(analyzer);
-    let mut expanded: Option<String> = None;
+    let mut expanded: Option<(ExactExternalCallProof, ResolverOwnedExternalCalleeIdentity)> = None;
     for import in provider.import_info_of(scope.token(), file) {
         let binding_name = rust_import_binding_name(&import);
         if binding_name.is_glob() || binding_name.named() != Some(owner) {
             continue;
         }
-        let Some(path) = import.path.as_ref() else {
-            continue;
+        // Only an owner path can carry the qualification; a `use foo;`
+        // binder has nothing to expand, exactly as before.
+        let path = match import.path.as_ref() {
+            Some(path) if path.segments.len() >= 2 => path,
+            _ => continue,
         };
-        if path.segments.len() < 2 {
+        // The binder is evidence only where the `use` declaration is in
+        // scope. A module-owned `use` binds its name inside that module's
+        // lexical extent -- which is exactly what `lexical_scopes` records --
+        // so a binder written in a sibling module names nothing at this call,
+        // and letting it answer would either veto a real identity or, when it
+        // binds the same path, prove an identity the call never wrote.
+        if !rust_import_binder_visible_at_byte(path, site.callee_start_byte) {
             continue;
         }
-        let rendered = path.render_segments("::");
-        match expanded.as_deref() {
-            Some(existing) if existing == rendered => {}
+        // A binder that names the local owner but proves no external identity
+        // is evidence against the expansion, so it ends the whole answer
+        // rather than extending the loop.
+        let proof = rust_import_binder_external_callee(
+            analyzer,
+            scope.token(),
+            file,
+            site.source,
+            site.tree,
+            &import,
+            member,
+            parameter_count,
+        )?;
+        match &expanded {
+            Some(existing) if *existing == proof => {}
             Some(_) => return None,
-            None => expanded = Some(rendered),
+            None => expanded = Some(proof),
         }
     }
-    expanded.map(|owner| format!("{owner}::{member}"))
+    // The binder selected one callable in the activated model, so the call
+    // carries that callable's exact proof and owner/member identity into the
+    // common dispatch path rather than a spelling a later stage has to
+    // re-interpret (#3484).
+    expanded.map(|(proof, identity)| ImportedExternalCallee::proven(proof, identity))
+}
+
+/// Whether the parser-derived `use` declaration behind `path` binds a name
+/// that is in scope at `call_start_byte`.
+///
+/// `lexical_scopes` records the containers the parser found around the
+/// declaration, outermost first, so a binder is in scope exactly where the
+/// innermost recorded container reaches. A module-owned `use` therefore names
+/// something only inside that module's body (and the modules nested in it,
+/// which is why containment, not equality, is the test). A top-level `use`
+/// records no container to constrain it and is visible anywhere in the file.
+///
+/// Without this filter a `use` written inside a sibling inline module answers
+/// for calls in other modules, where the name it binds is not in scope: the
+/// binder can then veto a real identity or, when it binds the same path, hand
+/// a call an identity it never wrote (#3484).
+fn rust_import_binder_visible_at_byte(path: &StructuredImportPath, call_start_byte: usize) -> bool {
+    path.lexical_scopes
+        .iter()
+        .all(|scope| scope.start_byte <= call_start_byte && call_start_byte < scope.end_byte)
 }
 
 impl LanguageSupport for RustSupport {
@@ -1578,8 +1648,9 @@ impl LanguageSupport for RustSupport {
         analyzer: &dyn IAnalyzer,
         file: &ProjectFile,
         callee_text: &str,
-    ) -> Option<String> {
-        expand_rust_imported_external_callee(analyzer, file, callee_text)
+        site: Option<&ExternalCalleeSite<'_>>,
+    ) -> Option<ImportedExternalCallee> {
+        expand_rust_imported_external_callee(analyzer, file, callee_text, site)
     }
 
     fn dead_code(&self) -> DeadCodeSupport {

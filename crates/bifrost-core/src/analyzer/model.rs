@@ -271,6 +271,46 @@ pub fn semantic_pack_realm(language: &str) -> &str {
 }
 
 impl LanguageDialect {
+    /// Every canonical artifact dialect, including the non-analyzable sentinel.
+    pub const ALL: [Self; 16] = [
+        Self::Standard(Language::None),
+        Self::Standard(Language::Java),
+        Self::Standard(Language::Go),
+        Self::Standard(Language::Cpp),
+        Self::Standard(Language::JavaScript),
+        Self::Standard(Language::TypeScript),
+        Self::Standard(Language::Python),
+        Self::Standard(Language::Rust),
+        Self::Standard(Language::Php),
+        Self::Standard(Language::Scala),
+        Self::Standard(Language::CSharp),
+        Self::Standard(Language::Ruby),
+        Self::Standard(Language::Kotlin),
+        Self::TypeScriptTsx,
+        Self::JavaScriptJsx,
+        Self::CppC,
+    ];
+
+    /// The finite value domain of a public artifact-dialect row field.
+    pub const STABLE_LABELS: &'static [&'static str] = &[
+        "none",
+        "java",
+        "go",
+        "cpp",
+        "javascript",
+        "typescript",
+        "python",
+        "rust",
+        "php",
+        "scala",
+        "csharp",
+        "ruby",
+        "kotlin",
+        "typescript-tsx",
+        "javascript-jsx",
+        "cpp-c",
+    ];
+
     /// Parse a user-facing language or dialect label.
     pub fn from_config_label(label: &str) -> Option<Self> {
         let normalized = label
@@ -412,6 +452,16 @@ impl fmt::Display for LanguageDialect {
 #[cfg(test)]
 mod language_dialect_tests {
     use super::*;
+
+    #[test]
+    fn stable_labels_cover_every_artifact_dialect() {
+        assert_eq!(
+            LanguageDialect::ALL
+                .map(LanguageDialect::stable_label)
+                .as_slice(),
+            LanguageDialect::STABLE_LABELS
+        );
+    }
 
     #[test]
     fn semantic_pack_identity_folds_the_grammar_only_dialects() {

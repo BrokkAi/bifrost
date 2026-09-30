@@ -853,6 +853,13 @@ impl<'a> SemanticQueryContext<'a> {
             call_contexts.push(super::dispatch::DispatchCallContext {
                 caller,
                 caller_is_exact,
+                unnamed_boundaries: observation
+                    .dispatch()
+                    .boundaries()
+                    .iter()
+                    .filter(|boundary| boundary.kind.target_locator().is_none())
+                    .map(|boundary| boundary.kind.label())
+                    .collect(),
             });
             for candidate in observation.dispatch().candidates() {
                 let target = candidate.target();
@@ -2838,7 +2845,8 @@ impl SemanticProcedureValue {
                 .public_fingerprint()
                 .to_string(),
             path: mapping.locator.path().as_str().to_string(),
-            language: mapping.locator.language().config_label(),
+            language: mapping.locator.language().language().config_label(),
+            dialect: self.handle.artifact().key().language().stable_label(),
             procedure_kind: procedure.kind().label(),
             range: public_range(mapping, &self.source),
             evidence: public_evidence(procedure_evidence(&self.handle), &self.quality),
@@ -2905,7 +2913,7 @@ impl SemanticProgramPointValue {
             id: program_point_wire_id(&self.handle),
             procedure_id: procedure_wire_id(procedure),
             path: mapping.locator.path().as_str().to_string(),
-            language: mapping.locator.language().config_label(),
+            language: mapping.locator.language().language().config_label(),
             range: public_range(mapping, &self.source),
             boundary: point_boundary(&self.handle),
             event_count: point.events.len(),
@@ -3018,7 +3026,7 @@ impl SemanticControlEdgeValue {
             id: control_edge_wire_id(&self.handle),
             procedure_id: procedure_wire_id(procedure),
             path: mapping.locator.path().as_str().to_string(),
-            language: mapping.locator.language().config_label(),
+            language: mapping.locator.language().language().config_label(),
             range: public_range(mapping, &self.source),
             edge_kind: edge.kind.label(),
             source: source.point_ref(),
@@ -3101,7 +3109,7 @@ impl SemanticCallResultValue {
             procedure_id: procedure_wire_id(procedure),
             point_id: program_point_wire_id(&point),
             path: mapping.locator.path().as_str().to_string(),
-            language: mapping.locator.language().config_label(),
+            language: mapping.locator.language().language().config_label(),
             range: public_range(mapping, &self.source),
             ordinal: u64::try_from(self.ordinal)
                 .expect("a semantic result ordinal fits the public integer domain"),

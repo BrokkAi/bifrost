@@ -438,6 +438,70 @@ test("merge groups and master pushes always select the full matrix", () => {
   }
 });
 
+test("version RC pushes select the full matrix for changed, empty, or failed diffs", () => {
+  const contexts = [
+    {
+      eventName: "push",
+      ref: "refs/heads/dave/v0.12.0-rc",
+      changedPaths: ["docs/src/content/docs/release.md"],
+    },
+    {
+      eventName: "push",
+      ref: "refs/heads/dave/v1.2.3-rc",
+      changedPaths: [],
+      diffFailed: true,
+    },
+    {
+      eventName: "push",
+      ref: "refs/heads/dave/v2.0.0-rc",
+      changedPaths: [],
+    },
+  ];
+
+  for (const context of contexts) {
+    const decision = classifyChangeSet(context);
+    assert.equal(decision.mode, "full");
+    assert.deepEqual(selected(decision), [...COMPONENTS].sort());
+    assert.match(decision.reasons[0], /release-candidate push/u);
+  }
+});
+
+test("manual RC CI selects the full matrix without a push before-SHA", () => {
+  const directory = mkdtempSync(join(tmpdir(), "bifrost-ci-impact-dispatch-"));
+  const output = join(directory, "output.txt");
+  const summary = join(directory, "summary.md");
+
+  try {
+    execFileSync(
+      process.execPath,
+      [
+        new URL("./ci-impact.mjs", import.meta.url).pathname,
+        "--event",
+        "workflow_dispatch",
+        "--ref",
+        "refs/heads/dave/v0.12.0-rc",
+        "--base",
+        "",
+        "--head",
+        "a".repeat(40),
+        "--output",
+        output,
+        "--summary",
+        summary,
+      ],
+      { encoding: "utf8" },
+    );
+
+    const result = readFileSync(output, "utf8");
+    assert.match(result, /^mode=full$/mu);
+    for (const component of COMPONENTS) {
+      assert.match(result, new RegExp(`^${component}=true$`, "mu"));
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("an empty pull request retains the always-on baseline", () => {
   const decision = classifyChangeSet({ eventName: "pull_request" });
   assert.equal(decision.mode, "impact");

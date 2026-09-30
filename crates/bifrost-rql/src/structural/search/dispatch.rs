@@ -198,6 +198,8 @@ pub(super) struct DispatchCallContext {
     pub(super) caller: Option<CodeUnit>,
     /// Whether the semantic procedure's own anchor equals a range of `caller`.
     pub(super) caller_is_exact: bool,
+    /// Residuals belonging to this exact observation, including cleanup copies.
+    pub(super) unnamed_boundaries: Vec<&'static str>,
 }
 
 /// Derive the dispatch answer for one pipeline input position and project the

@@ -9829,7 +9829,11 @@ fn enclosing_lexical_scope_components_with_unresolved_owner(
                 if let Some(name) = parent.child_by_field_name("name") {
                     let mut components = Vec::new();
                     if append_cpp_name_components(name, source, &mut components).is_some() {
-                        namespaces.push((parent.start_byte(), components));
+                        namespaces.push((
+                            parent.start_byte(),
+                            components,
+                            namespace_definition_has_real_braces(parent),
+                        ));
                     }
                 }
             }

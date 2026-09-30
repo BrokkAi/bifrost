@@ -1,6 +1,8 @@
 use super::*;
+use schemars::JsonSchema;
 
-#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CodeQueryFile {
     pub path: String,
     pub language: &'static str,
@@ -22,7 +24,8 @@ pub struct CodeQueryFile {
 /// `ast_id` is absent for exactly one scope per file: the synthesized whole-file
 /// scope, which no grammar gives an arena node. Every other scope is a fact, so
 /// its `ast_id` joins with a structural capture over the same node.
-#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CodeQueryLexicalScope {
     pub id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -42,7 +45,8 @@ pub struct CodeQueryLexicalScope {
 }
 
 /// One construct that materializes declarations (#1476).
-#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CodeQueryGenerationSite {
     pub id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -64,7 +68,8 @@ pub struct CodeQueryGenerationSite {
 /// One declaration a generation site materialized, with the literal naming
 /// argument that produced it — the multi-location half of generation
 /// evidence (#1476).
-#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CodeQueryGeneratedDeclaration {
     pub fq_name: String,
     pub argument_start_byte: usize,
@@ -73,7 +78,8 @@ pub struct CodeQueryGeneratedDeclaration {
 }
 
 /// One export declaration (#1476).
-#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CodeQueryExport {
     pub id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -92,7 +98,8 @@ pub struct CodeQueryExport {
 
 /// The state of one declaration: where it came from and what it must not be
 /// mistaken for (#1476).
-#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CodeQueryDeclarationState {
     pub id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -113,7 +120,8 @@ pub struct CodeQueryDeclarationState {
 }
 
 /// One name a scope introduces (#1474).
-#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CodeQueryBinding {
     pub id: String,
     /// Absent when the binder's local name is not spelled by a classified
@@ -156,7 +164,8 @@ pub struct CodeQueryBinding {
 }
 
 /// What an import binder contributes, as far as the adapter can state it.
-#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CodeQueryImportBinder {
     pub local_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -177,7 +186,8 @@ pub struct CodeQueryImportBinder {
 /// `tier` is optional by construction: the shared outcome constructors receive
 /// a bare candidate list and cannot name the tier that produced it, so an
 /// absent tier means *unattributed*, never "the weakest tier".
-#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CodeQueryResolutionCandidate {
     pub id: String,
     /// The AST identity of the *reference* the candidate was considered for,
@@ -240,7 +250,8 @@ pub struct CodeQueryResolutionCandidate {
 /// attribution contributes none either. Zero rows is therefore never a claim
 /// that no hierarchy was walked; the mandatory per-occurrence outcome is the
 /// `member_selection` summary's job, not this domain's.
-#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CodeQueryCandidateHop {
     pub id: String,
     /// The exact `id` of the `resolution_candidate` row this hop belongs to.
@@ -278,7 +289,8 @@ pub struct CodeQueryCandidateHop {
 /// inferred from counts. `ast_id` is the site token's content-scoped AST
 /// identity when the producer can address it as a facts-arena node; string
 /// equality with a capture's or occurrence's `ast_id` is the correlation join.
-#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CodeQueryReferenceEdge {
     pub id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -316,7 +328,8 @@ pub struct CodeQueryReferenceEdge {
 /// response alone, so a row that survives a filter still states whether its
 /// derivation answered the axis it belongs to. Source order and containment are
 /// never evidence for anything on this row.
-#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CodeQueryStateEvent {
     pub id: String,
     /// The content-scoped AST identity of the event's own token; absent when
@@ -356,13 +369,15 @@ pub struct CodeQueryStateEvent {
     /// The axes the derivation does not answer for. Empty exactly when
     /// `completeness` is `complete`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[schemars(default)]
     pub uncovered_axes: Vec<&'static str>,
     pub generation: u64,
 }
 
 /// One end of a flow relation, rendered inline so the relation is readable
 /// without a second query (#1480).
-#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CodeQueryStateEventRef {
     pub id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -382,7 +397,8 @@ pub struct CodeQueryStateEventRef {
 /// `source` is always the establishment or kill end and `target` the read end.
 /// The row carries no subject of its own: a `same_evaluation` row legitimately
 /// relates two different subjects (a property write to a binding read).
-#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CodeQueryFlowRelation {
     pub id: String,
     pub procedure_id: String,
@@ -398,6 +414,7 @@ pub struct CodeQueryFlowRelation {
     pub target: CodeQueryStateEventRef,
     pub completeness: &'static str,
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[schemars(default)]
     pub uncovered_axes: Vec<&'static str>,
     pub generation: u64,
 }
@@ -407,7 +424,8 @@ pub struct CodeQueryFlowRelation {
 /// `state_key` is the *semantic* state the cycle check keys on, which is not
 /// the rewritten object: the object usually grows every hop and can never
 /// repeat, so keying on it would never detect a cycle.
-#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CodeQueryRewriteStep {
     pub state_key: String,
     pub input: String,
@@ -429,7 +447,8 @@ pub struct CodeQueryRewriteStep {
 /// whose last state repeats its first and closes the loop -- a concrete
 /// counterexample. `exceeded_budget` carries only `explored`: it is absence of
 /// evidence, never a proven cycle and never a clean convergence.
-#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CodeQueryRewritePath {
     pub id: String,
     pub path: String,
@@ -454,6 +473,7 @@ pub struct CodeQueryRewritePath {
     /// The ordered repeated-state witness of a cycle; empty for the other
     /// outcomes.
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[schemars(default)]
     pub witness: Vec<String>,
     /// The steps a budget-exhausted chase performed; absent otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -461,13 +481,15 @@ pub struct CodeQueryRewritePath {
     /// `complete` or `partial`, from the derivation's own account.
     pub completeness: &'static str,
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[schemars(default)]
     pub uncovered_domains: Vec<&'static str>,
     pub generation: u64,
 }
 
 /// One qualified-path chain (#1475): a linear sequence of segments the
 /// grammar records, anchored at its terminal segment token.
-#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CodeQueryQualifiedPath {
     pub id: String,
     /// The terminal segment token's AST identity — the equijoin key with
@@ -482,7 +504,8 @@ pub struct CodeQueryQualifiedPath {
 }
 
 /// One segment of one qualified path (#1475).
-#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CodeQueryPathSegment {
     pub id: String,
     /// The segment token's AST identity; absent for a segment the kind table
@@ -521,7 +544,7 @@ pub struct CodeQueryPathSegment {
 
 /// What a candidate row points at. Two of the five shapes carry no workspace
 /// declaration, which is why `candidate-target` is partial by construction.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(tag = "candidate_kind", rename_all = "snake_case")]
 pub enum CodeQueryCandidateRef {
     Unit {
@@ -547,6 +570,7 @@ pub enum CodeQueryCandidateRef {
         /// adapter or seam recorded no structured target. That is a stated
         /// gap, not a claim that the import has no target.
         #[serde(skip_serializing_if = "Vec::is_empty")]
+        #[schemars(default)]
         target_segments: Vec<String>,
     },
     ExternalRoute {

@@ -20,7 +20,9 @@ use tree_sitter::{Language, Node, Parser, Tree};
 
 // Version 3: brokk-tree-sitter-json accepts positive exponent signs and emits
 // recoverable syntax for whitespace outside RFC 8259's four-character set.
-const JSON_ADAPTER_SCHEMA_VERSION: u32 = 3;
+// Version 4: a parser-inserted missing value is refused instead of being
+// published as an authored scalar.
+const JSON_ADAPTER_SCHEMA_VERSION: u32 = 4;
 const PROPERTIES_ADAPTER_SCHEMA_VERSION: u32 = 1;
 const TOML_ADAPTER_SCHEMA_VERSION: u32 = 1;
 const XML_ADAPTER_SCHEMA_VERSION: u32 = 1;
@@ -306,6 +308,14 @@ fn add_node<'tree>(
     stack: &mut Vec<Work<'tree>>,
     recoveries: &mut Vec<ConfigurationRecovery>,
 ) -> Result<(), ConfigurationIngestionError> {
+    // The parser inserts a missing node where authored syntax is absent
+    // (`{"x":}`). The node covers no source byte, so no authored fact can
+    // describe it: it gets no arena entry, and the `x` member keeps its
+    // authored key with no value. `collect_recoveries` in `ingest_json`
+    // already recorded its typed MalformedSyntax recovery.
+    if work.node.is_missing() {
+        return Ok(());
+    }
     let range = source_range(work.node)?;
     let id = pending.len();
     let mut children = Vec::new();

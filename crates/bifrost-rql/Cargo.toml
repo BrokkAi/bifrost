@@ -12,28 +12,38 @@ keywords.workspace = true
 categories.workspace = true
 publish = true
 
+[features]
+query-result-fixtures = []
+
 [lib]
 name = "brokk_bifrost_rql"
 
+[[bin]]
+name = "query_result_fixtures"
+required-features = ["query-result-fixtures"]
+
 [dependencies]
-brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.11.5" }
-brokk-bifrost-core = { path = "../bifrost-core", version = "=0.11.5" }
-brokk-bifrost-flow = { path = "../bifrost-flow", version = "=0.11.5" }
+brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.12.0" }
+brokk-bifrost-core = { path = "../bifrost-core", version = "=0.12.0" }
+brokk-bifrost-flow = { path = "../bifrost-flow", version = "=0.12.0" }
 glob = "0.3.3"
 regex = "1.12.2"
 regex-syntax = "0.8"
 serde = { version = "1.0.228", features = ["derive"] }
+schemars = "1.2.1"
 serde_json = "1.0.145"
 sha2 = "0.10.8"
 strsim = "0.11.1"
+tree-sitter = "0.25.10"
 
 [dev-dependencies]
-brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.11.5", features = ["test-support"] }
-brokk-bifrost-flow = { path = "../bifrost-flow", version = "=0.11.5", features = ["test-support"] }
+brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.12.0", features = ["test-support"] }
+brokk-bifrost-flow = { path = "../bifrost-flow", version = "=0.12.0", features = ["test-support"] }
 tempfile = "3.23.0"
 git2 = { version = "0.20.2", default-features = false }
 proptest = "1.11"
 semver = "1.0.28"
+zip = { version = "2.4.2", default-features = false, features = ["deflate"] }
 
 [lints]
 workspace = true

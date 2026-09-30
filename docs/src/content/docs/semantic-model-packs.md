@@ -65,6 +65,35 @@ When the document is absent, the shared host path selects every ecosystem that
 serves a language present in the workspace. An explicit `enable` entry can
 satisfy a pack's `review_required` gate; it cannot bypass compatibility checks.
 
+Java rules that use reviewed JDK return-value obligations also require an
+explicit source-tree binding in `.bifrost/jvm-toolchains.json`:
+
+```json
+{
+  "schema_version": 1,
+  "source_toolchains": [
+    {"source_root": ".", "jdk_home": "/opt/jdk-21"},
+    {"source_root": "preview-module", "jdk_home": "/opt/jdk-22"}
+  ]
+}
+```
+
+Source roots are workspace-relative; `.` binds the entire workspace. JDK homes
+may be absolute or relative to the workspace. The deepest matching source root
+wins. Equally specific bindings to different homes remain ambiguous. The CLI,
+MCP and LSP load these bindings when constructing the workspace; restart a
+running host after changing them. Missing or ambiguous bindings leave reviewed
+result obligations incomplete. Discovering a JDK through `JAVA_HOME` alone
+does not select it for these rules.
+
+The selected installation must provide supported declaration artifacts such as
+`lib/src.zip`. Bifrost joins the exact artifact used to resolve the call with
+the reviewed model's compatible activation evidence. The initial JDK 21 pack
+covers `String.trim()` as a pure transformation and
+`Files.deleteIfExists(Path)` as a status result. For the latter, `false` means
+the file did not exist; I/O exceptions are separate. A discarded-status note
+does not establish that the caller intended to handle that status.
+
 The same transaction mints workspace evidence the reviewed runtime packs need.
 Besides one intrinsic language/ecosystem row per present language, a workspace
 whose root `package.json` (`engines.node` or `volta.node`), `.nvmrc`, or
@@ -401,7 +430,7 @@ instead of falling back. Every object rejects unknown fields, and every variant
 is explicitly tagged. A schema addition takes a new version number and a new
 checked-in schema rather than silently widening a number that already shipped.
 
-Producers write `4`. Reading a set of versions rather than one exact number is
+Producers write `5`. Reading a set of versions rather than one exact number is
 what lets an installed version-two pack or release asset keep loading across the
 bump and be regenerated on its producer's normal cadence. A field a version
 introduces is rejected in a pack that declares an earlier version, so a pack that
@@ -410,11 +439,16 @@ an older reader accepts by its number is one that older reader can also parse:
 additive field.
 
 The machine-readable contract is
-[`schemas/semantic-model-pack-v4.schema.json`](https://github.com/BrokkAi/bifrost/blob/master/schemas/semantic-model-pack-v4.schema.json).
+[`schemas/semantic-model-pack-v5.schema.json`](https://github.com/BrokkAi/bifrost/blob/master/schemas/semantic-model-pack-v5.schema.json).
 It is generated from `AuthoredSemanticModelPack`; a repository test requires
 the checked-in bytes to match the Rust-derived schema exactly.
 [`schemas/semantic-model-pack-v2.schema.json`](https://github.com/BrokkAi/bifrost/blob/master/schemas/semantic-model-pack-v2.schema.json)
-and the version-three schema stay checked in as frozen descriptions.
+and the version-three and version-four schemas stay checked in as frozen descriptions.
+
+Version five adds reviewed normal-result use obligations to procedure summaries.
+An obligation names one normal-result ordinal and either a pure transformation
+value or a fallible status with an explicit failure predicate. An omitted
+obligation makes no claim that discarding the result is safe or unsafe.
 
 Version four adds the `runtime_contracts` companion for CSMI runtime-values 0.2.
 It retains the five fact families and their semantic-document envelope. Packs

@@ -279,6 +279,17 @@ pub struct StructuralPreparedSyntax {
 }
 
 impl StructuralPreparedSyntax {
+    /// Exact prepared tree retained by this bounded syntax acquisition.
+    pub fn prepared(&self) -> &PreparedSyntaxTree {
+        &self.inner
+    }
+
+    /// Share this exact source snapshot with a semantic derivation without
+    /// parsing or cloning its tree again.
+    pub fn clone_prepared(&self) -> Arc<PreparedSyntaxTree> {
+        Arc::clone(&self.inner)
+    }
+
     pub(crate) fn into_inner(self) -> Arc<PreparedSyntaxTree> {
         self.inner
     }

@@ -497,6 +497,16 @@ pub enum SemanticValueKind {
     Boolean(bool),
     /// A non-negative compile-time integer magnitude that fits in `u128`.
     UnsignedInteger(u128),
+    /// A compile-time integer with a signed payload. Producers must establish
+    /// the language's literal and conversion rules before publishing it.
+    SignedInteger(i128),
+    /// A compile-time finite IEEE 754 binary64 value, as its exact bit
+    /// pattern. Producers apply the language's literal rounding, including a
+    /// narrower source type such as Java `float`, before publishing it; a
+    /// binary32 value widens to binary64 exactly.
+    FloatingPoint {
+        bits: u64,
+    },
     /// A compile-time constant whose payload is not represented structurally.
     Constant,
     /// A compile-time string constant with its exact payload. Two values of
@@ -597,6 +607,8 @@ impl SemanticValueKind {
             Self::Null => "null",
             Self::Boolean(_) => "boolean",
             Self::UnsignedInteger(_) => "unsigned_integer",
+            Self::SignedInteger(_) => "signed_integer",
+            Self::FloatingPoint { .. } => "floating_point",
             Self::Constant => "constant",
             Self::ConstantString(_) => "constant_string",
             Self::Exception => "exception",
@@ -612,6 +624,8 @@ impl SemanticValueKind {
             Self::Null
                 | Self::Boolean(_)
                 | Self::UnsignedInteger(_)
+                | Self::SignedInteger(_)
+                | Self::FloatingPoint { .. }
                 | Self::Constant
                 | Self::ConstantString(_)
         )
@@ -1105,6 +1119,19 @@ pub struct SourceMapping {
     pub ast_identity: Option<StructuralNodeIdentity>,
 }
 
+/// One producer-attested entry into an executable source statement.
+///
+/// A statement may have several entries when cleanup is specialized for
+/// distinct completions. Its entry point can also be shared with an enclosing
+/// statement, so the source mapping names the statement itself rather than
+/// inheriting the point's source mapping.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct StatementEntrySite {
+    pub source: SourceMappingId,
+    pub evidence: EvidenceId,
+    pub point: ProgramPointId,
+}
+
 /// Whether the evidence actually establishes the attached fact.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ProofStatus {
@@ -1415,7 +1442,9 @@ impl SemanticGapImpacts {
 /// evaluations rather than their order. `RetainedControlTopology` marks a
 /// point-scoped control gap where every source-local parent normal successor is
 /// retained, but feasibility, blocking, termination, or concurrent child
-/// execution remains unresolved. A consumer may discharge it only for a
+/// execution remains unresolved. On an exceptional-control gap it marks an
+/// exception dispatch that retains every handler and the unmatched
+/// propagation as successors and runs no user code to select among them. A consumer may discharge it only for a
 /// positive proof that depends on the retained parent successor topology, not
 /// on liveness, evaluation effects, or spawned work.
 /// `CanonicalIndexIdentity` marks a memory-location-scoped index gap where the
@@ -1462,6 +1491,14 @@ impl SemanticGapImpacts {
 /// result-observation and generic control proofs must keep it open. For
 /// observation enumeration its point/value subject scopes the triggering
 /// transfer only; active completion may observe any captured result.
+/// `RebindAtCallOrSuspension` marks a value-scoped `Captures` gap on a local
+/// or parameter that this procedure fully establishes, but that a nested
+/// callable assigns. That callable can run only during a call or a suspension
+/// of this procedure, so the binding keeps its projected value between those
+/// points. A consumer may discharge the gap for a proof whose relevant path
+/// crosses no call or suspension, or by releasing the binding's value at
+/// every call and suspension. An assignment by the callable still establishes
+/// the binding, so an initialization proof may discharge it outright.
 /// A gap without a declared discharge (`None`) stands until the adapter itself
 /// lowers the construct.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1479,6 +1516,9 @@ pub enum SemanticGapDischarge {
     /// The adapter modeled every operation effect except the exact impact set
     /// retained by this gap. Consumers may discharge only that partition.
     ModeledEffectPartition,
+    /// A nested callable rebinds the subject binding only at a call or a
+    /// suspension of this procedure.
+    RebindAtCallOrSuspension,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -2327,6 +2367,19 @@ pub enum GuardPredicate {
         relation: IntegerComparison,
         constant: ValueId,
     },
+    /// The subject is ordered relative to one represented floating constant
+    /// by the language's numeric order, which is false whenever an operand
+    /// is NaN. A consumer refines only a subject it already knows to hold a
+    /// number; an operand that may convert or dispatch stays unknown.
+    OrderedFloatComparison {
+        relation: IntegerComparison,
+        constant: ValueId,
+    },
+    /// The condition compares the subject with itself by IEEE equality or a
+    /// non-strict order (`x != x`, `x == x`, `x <= x`), which only NaN
+    /// decides. `nan_on_true` states which arm a NaN subject takes; every
+    /// other number takes the other arm.
+    NanComparison { nan_on_true: bool },
     /// The condition tests whether `value` is an instance of one or more
     /// classes denoted by `classes`.
     InstanceOf { value: ValueId, classes: ValueId },
@@ -2352,9 +2405,12 @@ pub enum GuardPredicate {
     HasMember { value: ValueId, member: ValueId },
     /// The condition is `value` itself, read for its truth.
     ///
-    /// Only the true arm carries information, and only about the language's
-    /// null value: `None` is falsy and nothing can make it truthy. A falsy
-    /// value is not necessarily null, so the false arm proves nothing.
+    /// For an arbitrary value only the true arm carries information, and only
+    /// about the language's null value: `None` is falsy and nothing can make
+    /// it truthy. A falsy value is not necessarily null. A value a consumer
+    /// already knows to be null, a Boolean, an integer, or a float that is
+    /// not NaN has the same truthiness in every language that publishes this
+    /// predicate, so both arms refine it.
     Truthy { value: ValueId },
     /// The decision is represented, but its condition was not normalizable.
     Opaque { digest: GuardConditionDigest },
@@ -2368,6 +2424,8 @@ impl GuardPredicate {
         "null_comparison",
         "constant_equality",
         "ordered_integer_comparison",
+        "ordered_float_comparison",
+        "nan_comparison",
         "instance_of",
         "exact_class",
         "has_member",
@@ -2381,6 +2439,8 @@ impl GuardPredicate {
             Self::NullComparison { .. } => "null_comparison",
             Self::ConstantEquality { .. } => "constant_equality",
             Self::OrderedIntegerComparison { .. } => "ordered_integer_comparison",
+            Self::OrderedFloatComparison { .. } => "ordered_float_comparison",
+            Self::NanComparison { .. } => "nan_comparison",
             Self::InstanceOf { .. } => "instance_of",
             Self::ExactClass { .. } => "exact_class",
             Self::HasMember { .. } => "has_member",
@@ -2397,6 +2457,8 @@ impl GuardPredicate {
             Self::NullComparison { .. }
             | Self::ConstantEquality { .. }
             | Self::OrderedIntegerComparison { .. }
+            | Self::OrderedFloatComparison { .. }
+            | Self::NanComparison { .. }
             | Self::InstanceOf { .. }
             | Self::ExactClass { .. }
             | Self::HasMember { .. }
@@ -2513,6 +2575,7 @@ pub struct ProcedureSemanticsParts {
     pub captures: Vec<CaptureBinding>,
     pub call_sites: Vec<SemanticCallSite>,
     pub source_mappings: Vec<SourceMapping>,
+    pub statement_entries: Vec<StatementEntrySite>,
     pub evidence_rows: Vec<Evidence>,
     pub gaps: Vec<SemanticGap>,
     pub blocks: Vec<BasicBlock>,
@@ -2544,6 +2607,7 @@ impl ProcedureSemanticsParts {
             captures: Vec::new(),
             call_sites: Vec::new(),
             source_mappings: Vec::new(),
+            statement_entries: Vec::new(),
             evidence_rows: Vec::new(),
             gaps: Vec::new(),
             blocks: Vec::new(),

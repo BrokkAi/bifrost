@@ -46,8 +46,44 @@ const EFFECTS_MANIFEST_SOURCE: &str = include_str!("../policy-packs/bifrost.effe
 
 const CODE_SMELLS_POLICY_SOURCES: &[(&str, &str)] = &[
     (
+        "policies/loop-body-never-repeats.rqlp",
+        include_str!("../policy-packs/bifrost.code-smells/policies/loop-body-never-repeats.rqlp"),
+    ),
+    (
+        "policies/unreachable-statement.rqlp",
+        include_str!("../policy-packs/bifrost.code-smells/policies/unreachable-statement.rqlp"),
+    ),
+    (
+        "policies/contradictory-condition.rqlp",
+        include_str!("../policy-packs/bifrost.code-smells/policies/contradictory-condition.rqlp"),
+    ),
+    (
+        "policies/discarded-pure-result.rqlp",
+        include_str!("../policy-packs/bifrost.code-smells/policies/discarded-pure-result.rqlp"),
+    ),
+    (
         "policies/dynamic-evaluation.rqlp",
         include_str!("../policy-packs/bifrost.code-smells/policies/dynamic-evaluation.rqlp"),
+    ),
+    (
+        "policies/identical-conditional-branches.rqlp",
+        include_str!(
+            "../policy-packs/bifrost.code-smells/policies/identical-conditional-branches.rqlp"
+        ),
+    ),
+    (
+        "policies/ignored-status-result.rqlp",
+        include_str!("../policy-packs/bifrost.code-smells/policies/ignored-status-result.rqlp"),
+    ),
+    (
+        "policies/repeated-branch-condition.rqlp",
+        include_str!("../policy-packs/bifrost.code-smells/policies/repeated-branch-condition.rqlp"),
+    ),
+    (
+        "policies/redundant-boolean-branches.rqlp",
+        include_str!(
+            "../policy-packs/bifrost.code-smells/policies/redundant-boolean-branches.rqlp"
+        ),
     ),
     (
         "policies/unsafe-deserialization.rqlp",
@@ -70,6 +106,26 @@ const CODE_SMELLS_POLICY_SOURCES: &[(&str, &str)] = &[
         include_str!(
             "../policy-packs/bifrost.code-smells/policies/go-wrong-error-on-failure-path.rqlp"
         ),
+    ),
+    (
+        "policies/empty-failure-handler.rqlp",
+        include_str!("../policy-packs/bifrost.code-smells/policies/empty-failure-handler.rqlp"),
+    ),
+    (
+        "policies/c-self-assignment.rqlp",
+        include_str!("../policy-packs/bifrost.code-smells/policies/c-self-assignment.rqlp"),
+    ),
+    (
+        "policies/local-self-assignment.rqlp",
+        include_str!("../policy-packs/bifrost.code-smells/policies/local-self-assignment.rqlp"),
+    ),
+    (
+        "policies/failed-swap.rqlp",
+        include_str!("../policy-packs/bifrost.code-smells/policies/failed-swap.rqlp"),
+    ),
+    (
+        "policies/overwritten-unread-value.rqlp",
+        include_str!("../policy-packs/bifrost.code-smells/policies/overwritten-unread-value.rqlp"),
     ),
     (
         "policies/loop-invariant-sort.rqlp",
@@ -1138,7 +1194,7 @@ mod tests {
                 .expect("code-smells pack")
                 .policies
                 .len(),
-            17
+            30
         );
         assert_eq!(
             catalog
@@ -1211,7 +1267,7 @@ mod tests {
                 })
                 .expect("select pack")
                 .len(),
-            17
+            30
         );
         let security = catalog
             .select(&BuiltInPolicySelection {
@@ -1432,13 +1488,31 @@ mod tests {
             ..BuiltInPolicySelection::default()
         })
         .expect("code-smells correctness policies");
-        assert!(
-            selected
-                .iter()
-                .all(|id| id.starts_with("bifrost.correctness.")),
-            "{selected:?}"
+        assert_eq!(
+            selected,
+            vec![
+                "bifrost.correctness.contradictory-condition",
+                "bifrost.correctness.discarded-pure-result",
+                "bifrost.correctness.dynamic-evaluation",
+                "bifrost.correctness.identical-conditional-branches",
+                "bifrost.correctness.ignored-status-result",
+                "bifrost.correctness.repeated-branch-condition",
+                "bifrost.correctness.redundant-boolean-branches",
+                "bifrost.correctness.unsafe-deserialization",
+                "bifrost.correctness.python-absent-member",
+                "bifrost.correctness.go-data-race",
+                "bifrost.correctness.go-nil-dereference",
+                "bifrost.correctness.go-wrong-error-on-failure-path",
+                "bifrost.correctness.empty-failure-handler",
+                "bifrost.correctness.c-self-assignment",
+                "bifrost.correctness.local-self-assignment",
+                "bifrost.correctness.failed-swap",
+                "bifrost.correctness.overwritten-unread-value",
+                "bifrost.correctness.loop-body-never-repeats",
+                "bifrost.correctness.unreachable-statement",
+                "bifrost.correctness.rayon-in-blocking-lazy-init",
+            ]
         );
-        assert_eq!(selected.len(), 7, "{selected:?}");
         // The security pack's only policy is in category `security`, so the
         // category dimension alone never reaches it from this request.
         assert!(

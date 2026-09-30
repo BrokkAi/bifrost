@@ -233,13 +233,13 @@ pub(crate) fn resolve_codeunit_fuzzy_bounded_with(
     }
 
     budget.keep_going()?;
-    if let Some(resolved) = exact_resolution(analyzer, trimmed, include) {
+    if let Some(resolved) = exact_resolution(analyzer, trimmed, include, budget)? {
         return Ok(resolved);
     }
 
     let stripped = strip_trailing_call_suffix(trimmed);
     if stripped != trimmed
-        && let Some(resolved) = exact_resolution(analyzer, &stripped, include)
+        && let Some(resolved) = exact_resolution(analyzer, &stripped, include, budget)?
     {
         return Ok(resolved);
     }
@@ -469,10 +469,21 @@ fn exact_resolution(
     analyzer: &dyn IAnalyzer,
     symbol: &str,
     include: impl Copy + Fn(&CodeUnit) -> bool,
-) -> Option<CodeUnitResolution> {
+    budget: FuzzyResolveBudget<'_>,
+) -> Result<Option<CodeUnitResolution>, FuzzyResolveStop> {
     let _scope = crate::profiling::scope(format!("exact_resolution[{symbol}]"));
     let definitions = matching_definitions(analyzer, symbol, include);
-    (!definitions.is_empty()).then_some(CodeUnitResolution::Resolved(definitions))
+    if definitions.is_empty() {
+        return Ok(None);
+    }
+    // The exact stage costs one indexed read, but its answer can still name
+    // more declarations than the caller can act on, and the fan-out gate is
+    // about the size of the answer rather than the price of finding it. Report
+    // the same count the fuzzy stages report, before the list leaves the
+    // resolver (#1839). An unbounded budget admits everything, so the stages
+    // that do not carry one are unchanged.
+    budget.admits(definitions.len())?;
+    Ok(Some(CodeUnitResolution::Resolved(definitions)))
 }
 
 fn matching_definitions(
@@ -491,20 +502,19 @@ fn matching_definitions(
 /// path, `suffix` for one that ends with it.
 #[derive(Default)]
 struct FuzzyMatches {
-    full: BTreeMap<String, CodeUnit>,
-    suffix: BTreeMap<String, CodeUnit>,
+    full: BTreeMap<String, BTreeSet<CodeUnit>>,
+    suffix: BTreeMap<String, BTreeSet<CodeUnit>>,
 }
 
 impl FuzzyMatches {
-    /// Union with `other`. The maps dedup by fq name and the first insertion
-    /// wins, matching `insert_match`, so merging the two accepted spellings of
-    /// one query yields the same map a single pass over their union would.
+    /// Union accepted spellings without losing independently addressable
+    /// declarations that share a rendered name.
     fn merge(&mut self, other: Self) {
-        for (fq_name, unit) in other.full {
-            self.full.entry(fq_name).or_insert(unit);
+        for (fq_name, units) in other.full {
+            self.full.entry(fq_name).or_default().extend(units);
         }
-        for (fq_name, unit) in other.suffix {
-            self.suffix.entry(fq_name).or_insert(unit);
+        for (fq_name, units) in other.suffix {
+            self.suffix.entry(fq_name).or_default().extend(units);
         }
     }
 }
@@ -568,6 +578,7 @@ fn suffix_stage_from_index(
         );
     }
     let no_indexed_matches = exact_matches.is_empty() && exact_suffix_matches.is_empty();
+    prefer_recorded_spelling_matches(&mut exact_matches, &query_paths_by_language);
     if let Some(CodeUnitResolution::Resolved(matches)) =
         unique_resolution_from_matches(analyzer, &exact_matches, include, budget)?
     {
@@ -601,14 +612,13 @@ fn suffix_stage_from_index(
     let _stage2_scope = crate::profiling::scope("suffix_resolution.pattern_stage");
     let mut full_matches = BTreeMap::new();
     let mut suffix_matches = BTreeMap::new();
-    for language in analyzer.languages() {
+    for (&language, query_paths) in &query_paths_by_language {
         budget.keep_going()?;
-        let query_paths = resolution_query_interpretations(language, symbol);
         if query_paths.iter().all(|path| path.len() < 2) {
             continue;
         }
 
-        for query_path in &query_paths {
+        for query_path in query_paths {
             budget.keep_going()?;
             let pattern = suffix_search_pattern(language, query_path);
             if pattern.is_empty() {
@@ -627,7 +637,7 @@ fn suffix_stage_from_index(
                     analyzer,
                     &candidate,
                     include,
-                    &query_paths,
+                    query_paths,
                     &mut full_matches,
                     &mut suffix_matches,
                 );
@@ -635,6 +645,7 @@ fn suffix_stage_from_index(
         }
     }
 
+    prefer_recorded_spelling_matches(&mut full_matches, &query_paths_by_language);
     let decided = if full_matches.is_empty() {
         unique_resolution_from_matches(analyzer, &suffix_matches, include, budget)?
     } else {
@@ -663,7 +674,7 @@ fn suffix_stage_from_index(
 /// the same maps to its caller, so only the one-match path pays a copy.
 fn unique_resolution_from_matches(
     analyzer: &dyn IAnalyzer,
-    matches: &BTreeMap<String, CodeUnit>,
+    matches: &BTreeMap<String, BTreeSet<CodeUnit>>,
     include: impl Copy + Fn(&CodeUnit) -> bool,
     budget: FuzzyResolveBudget<'_>,
 ) -> Result<Option<CodeUnitResolution>, FuzzyResolveStop> {
@@ -731,13 +742,52 @@ fn suffix_terminal_identifiers(query_path: &[String]) -> Vec<String> {
     spellings
 }
 
+/// Narrow a full-match set to the declarations the caller actually spelled:
+/// those whose *recorded* segment texts are exactly one reading of the query.
+///
+/// The string-derived aliases in [`codeunit_lookup_aliases`] cannot always tell
+/// a segment's own text from the renderer's decoration, because Scala's `$` is
+/// both. [`FqName::render_native`] appends one to a `Companion` segment, and it
+/// is also a legal identifier character: `def run$` inside
+/// `object ConstellationNode$` aliases down to
+/// `org.constellation.ConstellationNode.run`, which is also the undecorated
+/// reading of its sibling `def run`. Each declaration then answered a query
+/// naming the other, and the pair could only resolve ambiguously (#3505).
+///
+/// A candidate whose recorded segments equal a query reading was named
+/// exactly; one reached through a derived alias was not, so it is not a
+/// competitor for that spelling. This is the structured form of the rule
+/// [`prefer_exact_lookup_matches`] applies to rendered names. When no
+/// candidate was named exactly, nothing is narrowed and the ambiguity decision
+/// is unchanged.
+///
+/// [`FqName::render_native`]: brokk_bifrost_core::analyzer::fq_name::FqName::render_native
+/// [`prefer_exact_lookup_matches`]: crate::searchtools::prefer_exact_lookup_matches
+fn prefer_recorded_spelling_matches(
+    matches: &mut BTreeMap<String, BTreeSet<CodeUnit>>,
+    query_paths_by_language: &BTreeMap<Language, BTreeSet<Vec<String>>>,
+) {
+    if matches.len() < 2 {
+        return;
+    }
+    let spelled = |unit: &CodeUnit| {
+        query_paths_by_language
+            .get(&code_unit_language(unit))
+            .is_some_and(|paths| paths.contains(&unit.fq_segment_texts()))
+    };
+    if !matches.values().flatten().any(&spelled) {
+        return;
+    }
+    matches.retain(|_, units| units.iter().any(&spelled));
+}
+
 fn collect_fuzzy_matches(
     analyzer: &dyn IAnalyzer,
     candidate: &CodeUnit,
     include: impl Copy + Fn(&CodeUnit) -> bool,
     query_paths: &BTreeSet<Vec<String>>,
-    full_matches: &mut BTreeMap<String, CodeUnit>,
-    suffix_matches: &mut BTreeMap<String, CodeUnit>,
+    full_matches: &mut BTreeMap<String, BTreeSet<CodeUnit>>,
+    suffix_matches: &mut BTreeMap<String, BTreeSet<CodeUnit>>,
 ) {
     if !include(candidate) {
         return;
@@ -773,81 +823,50 @@ fn collect_fuzzy_matches(
     }
 }
 
-fn insert_match(matches: &mut BTreeMap<String, CodeUnit>, candidate: &CodeUnit) {
+fn insert_match(matches: &mut BTreeMap<String, BTreeSet<CodeUnit>>, candidate: &CodeUnit) {
     matches
         .entry(candidate.fq_name())
-        .or_insert_with(|| candidate.clone());
+        .or_default()
+        .insert(candidate.clone());
 }
 
 fn resolution_from_matches(
     analyzer: &dyn IAnalyzer,
-    mut matches: BTreeMap<String, CodeUnit>,
+    mut matches: BTreeMap<String, BTreeSet<CodeUnit>>,
     include: impl Copy + Fn(&CodeUnit) -> bool,
     budget: FuzzyResolveBudget<'_>,
 ) -> Result<Option<CodeUnitResolution>, FuzzyResolveStop> {
-    // The fan-out gate, before any per-match work. Everything below is one
-    // store read per surviving key -- `prefer_types_over_their_owner_named_constructors`
-    // asks `parent_of` per JVM-family function and the `_` arm asks
-    // `definitions` per key -- so a selector that tens of thousands of
-    // declarations answer must be reported by its count here rather than
-    // expanded into a candidate list nobody can act on (#1839). The count is
-    // the deduplicated matched-declaration count: the constructor pruning
-    // below can only shrink it, and running that pruning first would be the
-    // very per-match work the gate exists to skip.
-    budget.admits(matches.len())?;
+    // Count distinct candidates before constructor preference or definition
+    // expansion performs per-candidate reads. Same-name declarations are
+    // independent candidates too; repeated index hits for one unit are not.
+    budget.admits(matches.values().map(BTreeSet::len).sum())?;
     prefer_types_over_their_owner_named_constructors(analyzer, &mut matches);
 
-    match matches.len() {
-        0 => Ok(None),
-        1 => {
-            let fq_name = matches.keys().next().expect("one match").clone();
-            let definitions = matching_definitions(analyzer, &fq_name, include);
-            if definitions.is_empty() {
-                Ok(Some(CodeUnitResolution::Resolved(
-                    matches.into_values().collect(),
-                )))
-            } else {
-                Ok(Some(CodeUnitResolution::Resolved(definitions)))
-            }
-        }
-        _ => {
-            // Like the `len == 1` arm above, each surviving key in `matches`
-            // holds only the single first-inserted representative for its fq
-            // name (see `insert_match`'s dedup-by-fq behavior). But a bare
-            // name's fq bucket can itself contain multiple independent
-            // declarations across files (e.g. several top-level
-            // `const Input = ...` arrow functions in different modules, all
-            // with empty package -> fq == short_name; see #1087). Re-expand
-            // every remaining key to its full set of declarations via
-            // `matching_definitions`, falling back to the stored
-            // representative when the lookup comes up empty, exactly as the
-            // `len == 1` arm does, so ambiguous results surface every
-            // candidate instead of silently collapsing cross-file
-            // duplicates down to one representative per fq.
-            //
-            // This expansion must run *after*
-            // `prefer_types_over_their_owner_named_constructors` has already
-            // pruned constructor-shaped functions above, not before: that
-            // filter reasons about one representative CodeUnit per fq key in
-            // the dedup'd map (owner/identifier checks against a single
-            // `unit`), so it needs the deduplicated shape to stay correct.
-            // Expanding first would turn `matches` into a multi-valued
-            // collection the filter isn't written to consume, and would risk
-            // re-introducing declarations the filter meant to drop before
-            // ambiguity was ever computed.
-            let mut expanded = Vec::with_capacity(matches.len());
-            for (fq_name, representative) in matches {
-                budget.keep_going()?;
-                let definitions = matching_definitions(analyzer, &fq_name, include);
-                if definitions.is_empty() {
-                    expanded.push(representative);
-                } else {
-                    expanded.extend(definitions);
-                }
-            }
-            Ok(Some(CodeUnitResolution::Ambiguous(expanded)))
+    if matches.is_empty() {
+        return Ok(None);
+    }
+    let multiple_names = matches.len() > 1;
+    let mut expanded = Vec::new();
+    for (fq_name, candidates) in matches {
+        budget.keep_going()?;
+        let definitions = matching_definitions(analyzer, &fq_name, include);
+        if definitions.is_empty() {
+            // A rendered nested name need not be an exact-lookup key. The
+            // structured candidates already found by the index remain the
+            // answer in that case, including every same-name declaration.
+            expanded.extend(candidates);
+        } else {
+            expanded.extend(definitions);
         }
     }
+    Ok(Some(if multiple_names {
+        CodeUnitResolution::Ambiguous(expanded)
+    } else {
+        // One name can still denote independently addressable declarations.
+        // The selector layer groups their physical identities and reports
+        // ambiguity while preserving callable declaration/definition families.
+        CodeUnitResolution::Resolved(expanded)
+    }))
 }
 
 /// A bare type name can also suffix-match that type's owner-named constructor
@@ -860,10 +879,11 @@ fn resolution_from_matches(
 /// constructor on every spelling without this gate (#2658).
 fn prefer_types_over_their_owner_named_constructors(
     analyzer: &dyn IAnalyzer,
-    matches: &mut BTreeMap<String, CodeUnit>,
+    matches: &mut BTreeMap<String, BTreeSet<CodeUnit>>,
 ) {
     let competing_types: BTreeSet<_> = matches
         .values()
+        .flatten()
         .filter(|unit| unit.is_class())
         .map(CodeUnit::fq_name)
         .collect();
@@ -871,26 +891,29 @@ fn prefer_types_over_their_owner_named_constructors(
         return;
     }
 
-    matches.retain(|_, unit| {
-        if !unit.is_function()
-            || !matches!(
-                code_unit_language(unit),
-                Language::Java
-                    | Language::CSharp
-                    | Language::Cpp
-                    | Language::Kotlin
-                    | Language::Scala
-            )
-        {
-            return true;
-        }
+    matches.retain(|_, units| {
+        units.retain(|unit| {
+            if !unit.is_function()
+                || !matches!(
+                    code_unit_language(unit),
+                    Language::Java
+                        | Language::CSharp
+                        | Language::Cpp
+                        | Language::Kotlin
+                        | Language::Scala
+                )
+            {
+                return true;
+            }
 
-        let Some(owner) = analyzer.parent_of(unit) else {
-            return true;
-        };
-        !(owner.is_class()
-            && unit.identifier() == owner.identifier()
-            && competing_types.contains(&owner.fq_name()))
+            let Some(owner) = analyzer.parent_of(unit) else {
+                return true;
+            };
+            !(owner.is_class()
+                && unit.identifier() == owner.identifier()
+                && competing_types.contains(&owner.fq_name()))
+        });
+        !units.is_empty()
     });
 }
 
@@ -1259,6 +1282,28 @@ mod tests {
         let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Python));
         let analyzer = TreeSitterAnalyzer::new(project, PythonAdapter);
         (temp, analyzer)
+    }
+
+    #[test]
+    fn nested_duplicate_candidates_count_toward_resolution_budget() {
+        let project = crate::inline_project::InlineTestProject::new()
+            .file("first.cpp", "struct Outer { struct Inner {}; };")
+            .file("second.cpp", "struct Outer { struct Inner {}; };")
+            .build();
+        let workspace = project.workspace_analyzer(crate::AnalyzerConfig::default());
+        let keep_going = || true;
+        let result = resolve_codeunit_fuzzy_bounded(
+            workspace.analyzer(),
+            "Outer$Inner",
+            FuzzyResolveBudget::new(&keep_going, 1),
+        );
+        assert!(
+            matches!(
+                result,
+                Err(FuzzyResolveStop::TooManyCandidates { total: 2, limit: 1 })
+            ),
+            "duplicate names are two candidates, repeated index hits are not: {result:?}"
+        );
     }
 
     /// A predicate that survives `polls` questions and then reports the

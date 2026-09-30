@@ -72,8 +72,8 @@ use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 pub(crate) use adapter::PythonAdapter;
 use brokk_bifrost_python::declarations::python_expanded_comment_start;
 use brokk_bifrost_python::graph_support::{
-    PythonSource, PythonUsageSource, compute_export_index_of, import_binder_from_imports,
-    render_skeleton_recursive,
+    PythonModuleSpellings, PythonSource, PythonUsageSource, compute_export_index_of,
+    import_binder_from_imports, render_skeleton_recursive,
 };
 pub(crate) use brokk_bifrost_python::graph_support::{
     resolve_module_code_unit, retain_modules_for_importer,
@@ -141,6 +141,11 @@ pub struct PythonAnalyzer {
     // protocol, which stops a cold whole-workspace build from parking every worker that arrives
     // behind the one thread running the initializer.
     usage_index: Arc<PoolSafeMemo<PythonUsageIndex>>,
+    // PoolSafeMemo for the same reason as `usage_index`: the import resolver
+    // reaches this from rayon workers. The build is path math over the
+    // workspace listing, but every import that names no indexed module asks
+    // for it, so it must not be recomputed per import.
+    module_spellings: Arc<PoolSafeMemo<PythonModuleSpellings>>,
     // PoolSafeMemo, not OnceLock: this whole-workspace scan is reached from
     // rayon workers and must not park a worker behind a build that can enter
     // the same query machinery. The bool is the closed (true) or explicitly
@@ -265,6 +270,16 @@ impl PythonAnalyzer {
     pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
         let mut clone = self.clone();
         clone.inner = clone.inner.clone_with_project(project);
+        // Both products describe the snapshot's file view, not just the
+        // analyzer's parsed content: the usage index holds the module index
+        // and the source-root spelling index the snapshot's own package
+        // markers built, and a re-projected analyzer must not answer an
+        // overlay with the candidates of the project it was cloned from
+        // (#3506). Content-keyed cells stay: a re-projection is a same-root
+        // overlay operation, so the files a caller resolves against are the
+        // files these were built from.
+        clone.module_spellings = Arc::new(PoolSafeMemo::new());
+        clone.usage_index = Arc::new(PoolSafeMemo::new());
         clone.usage_edges = build_weighted_cache(self.memo_budget / 8, weight_python_usage_edges);
         clone.saved_default_arguments = Arc::new(PoolSafeMemo::new());
         clone
@@ -311,6 +326,7 @@ impl PythonAnalyzer {
             direct_descendant_index: Arc::new(KeyedPoolSafeMemo::new()),
             reverse_import_index: Arc::new(PoolSafeMemo::new()),
             usage_index: Arc::new(PoolSafeMemo::new()),
+            module_spellings: Arc::new(PoolSafeMemo::new()),
             saved_default_arguments: Arc::new(PoolSafeMemo::new()),
         }
     }
@@ -439,6 +455,26 @@ impl PythonSource for PythonAnalyzer {
 
     fn definition_fqn(&self, fqn: &str) -> Vec<CodeUnit> {
         self.inner.forward_definition_fqn(fqn)
+    }
+
+    fn module_spellings(&self) -> Arc<PythonModuleSpellings> {
+        // `workspace_language_files`, not the analyzed set: this answers a
+        // question about file identity, and a workspace file that has not been
+        // parsed yet still has a path-derived module name. The markers are read
+        // through the project, so an overlay's unsaved `__path__` statement is
+        // the evidence this snapshot's roots rest on (#3506).
+        self.module_spellings.get_or_build(
+            || {
+                PythonModuleSpellings::build(self.inner.workspace_language_files(), |file| {
+                    self.inner.project().read_source(file).ok()
+                })
+            },
+            || {
+                PythonModuleSpellings::build(self.inner.workspace_language_files(), |file| {
+                    self.inner.project().read_source(file).ok()
+                })
+            },
+        )
     }
 
     fn import_binder_of(&self, file: &ProjectFile) -> Arc<ImportBinder> {
@@ -781,6 +817,7 @@ impl IAnalyzer for PythonAnalyzer {
             direct_descendant_index: Arc::new(KeyedPoolSafeMemo::new()),
             reverse_import_index: Arc::new(PoolSafeMemo::new()),
             usage_index: Arc::new(PoolSafeMemo::new()),
+            module_spellings: Arc::new(PoolSafeMemo::new()),
             saved_default_arguments: Arc::new(PoolSafeMemo::new()),
         }
     }
@@ -803,6 +840,7 @@ impl IAnalyzer for PythonAnalyzer {
             direct_descendant_index: Arc::new(KeyedPoolSafeMemo::new()),
             reverse_import_index: Arc::new(PoolSafeMemo::new()),
             usage_index: Arc::new(PoolSafeMemo::new()),
+            module_spellings: Arc::new(PoolSafeMemo::new()),
             saved_default_arguments: Arc::new(PoolSafeMemo::new()),
         }
     }

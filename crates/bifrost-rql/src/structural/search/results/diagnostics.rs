@@ -1,5 +1,6 @@
 use super::*;
 use crate::analyzer::semantic::{SemanticBudgetDimension, SemanticWork};
+use schemars::JsonSchema;
 
 /// Declare one labeled CodeQuery diagnostic vocabulary once.
 ///
@@ -34,7 +35,9 @@ macro_rules! code_query_labeled_enum {
 }
 
 code_query_labeled_enum! {
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+    #[derive(
+        Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+    )]
     #[serde(rename_all = "snake_case")]
     CodeQueryDiagnosticCode {
         InvalidPlan => "invalid_plan",
@@ -118,6 +121,10 @@ code_query_labeled_enum! {
         RewriteDomainUnsupported => "rewrite_domain_unsupported",
         RewritePathDerivationIncomplete => "rewrite_path_derivation_incomplete",
         ControlRelationDerivationIncomplete => "control_relation_derivation_incomplete",
+        BranchRelationDerivationIncomplete => "branch_relation_derivation_incomplete",
+        LoopRelationDerivationIncomplete => "loop_relation_derivation_incomplete",
+        FailureHandlerDerivationIncomplete => "failure_handler_derivation_incomplete",
+        StatementReachabilityDerivationIncomplete => "statement_reachability_derivation_incomplete",
         ControlRelationExitPartitionPartial => "control_relation_exit_partition_partial",
         TopologyDerivationIncomplete => "topology_derivation_incomplete",
         TopologyOwnershipAmbiguous => "topology_ownership_ambiguous",
@@ -125,6 +132,7 @@ code_query_labeled_enum! {
         PathDerivationIncomplete => "path_derivation_incomplete",
         EffectDerivationIncomplete => "effect_derivation_incomplete",
         ResultContractDerivationIncomplete => "result_contract_derivation_incomplete",
+        ResultObligationDerivationIncomplete => "result_obligation_derivation_incomplete",
         EffectBudgetExhausted => "effect_budget_exhausted",
         CallShapeCoverageIncomplete => "call_shape_coverage_incomplete",
         JsxProjectionIncomplete => "jsx_projection_incomplete",
@@ -134,7 +142,7 @@ code_query_labeled_enum! {
 }
 
 code_query_labeled_enum! {
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
     #[serde(rename_all = "snake_case")]
     CodeQueryDiagnosticImpact {
         Advisory => "advisory",
@@ -144,11 +152,12 @@ code_query_labeled_enum! {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CodeQueryDiagnostic {
     pub code: CodeQueryDiagnosticCode,
     pub impact: CodeQueryDiagnosticImpact,
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[schemars(default)]
     pub branch: Vec<usize>,
     pub language: &'static str,
     pub message: String,
@@ -164,7 +173,7 @@ pub struct CodeQueryDiagnostic {
 }
 
 /// One root or file whose work stopped against a named limit.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct CodeQueryExhaustedRoot {
     /// The workspace-relative path of the file the work belonged to.
     pub path: String,
@@ -192,7 +201,7 @@ pub struct CodeQueryExhaustedRoot {
 }
 
 /// The exact charge one lane refused.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct CodeQueryExhaustedCharge {
     pub attempted: usize,
     pub limit: usize,

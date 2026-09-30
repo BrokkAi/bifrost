@@ -1,0 +1,25 @@
+; Report an ordered conditional only when one outcome is proven infeasible in
+; the scalar state reaching the exact condition span.
+(policy
+  :schema-version 1
+  :id "bifrost.correctness.contradictory-condition"
+  :name "Fixed conditional outcome"
+  :message "this condition has a fixed truth value under the proven scalar constraints"
+  :severity warning
+  :description "One outcome of this exact condition is impossible under the proven scalar facts at its decision point, so either its true arm or its false arm cannot run. The row orientation records which outcome is impossible. The proof accounts for the control-flow path that reaches the condition; unsupported predicates, partial semantic evidence, and inexact source mappings remain inconclusive. Review the intended condition and branch behavior before changing code."
+  :help-uri "https://bifrost.brokk.ai/static-analysis-policies/#built-in-code-smell-pack"
+  :tags ["correctness" "conditional" "code-smell"]
+  :analysis (analysis
+    :type assertion
+    (bind :name branch
+      :query (rql :schema-version 1
+        (filter :where ((verdict eq proven))
+          (branch-relations :relation [contradictory-condition]
+            (union
+              (language java (if))
+              (language javascript (if))
+              (language typescript (if))
+              (language python (if)))))))
+    (group :name by-branch :by (branch.id)
+      (aggregate :name violations :op count))
+    (assert :group by-branch :value violations :cardinality (exactly 0))))

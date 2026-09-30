@@ -21,12 +21,12 @@ use crate::hash::{HashMap, HashSet};
 use brokk_bifrost_js_ts::structural::{JAVASCRIPT_STRUCTURAL_SPEC, TYPESCRIPT_STRUCTURAL_SPEC};
 use brokk_bifrost_js_ts::syntax::{
     JsTsImportBinder, JsTsLexicalBindingIndex, compute_import_binder, is_declaration_identifier,
-    pattern_binder_identifiers, static_member_receiver,
+    pattern_binder_identifiers, static_member_receiver, ts_type_wrapper_operand,
 };
 use brokk_bifrost_js_ts::ts_owners::ts_unwrap_expression;
 
-const JAVASCRIPT_ADAPTER_VERSION: &[u8] = b"javascript-value-semantics-v19";
-const TYPESCRIPT_ADAPTER_VERSION: &[u8] = b"typescript-value-semantics-v23";
+const JAVASCRIPT_ADAPTER_VERSION: &[u8] = b"javascript-value-semantics-v28";
+const TYPESCRIPT_ADAPTER_VERSION: &[u8] = b"typescript-value-semantics-v33";
 
 #[derive(Debug, Clone, Copy)]
 enum JsTsSemanticFlavor {

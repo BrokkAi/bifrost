@@ -2,23 +2,42 @@ use super::syntax::*;
 use super::*;
 
 impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
+    /// Emit this procedure's capture slots and the loads that read them.
+    ///
+    /// `capture_binding_expected` says whether the enclosing procedure has
+    /// already published the matching capture binding for this target. Kotlin
+    /// lowers a local `fun` as a direct call, so a local function that reads an
+    /// enclosing `val` captures it although no enclosing closure creation ever
+    /// binds it. Such a slot keeps its typed load and publishes a `Captures`
+    /// gap rather than claiming a binding the parent does not have (#3664).
     pub(super) fn emit_capture_inputs(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
         entry: ProgramPointId,
         spec: &ProcedureSpec<'tree>,
+        capture_binding_expected: bool,
     ) -> Result<(), KotlinLoweringError> {
         let Some(lexical_parent) = spec.lexical_parent else {
             return Ok(());
         };
         if spec.captures_receiver {
             let metadata = self.value_mapping(builder, spec.callable)?;
-            let (value, _) = self.session.add_receiver_capture_input(
+            let (value, location) = self.session.add_receiver_capture_input(
                 builder,
                 entry,
                 metadata,
                 lexical_parent,
             )?;
+            if !capture_binding_expected {
+                self.add_gap(
+                    builder,
+                    entry,
+                    SemanticGapSubject::MemoryLocation(location),
+                    SemanticCapability::Captures,
+                    SemanticGapKind::Unsupported,
+                    "lexical receiver capture source is not represented by the parent procedure",
+                )?;
+            }
             self.captured_receiver = Some(value);
         }
         for (index, capture) in spec.captures.iter().enumerate() {
@@ -51,6 +70,16 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     result: value,
                 },
             )?;
+            if !capture_binding_expected {
+                self.add_gap(
+                    builder,
+                    entry,
+                    SemanticGapSubject::MemoryLocation(location),
+                    SemanticCapability::Captures,
+                    SemanticGapKind::Unsupported,
+                    "lexical value capture source is not represented by the parent procedure",
+                )?;
+            }
             self.captured_bindings.insert(capture.name.into(), value);
         }
         Ok(())

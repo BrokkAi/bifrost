@@ -26,10 +26,10 @@ use brokk_bifrost_analysis::analyzer::semantic::{
 };
 use brokk_bifrost_analysis::analyzer::semantic_model::{
     ActiveSemanticModelShard, ActiveSemanticModelSnapshot, CatalogPackSourceKind,
-    ResolvedActiveSemanticModels, SemanticModelActivationExplanation,
-    SemanticModelActivationPersistence, SemanticModelActivationRequest,
-    SemanticModelActivationStatus, SemanticModelRuntimeOutcome, SemanticPackCatalog,
-    WORKSPACE_SEMANTIC_MODEL_DIRECTORY, acquire_active_semantic_models,
+    DependencyPackDiagnosticSeverity, ResolvedActiveSemanticModels,
+    SemanticModelActivationExplanation, SemanticModelActivationPersistence,
+    SemanticModelActivationRequest, SemanticModelActivationStatus, SemanticModelRuntimeOutcome,
+    SemanticPackCatalog, WORKSPACE_SEMANTIC_MODEL_DIRECTORY, acquire_active_semantic_models,
     workspace_semantic_models_not_active,
 };
 use brokk_bifrost_analysis::analyzer::store::policy_units::{
@@ -40,10 +40,12 @@ use brokk_bifrost_analysis::analyzer::usages::effects::modeled_procedure_key_for
 use brokk_bifrost_analysis::analyzer::{
     AnalyzerConfig, AnalyzerQueryScope, ChangedFacts, CodeUnit, DependencyPackEcosystem,
     FilesystemProject, GoDependencyDiscoveryMode, Project, ProjectFile, WorkspaceAnalyzer,
+    WorkspaceFileListingCache,
 };
 use brokk_bifrost_analysis::diff_analysis::{
     RevisionExport, RevisionWorkspace, export_revision, resolve_revision_subtree,
 };
+use brokk_bifrost_analysis::path_normalization::NormalizePath;
 use brokk_bifrost_analysis::path_utils::rel_path_string;
 use brokk_bifrost_analysis::schema_version::SchemaVersionOrigin;
 use brokk_bifrost_analysis::workspace_document::WorkspaceRoot;
@@ -1697,7 +1699,23 @@ fn pack_activation_review(
         for diagnostic in &preparation.diagnostics {
             let status = match diagnostic.code.as_str() {
                 "dependency.pack_version_mismatch" => PolicyPackDecisionStatus::VersionMismatch,
-                "dependency.pack_unavailable" => PolicyPackDecisionStatus::Missing,
+                "dependency.pack_unavailable" | "preparation.unaccounted-dependency" => {
+                    PolicyPackDecisionStatus::Missing
+                }
+                _ if diagnostic.severity == DependencyPackDiagnosticSeverity::Error
+                    && diagnostic.dependency_id.as_ref().is_none_or(|id| {
+                        !preparation
+                            .packs
+                            .iter()
+                            .any(|pack| &pack.dependency_id == id)
+                            && !preparation
+                                .installed_packs
+                                .iter()
+                                .any(|pack| &pack.dependency_id == id)
+                    }) =>
+                {
+                    PolicyPackDecisionStatus::Rejected
+                }
                 _ => continue,
             };
             decisions.push(PolicyPackDecision::new(
@@ -1706,7 +1724,7 @@ fn pack_activation_review(
                     .clone()
                     .unwrap_or_else(|| diagnostic.code.clone()),
                 status,
-                Some(diagnostic.message.clone()),
+                Some(format!("{}: {}", diagnostic.code, diagnostic.message)),
             ));
         }
     }
@@ -2183,7 +2201,7 @@ fn evaluate_prepared_policy_inputs(
         .iter()
         .any(|input| matches!(input, InputOutcome::Pending(_) | InputOutcome::Runnable(_)));
     let owned_analyzer = if needs_workspace && supplied_workspace.is_none() {
-        let project = FilesystemProject::new(root).map_err(|error| {
+        let project = owned_policy_project(root).map_err(|error| {
             PolicyCoordinatorError::new(format!(
                 "failed to construct analyzer project {}: {error}",
                 root.display()
@@ -4424,6 +4442,16 @@ fn open_policy_workspace_root(
     Ok((root, workspace))
 }
 
+fn owned_policy_project(root: &Path) -> std::io::Result<FilesystemProject> {
+    // The project and its listing live for one owned policy-evaluation snapshot.
+    // A later evaluation constructs a fresh cache, while repeated analyzer
+    // queries in this evaluation reuse the same tracked-plus-ignore-aware set.
+    let listing = Arc::new(WorkspaceFileListingCache::new(
+        root.to_path_buf().normalize(),
+    ));
+    FilesystemProject::with_cached_listing(root, listing)
+}
+
 fn check_policy_cancellation(
     cancellation: Option<&CancellationToken>,
 ) -> Result<(), PolicyCoordinatorError> {
@@ -5016,6 +5044,55 @@ mod tests {
     }
 
     #[test]
+    fn failed_dependency_preparation_retains_its_reason_in_the_pack_review() {
+        use brokk_bifrost_analysis::analyzer::DependencyPackEcosystemOutcome;
+        use brokk_bifrost_analysis::analyzer::semantic_model::{
+            DependencyDiscoveryOutcome, DependencyPackDiagnostic, DependencyPackPreparationOutcome,
+        };
+
+        let activation = WorkspacePacksActivation {
+            ecosystems: vec![DependencyPackEcosystem::Jvm],
+            workspace_models: Vec::new(),
+            outcome: DependencyPackActivationOutcome {
+                ecosystems: vec![DependencyPackEcosystemOutcome {
+                    ecosystem: DependencyPackEcosystem::Jvm,
+                    discovery: DependencyDiscoveryOutcome::complete(Vec::new()),
+                    preparation: Some(DependencyPackPreparationOutcome {
+                        packs: Vec::new(),
+                        installed_packs: Vec::new(),
+                        evidence: Vec::new(),
+                        diagnostics: vec![DependencyPackDiagnostic {
+                            severity: DependencyPackDiagnosticSeverity::Error,
+                            code: "catalog.install".to_owned(),
+                            dependency_id: Some("jdk:21.0.8".to_owned()),
+                            location: None,
+                            message: "generated artifact failed validation".to_owned(),
+                        }],
+                        suppressed_diagnostics: Default::default(),
+                        complete: false,
+                        cancelled: false,
+                        profile: Default::default(),
+                    }),
+                }],
+                runtime: None,
+                diagnostic_refresh_required: true,
+            },
+        };
+        let review = pack_activation_review(None, Some(&activation), None, None, None)
+            .expect("an attempted dependency activation has a review");
+        assert!(!review.complete());
+        let json = serde_json::to_value(review).unwrap();
+        assert_eq!(
+            json["decisions"],
+            json!([{
+                "pack": "jdk:21.0.8",
+                "status": "rejected",
+                "reason": "catalog.install: generated artifact failed validation"
+            }])
+        );
+    }
+
+    #[test]
     fn owned_policy_workspaces_enable_curated_go_evidence_without_changing_the_global_default() {
         assert_eq!(
             AnalyzerConfig::default().go.dependency_discovery.mode,
@@ -5025,6 +5102,109 @@ mod tests {
             owned_policy_analyzer_config().go.dependency_discovery.mode,
             GoDependencyDiscoveryMode::CuratedPackEvidence
         );
+    }
+
+    #[test]
+    fn owned_policy_project_reuses_and_invalidates_workspace_listing() {
+        let workspace = tempfile::tempdir().expect("workspace directory");
+        let root = workspace
+            .path()
+            .canonicalize()
+            .expect("canonical workspace");
+        fs::write(root.join("before.py"), "value = 1\n").expect("initial Python file");
+
+        let project = owned_policy_project(&root).expect("cached policy project");
+        let first = project
+            .all_files_shared()
+            .expect("initial workspace listing");
+        let repeated = project
+            .all_files_shared()
+            .expect("repeated workspace listing");
+        assert!(
+            Arc::ptr_eq(&first, &repeated),
+            "readers share the cached Arc"
+        );
+
+        fs::write(root.join("after.py"), "value = 2\n").expect("later Python file");
+        fs::remove_file(root.join("before.py")).expect("remove old Python file");
+        project.invalidate_cached_file_listing();
+        let refreshed = project
+            .all_files_shared()
+            .expect("listing after invalidation");
+        assert!(
+            !Arc::ptr_eq(&first, &refreshed),
+            "invalidation replaces the Arc"
+        );
+        assert!(
+            refreshed
+                .iter()
+                .any(|file| file.rel_path() == Path::new("after.py")),
+            "invalidation makes newly added workspace files visible"
+        );
+        assert!(
+            !refreshed
+                .iter()
+                .any(|file| file.rel_path() == Path::new("before.py")),
+            "invalidation removes deleted workspace files"
+        );
+    }
+
+    #[test]
+    fn owned_policy_evaluation_observes_added_and_deleted_python_files() {
+        let workspace = tempfile::tempdir().expect("workspace directory");
+        fs::write(
+            workspace.path().join("before.py"),
+            "def target():\n    return 1\n",
+        )
+        .expect("initial Python file");
+        let policy = r#"(policy
+  :schema-version 1
+  :id "test.policy-inventory"
+  :name "Python target"
+  :message "Avoid target"
+  :severity warning
+  :analysis
+    (analysis
+      :type match
+      :selector
+        (rql :schema-version 1
+          (language python (function :name "target")))))"#;
+        let input = PolicyEvaluationInput::embedded(
+            PolicySourceIdentity::new("policies/target.rqlp"),
+            policy,
+        );
+
+        let initial = evaluate_policy_inputs(
+            workspace.path(),
+            std::slice::from_ref(&input),
+            &evaluation_options(),
+        )
+        .expect("initial owned policy evaluation");
+        let initial_run = &initial.report().runs()[0];
+        assert_eq!(initial.exit_status(), POLICY_EXIT_CLEAN);
+        assert!(initial_run.completion().is_complete());
+        let initial_findings = initial_run.findings();
+        assert_eq!(initial_findings.len(), 1, "the initial file matches");
+        assert_eq!(initial_findings[0].primary().path(), "before.py");
+
+        fs::remove_file(workspace.path().join("before.py")).expect("remove initial file");
+        fs::write(
+            workspace.path().join("after.py"),
+            "def target():\n    return 2\n",
+        )
+        .expect("replacement Python file");
+        let refreshed = evaluate_policy_inputs(
+            workspace.path(),
+            std::slice::from_ref(&input),
+            &evaluation_options(),
+        )
+        .expect("fresh owned policy evaluation");
+        let refreshed_run = &refreshed.report().runs()[0];
+        assert_eq!(refreshed.exit_status(), POLICY_EXIT_CLEAN);
+        assert!(refreshed_run.completion().is_complete());
+        let refreshed_findings = refreshed_run.findings();
+        assert_eq!(refreshed_findings.len(), 1, "the replacement file matches");
+        assert_eq!(refreshed_findings[0].primary().path(), "after.py");
     }
 
     const REVIEW_SUMMARY_MODEL: &str = r#"{

@@ -12,7 +12,7 @@ use super::{
     HierarchyKind, ImplicitOperation, KeyedReadBehavior, KeyedReadObservation, Locator, MemberFact,
     MemberKind, ParameterPassingMode, ReceiverFact, RelationFact, RelationKind,
     ResolvedActiveSemanticModels, RuleEmission, RuleTrigger, RuntimeGlobalBindingEvidence,
-    RuntimeGlobalExposure, RuntimeValuesPayload, SemanticModelActivationStatus,
+    RuntimeGlobalExposure, RuntimeValuesPayload, SemanticModelActivationStatus, SemanticModelMatch,
     SemanticModelMatchDisposition, Signature, StructuredTypeExpression, TemplateExpression,
     TemplateSignature, TemplateTypeRef, TypeFact, TypeKind, TypeParameterConstraint, TypeRef,
     TypeRefReferenceKind, TypeValueSemantics, Visibility,
@@ -25,7 +25,7 @@ use crate::hash::{HashMap, HashSet};
 
 const MODEL_URI_BASE: &str = "bifrost-model://v1";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SemanticModelOriginKind {
     WorkspaceSource,
@@ -36,7 +36,7 @@ pub enum SemanticModelOriginKind {
     DeclarativeModel,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SemanticModelProof {
     AuthoredAnchor,
@@ -44,7 +44,7 @@ pub enum SemanticModelProof {
     PackFact,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SemanticModelCompleteness {
     Partial,
@@ -131,7 +131,7 @@ impl SemanticModelLocation {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 pub struct SemanticModelActivationProvenance {
     pub status: String,
     pub reason: String,
@@ -140,14 +140,14 @@ pub struct SemanticModelActivationProvenance {
     pub matched_evidence: SemanticModelMatchedEvidence,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 pub struct SemanticModelMatchedCoordinate {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 pub struct SemanticModelMatchedEvidence {
     pub language: String,
     pub ecosystem: String,
@@ -165,7 +165,7 @@ pub struct SemanticModelMatchedEvidence {
     pub artifact_sha256: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 pub struct SemanticModelProvenance {
     pub active_model_set_hash: String,
     pub pack_digest: String,
@@ -204,6 +204,10 @@ pub struct SemanticModelSymbol {
     pub visibility: Visibility,
     #[serde(skip)]
     pub(crate) is_static: bool,
+    #[serde(skip)]
+    declaration_is_abstract: bool,
+    #[serde(skip)]
+    declaration_is_sealed: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
     #[serde(skip)]
@@ -917,7 +921,7 @@ impl SemanticModelOverlay {
                 return Err(SemanticModelOverlayBuildError::Cancelled);
             }
             let matched = active.types_with_id(&id);
-            let ambiguous = matched.disposition == SemanticModelMatchDisposition::Conflict;
+            let ambiguous = declaration_records_conflict(&matched);
             for activated in matched.records {
                 let symbol = type_symbol(
                     analyzer,
@@ -946,7 +950,7 @@ impl SemanticModelOverlay {
                 return Err(SemanticModelOverlayBuildError::Cancelled);
             }
             let matched = active.members_with_id(&id);
-            let ambiguous = matched.disposition == SemanticModelMatchDisposition::Conflict;
+            let ambiguous = declaration_records_conflict(&matched);
             for activated in matched.records {
                 symbols.push(member_symbol(
                     analyzer,
@@ -2544,6 +2548,19 @@ fn binding_layouts_match(left: &Signature, right: &Signature) -> bool {
 }
 
 impl SemanticModelSymbol {
+    /// Abstractness published by the declaration producer. Consumers must
+    /// separately require complete, unambiguous declaration provenance.
+    pub fn declaration_is_abstract(&self) -> bool {
+        self.declaration_is_abstract
+    }
+
+    /// Whether the producer records restricted or closed inheritance. In Java
+    /// this includes both `sealed` and `final`; it does not enumerate permitted
+    /// subclasses or prove that a class has no descendants.
+    pub fn declaration_is_sealed(&self) -> bool {
+        self.declaration_is_sealed
+    }
+
     pub fn externally_visible(&self) -> bool {
         matches!(
             self.visibility,
@@ -2699,12 +2716,39 @@ fn push_unique_posting(postings: &mut HashMap<String, Vec<usize>>, key: &str, in
     }
 }
 
+fn declaration_records_conflict<T>(matched: &SemanticModelMatch<'_, T>) -> bool {
+    if matched.disposition != SemanticModelMatchDisposition::Conflict {
+        return false;
+    }
+    let mut artifacts = HashSet::default();
+    !matched.records.iter().all(|record| {
+        let evidence = &record.shard.matched_evidence;
+        evidence.ecosystem == "jdk"
+            && evidence
+                .artifact_sha256
+                .as_ref()
+                .is_some_and(|digest| artifacts.insert(digest.as_str()))
+    })
+}
+
 fn mark_symbol_identity_conflicts(symbols: &mut [SemanticModelSymbol]) {
     let mut identities: HashMap<String, Vec<usize>> = HashMap::default();
     for (index, symbol) in symbols.iter().enumerate() {
         identities.entry(symbol.id.clone()).or_default().push(index);
     }
     for posting in identities.values().filter(|posting| posting.len() > 1) {
+        let mut artifacts = HashSet::default();
+        let distinct_jdk_artifacts = posting.iter().all(|&index| {
+            let evidence = &symbols[index].provenance.activation.matched_evidence;
+            evidence.ecosystem == "jdk"
+                && evidence
+                    .artifact_sha256
+                    .as_ref()
+                    .is_some_and(|digest| artifacts.insert(digest.as_str()))
+        });
+        if distinct_jdk_artifacts {
+            continue;
+        }
         for &index in posting {
             symbols[index].provenance.ambiguous = true;
         }
@@ -4541,6 +4585,8 @@ fn emit_rule_match(
                 let symbol = match declaration {
                     EmittedDeclaration::Type {
                         type_kind: emitted_kind,
+                        is_abstract,
+                        is_sealed,
                         ..
                     } => SemanticModelSymbol {
                         ambient_use: None,
@@ -4552,6 +4598,8 @@ fn emit_rule_match(
                         kind: type_kind(*emitted_kind),
                         visibility: Visibility::Public,
                         is_static: false,
+                        declaration_is_abstract: *is_abstract,
+                        declaration_is_sealed: *is_sealed,
                         signature: None,
                         structured_signature: None,
                         has_explicit_type_terms: false,
@@ -4578,6 +4626,7 @@ fn emit_rule_match(
                         member_kind: emitted_kind,
                         signature,
                         is_static,
+                        is_abstract,
                         ..
                     } => {
                         let owner = match owner {
@@ -4602,6 +4651,8 @@ fn emit_rule_match(
                             kind: member_kind(*emitted_kind),
                             visibility: Visibility::Public,
                             is_static: *is_static,
+                            declaration_is_abstract: *is_abstract,
+                            declaration_is_sealed: false,
                             signature: signature.as_ref().and_then(|signature| {
                                 render_template_signature(&name, signature, captures)
                             }),
@@ -5017,6 +5068,8 @@ fn type_symbol(
         kind: type_kind(record.type_kind),
         visibility: record.visibility,
         is_static: false,
+        declaration_is_abstract: record.is_abstract,
+        declaration_is_sealed: record.is_sealed,
         signature: None,
         structured_signature: None,
         has_explicit_type_terms: record.has_explicit_type_terms,
@@ -5078,6 +5131,8 @@ fn member_symbol(
         kind: member_kind(record.member_kind),
         visibility: record.visibility,
         is_static: record.is_static,
+        declaration_is_abstract: record.is_abstract,
+        declaration_is_sealed: false,
         signature: record
             .signature
             .as_ref()
@@ -5767,6 +5822,8 @@ mod tests {
             kind: SemanticModelSymbolKind::Class,
             visibility: Visibility::Public,
             is_static: false,
+            declaration_is_abstract: false,
+            declaration_is_sealed: false,
             signature: None,
             structured_signature: None,
             has_explicit_type_terms: false,
@@ -5796,6 +5853,47 @@ mod tests {
             }),
             provenance: provenance(SemanticModelCompleteness::Complete),
         }
+    }
+
+    #[test]
+    fn ruby_constructor_result_uses_the_declared_type_instead_of_the_receiver() {
+        use crate::analyzer::ruby::constant_identity::RubyOverlayConstants;
+
+        let mut factory = class("Example::Factory", "ruby");
+        factory.id = RubyOverlayConstants::declaration_id(&factory.qualified_name);
+        let mut product = class("Example::Product", "ruby");
+        product.id = RubyOverlayConstants::declaration_id(&product.qualified_name);
+        let mut constructor = method(
+            &factory,
+            "example.new",
+            "new",
+            Some(Signature {
+                type_parameters: Vec::new(),
+                parameters: Vec::new(),
+                returns: Some(TypeRef::Declared {
+                    id: product.id.clone(),
+                    arguments: Vec::new(),
+                    nullable: false,
+                }),
+            }),
+        );
+        constructor.is_static = true;
+        let overlay = overlay(vec![factory, product, constructor], Vec::new());
+        let constants = RubyOverlayConstants::new(Some(&overlay));
+        let owner = constants.unique_type("Example::Factory").unwrap();
+        assert_eq!(
+            constants
+                .declared_result(constants.callable(owner, "new", 0).unwrap())
+                .unwrap()
+                .qualified_name,
+            "Example::Product"
+        );
+        assert!(constants.callable(owner, "new", 1).is_none());
+        assert!(
+            RubyOverlayConstants::new(None)
+                .declared_result(constants.callable(owner, "new", 0).unwrap())
+                .is_none()
+        );
     }
 
     #[test]
@@ -5884,6 +5982,8 @@ mod tests {
             kind: SemanticModelSymbolKind::Method,
             visibility: Visibility::Public,
             is_static: false,
+            declaration_is_abstract: false,
+            declaration_is_sealed: false,
             signature: signature
                 .as_ref()
                 .map(|value| render_signature(name, value)),

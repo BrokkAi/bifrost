@@ -1247,6 +1247,89 @@ fn switch_coverage_steps_parse_and_lower_from_both_frontends() {
 }
 
 #[test]
+fn assignment_relation_steps_parse_and_lower_from_both_frontends() {
+    let query = parse_ok(json!({
+        "schema_version": 1,
+        "match": { "kind": "function", "name": "assign" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "assignment_relations" }
+        ]
+    }));
+    assert_eq!(
+        query.plan.steps,
+        vec![
+            QueryStep::ProcedureOf,
+            QueryStep::AssignmentRelations(AssignmentRelationFilter::default())
+        ]
+    );
+    assert_eq!(
+        query.validate_steps().unwrap(),
+        QueryValueKind::AssignmentRelation
+    );
+
+    let rql =
+        CodeQuery::from_sexp("(assignment-relations (procedure-of (function :name \"assign\")))")
+            .expect("assignment relation RQL should lower");
+    assert_eq!(rql.schema_version, SCHEMA_VERSION);
+    assert_eq!(rql.plan.steps, query.plan.steps);
+    assert_eq!(rql.to_canonical_json(), query.to_canonical_json());
+
+    let swap = parse_ok(json!({
+        "schema_version": 1,
+        "match": { "kind": "function", "name": "assign" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "assignment_relations", "assignment_relation": ["failed_swap"] }
+        ]
+    }));
+    let swap_rql = CodeQuery::from_sexp(
+        "(assignment-relations :relation [failed-swap] (procedure-of (function :name \"assign\")))",
+    )
+    .expect("selected assignment relation RQL should lower");
+    assert_eq!(swap_rql.plan.steps, swap.plan.steps);
+    assert_eq!(swap_rql.to_canonical_json(), swap.to_canonical_json());
+}
+
+#[test]
+fn loop_relation_step_parses_from_json_and_rql() {
+    let json = parse_ok(json!({
+        "schema_version": 1,
+        "match": { "kind": "function", "name": "check" },
+        "steps": [{ "op": "procedure_of" }, { "op": "loop_relations" }]
+    }));
+    assert_eq!(
+        json.plan.steps,
+        vec![QueryStep::ProcedureOf, QueryStep::LoopRelations]
+    );
+    assert_eq!(json.validate_steps().unwrap(), QueryValueKind::LoopRelation);
+    let rql = CodeQuery::from_sexp("(loop-relations (procedure-of (function :name \"check\")))")
+        .expect("Java loop relation RQL should lower");
+    assert_eq!(rql.to_canonical_json(), json.to_canonical_json());
+}
+
+#[test]
+fn statement_reachability_step_parses_from_json_and_rql() {
+    let json = parse_ok(json!({
+        "schema_version": 1,
+        "match": { "kind": "function", "name": "check" },
+        "steps": [{ "op": "procedure_of" }, { "op": "statement_reachability" }]
+    }));
+    assert_eq!(
+        json.plan.steps,
+        vec![QueryStep::ProcedureOf, QueryStep::StatementReachability]
+    );
+    assert_eq!(
+        json.validate_steps().unwrap(),
+        QueryValueKind::StatementReachability
+    );
+    let rql =
+        CodeQuery::from_sexp("(statement-reachability (procedure-of (function :name \"check\")))")
+            .expect("statement reachability RQL should lower");
+    assert_eq!(rql.to_canonical_json(), json.to_canonical_json());
+}
+
+#[test]
 fn concurrent_access_conflict_steps_parse_and_lower_from_both_frontends() {
     let query = parse_ok(json!({
         "schema_version": 1,
@@ -2568,6 +2651,32 @@ fn call_result_contracts_project_a_typed_row_from_call_shape() {
 }
 
 #[test]
+fn call_result_obligations_project_a_separate_typed_row() {
+    let rql =
+        CodeQuery::from_sexp(r#"(call-result-obligations (call-shape (call :callee "trim")))"#)
+            .expect("result obligation RQL");
+    assert_eq!(
+        rql.validate_steps().unwrap(),
+        QueryValueKind::CallResultObligation
+    );
+    let json = parse_ok(json!({
+        "schema_version": SCHEMA_VERSION,
+        "match": { "kind": "call", "callee": { "name": "trim" } },
+        "steps": [
+            { "op": "call_shape" },
+            { "op": "call_result_obligations" }
+        ]
+    }));
+    assert_eq!(rql.to_canonical_json(), json.to_canonical_json());
+    let wrong = CodeQuery::from_json(&json!({
+        "match": { "kind": "call" },
+        "steps": [{ "op": "call_result_obligations" }]
+    }))
+    .expect_err("obligation projection requires a call shape");
+    assert!(wrong.message.contains("requires call_shape"));
+}
+
+#[test]
 fn result_contract_uses_enriches_a_contract_row_without_changing_its_type() {
     let rql = CodeQuery::from_sexp(
         r#"(result-contract-uses (call-result-contracts (call-shape (call :callee "Open"))))"#,
@@ -3786,4 +3895,89 @@ fn schema_version_strings_round_trip_and_normalize_legacy_numbers() {
         let error = error_of(json!({"schema_version": version, "match": {"kind": "call"}}));
         assert_eq!(error.path, "schema_version");
     }
+}
+
+#[test]
+fn branch_relations_parse_and_filter_by_relation() {
+    let json = parse_ok(json!({
+        "schema_version": 1,
+        "match": { "kind": "if" },
+        "steps": [{ "op": "branch_relations", "branch_relation": ["identical_bodies"] }]
+    }));
+    assert_eq!(
+        json.validate_steps().unwrap(),
+        QueryValueKind::BranchRelation
+    );
+    assert_eq!(
+        json.plan.steps,
+        vec![QueryStep::BranchRelations(BranchRelationFilter {
+            relations: vec![BranchRelationKind::IdenticalBodies],
+        })]
+    );
+    let rql = CodeQuery::from_sexp("(branch-relations :relation [identical-bodies] (if))")
+        .expect("branch relation RQL");
+    assert_eq!(rql.to_canonical_json(), json.to_canonical_json());
+
+    let reserved = CodeQuery::from_sexp(
+        "(branch-relations :relation [contradictory-condition redundant-boolean-return] (if))",
+    )
+    .expect("reserved relations are declared values");
+    assert_eq!(
+        reserved.validate_steps().unwrap(),
+        QueryValueKind::BranchRelation
+    );
+
+    let wrong = error_of(json!({
+        "schema_version": 1,
+        "match": { "kind": "function" },
+        "steps": [{ "op": "file_of" }, { "op": "branch_relations" }]
+    }));
+    assert!(wrong.message.contains("structural_match"), "{wrong:?}");
+    let unknown = error_of(json!({
+        "schema_version": 1,
+        "match": { "kind": "if" },
+        "steps": [{ "op": "branch_relations", "branch_relation": ["clone"] }]
+    }));
+    assert_eq!(unknown.path, "steps[0].branch_relation[0]");
+}
+
+#[test]
+fn failure_handler_state_parses_in_rql_and_json_with_structural_input() {
+    let rql = CodeQuery::from_sexp("(failure-handler-state (language java (catch)))")
+        .expect("Java catch state RQL");
+    let json = parse_ok(json!({
+        "schema_version": 1,
+        "languages": ["java"],
+        "match": { "kind": "catch" },
+        "steps": [{ "op": "failure_handler_state" }]
+    }));
+    assert_eq!(rql.to_canonical_json(), json.to_canonical_json());
+    assert_eq!(
+        rql.validate_steps().unwrap(),
+        QueryValueKind::FailureHandlerState
+    );
+    let wrong = error_of(json!({
+        "schema_version": 1,
+        "match": { "kind": "function" },
+        "steps": [{ "op": "file_of" }, { "op": "failure_handler_state" }]
+    }));
+    assert!(wrong.message.contains("structural_match"), "{wrong:?}");
+}
+
+#[test]
+fn explicit_enum_row_literals_preserve_boolean_named_labels() {
+    let query = CodeQuery::from_sexp(
+        "(filter :where ((failure_predicate eq (enum false)) (terminal eq false)) (call-result-obligations (call-shape (call))))",
+    ).expect("enum and Boolean literals remain distinct");
+    let json = query.to_canonical_json();
+    let predicates = &json["steps"][2]["where"];
+    assert_eq!(predicates[0]["value"], json!({"enum": "false"}));
+    assert_eq!(predicates[1]["value"], json!({"boolean": false}));
+    assert_eq!(
+        CodeQuery::from_json(&json).unwrap().to_canonical_json(),
+        json
+    );
+    assert!(CodeQuery::from_sexp(
+        "(filter :where ((failure_predicate in [(enum true) (enum false)])) (call-result-obligations (call-shape (call))))"
+    ).is_ok());
 }

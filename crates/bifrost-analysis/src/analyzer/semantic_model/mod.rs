@@ -14,6 +14,7 @@ mod identity;
 mod model;
 mod overlay;
 mod producer;
+mod python_condition;
 mod runtime;
 mod runtime_contract_activation;
 mod runtime_contracts;
@@ -29,15 +30,16 @@ pub use artifact::{
     CompiledNormalReturnTypeRefinement, CompiledOperationPrecondition, CompiledPackManifest,
     CompiledPayload, CompiledPredicateProofEffect, CompiledProcedureSummary,
     CompiledProcedureTarget, CompiledResultContract, CompiledResultMemberContract,
-    CompiledResultPredicate, CompiledSemanticModelPack, CompiledShard, CompiledShardArtifact,
-    CompiledShardDescriptor, CompiledSummaryEffect, CompiledSummaryExitKind, CompiledSummaryInput,
-    CompiledSummaryLocation, CompiledSummaryLocationKind, CompiledSummaryMoveInvalidation,
-    CompiledSummaryOutput, CompiledSummaryTransfer, CompiledSummaryValuePreservation,
-    CompiledSummaryValueTransfer, CompiledSummaryValueTransferKind,
-    CompiledSummaryValueTransferLimitation, CompiledSummaryValueTransferLimitationKind,
-    CompiledSummaryValueTransferOperation, CompiledSyncMapOperation, CompiledTaskSpawnCondition,
-    DecodeLimits, PayloadKind, decode_manifest, decode_shard, decode_shard_for_manifest,
-    decode_validated_shard_for_manifest, validate_manifest_inventory,
+    CompiledResultPredicate, CompiledResultUseObligation, CompiledSemanticModelPack, CompiledShard,
+    CompiledShardArtifact, CompiledShardDescriptor, CompiledSummaryEffect, CompiledSummaryExitKind,
+    CompiledSummaryInput, CompiledSummaryLocation, CompiledSummaryLocationKind,
+    CompiledSummaryMoveInvalidation, CompiledSummaryOutput, CompiledSummaryTransfer,
+    CompiledSummaryValuePreservation, CompiledSummaryValueTransfer,
+    CompiledSummaryValueTransferKind, CompiledSummaryValueTransferLimitation,
+    CompiledSummaryValueTransferLimitationKind, CompiledSummaryValueTransferOperation,
+    CompiledSyncMapOperation, CompiledTaskSpawnCondition, DecodeLimits, PayloadKind,
+    decode_manifest, decode_shard, decode_shard_for_manifest, decode_validated_shard_for_manifest,
+    validate_manifest_inventory,
 };
 pub use authoring::*;
 pub use catalog::*;
@@ -54,6 +56,7 @@ pub use producer::{
     ExternalArtifactPackProducer, ProducerDiagnostic, ProducerDiagnosticSeverity,
     read_exact_artifact, read_exact_source_set,
 };
+pub use python_condition::*;
 pub use runtime::*;
 pub use runtime_contract_activation::*;
 pub use runtime_contracts::*;

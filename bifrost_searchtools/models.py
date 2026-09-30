@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import MISSING, dataclass, field
 from enum import StrEnum
 from typing import Any, ClassVar, Literal, cast, get_args
 
@@ -5450,7 +5450,7 @@ class CodeQueryConfigurationFact:
             path=data["path"],
             format=data["format"],
             node_kind=data["node_kind"],
-            provenance=data["provenance"],
+            provenance=data["fact_provenance"],
             completeness=data["completeness"],
             route=data["route"],
             ordinal=_strict_nonnegative_int(data, "ordinal"),
@@ -9422,3 +9422,183 @@ class CodeQualityReport:
 
     def __str__(self) -> str:
         return self.report
+
+
+# Query-result wire models are generated from the Rust serialization schema.
+# Keep presentation methods handwritten by attaching the existing renderers to
+# the generated data classes; fields, enums, defaults, and decoding all come
+# from the producer contract.
+from . import _generated_query_models as _generated_query_models
+
+_legacy_query_models = dict(globals())
+for _generated_name in dir(_generated_query_models):
+    if not _generated_name.startswith("CodeQuery"):
+        continue
+    _generated_type = getattr(_generated_query_models, _generated_name)
+    _legacy_type = _legacy_query_models.get(_generated_name)
+    if isinstance(_generated_type, type) and isinstance(_legacy_type, type):
+        if hasattr(_legacy_type, "render_text"):
+            setattr(_generated_type, "render_text", _legacy_type.render_text)
+    globals()[_generated_name] = _generated_type
+
+_query_result_compatibility_names = {
+    "CodeQueryMatch": "CodeQueryStructuralMatch",
+    "CodeQueryRuntimeKeyedReadValue": "CodeQueryKeyedReadValue",
+    "CodeQueryCallShapeArgument": "CodeQueryCallArgument2",
+}
+for _public_name, _generated_name in _query_result_compatibility_names.items():
+    _generated_type = getattr(_generated_query_models, _generated_name)
+    _legacy_type = _legacy_query_models[_public_name]
+    if hasattr(_legacy_type, "render_text"):
+        setattr(_generated_type, "render_text", _legacy_type.render_text)
+    globals()[_public_name] = _generated_type
+
+
+def _constant_property(value):
+    return property(lambda _self, _value=value: _value)
+
+
+for _union_name, (_tag_name, _tagged_variants) in (
+    _generated_query_models.TAGGED_UNION_VARIANTS.items()
+):
+    _legacy_union_type = _legacy_query_models.get(_union_name)
+    for _tag_value, _variant_type in _tagged_variants.items():
+        setattr(_variant_type, _tag_name, _constant_property(_tag_value))
+        if isinstance(_legacy_union_type, type):
+            for _field_name, _legacy_field in getattr(
+                _legacy_union_type, "__dataclass_fields__", {}
+            ).items():
+                if _field_name in getattr(_variant_type, "__dataclass_fields__", {}):
+                    continue
+                if _legacy_field.default is not MISSING:
+                    setattr(
+                        _variant_type,
+                        _field_name,
+                        _constant_property(_legacy_field.default),
+                    )
+                elif _legacy_field.default_factory is not MISSING:
+                    setattr(
+                        _variant_type,
+                        _field_name,
+                        property(
+                            lambda _self, _factory=_legacy_field.default_factory: _factory()
+                        ),
+                    )
+        if isinstance(_legacy_union_type, type) and hasattr(
+            _legacy_union_type, "render_text"
+        ):
+            setattr(_variant_type, "render_text", _legacy_union_type.render_text)
+
+
+for _union_name in (
+    "CodeQueryFlowWitnessStepKind",
+    "CodeQueryTypestateWitnessStepKind",
+):
+    _tag_name, _tagged_variants = _generated_query_models.TAGGED_UNION_VARIANTS[
+        _union_name
+    ]
+    for _tag_value, _variant_type in _tagged_variants.items():
+        setattr(
+            _variant_type,
+            _tag_name,
+            _constant_property(CodeQueryTypestateWitnessStepKindType(_tag_value)),
+        )
+
+_tag_name, _tagged_variants = _generated_query_models.TAGGED_UNION_VARIANTS[
+    "CodeQueryTypestateFindingKind"
+]
+for _tag_value, _variant_type in _tagged_variants.items():
+    setattr(
+        _variant_type,
+        _tag_name,
+        _constant_property(CodeQueryTypestateFindingKindType(_tag_value)),
+    )
+
+setattr(
+    _tagged_variants["error_transition"],
+    "render_text",
+    lambda self: f"{self.event}: {self.from_state} -> {self.to_state}",
+)
+setattr(
+    _tagged_variants["terminal_expectation"],
+    "render_text",
+    lambda self: f"{self.expectation}: actual {', '.join(self.actual_states)}",
+)
+setattr(
+    _generated_query_models.CodeQueryClassSetRow,
+    "class_name",
+    property(lambda self: self.class_),
+)
+setattr(
+    _generated_query_models.CodeQueryAbsentMemberFinding,
+    "class_name",
+    property(lambda self: self.class_),
+)
+setattr(
+    _generated_query_models.CodeQueryOccurrence,
+    "occurrence_class",
+    property(lambda self: self.class_),
+)
+setattr(
+    _generated_query_models.CodeQueryOccurrence,
+    "effective_spelling",
+    property(lambda self: self.decoded_spelling or self.raw_spelling),
+)
+setattr(
+    _generated_query_models.CodeQueryBinding,
+    "import_binder",
+    property(lambda self: self.import_),
+)
+setattr(
+    _generated_query_models.CodeQueryReferenceEdge,
+    "provenance_direction",
+    property(lambda self: self.edge_provenance),
+)
+setattr(
+    _generated_query_models.CodeQueryCandidateRefVariant1,
+    "name",
+    property(lambda self: self.unit.fq_name),
+)
+setattr(
+    _generated_query_models.CodeQueryTypestateSubject,
+    "class_name",
+    property(lambda self: self.class_),
+)
+
+_generated_subset = _generated_query_models.SubsetCoverage
+setattr(_generated_subset, "render_text", _legacy_query_models["SessionSubset"].render_text)
+SessionSubset = _generated_subset
+
+_CODE_QUERY_RESULT_ITEM_TYPES = (
+    _generated_query_models.CODE_QUERY_RESULT_ITEM_TYPES
+)
+_result_item_type_iterator = iter(_CODE_QUERY_RESULT_ITEM_TYPES.values())
+CodeQueryResultItem = next(_result_item_type_iterator)
+for _result_item_type in _result_item_type_iterator:
+    CodeQueryResultItem |= _result_item_type
+
+_GeneratedCodeQueryResult = _generated_query_models.CodeQueryResult
+_LegacyCodeQueryResult = _legacy_query_models["CodeQueryResult"]
+
+
+@dataclass(frozen=True)
+class CodeQueryResult(_GeneratedCodeQueryResult):
+    rendered_text: str | None = None
+
+    @classmethod
+    def from_dict(
+        cls, data: dict, rendered_text: str | None = None
+    ) -> CodeQueryResult:
+        decoded = _GeneratedCodeQueryResult.from_dict(data)
+        return cls(
+            diagnostics=decoded.diagnostics,
+            results=decoded.results,
+            session_subset=decoded.session_subset,
+            truncated=decoded.truncated,
+            rendered_text=rendered_text,
+        )
+
+    count = _LegacyCodeQueryResult.count
+    completion = _LegacyCodeQueryResult.completion
+    _codes_with_impact = _LegacyCodeQueryResult._codes_with_impact
+    render_text = _LegacyCodeQueryResult.render_text

@@ -138,6 +138,9 @@ done
 require_archive_file brokk-bifrost-semantic-packs src/lib.rs
 require_archive_file brokk-bifrost-semantic-packs src/release_bundle.rs
 require_archive_file brokk-bifrost-semantic-packs src/bin/bifrost-semantic-pack.rs
+require_archive_file brokk-bifrost-semantic-packs models/jdk21-result-use-obligations.json
+require_archive_file brokk-bifrost-semantic-packs embedded/jdk21-result-use-obligations/manifest.json
+require_archive_file brokk-bifrost-semantic-packs embedded/jdk21-result-use-obligations/shards/jdk21.reviewed-result-use.deflate
 require_archive_file brokk-bifrost-semantic-packs models/go-stdlib-bytes-declarations.json
 require_archive_file brokk-bifrost-semantic-packs embedded/go-stdlib-bytes-declarations/manifest.json
 require_archive_file brokk-bifrost-semantic-packs embedded/go-stdlib-bytes-declarations/shards/go.stdlib.bytes.declarations.json
@@ -209,6 +212,7 @@ require_archive_file brokk-bifrost-mcp resources/agent-guidance/bifrost-agents.m
 require_archive_file brokk-bifrost schemas/semantic-model-pack-v2.schema.json
 require_archive_file brokk-bifrost schemas/semantic-model-pack-v3.schema.json
 require_archive_file brokk-bifrost schemas/semantic-model-pack-v4.schema.json
+require_archive_file brokk-bifrost schemas/semantic-model-pack-v5.schema.json
 require_archive_file brokk-bifrost schemas/workspace-packs-v1.schema.json
 
 root_archive=$(archive_for brokk-bifrost)

@@ -100,6 +100,7 @@ pub mod property_reaching;
 pub mod provider;
 pub mod render;
 pub mod service;
+pub mod statement_entries;
 pub(crate) mod structural_identity;
 pub mod type_flow;
 pub mod workspace_oracle;
@@ -119,6 +120,7 @@ pub use render::*;
 pub use service::semantic_artifact_retained_bytes;
 #[cfg(any(test, feature = "test-support"))]
 pub use service::{SemanticCacheRevivalCensus, SemanticMaterializationCensus};
+pub use statement_entries::*;
 pub use type_flow::{
     CallGuardOutcome, ClassAtom, ClassBodyMemberBinding, ClassHierarchy, ClassIdentity, ClassSeed,
     DispatchHint, DispatchHintCallSiteKey, DispatchHintSet, DispatchHints, DynamicFieldWrite,

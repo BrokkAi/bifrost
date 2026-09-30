@@ -1,20 +1,23 @@
 use super::*;
+use schemars::JsonSchema;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct CodeQuerySourceSite {
     pub path: String,
     pub range: CodeQueryRange,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CodeQueryProvenance {
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[schemars(default)]
     pub branch: Vec<usize>,
     pub seed: CodeQueryResultRef,
     pub steps: Vec<CodeQueryProvenanceStep>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CodeQueryProvenanceStep {
     pub op: &'static str,
     pub result: CodeQueryResultRef,
@@ -22,7 +25,7 @@ pub struct CodeQueryProvenanceStep {
     pub via: Option<CodeQueryResultRef>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(tag = "result_type", rename_all = "snake_case")]
 pub enum CodeQueryResultRef {
     StructuralMatch {
@@ -317,6 +320,16 @@ pub enum CodeQueryResultRef {
         result_success_predicate: Option<&'static str>,
         coverage: &'static str,
     },
+    CallResultObligation {
+        id: String,
+        site_id: String,
+        path: String,
+        range: CodeQueryRange,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        obligation_kind: Option<&'static str>,
+        result_use: &'static str,
+        coverage: &'static str,
+    },
     ResultContractUse {
         id: String,
         acquisition_id: String,
@@ -348,6 +361,14 @@ pub enum CodeQueryResultRef {
     },
     SwitchCoverage {
         id: String,
+        path: String,
+        range: CodeQueryRange,
+        verdict: &'static str,
+        proof: &'static str,
+    },
+    AssignmentRelation {
+        id: String,
+        procedure_id: String,
         path: String,
         range: CodeQueryRange,
         verdict: &'static str,
@@ -525,6 +546,37 @@ pub enum CodeQueryResultRef {
         certainty: &'static str,
         exit_partition: &'static str,
     },
+    BranchRelation {
+        id: String,
+        path: String,
+        range: CodeQueryRange,
+        owner_id: String,
+        relation: &'static str,
+        verdict: &'static str,
+    },
+    LoopRelation {
+        id: String,
+        path: String,
+        range: CodeQueryRange,
+        procedure_id: String,
+        loop_kind: &'static str,
+        verdict: &'static str,
+    },
+    FailureHandlerState {
+        id: String,
+        path: String,
+        range: CodeQueryRange,
+        catch_ast_id: String,
+        verdict: &'static str,
+    },
+    StatementReachability {
+        id: String,
+        path: String,
+        range: CodeQueryRange,
+        procedure_id: String,
+        statement_kind: &'static str,
+        verdict: &'static str,
+    },
     Guard {
         id: String,
         path: String,
@@ -645,10 +697,12 @@ impl CodeQueryResultRef {
             Self::CallBinding { .. } => "call_binding",
             Self::CallEffect { .. } => "call_effect",
             Self::CallResultContract { .. } => "call_result_contract",
+            Self::CallResultObligation { .. } => "call_result_obligation",
             Self::ResultContractUse { .. } => "result_contract_use",
             Self::ResultContractFailureUse { .. } => "result_contract_failure_use",
             Self::NilnessOperation { .. } => "nilness_operation",
             Self::SwitchCoverage { .. } => "switch_coverage",
+            Self::AssignmentRelation { .. } => "assignment_relation",
             Self::ConcurrentAccessConflict { .. } => "concurrent_access_conflict",
             Self::ClassSetRow { .. } => "class_set_row",
             Self::AbsentMemberFinding { .. } => "absent_member_finding",
@@ -669,6 +723,10 @@ impl CodeQueryResultRef {
             Self::StateEvent { .. } => "state_event",
             Self::FlowRelation { .. } => "flow_relation",
             Self::ControlRelation { .. } => "control_relation",
+            Self::BranchRelation { .. } => "branch_relation",
+            Self::LoopRelation { .. } => "loop_relation",
+            Self::FailureHandlerState { .. } => "failure_handler_state",
+            Self::StatementReachability { .. } => "statement_reachability",
             Self::Guard { .. } => "guard",
             Self::RewritePath { .. } => "rewrite_path",
             Self::SourceSet { .. } => "source_set",
@@ -721,10 +779,12 @@ impl CodeQueryResultRef {
             | Self::CallBinding { path, .. }
             | Self::CallEffect { path, .. }
             | Self::CallResultContract { path, .. }
+            | Self::CallResultObligation { path, .. }
             | Self::ResultContractUse { path, .. }
             | Self::ResultContractFailureUse { path, .. }
             | Self::NilnessOperation { path, .. }
             | Self::SwitchCoverage { path, .. }
+            | Self::AssignmentRelation { path, .. }
             | Self::ConcurrentAccessConflict { path, .. }
             | Self::ClassSetRow { path, .. }
             | Self::AbsentMemberFinding { path, .. }
@@ -745,6 +805,10 @@ impl CodeQueryResultRef {
             | Self::StateEvent { path, .. }
             | Self::FlowRelation { path, .. }
             | Self::ControlRelation { path, .. }
+            | Self::BranchRelation { path, .. }
+            | Self::LoopRelation { path, .. }
+            | Self::FailureHandlerState { path, .. }
+            | Self::StatementReachability { path, .. }
             | Self::Guard { path, .. }
             | Self::RewritePath { path, .. }
             | Self::SourceSet { path, .. }
@@ -760,7 +824,7 @@ impl CodeQueryResultRef {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CodeQueryCapture {
     pub name: String,
     pub text: String,
@@ -776,7 +840,8 @@ pub struct CodeQueryCapture {
     pub ast_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub struct CodeQueryRange {
     pub start_line: usize,
     pub start_column: usize,

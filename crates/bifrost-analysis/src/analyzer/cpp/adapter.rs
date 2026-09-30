@@ -80,12 +80,13 @@ impl LanguageAdapter for CppAdapter {
         ]
     }
 
-    fn parser_included_ranges(
+    fn parser_included_ranges_from_tree(
         &self,
-        _file: &ProjectFile,
         source: &str,
-    ) -> Option<Vec<tree_sitter::Range>> {
-        brokk_bifrost_cpp::graph::syntax::function_macro_included_ranges(source)
+        tree: &Tree,
+        should_stop: &mut dyn FnMut() -> bool,
+    ) -> std::ops::ControlFlow<(), Option<Vec<tree_sitter::Range>>> {
+        brokk_bifrost_cpp::graph::syntax::function_macro_included_ranges(source, tree, should_stop)
     }
 
     fn contains_tests(
@@ -154,12 +155,19 @@ impl LanguageAdapter for CppAdapter {
             &ancestry,
             &orphaned_namespaces,
         );
+        let c_tag_scope_witness = primary.c_tag_scope_witness;
+        let primary = primary.parsed;
         // The span covers only the second reading, so the counter answers what
         // the second reading costs rather than what parsing C++ costs. Started
         // before the translation-unit exit so the file count stays "every file
         // this adapter parsed", as it was when this was a separate call.
         let started = profiling::enabled().then(Instant::now);
-        if super::imports::is_cpp_translation_unit(file) {
+        // For headers, a witness only signals possible divergence, so the full
+        // C walk and comparison below remain required. Absence permits skipping
+        // only while every C-sensitive declaration path passes through the
+        // visitor decision that records this witness. C translation units keep
+        // their direct dialect.
+        if super::imports::is_cpp_translation_unit(file) || !c_tag_scope_witness {
             record_additional_projection(Language::Cpp, started, 0);
             return (primary, Vec::new());
         }

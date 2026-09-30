@@ -165,6 +165,7 @@ pub(super) fn prepare_seed_access(
     provider_file_count: usize,
     files: &[ProjectFile],
     plan: &QueryPlan,
+    include_inside_decl_anchors: bool,
     state: &mut QueryExecutionState<'_>,
 ) -> SeedStructuralAccess {
     if state.access_mode == StructuralAccessMode::ScanOnly {
@@ -317,7 +318,7 @@ pub(super) fn prepare_seed_access(
             let selection = index.select(
                 plan.structural_access(),
                 files,
-                plan.has_source_anchors(),
+                plan.has_source_anchors_for(include_inside_decl_anchors),
                 cache_ready_before_lookup,
                 cancellation,
             );
@@ -1050,7 +1051,6 @@ pub(super) fn execute_seed(
 
     let diagnostic_start = diagnostics.len();
     let plan = QueryPlan::for_query(seed);
-    let source_index = plan.build_source_index();
     let analyzer = state.analyzer;
     let mut providers = analyzer.structural_fact_providers();
     providers.sort_by_key(|provider| provider.structural_language());
@@ -1109,7 +1109,14 @@ pub(super) fn execute_seed(
         let access = if files.is_empty() {
             SeedStructuralAccess::Scan
         } else {
-            prepare_seed_access(provider, provider_file_count, &files, &plan, state)
+            prepare_seed_access(
+                provider,
+                provider_file_count,
+                &files,
+                &plan,
+                language != Language::Rust,
+                state,
+            )
         };
         provider_scopes.push((language, provider, files, access));
     }
@@ -1170,6 +1177,11 @@ pub(super) fn execute_seed(
                 pipeline_halted: false,
             };
         }
+        // A Rust impl member can be owned by a type declaration in another
+        // file, so the owner's `inside_decl` name is not a sound source anchor
+        // for the member file. Other adapters retain lexical declaration
+        // containment and keep the stronger prefilter.
+        let source_index = plan.build_source_index(language != Language::Rust);
         let indexed_file = access.index_file(&file);
         let source_definitely_absent = source_index.requires_source()
             && access.source_may_contain(&file, source_index.required_anchors()) == Some(false);
@@ -1424,6 +1436,11 @@ pub(super) fn execute_seed(
         let oracle = signature_oracle
             .as_ref()
             .map(|oracle| oracle as &dyn super::super::matcher::CallableSignatureOracle);
+        let owner_oracle = (language == Language::Rust && seed.inside_decl.is_some())
+            .then(|| super::relations::RustDeclarationOwnerOracle::for_file(state.analyzer, &file));
+        let owner_oracle = owner_oracle
+            .as_ref()
+            .map(|oracle| oracle as &dyn super::super::matcher::DeclarationOwnerOracle);
         let matches = if indexed_file.is_some() {
             let mut examined = 0u64;
             let matches = super::super::matcher::match_query_candidates(
@@ -1433,6 +1450,7 @@ pub(super) fn execute_seed(
                 remaining,
                 &mut examined,
                 oracle,
+                owner_oracle,
                 &signature_incomplete,
             );
             if let Some(profile) = &mut state.profile {
@@ -1491,6 +1509,7 @@ pub(super) fn execute_seed(
                 remaining,
                 &mut examined,
                 oracle,
+                owner_oracle,
                 &signature_incomplete,
             )
         };

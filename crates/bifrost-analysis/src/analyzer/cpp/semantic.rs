@@ -31,6 +31,9 @@ use crate::analyzer::semantic_model::{
 use crate::analyzer::tree_sitter_analyzer::{
     PreparedSyntaxTree, WalkControl, try_walk_named_tree_preorder,
 };
+use crate::analyzer::usages::callable_signature::{
+    agreed_callable_identity, callable_signature_reports,
+};
 use crate::analyzer::usages::get_definition::{
     BoundedResolution, DefinitionLookupStatus, resolve_cpp_bounded,
 };
@@ -41,7 +44,20 @@ use crate::hash::{HashMap, HashSet};
 use crate::text_utils::find_line_index_for_offset;
 use std::sync::Arc;
 
-const ADAPTER_VERSION: &[u8] = b"cpp-cfg-values-v16";
+// Bumped for #3508: the declared type of a call whose target declaration
+// publishes several occurrence rows -- an in-class prototype beside the
+// definition that completes it -- now reads the body-bearing row from an
+// occurrence query that asks for one row beyond the pair it decides, so a warm
+// value-semantics result computed while that reader refused the declaration
+// must not be reused. That covers results written before the lookahead row
+// stopped a capped store answer from being read as a refusal.
+const ADAPTER_VERSION: &[u8] = b"cpp-cfg-values-v18";
+
+/// Occurrence rows of one declaration the declared-type reader decides: an
+/// in-class member prototype beside the out-of-line definition that completes
+/// it (#3508). More rows mean the declaration describes more than one callable,
+/// which this reader cannot name a return type for.
+const DECIDABLE_OCCURRENCE_ROWS: usize = 2;
 
 impl_program_semantics_provider!(CppAnalyzer, |analyzer| CppSemanticLowerer::new(analyzer));
 
@@ -1158,7 +1174,7 @@ fn qualified_declarator(mut node: Node<'_>) -> Option<Node<'_>> {
     }
 }
 
-fn declarator_name_node(mut node: Node<'_>) -> Option<Node<'_>> {
+pub(super) fn declarator_name_node(mut node: Node<'_>) -> Option<Node<'_>> {
     loop {
         match node.kind() {
             "identifier"
@@ -2503,14 +2519,53 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             "call_expression" => {
                 let definition =
                     self.exact_function_definition(node.child_by_field_name("function")?)?;
-                let metadata = self.analyzer.signature_metadata_limited(&definition, 2);
-                if !metadata.complete {
+                // Signature metadata answers "incomplete" whenever a provider
+                // returns exactly the cap it was handed, because a capped
+                // cursor cannot prove exhaustion: a store-backed read of a
+                // declaration with two occurrence rows answers incomplete at
+                // two rows, so this reader asks for one row beyond the pair it
+                // decides and refuses any answer that still runs past it.
+                let metadata = self
+                    .analyzer
+                    .signature_metadata_limited(&definition, DECIDABLE_OCCURRENCE_ROWS + 1);
+                if !metadata.complete || metadata.rows.len() > DECIDABLE_OCCURRENCE_ROWS {
                     return None;
                 }
-                let [signature] = metadata.rows.as_slice() else {
-                    return None;
-                };
-                signature.return_type_identity().cloned()
+                match metadata.rows.as_slice() {
+                    [single] => single.return_type_identity().cloned(),
+                    // Exactly two occurrence rows for the resolved declaration:
+                    // an in-class member prototype and the out-of-line
+                    // definition completing it inside one translation unit are
+                    // two rows of a single callable (#3508), while an overload
+                    // set publishes rows describing more than one. Only the
+                    // first shape has a declared return type this reader can
+                    // name.
+                    [_, _] => {
+                        let reports = callable_signature_reports(
+                            "cpp-declared-call-type",
+                            &definition,
+                            &metadata.rows,
+                        );
+                        agreed_callable_identity(&reports)?;
+                        // The body-bearing entry declares the return type in the
+                        // scope that holds the body, which is the callable's own
+                        // declaration context; a prototype states it in the
+                        // scope that holds the class. Distinct bodies whose
+                        // declared return types disagree are an unresolved
+                        // overload set and decide nothing.
+                        let mut bodies = metadata
+                            .rows
+                            .iter()
+                            .filter(|entry| !entry.is_declaration_only());
+                        let first = bodies.next()?;
+                        let identity = first.return_type_identity()?;
+                        if !bodies.all(|entry| entry.return_type_identity() == Some(identity)) {
+                            return None;
+                        }
+                        Some(identity.clone())
+                    }
+                    _ => None,
+                }
             }
             _ => None,
         }
@@ -7138,7 +7193,7 @@ fn cpp_nested_execution_boundary(node: Node<'_>) -> bool {
     matches!(node.kind(), "function_definition" | "lambda_expression")
 }
 
-fn cpp_local_declarators(declaration: Node<'_>) -> Vec<Node<'_>> {
+pub(super) fn cpp_local_declarators(declaration: Node<'_>) -> Vec<Node<'_>> {
     let mut cursor = declaration.walk();
     let mut declarators = declaration
         .children_by_field_name("declarator", &mut cursor)
@@ -7155,7 +7210,7 @@ fn cpp_local_declarators(declaration: Node<'_>) -> Vec<Node<'_>> {
     declarators
 }
 
-fn cpp_declarator_contains_kind(mut node: Node<'_>, expected: &str) -> bool {
+pub(super) fn cpp_declarator_contains_kind(mut node: Node<'_>, expected: &str) -> bool {
     loop {
         if node.kind() == expected {
             return true;
@@ -7201,7 +7256,7 @@ fn cpp_declarator_preserves_identity(mut node: Node<'_>) -> bool {
 /// overloaded operator can be associated with such a type. Copying an object
 /// of a fundamental type therefore transfers the value itself, and every
 /// operator applied to operands of fundamental type is the built-in one.
-fn cpp_type_is_fundamental(type_node: Node<'_>) -> bool {
+pub(super) fn cpp_type_is_fundamental(type_node: Node<'_>) -> bool {
     matches!(
         type_node.kind(),
         "primitive_type" | "sized_type_specifier" | "enum_specifier"

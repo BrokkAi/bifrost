@@ -1,4 +1,6 @@
-use super::super::matcher::{CallableSignatureFacts, CallableSignatureOracle};
+use super::super::matcher::{
+    CallableSignatureFacts, CallableSignatureOracle, DeclarationOwnerOracle,
+};
 use super::*;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 
@@ -843,6 +845,94 @@ impl CallableSignatureOracle for FileCallableSignatureOracle<'_> {
             visibility: recorded.callable_declared_visibility(),
             parameter_types: recorded.callable_parameter_types().map(<[String]>::to_vec),
         })
+    }
+}
+
+/// Rust's declaration owner is not always a lexical structural ancestor: an
+/// inherent or trait `impl` and the type it implements are separate
+/// declarations and can be in separate files. Declaration extraction reads
+/// the impl item's `type` AST field to construct each member's structured
+/// owner identity; `parent_of` resolves that identity back to the exact
+/// workspace declaration. This oracle joins that declaration to its own
+/// normalized fact so `inside-decl` can apply the ordinary pattern verifier.
+pub(super) struct RustDeclarationOwnerOracle<'a> {
+    analyzer: &'a dyn IAnalyzer,
+    declarations: EnclosingDeclarationIndex,
+}
+
+impl<'a> RustDeclarationOwnerOracle<'a> {
+    pub(super) fn for_file(analyzer: &'a dyn IAnalyzer, file: &ProjectFile) -> Self {
+        let mut declarations = EnclosingDeclarationIndex::default();
+        for unit in analyzer.get_declarations(file) {
+            declarations.retain(unit.clone(), analyzer.ranges_of(&unit));
+        }
+        declarations.sort();
+        Self {
+            analyzer,
+            declarations,
+        }
+    }
+}
+
+impl DeclarationOwnerOracle for RustDeclarationOwnerOracle<'_> {
+    fn owner_matches(
+        &self,
+        declaration: Range,
+        pattern: &Pattern,
+        captures: &mut Vec<super::super::matcher::CaptureBinding>,
+        examined_facts: &mut u64,
+        incomplete: &super::super::matcher::CallableSignatureIncomplete,
+    ) -> bool {
+        let Some(member) = self.declarations.exact(declaration) else {
+            return false;
+        };
+        let Some(owner) = self
+            .analyzer
+            .parent_of(&member.unit)
+            .filter(CodeUnit::is_class)
+        else {
+            return false;
+        };
+        let language = crate::analyzer::common::language_for_file(owner.source());
+        if language != Language::Rust {
+            return false;
+        }
+        let Some(facts) = self
+            .analyzer
+            .structural_fact_providers()
+            .into_iter()
+            .find(|provider| provider.structural_language() == language)
+            .and_then(|provider| provider.structural_facts(owner.source()))
+        else {
+            return false;
+        };
+        let signature_oracle = pattern
+            .constrains_callable_signature()
+            .then(|| FileCallableSignatureOracle::for_file(self.analyzer, owner.source()));
+        let signature_oracle = signature_oracle
+            .as_ref()
+            .map(|oracle| oracle as &dyn CallableSignatureOracle);
+        let owner_ranges = self.analyzer.ranges_of(&owner);
+        for (node, fact) in facts.nodes().iter().enumerate() {
+            if !fact.kind.satisfies(NormalizedKind::Declaration)
+                || !owner_ranges.contains(&fact.range)
+            {
+                continue;
+            }
+            let node = u32::try_from(node).expect("FileFacts node ids fit in u32");
+            if super::super::matcher::match_owner_pattern(
+                pattern,
+                &facts,
+                node,
+                captures,
+                examined_facts,
+                signature_oracle,
+                incomplete,
+            ) {
+                return true;
+            }
+        }
+        false
     }
 }
 

@@ -182,6 +182,7 @@ pub(super) fn measure_artifact_work(
         // rather than as a budget dimension of its own.
         work.nested_entries = work
             .nested_entries
+            .saturating_add(procedure.statement_entries.len())
             .saturating_add(procedure.guard_facts.len())
             .saturating_add(procedure.switch_facts.iter().fold(0usize, |total, fact| {
                 total.saturating_add(fact.cases.len().saturating_add(1))
@@ -226,6 +227,8 @@ pub(super) fn measure_artifact_work(
                 | SemanticValueKind::Null
                 | SemanticValueKind::Boolean(_)
                 | SemanticValueKind::UnsignedInteger(_)
+                | SemanticValueKind::SignedInteger(_)
+                | SemanticValueKind::FloatingPoint { .. }
                 | SemanticValueKind::Constant
                 | SemanticValueKind::Exception
                 | SemanticValueKind::Callable
@@ -619,7 +622,8 @@ fn validate_procedure(
                 || !matches!(
                     (gap.capability, gap.kind),
                     (
-                        SemanticCapability::NormalControlFlow,
+                        SemanticCapability::NormalControlFlow
+                            | SemanticCapability::ExceptionalControlFlow,
                         SemanticGapKind::Unknown
                     ) | (
                         SemanticCapability::ConcurrentSpawn,
@@ -631,7 +635,7 @@ fn validate_procedure(
                 id,
                 SemanticIrErrorKind::GapContract,
                 format!(
-                    "gap {} declares retained control topology outside a point-scoped parent-control gap",
+                    "gap {} declares retained control topology outside a point-scoped parent-control or exception-dispatch gap",
                     gap.id
                 ),
             ));
@@ -804,6 +808,16 @@ fn validate_procedure(
                     ));
                 }
             }
+            SemanticValueKind::FloatingPoint { bits } if !f64::from_bits(*bits).is_finite() => {
+                return Err(SemanticIrError::procedure(
+                    id,
+                    SemanticIrErrorKind::ValueFlowContract,
+                    format!(
+                        "floating constant {} is not a finite binary64 value",
+                        value.id
+                    ),
+                ));
+            }
             SemanticValueKind::DefaultArgument { ordinal }
                 if !default_argument_ordinals.insert(*ordinal) =>
             {
@@ -949,6 +963,7 @@ fn validate_procedure(
     }
 
     validate_blocks(procedure)?;
+    validate_statement_entries(procedure)?;
     let control_edges = validate_control_edges(capabilities, procedure)?;
     validate_guard_facts(capabilities, procedure, &control_edges)?;
     validate_switch_facts(capabilities, procedure, &control_edges)?;
@@ -962,6 +977,52 @@ fn validate_procedure(
         &control_edges,
     )?;
     find_boundaries(procedure)?;
+    Ok(())
+}
+
+fn validate_statement_entries(procedure: &ProcedureSemanticsParts) -> Result<(), SemanticIrError> {
+    for site in &procedure.statement_entries {
+        validate_metadata(
+            procedure.id,
+            site.source,
+            site.evidence,
+            procedure,
+            "statement entry",
+        )?;
+        ensure_point(
+            procedure.id,
+            site.point,
+            procedure.points.len(),
+            "statement entry",
+        )?;
+        let mapping = &procedure.source_mappings[site.source.index()];
+        if mapping.kind != SourceMappingKind::Exact
+            || !mapping.locator.belongs_to_procedure(&procedure.locator)
+        {
+            return Err(SemanticIrError::procedure(
+                procedure.id,
+                SemanticIrErrorKind::SourceScope,
+                format!(
+                    "statement entry {:?} has a non-exact or foreign source mapping {}",
+                    site.point, site.source
+                ),
+            ));
+        }
+        let evidence = &procedure.evidence_rows[site.evidence.index()];
+        if evidence.proof != ProofStatus::Proven
+            || evidence.completeness != EvidenceCompleteness::Complete
+            || !evidence.sources.contains(&site.source)
+        {
+            return Err(SemanticIrError::procedure(
+                procedure.id,
+                SemanticIrErrorKind::GapContract,
+                format!(
+                    "statement entry {:?} lacks complete source proof",
+                    site.point
+                ),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -1180,7 +1241,7 @@ fn validate_guard_facts(
             )?;
             if !matches!(
                 procedure.values[constant.index()].kind,
-                SemanticValueKind::UnsignedInteger(_)
+                SemanticValueKind::UnsignedInteger(_) | SemanticValueKind::SignedInteger(_)
             ) {
                 return Err(SemanticIrError::procedure(
                     id,
@@ -1192,6 +1253,45 @@ fn validate_guard_facts(
                     ),
                 ));
             }
+        }
+        if let GuardPredicate::OrderedFloatComparison { constant, .. } = guard.predicate {
+            let Some(subject) = guard.subject else {
+                return Err(SemanticIrError::procedure(
+                    id,
+                    SemanticIrErrorKind::GuardContract,
+                    format!("ordered floating guard {} has no subject", guard.id),
+                ));
+            };
+            ensure_value(id, subject, procedure.values.len(), "ordered guard subject")?;
+            ensure_value(
+                id,
+                constant,
+                procedure.values.len(),
+                "ordered guard constant",
+            )?;
+            if !matches!(
+                procedure.values[constant.index()].kind,
+                SemanticValueKind::FloatingPoint { .. }
+            ) {
+                return Err(SemanticIrError::procedure(
+                    id,
+                    SemanticIrErrorKind::GuardContract,
+                    format!(
+                        "ordered floating guard {} compares against value {constant}, which is a {} rather than a represented floating constant",
+                        guard.id,
+                        procedure.values[constant.index()].kind.label()
+                    ),
+                ));
+            }
+        }
+        if matches!(guard.predicate, GuardPredicate::NanComparison { .. })
+            && guard.subject.is_none()
+        {
+            return Err(SemanticIrError::procedure(
+                id,
+                SemanticIrErrorKind::GuardContract,
+                format!("NaN comparison guard {} has no subject", guard.id),
+            ));
         }
         match guard.predicate {
             GuardPredicate::InstanceOf { value, classes }
@@ -1210,6 +1310,8 @@ fn validate_guard_facts(
             | GuardPredicate::NullComparison { .. }
             | GuardPredicate::ConstantEquality { .. }
             | GuardPredicate::OrderedIntegerComparison { .. }
+            | GuardPredicate::OrderedFloatComparison { .. }
+            | GuardPredicate::NanComparison { .. }
             | GuardPredicate::Opaque { .. } => {}
         }
     }

@@ -13,6 +13,22 @@ use tree_sitter::{Node, Parser, Tree};
 use crate::java::graph_support::{java_declared_type_parameters, java_type_parameter_name};
 use crate::java::imports::parse_import_info;
 
+/// The declaration's modifier keyword tokens, excluding annotations and
+/// comments. In particular, `non-sealed` is one token, not `sealed` plus text.
+pub fn java_modifier_keywords(node: Node<'_>) -> impl Iterator<Item = &'static str> + '_ {
+    let modifiers = node.child_by_field_name("modifiers").or_else(|| {
+        (0..node.named_child_count())
+            .filter_map(|index| node.named_child(index))
+            .find(|child| child.kind() == "modifiers")
+    });
+    modifiers.into_iter().flat_map(|modifiers| {
+        (0..modifiers.child_count()).filter_map(move |index| {
+            let child = modifiers.child(index).expect("modifier child exists");
+            (!child.is_named()).then(|| child.kind())
+        })
+    })
+}
+
 /// Intern one qualified-name segment in the process-global interner.
 fn java_segment(text: &str, kind: SegmentKind) -> SegmentId {
     segment_interner().intern(text, kind)
@@ -910,21 +926,13 @@ fn visit_field_declaration<'tree>(
 }
 
 fn java_field_modifiers(field: Node<'_>) -> (bool, bool) {
-    let modifiers = (0..field.named_child_count())
-        .filter_map(|index| field.named_child(index))
-        .find(|child| child.kind() == "modifiers");
     let mut is_static = false;
     let mut is_final = false;
-    if let Some(modifiers) = modifiers {
-        for index in 0..modifiers.child_count() {
-            let Some(modifier) = modifiers.child(index) else {
-                continue;
-            };
-            match modifier.kind() {
-                "static" => is_static = true,
-                "final" => is_final = true,
-                _ => {}
-            }
+    for modifier in java_modifier_keywords(field) {
+        match modifier {
+            "static" => is_static = true,
+            "final" => is_final = true,
+            _ => {}
         }
     }
 
@@ -1597,21 +1605,14 @@ fn java_callable_modifiers(node: Node<'_>) -> JavaCallableModifiers {
         is_native: false,
         visibility: DeclaredVisibility::PackagePrivate,
     };
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        if child.kind() != "modifiers" {
-            continue;
-        }
-        let mut inner = child.walk();
-        for modifier in child.children(&mut inner) {
-            match modifier.kind() {
-                "static" => modifiers.is_static = true,
-                "native" => modifiers.is_native = true,
-                "public" => modifiers.visibility = DeclaredVisibility::Public,
-                "protected" => modifiers.visibility = DeclaredVisibility::Protected,
-                "private" => modifiers.visibility = DeclaredVisibility::Private,
-                _ => {}
-            }
+    for modifier in java_modifier_keywords(node) {
+        match modifier {
+            "static" => modifiers.is_static = true,
+            "native" => modifiers.is_native = true,
+            "public" => modifiers.visibility = DeclaredVisibility::Public,
+            "protected" => modifiers.visibility = DeclaredVisibility::Protected,
+            "private" => modifiers.visibility = DeclaredVisibility::Private,
+            _ => {}
         }
     }
     modifiers

@@ -548,6 +548,17 @@ impl JavaAnalyzer {
         file: &ProjectFile,
         raw_name: &str,
     ) -> Option<JavaTypeResolution> {
+        self.resolve_type_name_with_selected_jdk(token, packs, file, raw_name, None)
+    }
+
+    pub(crate) fn resolve_type_name_with_selected_jdk(
+        &self,
+        token: QueryToken<'_>,
+        packs: Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>,
+        file: &ProjectFile,
+        raw_name: &str,
+        selected_jdk_artifact_sha256: Option<&str>,
+    ) -> Option<JavaTypeResolution> {
         let normalized = raw_name.trim();
         if normalized.is_empty() {
             return None;
@@ -557,7 +568,10 @@ impl JavaAnalyzer {
             return Some(JavaTypeResolution::Source(code_unit));
         }
 
-        let external = self.external_declarations(packs);
+        let external = match selected_jdk_artifact_sha256 {
+            Some(digest) => self.external_declarations_for_source_jdk(packs, digest),
+            None => self.external_declarations(packs),
+        };
         if external.is_empty() {
             return None;
         }
@@ -676,17 +690,37 @@ impl JavaAnalyzer {
         file: &ProjectFile,
         raw_name: &str,
     ) -> Option<JvmExternalMember> {
+        self.resolve_member_name_with_selected_jdk(token, packs, file, raw_name, None)
+    }
+
+    pub(crate) fn resolve_member_name_with_selected_jdk(
+        &self,
+        token: QueryToken<'_>,
+        packs: Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>,
+        file: &ProjectFile,
+        raw_name: &str,
+        selected_jdk_artifact_sha256: Option<&str>,
+    ) -> Option<JvmExternalMember> {
         let normalized = raw_name.trim();
         if normalized.is_empty() {
             return None;
         }
-        let external = self.external_declarations(packs.clone());
+        let external = match selected_jdk_artifact_sha256 {
+            Some(digest) => self.external_declarations_for_source_jdk(packs.clone(), digest),
+            None => self.external_declarations(packs.clone()),
+        };
         if external.is_empty() {
             return None;
         }
         let access_package = self.package_name_of(file).unwrap_or_default();
         external.resolve_member_spelling(normalized, &access_package, |owner_spelling| {
-            match self.resolve_type_name_with_external(token, packs, file, owner_spelling) {
+            match self.resolve_type_name_with_selected_jdk(
+                token,
+                packs,
+                file,
+                owner_spelling,
+                selected_jdk_artifact_sha256,
+            ) {
                 Some(JavaTypeResolution::External(external_type)) => Some(external_type),
                 Some(JavaTypeResolution::Source(_)) | None => None,
             }

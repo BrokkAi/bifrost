@@ -1,16 +1,17 @@
 use crate::analyzer::cpp::external::{
     CppDependencyPackAdapter, resolve_cpp_semantic_pack_dependencies,
 };
+use crate::analyzer::jvm::external::{jdk_home_for_dependency, resolve_path};
 use crate::analyzer::languages::language_support;
 use crate::analyzer::multi_analyzer::{WorkspaceBuildContext, build_language_delegate};
 use crate::analyzer::semantic_model::{
     DependencyDiscoveryEvidence, DependencyDiscoveryOutcome, DependencyPackAdapter,
     DependencyPackLimits, DependencyPackPreparationOutcome, DependencyResolver,
-    DependencyResolverBounds, PendingDependencyPackAcquisition, SemanticModelActivationPersistence,
-    SemanticModelActivationRequest, SemanticModelRuntimeOutcome, SemanticPackCatalog,
-    SubprocessPolicy, acquire_active_semantic_models_with_evidence,
-    prepare_compatible_installed_semantic_packs, prepare_dependency_semantic_packs,
-    prepare_installed_dependency_packs,
+    DependencyResolverBounds, PendingDependencyPackAcquisition, SemanticModelActivationEvidence,
+    SemanticModelActivationPersistence, SemanticModelActivationRequest,
+    SemanticModelRuntimeOutcome, SemanticPackCatalog, SubprocessPolicy,
+    acquire_active_semantic_models_with_jdk_artifacts, prepare_compatible_installed_semantic_packs,
+    prepare_dependency_semantic_packs, prepare_installed_dependency_packs,
 };
 use crate::analyzer::store::StoreError;
 use crate::analyzer::tree_sitter_analyzer::WorkspaceBuildSnapshot;
@@ -25,10 +26,11 @@ use crate::analyzer::{
     resolve_python_semantic_pack_dependencies, resolve_ruby_semantic_pack_dependencies,
     resolve_rust_semantic_pack_dependencies,
 };
+use crate::hash::HashMap;
 use crate::profiling;
 use std::collections::{BTreeMap, BTreeSet};
 use std::panic::AssertUnwindSafe;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// The repository's shared content-addressed analyzer cache, opened once for a
@@ -866,6 +868,53 @@ pub struct DependencyPackActivationOutcome {
     pub diagnostic_refresh_required: bool,
 }
 
+struct DependencyPackPublicationEvidence {
+    dependencies: Vec<(Box<[Language]>, DependencyDiscoveryEvidence)>,
+    jdk_artifacts: Option<HashMap<PathBuf, SemanticModelActivationEvidence>>,
+}
+
+/// Correlate a configured source toolchain with the exact pack produced from
+/// that home's artifacts. Discovery IDs are run-local join keys; only the
+/// prepared evidence's artifact digest authorizes later call applicability.
+pub(crate) fn prepared_jdk_artifacts_for_source_bindings(
+    config: &AnalyzerConfig,
+    project_root: &Path,
+    outcomes: &[DependencyPackEcosystemOutcome],
+) -> Option<HashMap<PathBuf, SemanticModelActivationEvidence>> {
+    let jvm = outcomes
+        .iter()
+        .find(|outcome| outcome.ecosystem == DependencyPackEcosystem::Jvm)?;
+    let mut by_home = HashMap::default();
+    if let Some(preparation) = &jvm.preparation {
+        let prepared = preparation
+            .packs
+            .iter()
+            .map(|pack| (pack.dependency_id.as_str(), &pack.evidence))
+            .collect::<HashMap<_, _>>();
+        for dependency in &jvm.discovery.dependencies {
+            let (Some(home), Some(evidence)) = (
+                jdk_home_for_dependency(dependency),
+                prepared.get(dependency.id.as_str()),
+            ) else {
+                continue;
+            };
+            if evidence.artifact_sha256.is_some() {
+                by_home.insert(home.to_path_buf(), (*evidence).clone());
+            }
+        }
+    }
+    let mut selected = HashMap::default();
+    for binding in &config.jvm.standard_library_discovery.source_toolchains {
+        let candidate = resolve_path(project_root, binding.jdk_home());
+        if let Ok(home) = std::fs::canonicalize(candidate)
+            && let Some(evidence) = by_home.get(&home)
+        {
+            selected.insert(binding.jdk_home().to_path_buf(), evidence.clone());
+        }
+    }
+    Some(selected)
+}
+
 /// The installed-pack stage's activation: the published interim outcome plus
 /// every dependency whose exact acquisition remains for the full stage.
 #[derive(Debug)]
@@ -1018,9 +1067,17 @@ impl WorkspaceAnalyzer {
             });
         }
 
+        let jdk_artifacts = prepared_jdk_artifacts_for_source_bindings(
+            config,
+            self.analyzer().project().root(),
+            &outcomes,
+        );
         self.publish_dependency_pack_activation(
             activation,
-            publication_evidence,
+            DependencyPackPublicationEvidence {
+                dependencies: publication_evidence,
+                jdk_artifacts,
+            },
             outcomes,
             cancelled,
             ecosystems.is_empty(),
@@ -1124,9 +1181,17 @@ impl WorkspaceAnalyzer {
             });
         }
 
+        let jdk_artifacts = prepared_jdk_artifacts_for_source_bindings(
+            config,
+            self.analyzer().project().root(),
+            &outcomes,
+        );
         let outcome = self.publish_dependency_pack_activation(
             activation,
-            publication_evidence,
+            DependencyPackPublicationEvidence {
+                dependencies: publication_evidence,
+                jdk_artifacts,
+            },
             outcomes,
             cancelled,
             ecosystems.is_empty(),
@@ -1142,7 +1207,7 @@ impl WorkspaceAnalyzer {
     fn publish_dependency_pack_activation(
         &self,
         mut activation: SemanticModelActivationRequest,
-        publication_evidence: Vec<(Box<[Language]>, DependencyDiscoveryEvidence)>,
+        publication: DependencyPackPublicationEvidence,
         outcomes: Vec<DependencyPackEcosystemOutcome>,
         cancelled: bool,
         ecosystems_empty: bool,
@@ -1150,7 +1215,7 @@ impl WorkspaceAnalyzer {
     ) -> DependencyPackActivationOutcome {
         if cancelled
             || (!ecosystems_empty
-                && publication_evidence.is_empty()
+                && publication.dependencies.is_empty()
                 && activation.evidence.is_empty())
         {
             return DependencyPackActivationOutcome {
@@ -1164,12 +1229,13 @@ impl WorkspaceAnalyzer {
         activation.evidence.dedup();
         let runtime = {
             let _scope = crate::profiling::scope("semantic_pack.acquire_active");
-            acquire_active_semantic_models_with_evidence(
+            acquire_active_semantic_models_with_jdk_artifacts(
                 self.analyzer(),
                 context.catalog,
                 context.persistence,
                 &activation,
-                Some(&publication_evidence),
+                Some(&publication.dependencies),
+                publication.jdk_artifacts.as_ref(),
                 context.cancellation,
             )
         };
@@ -1518,12 +1584,21 @@ impl WorkspaceAnalyzer {
 
     fn build_filtered(
         project: Arc<dyn Project>,
-        config: AnalyzerConfig,
+        mut config: AnalyzerConfig,
         requested_languages: Option<&BTreeSet<Language>>,
         store_context: crate::analyzer::AnalyzerStoreContext,
         progress: Option<BuildProgress>,
     ) -> Result<Self, StoreError> {
         let _scope = profiling::scope("WorkspaceAnalyzer::build");
+        for binding in
+            crate::analyzer::jvm::toolchains_document::load_source_toolchains(project.root())
+                .map_err(StoreError::new)?
+        {
+            let bindings = &mut config.jvm.standard_library_discovery.source_toolchains;
+            if !bindings.contains(&binding) {
+                bindings.push(binding);
+            }
+        }
         // A fresh abort per fan-out. The caller's context may outlive this
         // build and go on to serve lazy per-language delegate builds, and those
         // must not inherit a flag this build set.

@@ -14,6 +14,7 @@ fn result_contract_artifact_file(value: &PipelineValue) -> Option<&ProjectFile> 
     match value {
         PipelineValue::CallShape(shape) => Some(&shape.report.outcome.file),
         PipelineValue::CallResultContract(contract) => Some(contract.file()),
+        PipelineValue::CallResultObligation(obligation) => Some(obligation.file()),
         PipelineValue::ResultContractUse(result_use) => Some(result_use.file()),
         PipelineValue::ResultContractFailureUse(result_use) => Some(result_use.file()),
         _ => None,
@@ -394,10 +395,12 @@ pub(super) fn apply_plan_step(
                     | PipelineValue::CallBinding(_)
                     | PipelineValue::CallEffect(_)
                     | PipelineValue::CallResultContract(_)
+                    | PipelineValue::CallResultObligation(_)
                     | PipelineValue::ResultContractUse(_)
                     | PipelineValue::ResultContractFailureUse(_)
                     | PipelineValue::NilnessOperation(_)
                     | PipelineValue::SwitchCoverage(_)
+                    | PipelineValue::AssignmentRelation(_)
                     | PipelineValue::ConcurrentAccessConflict(_)
                     | PipelineValue::ClassSetRow(_)
                     | PipelineValue::AbsentMemberFinding(_)
@@ -426,6 +429,10 @@ pub(super) fn apply_plan_step(
                     PipelineValue::StateEvent(_)
                     | PipelineValue::FlowRelation(_)
                     | PipelineValue::ControlRelation(_)
+                    | PipelineValue::BranchRelation(_)
+                    | PipelineValue::LoopRelation(_)
+                    | PipelineValue::FailureHandlerState(_)
+                    | PipelineValue::StatementReachability(_)
                     | PipelineValue::Guard(_)
                     | PipelineValue::SourceSet(_)
                     | PipelineValue::BuildTarget(_)
@@ -489,10 +496,12 @@ pub(super) fn apply_plan_step(
                                 | PipelineValue::CallBinding(_)
                                 | PipelineValue::CallEffect(_)
                                 | PipelineValue::CallResultContract(_)
+                                | PipelineValue::CallResultObligation(_)
                                 | PipelineValue::ResultContractUse(_)
                                 | PipelineValue::ResultContractFailureUse(_)
                                 | PipelineValue::NilnessOperation(_)
                                 | PipelineValue::SwitchCoverage(_)
+                                | PipelineValue::AssignmentRelation(_)
                                 | PipelineValue::ConcurrentAccessConflict(_)
                                 | PipelineValue::ClassSetRow(_)
                                 | PipelineValue::AbsentMemberFinding(_)
@@ -521,6 +530,10 @@ pub(super) fn apply_plan_step(
                                 | PipelineValue::StateEvent(_)
                                 | PipelineValue::FlowRelation(_)
                                 | PipelineValue::ControlRelation(_)
+                                | PipelineValue::BranchRelation(_)
+                                | PipelineValue::LoopRelation(_)
+                                | PipelineValue::FailureHandlerState(_)
+                                | PipelineValue::StatementReachability(_)
                                 | PipelineValue::Guard(_)
                                 | PipelineValue::SourceSet(_)
                                 | PipelineValue::BuildTarget(_)
@@ -596,10 +609,12 @@ pub(super) fn apply_plan_step(
                         | PipelineValue::CallBinding(_)
                         | PipelineValue::CallEffect(_)
                         | PipelineValue::CallResultContract(_)
+                        | PipelineValue::CallResultObligation(_)
                         | PipelineValue::ResultContractUse(_)
                         | PipelineValue::ResultContractFailureUse(_)
                         | PipelineValue::NilnessOperation(_)
                         | PipelineValue::SwitchCoverage(_)
+                        | PipelineValue::AssignmentRelation(_)
                         | PipelineValue::ConcurrentAccessConflict(_)
                         | PipelineValue::ClassSetRow(_)
                         | PipelineValue::AbsentMemberFinding(_)
@@ -628,6 +643,10 @@ pub(super) fn apply_plan_step(
                         PipelineValue::StateEvent(_)
                         | PipelineValue::FlowRelation(_)
                         | PipelineValue::ControlRelation(_)
+                        | PipelineValue::BranchRelation(_)
+                        | PipelineValue::LoopRelation(_)
+                        | PipelineValue::FailureHandlerState(_)
+                        | PipelineValue::StatementReachability(_)
                         | PipelineValue::Guard(_)
                         | PipelineValue::SourceSet(_)
                         | PipelineValue::BuildTarget(_)
@@ -746,6 +765,8 @@ pub(super) fn apply_plan_step(
         &mut state.edge_cache,
         &mut state.flow_state_cache,
         &mut state.control_relation_cache,
+        &mut state.branch_relation_cache,
+        &mut state.failure_handler_state_cache,
         &mut state.topology_cache,
         &mut state.rewrite_path_cache,
         &mut state.path_cache,
@@ -942,7 +963,7 @@ pub(super) fn combine_set_rows(
                 }
                 if present {
                     for contribution in contributions {
-                        row.value.merge_evidence(contribution.value);
+                        row.value.merge_intersect_evidence(contribution.value);
                         row.traces.extend(contribution.traces);
                         row.provenance_truncated |= contribution.provenance_truncated;
                     }
@@ -1263,7 +1284,7 @@ pub(super) fn query_analysis_context_error_result(
 }
 
 pub(super) fn query_step_requires_semantic(step: &QueryStep) -> bool {
-    !step.op().semantic_facets().is_empty()
+    !step.semantic_facets().is_empty()
 }
 
 pub(super) fn push_cancelled_diagnostic(diagnostics: &mut Vec<CodeQueryDiagnostic>) {
@@ -1300,6 +1321,8 @@ pub(super) fn apply_pipeline_step(
     edge_cache: &mut EdgeTraversalCache,
     flow_state_cache: &mut FlowStateTraversalCache,
     control_relation_cache: &mut ControlRelationTraversalCache,
+    branch_relation_cache: &mut BranchRelationTraversalCache,
+    failure_handler_state_cache: &mut FailureHandlerStateCache,
     topology_cache: &mut TopologyTraversalCache,
     rewrite_path_cache: &mut RewritePathTraversalCache,
     path_cache: &mut PathTraversalCache,
@@ -2030,6 +2053,18 @@ pub(super) fn apply_pipeline_step(
                     .into_iter()
                     .map(pipeline_expansion)
                     .collect()
+            }
+            (PipelineValue::FailureHandlerState(value), QueryStep::FileOf) => {
+                vec![pipeline_expansion(PipelineValue::File(value.file.clone()))]
+            }
+            (PipelineValue::BranchRelation(value), QueryStep::FileOf) => {
+                vec![pipeline_expansion(PipelineValue::File(value.file.clone()))]
+            }
+            (PipelineValue::LoopRelation(value), QueryStep::FileOf) => {
+                vec![pipeline_expansion(PipelineValue::File(value.file.clone()))]
+            }
+            (PipelineValue::StatementReachability(value), QueryStep::FileOf) => {
+                vec![pipeline_expansion(PipelineValue::File(value.file.clone()))]
             }
             (PipelineValue::StructuralMatch(seed), QueryStep::FileOf) => {
                 vec![pipeline_expansion(PipelineValue::File(seed.file.clone()))]
@@ -2827,6 +2862,17 @@ pub(super) fn apply_pipeline_step(
                     value,
                 )
             }
+            (PipelineValue::CallShape(value), QueryStep::CallResultObligations) => {
+                effects::call_result_obligation_expansions(
+                    analyzer,
+                    semantic
+                        .as_mut()
+                        .expect("semantic context exists for semantic steps"),
+                    &mut call_cache.effects,
+                    diagnostics,
+                    value,
+                )
+            }
             (PipelineValue::CallResultContract(value), QueryStep::ResultContractUses) => {
                 effects::result_contract_use_expansions(
                     analyzer,
@@ -3282,6 +3328,20 @@ pub(super) fn apply_pipeline_step(
             ) => effects::switch_coverage_expansions(procedure),
             (
                 PipelineValue::Semantic(SemanticPipelineValue::Procedure(procedure)),
+                QueryStep::AssignmentRelations(filter),
+            ) => assignment_relations::assignment_relation_expansions(
+                workspace.expect("assignment relations require a semantic workspace"),
+                semantic
+                    .as_mut()
+                    .expect("semantic context exists for assignment relations"),
+                flow_state_cache,
+                cancellation,
+                diagnostics,
+                procedure,
+                filter,
+            ),
+            (
+                PipelineValue::Semantic(SemanticPipelineValue::Procedure(procedure)),
                 QueryStep::DetachedTaskTransfers,
             ) => effects::detached_task_transfer_expansions(
                 semantic
@@ -3345,6 +3405,50 @@ pub(super) fn apply_pipeline_step(
                 filter,
                 cancellation,
                 diagnostics,
+            ),
+            (PipelineValue::StructuralMatch(seed), QueryStep::FailureHandlerState) => {
+                failure_handler_state::failure_handler_state_expansions(
+                    analyzer,
+                    failure_handler_state_cache,
+                    seed,
+                    cancellation,
+                    diagnostics,
+                )
+            }
+            (PipelineValue::StructuralMatch(seed), QueryStep::BranchRelations(filter)) => {
+                branch_relations::branch_relation_expansions(
+                    analyzer,
+                    workspace,
+                    semantic,
+                    branch_relation_cache,
+                    environment_cache,
+                    seed,
+                    filter,
+                    cancellation,
+                    diagnostics,
+                )
+            }
+            (
+                PipelineValue::Semantic(SemanticPipelineValue::Procedure(procedure)),
+                QueryStep::LoopRelations,
+            ) => loop_relations::loop_relation_expansions(
+                workspace.expect("loop relations require a semantic workspace"),
+                semantic
+                    .as_mut()
+                    .expect("loop relations require semantic context"),
+                flow_state_cache,
+                cancellation,
+                diagnostics,
+                procedure,
+            ),
+            (
+                PipelineValue::Semantic(SemanticPipelineValue::Procedure(procedure)),
+                QueryStep::StatementReachability,
+            ) => statement_reachability::statement_reachability_expansions(
+                workspace.expect("statement reachability requires a semantic workspace"),
+                cancellation,
+                diagnostics,
+                procedure,
             ),
             (
                 PipelineValue::Semantic(SemanticPipelineValue::Procedure(procedure)),
@@ -3704,7 +3808,9 @@ pub(super) fn apply_pipeline_step(
         // otherwise retain the first exhausted row and silently omit the rest.
         if !matches!(
             step,
-            QueryStep::CallResultContracts | QueryStep::ResultContractUses
+            QueryStep::CallResultContracts
+                | QueryStep::CallResultObligations
+                | QueryStep::ResultContractUses
         ) && semantic
             .as_ref()
             .is_some_and(|service| service.work().budget_exhausted)

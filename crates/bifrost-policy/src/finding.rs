@@ -33,7 +33,7 @@ use super::scope::PolicyFindingScope;
 use super::suppression::PolicyFindingSuppression;
 use crate::is_false;
 
-const MAX_REPORT_PROSE_BYTES: usize = 4_096;
+pub(crate) const MAX_REPORT_PROSE_BYTES: usize = 4_096;
 const MAX_REPORT_IDENTIFIER_BYTES: usize = 128;
 const MAX_TYPED_REASONS: usize = 256;
 const MAX_QUERY_PROVENANCE: usize = 16;

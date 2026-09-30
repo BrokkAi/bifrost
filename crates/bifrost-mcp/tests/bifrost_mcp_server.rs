@@ -1801,7 +1801,7 @@ fn bifrost_mcp_lists_and_runs_built_in_policies() {
     let code_smells_policies = packs[0]["policies"]
         .as_array()
         .expect("code-smells policies");
-    assert_eq!(code_smells_policies.len(), 17);
+    assert_eq!(code_smells_policies.len(), 30);
     assert!(code_smells_policies.iter().all(|policy| {
         policy["authored_hash"].as_str().is_some()
             && policy["resolved_semantic_hash"]
@@ -1812,6 +1812,16 @@ fn bifrost_mcp_lists_and_runs_built_in_policies() {
         code_smells_policies
             .iter()
             .any(|policy| policy["id"] == "bifrost.correctness.go-data-race")
+    );
+    assert!(
+        code_smells_policies
+            .iter()
+            .any(|policy| policy["id"] == "bifrost.correctness.c-self-assignment")
+    );
+    assert!(
+        code_smells_policies
+            .iter()
+            .any(|policy| policy["id"] == "bifrost.correctness.unreachable-statement")
     );
     assert_eq!(packs[1]["id"], "bifrost.correctness");
     let resource_lifecycle_policies = packs[1]["policies"]
@@ -1915,13 +1925,26 @@ fn bifrost_mcp_lists_and_runs_built_in_policies() {
     assert_eq!(
         category_ids,
         vec![
+            "bifrost.correctness.c-self-assignment",
+            "bifrost.correctness.contradictory-condition",
+            "bifrost.correctness.discarded-pure-result",
             "bifrost.correctness.dynamic-evaluation",
+            "bifrost.correctness.empty-failure-handler",
+            "bifrost.correctness.failed-swap",
             "bifrost.correctness.go-data-race",
             "bifrost.correctness.go-nil-dereference",
             "bifrost.correctness.go-wrong-error-on-failure-path",
+            "bifrost.correctness.identical-conditional-branches",
+            "bifrost.correctness.ignored-status-result",
+            "bifrost.correctness.local-self-assignment",
+            "bifrost.correctness.loop-body-never-repeats",
+            "bifrost.correctness.overwritten-unread-value",
             "bifrost.correctness.python-absent-member",
             "bifrost.correctness.rayon-in-blocking-lazy-init",
+            "bifrost.correctness.redundant-boolean-branches",
+            "bifrost.correctness.repeated-branch-condition",
             "bifrost.correctness.resource-lifecycle",
+            "bifrost.correctness.unreachable-statement",
             "bifrost.correctness.unsafe-deserialization"
         ],
         "{category}"
@@ -1955,12 +1978,25 @@ fn bifrost_mcp_lists_and_runs_built_in_policies() {
     assert_eq!(
         pack_ids,
         vec![
+            "bifrost.correctness.c-self-assignment",
+            "bifrost.correctness.contradictory-condition",
+            "bifrost.correctness.discarded-pure-result",
             "bifrost.correctness.dynamic-evaluation",
+            "bifrost.correctness.empty-failure-handler",
+            "bifrost.correctness.failed-swap",
             "bifrost.correctness.go-data-race",
             "bifrost.correctness.go-nil-dereference",
             "bifrost.correctness.go-wrong-error-on-failure-path",
+            "bifrost.correctness.identical-conditional-branches",
+            "bifrost.correctness.ignored-status-result",
+            "bifrost.correctness.local-self-assignment",
+            "bifrost.correctness.loop-body-never-repeats",
+            "bifrost.correctness.overwritten-unread-value",
             "bifrost.correctness.python-absent-member",
             "bifrost.correctness.rayon-in-blocking-lazy-init",
+            "bifrost.correctness.redundant-boolean-branches",
+            "bifrost.correctness.repeated-branch-condition",
+            "bifrost.correctness.unreachable-statement",
             "bifrost.correctness.unsafe-deserialization",
             "bifrost.performance.database-call-in-loop",
             "bifrost.performance.expensive-operation-in-nested-loop",

@@ -24,6 +24,8 @@ const JAVASCRIPT_TYPESCRIPT_SCHEMA_JSON: &str =
 const NODE_COMPATIBILITY_SCHEMA_JSON: &str =
     include_str!("profiles/node-compatibility.schema.json");
 const PYTHON_SCHEMA_JSON: &str = include_str!("profiles/python.schema.json");
+const TRANSFER_PARTITIONS_SCHEMA_JSON: &str =
+    include_str!("profiles/transfer-partitions.schema.json");
 const RUST_SCHEMA_JSON: &str = include_str!("profiles/rust.schema.json");
 const VALUE_TRANSFER_SCHEMA_JSON: &str = include_str!("profiles/value-transfer.schema.json");
 const CPP_SCHEMA_JSON: &str = include_str!("profiles/cpp.schema.json");
@@ -380,6 +382,13 @@ struct KnownProfile {
 
 const KNOWN_PROFILES: &[KnownProfile] = &[
     KnownProfile {
+        identifier: CSMI_TRANSFER_PARTITIONS_PROFILE_ID,
+        version: CSMI_TRANSFER_PARTITIONS_PROFILE_VERSION,
+        schema: CSMI_TRANSFER_PARTITIONS_PROFILE_SCHEMA,
+        schema_json: TRANSFER_PARTITIONS_SCHEMA_JSON,
+        payload_definitions: &[],
+    },
+    KnownProfile {
         identifier: CSMI_CONDITIONAL_TYPE_REFINEMENT_PROFILE_ID,
         version: CSMI_CONDITIONAL_TYPE_REFINEMENT_PROFILE_VERSION,
         schema: CSMI_CONDITIONAL_TYPE_REFINEMENT_PROFILE_SCHEMA,
@@ -721,6 +730,47 @@ fn validate_profile_schemas(
         }
     }
     outcomes
+}
+
+/// Revalidate a retained Python profile fact after native pack decoding.
+/// Outer artifact hashes alone cannot certify a rebuilt but malformed payload.
+pub(crate) fn validate_python_profile_payload(payload: &Value) -> Vec<String> {
+    let (index, _) = known_profile(
+        CSMI_PYTHON_PROFILE_ID,
+        CSMI_PYTHON_PROFILE_VERSION,
+        CSMI_PYTHON_PROFILE_SCHEMA,
+    )
+    .expect("the Python profile is registered");
+    profile_schema_validators()[index]
+        .as_ref()
+        .expect("the Python profile schema compiles")
+        .iter_errors(payload)
+        .map(|violation| violation.to_string())
+        .collect()
+}
+
+/// Validate one condition against the pinned Python profile definition rather
+/// than maintaining a second, narrower copy of its field grammar.
+pub(crate) fn validate_python_profile_condition(condition: &Value) -> Vec<String> {
+    static VALIDATOR: OnceLock<jsonschema::Validator> = OnceLock::new();
+    let validator = VALIDATOR.get_or_init(|| {
+        let mut schema: Value =
+            serde_json::from_str(PYTHON_SCHEMA_JSON).expect("pinned Python schema is valid JSON");
+        let root = schema
+            .as_object_mut()
+            .expect("pinned Python schema has an object root");
+        root.remove("oneOf");
+        root.insert(
+            "$ref".to_owned(),
+            Value::String("#/$defs/condition".to_owned()),
+        );
+        jsonschema::draft202012::new(&schema)
+            .expect("pinned Python condition schema is valid Draft 2020-12")
+    });
+    validator
+        .iter_errors(condition)
+        .map(|violation| violation.to_string())
+        .collect()
 }
 
 pub fn validate_csmi_document(
@@ -2535,6 +2585,149 @@ fn validate_model(
         &callable_declarations,
         diagnostics,
     ) {
+        valid = false;
+    }
+    if !validate_transfer_partition_semantics(model, &prefix, &callable_declarations, diagnostics) {
+        valid = false;
+    }
+    valid
+}
+
+fn validate_transfer_partition_semantics(
+    model: &CsmiSemanticModel,
+    prefix: &str,
+    callables: &HashMap<String, &CsmiCallableShape>,
+    diagnostics: &mut Vec<CsmiDiagnostic>,
+) -> bool {
+    static VALIDATOR: OnceLock<jsonschema::Validator> = OnceLock::new();
+    let validator = VALIDATOR.get_or_init(|| {
+        let schema: Value = serde_json::from_str(TRANSFER_PARTITIONS_SCHEMA_JSON)
+            .expect("pinned transfer-partitions schema is JSON");
+        jsonschema::draft202012::new(&schema).expect("pinned transfer-partitions schema is valid")
+    });
+    let symbols = model
+        .symbols
+        .iter()
+        .map(|symbol| symbol.id.clone())
+        .collect();
+    let mut valid = true;
+    for (index, statement) in model.completeness_statements.iter().enumerate() {
+        if statement.vocabulary.as_deref() != Some(CSMI_TRANSFER_PARTITIONS_PROFILE_ID) {
+            continue;
+        }
+        let path = format!("{prefix}.completenessStatements[{index}]");
+        if statement.version.as_deref() != Some(CSMI_TRANSFER_PARTITIONS_PROFILE_VERSION)
+            || statement.family != "transfer-partitions"
+            || !statement.extensions.is_empty()
+            || !validator.is_valid(&statement.scope)
+        {
+            error(
+                diagnostics,
+                "semantic.transfer_partition_scope",
+                &path,
+                "unsupported transfer-partitions version, family, attachment, or scope",
+            );
+            valid = false;
+            continue;
+        }
+        let scope: CsmiTransferPartitionScope = serde_json::from_value(statement.scope.clone())
+            .expect("schema-validated transfer-partition scope deserializes");
+        let declared = model.vocabulary_uses.iter().any(|use_| {
+            use_.identifier == CSMI_TRANSFER_PARTITIONS_PROFILE_ID
+                && use_.version == CSMI_TRANSFER_PARTITIONS_PROFILE_VERSION
+                && use_.schema == CSMI_TRANSFER_PARTITIONS_PROFILE_SCHEMA
+                && use_.requirement == CsmiVocabularyRequirement::Required
+                && use_
+                    .affects
+                    .contains(&CsmiAffectedUnit::FactFamily(CsmiAffectedFactFamily {
+                        kind: CsmiAffectedFactFamilyKind::FactFamily,
+                        family: "transfer-partitions".to_owned(),
+                        scope: statement.scope.clone(),
+                    }))
+        });
+        if !declared {
+            error(
+                diagnostics,
+                "semantic.transfer_partition_affect",
+                &path,
+                "partition claim requires an exact required vocabulary use",
+            );
+            valid = false;
+        }
+        let Some(shape) = callables.get(&scope.callable) else {
+            error(
+                diagnostics,
+                "semantic.transfer_partition_callable",
+                &path,
+                "partition callable must resolve to a callable declaration",
+            );
+            valid = false;
+            continue;
+        };
+        if !model.completeness_statements.iter().any(|shape_statement| {
+            shape_statement.vocabulary.is_none()
+                && shape_statement.version.is_none()
+                && shape_statement.family == "declaration-aspects"
+                && shape_statement.scope
+                    == serde_json::json!({"symbol":scope.callable,"aspect":"callable-shape"})
+                && shape_statement.status == CsmiCoverageStatus::Complete
+        }) {
+            error(
+                diagnostics,
+                "semantic.transfer_partition_shape",
+                &path,
+                "partition requires a complete callable shape",
+            );
+            valid = false;
+        }
+        if !model
+            .procedure_summaries
+            .iter()
+            .any(|summary| summary.callable == scope.callable)
+        {
+            error(
+                diagnostics,
+                "semantic.transfer_partition_summary",
+                &path,
+                "partition requires an explicit applicable procedure summary",
+            );
+            valid = false;
+        }
+        if scope.destination.position as usize >= shape.results.len() {
+            error(
+                diagnostics,
+                "semantic.transfer_partition_result",
+                &path,
+                "partition normal-result port is outside callable shape",
+            );
+            valid = false;
+        }
+        if let CsmiTransferPartitionSource::InputRoot { root } = scope.source
+            && !validate_input_location(
+                &CsmiInputLocation {
+                    root,
+                    projection: None,
+                },
+                shape,
+                &symbols,
+                &format!("{path}.scope.source.root"),
+                diagnostics,
+            )
+        {
+            valid = false;
+        }
+    }
+    if model
+        .extension_facts
+        .iter()
+        .any(|fact| fact.vocabulary == CSMI_TRANSFER_PARTITIONS_PROFILE_ID)
+    {
+        error(
+            diagnostics,
+            "semantic.transfer_partition_fact",
+            prefix,
+            "transfer-partitions has no extension fact payload",
+        );
         valid = false;
     }
     valid

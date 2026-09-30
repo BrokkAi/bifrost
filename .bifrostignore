@@ -1,2 +1,1 @@
-crates/bifrost-analysis/vendor/tree-sitter-scala/src/
-crates/bifrost-analysis/vendor/tree-sitter-kotlin/src/
+crates/bifrost-jvm/src/scala/grammar/src/

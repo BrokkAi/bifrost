@@ -86,6 +86,7 @@ const JVM_EXTERNAL_DISPATCH_BEHAVIOR_DOMAIN: &[u8] = b"bifrost-jvm-external-disp
 const JVM_EXTERNAL_INDEX_MEMO_DOMAIN: &[u8] = b"bifrost-jvm-external-index-memo/v1";
 /// Domain of the read-free identity of one JDK's selected JMOD set.
 const JDK_JMOD_SET_SOURCE_IDENTITY_DOMAIN: &[u8] = b"bifrost-jvm.jdk-jmod-set-source-identity/v1";
+const JDK_DISCOVERY_HOME_ID_DOMAIN: &[u8] = b"bifrost-jvm.jdk-discovery-home-id/v1";
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct JvmExternalDeclarationIndex {
@@ -187,16 +188,30 @@ impl JavaArtifactFacts {
             }
             let is_static = fact.is_static;
             let is_constant = fact.member_kind == MemberKind::Constant;
-            members
-                .entry(fact.name.clone())
-                .or_insert_with(|| JvmExternalMember {
-                    fqn: qualified_name(owner_fqn, &fact.name),
-                    declaring_package: owner_package.to_owned(),
+            let shape = external_call_shape(fact.member_kind, is_static, fact.signature.as_ref());
+            let shapes_incomplete = callable_shape_is_incomplete(
+                fact.member_kind,
+                fact.signature.as_ref(),
+                fact.callable_family_complete,
+                shape.is_some(),
+            );
+            retain_external_member(
+                &mut members,
+                owner_fqn,
+                owner_package,
+                RetainedExternalMember {
+                    name: fact.name,
                     visibility: semantic_visibility(fact.visibility),
                     returns: fact.signature.and_then(|signature| signature.returns),
                     is_static,
                     is_constant,
-                });
+                    shape,
+                    shapes_incomplete,
+                },
+            );
+        }
+        if budget.exhausted {
+            mark_call_shapes_incomplete(&mut members);
         }
         JvmIndexedOwnerSurface {
             members,
@@ -541,6 +556,13 @@ fn discover_jdk_semantic_pack_dependencies(
         .iter()
         .map(|home| (resolve_path(project_root, home), true))
         .collect();
+    candidates.extend(
+        config
+            .standard_library_discovery
+            .source_toolchains
+            .iter()
+            .map(|binding| (resolve_path(project_root, binding.jdk_home()), true)),
+    );
     if let Some(java_home) = java_home.filter(|value| !value.is_empty()) {
         candidates.push((resolve_path(project_root, Path::new(&java_home)), false));
     }
@@ -552,7 +574,7 @@ fn discover_jdk_semantic_pack_dependencies(
         ..JdkDiscovery::default()
     };
     let mut seen_homes = crate::hash::HashSet::default();
-    let mut dependency_by_version = crate::hash::HashMap::default();
+    let mut dependency_homes = Vec::new();
     for (candidate, configured) in candidates {
         let home = fs::canonicalize(&candidate).unwrap_or(candidate);
         if !seen_homes.insert(home.clone()) {
@@ -581,7 +603,7 @@ fn discover_jdk_semantic_pack_dependencies(
             .find(|path| path.is_file());
         let dependency = if !configured {
             match discover_jdk_jmods(&home) {
-                Ok(Some(jmods)) => resolved_jdk_jmod_dependency(&release, home, jmods),
+                Ok(Some(jmods)) => resolved_jdk_jmod_dependency(&release, home.clone(), jmods),
                 Ok(None) => resolved_jdk_dependency(version.clone(), source),
                 Err(message) => {
                     discovery.diagnostics.push(DependencyPackDiagnostic {
@@ -616,7 +638,7 @@ fn discover_jdk_semantic_pack_dependencies(
             dependency
         } else {
             match discover_jdk_jmods(&home) {
-                Ok(Some(jmods)) => resolved_jdk_jmod_dependency(&release, home, jmods),
+                Ok(Some(jmods)) => resolved_jdk_jmod_dependency(&release, home.clone(), jmods),
                 Ok(None) => resolved_jdk_dependency(version.clone(), None),
                 Err(message) => {
                     discovery.diagnostics.push(DependencyPackDiagnostic {
@@ -634,17 +656,24 @@ fn discover_jdk_semantic_pack_dependencies(
                 }
             }
         };
-        match dependency_by_version.entry(version) {
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert(discovery.dependencies.len());
-                discovery.dependencies.push(dependency);
-            }
-            std::collections::hash_map::Entry::Occupied(entry) => {
-                let existing = &discovery.dependencies[*entry.get()];
-                if jdk_dependency_priority(&dependency) > jdk_dependency_priority(existing) {
-                    discovery.dependencies[*entry.get()] = dependency;
-                }
-            }
+        // Distinct homes can report the same version while carrying different
+        // source or JMOD artifacts. Preparation supplies the exact digest;
+        // coalescing by release version here would erase one source binding.
+        dependency_homes.push(home);
+        discovery.dependencies.push(dependency);
+    }
+    let mut id_counts = HashMap::default();
+    for dependency in &discovery.dependencies {
+        *id_counts.entry(dependency.id.clone()).or_insert(0usize) += 1;
+    }
+    for (dependency, home) in discovery.dependencies.iter_mut().zip(dependency_homes) {
+        if id_counts[&dependency.id] > 1 {
+            // The ID correlates discovery with preparation in this run; the
+            // prepared input digest, not this path-derived suffix, is the
+            // artifact proof. Single-home IDs keep their existing display.
+            let mut digest = LengthDelimitedDigest::new(JDK_DISCOVERY_HOME_ID_DOMAIN);
+            digest.push(home.as_os_str().as_encoded_bytes());
+            dependency.id = format!("{}@{}", dependency.id, digest.finish());
         }
     }
     if discovery.dependencies.is_empty() && discovery.diagnostics.is_empty() && discovery_requested
@@ -661,22 +690,34 @@ fn discover_jdk_semantic_pack_dependencies(
     discovery
 }
 
-fn jdk_dependency_priority(dependency: &ResolvedDependency) -> u8 {
-    if dependency
-        .artifacts
-        .iter()
-        .any(|artifact| artifact.kind == ExternalArtifactKind::JdkSourceZip)
-    {
-        2
-    } else if dependency
-        .artifacts
-        .iter()
-        .any(|artifact| artifact.kind == ExternalArtifactKind::JdkJmodSet)
-    {
-        1
-    } else {
-        0
+/// The discovered home of one JDK dependency, derived only from the artifact
+/// layout that discovery itself emitted. This identifies the configured input
+/// for host-side correlation; it is never an artifact-content proof.
+pub(crate) fn jdk_home_for_dependency(dependency: &ResolvedDependency) -> Option<&Path> {
+    if dependency.evidence.ecosystem != "jdk" {
+        return None;
     }
+    let mut selected = None;
+    for artifact in &dependency.artifacts {
+        let home = match artifact.kind {
+            ExternalArtifactKind::JdkJmodSet => artifact.path(),
+            ExternalArtifactKind::JdkSourceZip => {
+                let parent = artifact.path().parent()?;
+                if parent.file_name().is_some_and(|name| name == "lib") {
+                    parent.parent()?
+                } else {
+                    parent
+                }
+            }
+            _ => return None,
+        };
+        match selected {
+            Some(previous) if previous != home => return None,
+            None => selected = Some(home),
+            _ => {}
+        }
+    }
+    selected
 }
 
 /// One selected JMOD archive with the filesystem metadata that stands in for
@@ -1912,6 +1953,32 @@ impl JvmExternalDeclarationIndex {
                     } else {
                         b"not-constant"
                     });
+                    digest.push(if member.call_shapes_incomplete {
+                        b"shapes-incomplete"
+                    } else {
+                        b"shapes-complete"
+                    });
+                    digest.push(&(member.call_shapes.len() as u64).to_le_bytes());
+                    for shape in &member.call_shapes {
+                        digest.push(&shape.parameter_count.to_le_bytes());
+                        digest.push(if shape.is_static {
+                            b"static-shape"
+                        } else {
+                            b"instance-shape"
+                        });
+                        digest.push(if shape.variadic {
+                            b"variadic"
+                        } else {
+                            b"fixed"
+                        });
+                        match shape.declared_return_type_fqn() {
+                            Some(return_type) => {
+                                digest.push(b"shape-named-return");
+                                digest.push(return_type.as_bytes());
+                            }
+                            None => digest.push(b"shape-no-named-return"),
+                        }
+                    }
                 }
             }
             digest.finish()
@@ -2236,11 +2303,20 @@ impl JvmExternalDeclarationIndex {
                 }
                 let is_static = member.is_static;
                 let is_constant = member.member_kind == MemberKind::Constant;
-                members
-                    .entry(member.name.clone())
-                    .or_insert_with(|| JvmExternalMember {
-                        fqn: qualified_name(&external_type.fqn, &member.name),
-                        declaring_package: external_type.package_name.clone(),
+                let shape =
+                    external_call_shape(member.member_kind, is_static, member.signature.as_ref());
+                let shapes_incomplete = callable_shape_is_incomplete(
+                    member.member_kind,
+                    member.signature.as_ref(),
+                    member.callable_family_complete,
+                    shape.is_some(),
+                );
+                retain_external_member(
+                    &mut members,
+                    &external_type.fqn,
+                    &external_type.package_name,
+                    RetainedExternalMember {
+                        name: member.name,
                         visibility: semantic_visibility(member.visibility),
                         // The class file's member table is what types a chained
                         // receiver (#2454), so this path carries the declared
@@ -2259,7 +2335,13 @@ impl JvmExternalDeclarationIndex {
                         // describes for return types.
                         is_static,
                         is_constant,
-                    });
+                        shape,
+                        shapes_incomplete,
+                    },
+                );
+            }
+            if member_budget.exhausted {
+                mark_call_shapes_incomplete(&mut members);
             }
             self.attach_member_surface(
                 &external_type.fqn,
@@ -2625,6 +2707,7 @@ fn semantic_visibility(visibility: Visibility) -> JvmVisibility {
 pub(crate) struct JvmExternalDeclarations<'a> {
     artifacts: &'a JvmExternalDeclarationIndex,
     packs: Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>,
+    selected_jdk_artifact_sha256: Option<Box<str>>,
 }
 
 impl<'a> JvmExternalDeclarations<'a> {
@@ -2632,7 +2715,30 @@ impl<'a> JvmExternalDeclarations<'a> {
         artifacts: &'a JvmExternalDeclarationIndex,
         packs: Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>,
     ) -> Self {
-        Self { artifacts, packs }
+        Self {
+            artifacts,
+            packs,
+            selected_jdk_artifact_sha256: None,
+        }
+    }
+
+    /// Scope JDK declaration facts to the exact artifact selected for this
+    /// Java source file. Other dependency packs keep their ordinary lookup.
+    pub(crate) fn select_jdk_artifact(mut self, digest: &str) -> Self {
+        self.selected_jdk_artifact_sha256 = Some(Box::<str>::from(digest));
+        self
+    }
+
+    fn admits_pack_symbol(
+        &self,
+        symbol: &crate::analyzer::semantic_model::SemanticModelSymbol,
+    ) -> bool {
+        self.selected_jdk_artifact_sha256
+            .as_deref()
+            .is_none_or(|expected| {
+                let matched = &symbol.provenance.activation.matched_evidence;
+                matched.ecosystem != "jdk" || matched.artifact_sha256.as_deref() == Some(expected)
+            })
     }
 
     /// Whether no surface can answer anything, so a caller may skip the ladder
@@ -2769,7 +2875,9 @@ impl<'a> JvmExternalDeclarations<'a> {
             .records
             .into_iter()
             .filter(|symbol| {
-                symbol.qualified_name == fqn || symbol.aliases.iter().any(|alias| alias == fqn)
+                self.admits_pack_symbol(symbol)
+                    && (symbol.qualified_name == fqn
+                        || symbol.aliases.iter().any(|alias| alias == fqn))
             })
             .filter_map(pack_external_type);
         let declared = declarations.next()?;
@@ -2814,49 +2922,102 @@ impl<'a> JvmExternalDeclarations<'a> {
         let owner_symbol = overlay
             .symbols_with_id(declaration_id)
             .records
-            .first()
-            .copied()?;
+            .into_iter()
+            .find(|symbol| self.admits_pack_symbol(symbol))?;
         let surface = overlay.owner_surface(owner_symbol);
-        surface.closure.iter().find_map(|declaring| {
-            let member = overlay
-                .members_of(&declaring.id)
-                .records
-                .into_iter()
-                .find(|symbol| {
-                    symbol.name == member_name
-                        && !symbol.provenance.ambiguous
-                        && JVM_SEMANTIC_PACK_LANGUAGES.contains(&symbol.language.as_str())
-                })?;
-            Some(JvmExternalMember {
-                fqn: member.qualified_name.clone(),
-                // The package split is the one [`pack_external_type`] makes on
-                // a type's declared name, taken from the declaring type rather
-                // than from the type the reference wrote.
-                declaring_package: declaring
-                    .qualified_name
-                    .rsplit_once('.')
-                    .map_or("", |(package, _)| package)
-                    .to_owned(),
-                visibility: semantic_visibility(member.visibility),
-                returns: member
-                    .structured_signature
-                    .as_ref()
-                    .and_then(|signature| signature.returns.clone()),
-                // Carried for parity with the artifact-derived member surface
-                // (#2538). The doc comment above already warns that a Scala
-                // `object` or Kotlin companion member is published without
-                // the static flag a Java `static` carries, so a caller that
-                // needs a *proof* of compile-time-constant-ness (not merely
-                // "declared const-shaped") must not rely on this half alone
-                // for those languages; [`JvmExternalMember::is_compile_time_constant`]
-                // requires both flags together and fails closed if either is
-                // under-reported.
-                is_static: member.is_static,
-                is_constant: member.kind
-                    == crate::analyzer::semantic_model::SemanticModelSymbolKind::Constant,
+        surface
+            .closure
+            .iter()
+            .filter(|declaring| self.admits_pack_symbol(declaring))
+            .find_map(|declaring| {
+                let matched = overlay
+                    .members_of(&declaring.id)
+                    .records
+                    .into_iter()
+                    .filter(|symbol| {
+                        symbol.name == member_name
+                            && self.admits_pack_symbol(symbol)
+                            && !symbol.provenance.ambiguous
+                            && JVM_SEMANTIC_PACK_LANGUAGES.contains(&symbol.language.as_str())
+                    })
+                    .collect::<Vec<_>>();
+                let member = *matched.first()?;
+                let mut call_shapes = Vec::new();
+                let mut call_shapes_incomplete = false;
+                for symbol in &matched {
+                    if !pack_symbol_is_callable(symbol.kind) {
+                        continue;
+                    }
+                    let Some(signature) = symbol.structured_signature.as_ref() else {
+                        call_shapes_incomplete = true;
+                        continue;
+                    };
+                    if !symbol.callable_family_complete {
+                        call_shapes_incomplete = true;
+                    }
+                    let Some(parameter_count) = u32::try_from(signature.parameters.len()).ok()
+                    else {
+                        call_shapes_incomplete = true;
+                        continue;
+                    };
+                    call_shapes.push(JvmExternalCallShape {
+                        parameter_count,
+                        is_static: symbol.is_static,
+                        variadic: signature
+                            .parameters
+                            .iter()
+                            .any(|parameter| parameter.variadic),
+                        returns: signature.returns.clone(),
+                    });
+                }
+                Some(JvmExternalMember {
+                    fqn: member.qualified_name.clone(),
+                    // The package split is the one [`pack_external_type`] makes on
+                    // a type's declared name, taken from the declaring type rather
+                    // than from the type the reference wrote.
+                    declaring_package: declaring
+                        .qualified_name
+                        .rsplit_once('.')
+                        .map_or("", |(package, _)| package)
+                        .to_owned(),
+                    visibility: semantic_visibility(member.visibility),
+                    returns: member
+                        .structured_signature
+                        .as_ref()
+                        .and_then(|signature| signature.returns.clone()),
+                    // Carried for parity with the artifact-derived member surface
+                    // (#2538). The doc comment above already warns that a Scala
+                    // `object` or Kotlin companion member is published without
+                    // the static flag a Java `static` carries, so a caller that
+                    // needs a *proof* of compile-time-constant-ness (not merely
+                    // "declared const-shaped") must not rely on this half alone
+                    // for those languages; [`JvmExternalMember::is_compile_time_constant`]
+                    // requires both flags together and fails closed if either is
+                    // under-reported.
+                    is_static: member.is_static,
+                    is_constant: member.kind
+                        == crate::analyzer::semantic_model::SemanticModelSymbolKind::Constant,
+                    jdk_artifact_sha256: (member.provenance.activation.matched_evidence.ecosystem
+                        == "jdk")
+                        .then(|| {
+                            member
+                                .provenance
+                                .activation
+                                .matched_evidence
+                                .artifact_sha256
+                                .clone()
+                        })
+                        .flatten(),
+                    call_shapes,
+                    call_shapes_incomplete,
+                })
             })
-        })
     }
+}
+
+fn pack_symbol_is_callable(kind: crate::analyzer::semantic_model::SemanticModelSymbolKind) -> bool {
+    use crate::analyzer::semantic_model::SemanticModelSymbolKind as Kind;
+    matches!(kind, Kind::Constructor | Kind::Method | Kind::Function)
 }
 
 /// One member an external declaration surface declares on an external type
@@ -2890,6 +3051,9 @@ pub(crate) struct JvmExternalMember {
     /// is the return type of the *first* declaration read for that name. That is
     /// the same "overloads are one name, not ambiguity" rule
     /// [`JvmIndexedOwnerSurface`] already applies to the member itself.
+    /// A caller that needs the return type of the overload a written call
+    /// *selects*, rather than a name to continue a ladder from, asks
+    /// [`JvmExternalMember::applicable_return_type_fqn`] instead (#3522).
     returns: Option<TypeRef>,
     /// Whether the declaring half marked this member `static` (#2538).
     is_static: bool,
@@ -2904,9 +3068,46 @@ pub(crate) struct JvmExternalMember {
     /// constant" should require both, so a producer that ever set one flag
     /// without the other fails closed instead of over-claiming.
     is_constant: bool,
+    /// Exact JDK declaration artifact. The Java source's selected toolchain is
+    /// separate evidence and cannot turn an arbitrary library call into a JDK call.
+    jdk_artifact_sha256: Option<String>,
+    /// Every callable overload of this name the declaring surface recorded.
+    ///
+    /// The collapsed member above answers "does this name exist". These shapes
+    /// answer whether one written receiver and argument count selects a single
+    /// signature. Same-arity overloads stay distinct entries so a call that
+    /// matches two of them is not treated as one proof. Each shape carries its
+    /// own declared return type, so a selected shape can type a chained
+    /// receiver without a name-only reading of some other overload (#3522).
+    call_shapes: Vec<JvmExternalCallShape>,
+    /// A callable with this name was dropped, lacked a signature, or did not
+    /// certify that its overload family is complete. Applicability then stays
+    /// unknown instead of treating the recorded shapes as exhaustive.
+    call_shapes_incomplete: bool,
+}
+
+/// One callable overload retained beside the collapsed member name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct JvmExternalCallShape {
+    parameter_count: u32,
+    is_static: bool,
+    variadic: bool,
+    /// The type this overload's own declaration writes as its return type.
+    ///
+    /// The collapsed [`JvmExternalMember::returns`] holds the first
+    /// declaration's answer for the whole name, which is enough to continue a
+    /// receiver ladder from a written name but is not the *selected*
+    /// overload's answer. Keeping the type beside the shape lets a caller ask
+    /// for the return type of the one signature an argument count and
+    /// receiver shape actually select (#3522).
+    returns: Option<TypeRef>,
 }
 
 impl JvmExternalMember {
+    pub(crate) fn jdk_artifact_sha256(&self) -> Option<&str> {
+        self.jdk_artifact_sha256.as_deref()
+    }
+
     pub(crate) fn fqn(&self) -> &str {
         &self.fqn
     }
@@ -2927,10 +3128,7 @@ impl JvmExternalMember {
     /// A primitive return spells a `Named` type no external surface declares, so
     /// it fails at the next rung rather than here.
     pub(crate) fn declared_return_type_fqn(&self) -> Option<&str> {
-        match self.returns.as_ref()? {
-            TypeRef::Named { name, .. } if !name.is_empty() => Some(name),
-            _ => None,
-        }
+        named_return_type_fqn(self.returns.as_ref())
     }
 
     fn is_accessible_from_package(&self, package_name: &str) -> bool {
@@ -2956,6 +3154,182 @@ impl JvmExternalMember {
     /// producer that only ever set one of the two still fails closed.
     pub(crate) fn is_compile_time_constant(&self) -> bool {
         self.is_static && self.is_constant
+    }
+
+    /// The parameter count of the one non-variadic overload that accepts
+    /// `arity` arguments with this receiver shape.
+    ///
+    /// `None` when the surface did not record a complete overload family, when
+    /// a variadic overload could also accept the call, or when zero or several
+    /// fixed signatures match. A name-only member is not a signature.
+    pub(crate) fn applicable_parameter_count(
+        &self,
+        instance_receiver: bool,
+        arity: usize,
+    ) -> Option<u32> {
+        self.applicable_shape(instance_receiver, arity)
+            .map(|shape| shape.parameter_count)
+    }
+
+    /// The declared return type of the same one overload
+    /// [`Self::applicable_parameter_count`] selects (#3522).
+    ///
+    /// `None` whenever the surface cannot select exactly one applicable
+    /// signature, and whenever that signature's own declaration writes no
+    /// class name as its return type. A chained receiver cannot be typed from
+    /// this surface on a name-only reading of some other overload.
+    pub(crate) fn applicable_return_type_fqn(
+        &self,
+        instance_receiver: bool,
+        arity: usize,
+    ) -> Option<&str> {
+        self.applicable_shape(instance_receiver, arity)?
+            .declared_return_type_fqn()
+    }
+
+    /// The one recorded overload this written arity and receiver shape select.
+    ///
+    /// `None` when the surface did not record a complete overload family, when
+    /// a variadic overload could also accept the call, or when zero or several
+    /// fixed signatures match. A name-only member is not a signature.
+    fn applicable_shape(
+        &self,
+        instance_receiver: bool,
+        arity: usize,
+    ) -> Option<&JvmExternalCallShape> {
+        if self.call_shapes_incomplete {
+            return None;
+        }
+        let arity = u32::try_from(arity).ok()?;
+        let wants_static = !instance_receiver;
+        let mut matched = None;
+        for shape in &self.call_shapes {
+            if shape.is_static != wants_static {
+                continue;
+            }
+            if shape.variadic {
+                let minimum = shape.parameter_count.saturating_sub(1);
+                if arity >= minimum {
+                    return None;
+                }
+                continue;
+            }
+            if shape.parameter_count != arity {
+                continue;
+            }
+            if matched.is_some() {
+                return None;
+            }
+            matched = Some(shape);
+        }
+        matched
+    }
+}
+
+impl JvmExternalCallShape {
+    /// The fully-qualified name this overload's declaration writes as its
+    /// return type, or `None` for a form that names no class.
+    fn declared_return_type_fqn(&self) -> Option<&str> {
+        named_return_type_fqn(self.returns.as_ref())
+    }
+}
+
+/// The class name one recorded declared return type spells, or `None` for a
+/// form that names no single declaration.
+///
+/// Shared by the collapsed member and each retained overload so a chained
+/// receiver reads the same rule from either (#2454, #3522): only a `Named`,
+/// non-empty type names a class the member lookup can continue from.
+fn named_return_type_fqn(returns: Option<&TypeRef>) -> Option<&str> {
+    match returns? {
+        TypeRef::Named { name, .. } if !name.is_empty() => Some(name),
+        _ => None,
+    }
+}
+
+fn callable_member_kind(kind: MemberKind) -> bool {
+    matches!(kind, MemberKind::Method | MemberKind::Constructor)
+}
+
+fn external_call_shape(
+    kind: MemberKind,
+    is_static: bool,
+    signature: Option<&Signature>,
+) -> Option<JvmExternalCallShape> {
+    if !callable_member_kind(kind) {
+        return None;
+    }
+    let signature = signature?;
+    let parameter_count = u32::try_from(signature.parameters.len()).ok()?;
+    Some(JvmExternalCallShape {
+        parameter_count,
+        is_static,
+        variadic: signature
+            .parameters
+            .iter()
+            .any(|parameter| parameter.variadic),
+        returns: signature.returns.clone(),
+    })
+}
+
+/// A callable whose signature or overload family is not fully known cannot
+/// support an exact applicability claim. Fields are not callables, so a field
+/// that shares the name does not make the method family incomplete.
+fn callable_shape_is_incomplete(
+    kind: MemberKind,
+    signature: Option<&Signature>,
+    family_complete: bool,
+    shape_recorded: bool,
+) -> bool {
+    callable_member_kind(kind) && (signature.is_none() || !family_complete || !shape_recorded)
+}
+
+/// One overload contribution while a declaration surface is collapsed to a
+/// single member name. Later contributions of the same name only add shapes.
+struct RetainedExternalMember {
+    name: String,
+    visibility: JvmVisibility,
+    returns: Option<TypeRef>,
+    is_static: bool,
+    is_constant: bool,
+    shape: Option<JvmExternalCallShape>,
+    shapes_incomplete: bool,
+}
+
+fn retain_external_member(
+    members: &mut HashMap<String, JvmExternalMember>,
+    owner_fqn: &str,
+    owner_package: &str,
+    retained: RetainedExternalMember,
+) {
+    match members.entry(retained.name) {
+        std::collections::hash_map::Entry::Vacant(slot) => {
+            let name = slot.key().clone();
+            slot.insert(JvmExternalMember {
+                fqn: qualified_name(owner_fqn, &name),
+                declaring_package: owner_package.to_owned(),
+                visibility: retained.visibility,
+                returns: retained.returns,
+                is_static: retained.is_static,
+                is_constant: retained.is_constant,
+                jdk_artifact_sha256: None,
+                call_shapes: retained.shape.into_iter().collect(),
+                call_shapes_incomplete: retained.shapes_incomplete,
+            });
+        }
+        std::collections::hash_map::Entry::Occupied(mut slot) => {
+            let existing = slot.get_mut();
+            if let Some(shape) = retained.shape {
+                existing.call_shapes.push(shape);
+            }
+            existing.call_shapes_incomplete |= retained.shapes_incomplete;
+        }
+    }
+}
+
+fn mark_call_shapes_incomplete(members: &mut HashMap<String, JvmExternalMember>) {
+    for member in members.values_mut() {
+        member.call_shapes_incomplete = true;
     }
 }
 
@@ -3552,7 +3926,7 @@ fn home_dir() -> Option<PathBuf> {
         })
 }
 
-fn resolve_path(project_root: &Path, path: &Path) -> PathBuf {
+pub(crate) fn resolve_path(project_root: &Path, path: &Path) -> PathBuf {
     if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -3993,6 +4367,63 @@ mod tests {
     const SOURCE_JAR: &str = "external-lib-1.2.3-sources.jar";
 
     #[test]
+    #[ignore = "requires BIFROST_JDK_HOME pointing to a pinned JDK installation"]
+    fn pinned_jdk_home_preparation_is_cached() {
+        use crate::analyzer::JvmStandardLibraryDiscoveryConfig;
+        use crate::analyzer::semantic_model::{
+            CatalogOptions, DependencyPackPreparationStatus, SemanticPackCatalog,
+            prepare_dependency_semantic_packs,
+        };
+
+        let home =
+            PathBuf::from(std::env::var_os("BIFROST_JDK_HOME").expect("set BIFROST_JDK_HOME"));
+        let root = tempfile::tempdir().unwrap();
+        let project = TestProject::new(root.path(), Language::Java);
+        let config = JvmAnalyzerConfig {
+            dependency_discovery: crate::analyzer::JvmDependencyDiscoveryConfig {
+                mode: JvmDependencyDiscoveryMode::Disabled,
+                ..Default::default()
+            },
+            standard_library_discovery: JvmStandardLibraryDiscoveryConfig {
+                jdk_homes: vec![home],
+                discover_java_home: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let limits = DependencyPackLimits::default();
+        let discovered = resolve_jvm_semantic_pack_dependencies(&config, &project, &limits, None);
+        assert!(discovered.complete, "{discovered:#?}");
+        assert_eq!(discovered.dependencies.len(), 1, "{discovered:#?}");
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        let prepared = prepare_dependency_semantic_packs(
+            &catalog,
+            &JvmDependencyPackAdapter,
+            &discovered.dependencies,
+            &limits,
+            None,
+        );
+        // Partial declaration coverage is expected, but the artifact must
+        // still install and leave exact activation evidence and a cache entry.
+        assert_eq!(prepared.packs.len(), 1, "{prepared:#?}");
+        assert_eq!(prepared.evidence.len(), 1, "{prepared:#?}");
+        assert_eq!(
+            prepared.packs[0].status,
+            DependencyPackPreparationStatus::Generated
+        );
+        let reused = prepare_dependency_semantic_packs(
+            &catalog,
+            &JvmDependencyPackAdapter,
+            &discovered.dependencies,
+            &limits,
+            None,
+        );
+        assert_eq!(reused.packs.len(), 1, "{reused:#?}");
+        assert_eq!(reused.profile.generated_packs, 0, "{reused:#?}");
+        assert_eq!(reused.evidence, prepared.evidence);
+    }
+
+    #[test]
     fn missing_jdk_discovery_explains_how_to_activate_stdlib_packs() {
         let config = JvmAnalyzerConfig::default();
         let root = tempfile::tempdir().expect("temp root");
@@ -4240,12 +4671,12 @@ mod tests {
     }
 
     #[test]
-    fn configured_jdk_home_discovers_and_generates_exact_source_pack() {
-        use crate::analyzer::JvmStandardLibraryDiscoveryConfig;
+    fn source_bound_jdk_home_discovers_and_generates_exact_source_pack() {
         use crate::analyzer::semantic_model::{
             CatalogOptions, DependencyPackPreparationStatus, SemanticPackCatalog,
             prepare_dependency_semantic_packs,
         };
+        use crate::analyzer::{JvmSourceToolchainBinding, JvmStandardLibraryDiscoveryConfig};
 
         let root = tempfile::tempdir().unwrap();
         let relative_home = PathBuf::from("toolchains").join("jdk-21");
@@ -4273,8 +4704,12 @@ mod tests {
                 ..Default::default()
             },
             standard_library_discovery: JvmStandardLibraryDiscoveryConfig {
-                jdk_homes: vec![relative_home],
+                source_toolchains: vec![JvmSourceToolchainBinding::new(
+                    PathBuf::from("src"),
+                    relative_home,
+                )],
                 discover_java_home: false,
+                ..Default::default()
             },
             ..JvmAnalyzerConfig::default()
         };
@@ -4306,6 +4741,318 @@ mod tests {
             DependencyPackPreparationStatus::Generated
         );
         assert!(prepared.packs[0].evidence.artifact_sha256.is_some());
+    }
+
+    #[test]
+    fn same_version_source_bound_jdk_homes_retain_distinct_artifact_evidence() {
+        use crate::analyzer::semantic_model::{
+            CatalogOptions, SemanticPackCatalog, prepare_dependency_semantic_packs,
+        };
+        use crate::analyzer::{JvmSourceToolchainBinding, JvmStandardLibraryDiscoveryConfig};
+
+        let root = tempfile::tempdir().unwrap();
+        let home_a = PathBuf::from("toolchains/jdk-a");
+        let home_b = PathBuf::from("toolchains/jdk-b");
+        for (home, source) in [
+            (
+                &home_a,
+                b"package java.lang; public final class String { public String trim() { return this; } }"
+                    .as_slice(),
+            ),
+            (
+                &home_b,
+                b"package java.lang; public final class String { public String strip() { return this; } }"
+                    .as_slice(),
+            ),
+        ] {
+            let absolute = root.path().join(home);
+            fs::create_dir_all(absolute.join("lib")).unwrap();
+            fs::write(absolute.join("release"), "JAVA_VERSION=\"21.0.8\"\n").unwrap();
+            write_zip_entries(
+                &absolute.join("lib/src.zip"),
+                &[
+                    (
+                        "java.base/module-info.java",
+                        b"module java.base { exports java.lang; }",
+                    ),
+                    ("java.base/java/lang/String.java", source),
+                ],
+            );
+        }
+        let project = TestProject::new(root.path(), Language::Java);
+        let config = JvmAnalyzerConfig {
+            dependency_discovery: crate::analyzer::JvmDependencyDiscoveryConfig {
+                mode: JvmDependencyDiscoveryMode::Disabled,
+                ..Default::default()
+            },
+            standard_library_discovery: JvmStandardLibraryDiscoveryConfig {
+                source_toolchains: vec![
+                    JvmSourceToolchainBinding::new(PathBuf::from("module-a"), home_a),
+                    JvmSourceToolchainBinding::new(PathBuf::from("module-b"), home_b),
+                    JvmSourceToolchainBinding::new(
+                        PathBuf::from("module-conflict"),
+                        PathBuf::from("toolchains/jdk-a"),
+                    ),
+                    JvmSourceToolchainBinding::new(
+                        PathBuf::from("module-conflict"),
+                        PathBuf::from("toolchains/jdk-b"),
+                    ),
+                ],
+                discover_java_home: false,
+                ..Default::default()
+            },
+            ..JvmAnalyzerConfig::default()
+        };
+        let limits = DependencyPackLimits::default();
+        let discovered = resolve_jvm_semantic_pack_dependencies(&config, &project, &limits, None);
+        assert!(discovered.complete, "{:#?}", discovered.diagnostics);
+        assert_eq!(discovered.dependencies.len(), 2);
+        assert_ne!(
+            discovered.dependencies[0].id, discovered.dependencies[1].id,
+            "equal release versions must still correlate to separate preparations"
+        );
+
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        let prepared = prepare_dependency_semantic_packs(
+            &catalog,
+            &JvmDependencyPackAdapter,
+            &discovered.dependencies,
+            &limits,
+            None,
+        );
+        assert!(prepared.complete, "{:#?}", prepared.diagnostics);
+        assert_eq!(prepared.packs.len(), 2);
+        for (discovered, prepared) in discovered.dependencies.iter().zip(&prepared.packs) {
+            assert_eq!(discovered.id, prepared.dependency_id);
+        }
+        let digests = prepared
+            .packs
+            .iter()
+            .map(|pack| pack.evidence.artifact_sha256.as_deref().unwrap())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            digests.len(),
+            2,
+            "each selected JDK needs its own exact artifact"
+        );
+        let mapping = crate::analyzer::workspace::prepared_jdk_artifacts_for_source_bindings(
+            &crate::analyzer::AnalyzerConfig {
+                jvm: config.clone(),
+                ..Default::default()
+            },
+            root.path(),
+            &[crate::analyzer::workspace::DependencyPackEcosystemOutcome {
+                ecosystem: crate::analyzer::DependencyPackEcosystem::Jvm,
+                discovery: discovered,
+                preparation: Some(prepared),
+            }],
+        )
+        .expect("the JVM ecosystem was prepared");
+        assert_eq!(mapping.len(), 2);
+        for binding in &config.standard_library_discovery.source_toolchains {
+            let evidence = mapping
+                .get(binding.jdk_home())
+                .expect("each configured home has exact prepared evidence");
+            assert_eq!(evidence.ecosystem, "jdk");
+            assert!(evidence.artifact_sha256.is_some());
+        }
+        assert_ne!(
+            mapping[config.standard_library_discovery.source_toolchains[0].jdk_home()]
+                .artifact_sha256,
+            mapping[config.standard_library_discovery.source_toolchains[1].jdk_home()]
+                .artifact_sha256,
+        );
+        for (module, source) in [
+            (
+                "module-a",
+                "class App { void run(String value) { value.trim(); value.strip(); } }",
+            ),
+            (
+                "module-b",
+                "class App { void run(String value) { value.strip(); value.trim(); } }",
+            ),
+            (
+                "module-conflict",
+                "class App { void run(String value) { value.trim(); } }",
+            ),
+            (
+                "module-unbound",
+                "class App { void run(String value) { value.trim(); } }",
+            ),
+        ] {
+            let source_dir = root.path().join(module).join("src");
+            fs::create_dir_all(&source_dir).unwrap();
+            fs::write(source_dir.join("App.java"), source).unwrap();
+        }
+        let workspace = crate::analyzer::WorkspaceAnalyzer::build_ephemeral_footgun(
+            Arc::new(TestProject::new(root.path(), Language::Java)),
+            crate::analyzer::AnalyzerConfig {
+                jvm: config.clone(),
+                ..Default::default()
+            },
+        )
+        .expect("two-module Java workspace builds");
+        let live = CancellationToken::default();
+        let activation = crate::analyzer::semantic_model::SemanticModelActivationRequest {
+            bifrost_version: Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
+            evidence: Vec::new(),
+            controls: Vec::new(),
+            limits: Default::default(),
+        };
+        let outcome = workspace.activate_dependency_packs(
+            &crate::analyzer::AnalyzerConfig {
+                jvm: config.clone(),
+                ..Default::default()
+            },
+            &[crate::analyzer::DependencyPackEcosystem::Jvm],
+            crate::analyzer::DependencyPackWorkspaceContext {
+                catalog: &catalog,
+                persistence: None,
+                activation: &activation,
+                limits,
+                cancellation: &live,
+            },
+        );
+        let crate::analyzer::semantic_model::SemanticModelRuntimeOutcome::Ready {
+            snapshot, ..
+        } = outcome.runtime.as_ref().expect("JDK activation runs")
+        else {
+            panic!("both prepared JDKs must publish: {outcome:#?}");
+        };
+        for binding in &config.standard_library_discovery.source_toolchains {
+            assert_eq!(
+                snapshot.jdk_artifact_for_home(binding.jdk_home()),
+                mapping.get(binding.jdk_home()),
+                "publication must keep the selected home and its exact artifact together"
+            );
+        }
+        let check = |module: &str, member: &str| {
+            let file = ProjectFile::new(root.path(), format!("{module}/src/App.java"));
+            let source = fs::read_to_string(file.abs_path()).unwrap();
+            let start = source.find(&format!("{member}()")).unwrap();
+            let scope = AnalyzerQueryScope::new(workspace.analyzer());
+            let outcomes =
+                crate::analyzer::usages::get_definition::resolve_call_target_batch_with_source(
+                    workspace.analyzer(),
+                    scope.token(),
+                    vec![
+                        crate::analyzer::usages::get_definition::DefinitionLookupRequest {
+                            file: file.clone(),
+                            line: None,
+                            column: None,
+                            start_byte: Some(start),
+                            end_byte: Some(start + member.len()),
+                        },
+                    ],
+                    file.clone(),
+                    Arc::<str>::from(source.as_str()),
+                    None,
+                );
+            outcomes.into_iter().next().expect("one call request")
+        };
+        for (module, accepted, rejected) in
+            [("module-a", "trim", "strip"), ("module-b", "strip", "trim")]
+        {
+            let positive = check(module, accepted);
+            let proof = positive
+                .exact_external_call
+                .as_ref()
+                .unwrap_or_else(|| panic!("{module} must bind its own JDK member: {positive:#?}"));
+            let home = config
+                .standard_library_discovery
+                .source_toolchains
+                .iter()
+                .find(|binding| binding.source_root() == Path::new(module))
+                .unwrap()
+                .jdk_home();
+            assert_eq!(
+                proof.source_jdk_artifact(),
+                mapping.get(home),
+                "the resolver must carry this module's prepared artifact"
+            );
+            let near_miss = check(module, rejected);
+            assert!(
+                near_miss.exact_external_call.is_none(),
+                "a member declared only by the other JDK must not bind here: {near_miss:#?}"
+            );
+        }
+        for module in ["module-conflict", "module-unbound"] {
+            let unresolved = check(module, "trim");
+            assert!(
+                unresolved.exact_external_call.is_none(),
+                "{module} has no unique selected JDK artifact: {unresolved:#?}"
+            );
+        }
+        let oracle = workspace.semantic_oracle_provider();
+        for (module, selected_member) in [("module-a", "trim"), ("module-b", "strip")] {
+            let file = ProjectFile::new(root.path(), format!("{module}/src/App.java"));
+            let mut budget = crate::analyzer::semantic::SemanticBudget::default();
+            let artifact = workspace
+                .materialize_program_semantics(
+                    &file,
+                    &mut crate::analyzer::semantic::SemanticRequest::new(&mut budget, &live),
+                )
+                .expect("Java semantic materialization")
+                .available_value()
+                .cloned()
+                .expect("Java semantic artifact");
+            let mut targets = Vec::new();
+            for procedure in artifact.procedures() {
+                for call in procedure.call_sites() {
+                    let handle = artifact
+                        .procedure_handle(procedure.id())
+                        .and_then(|procedure| procedure.call_site_handle(call.id))
+                        .expect("scoped call handle");
+                    let mut budget = crate::analyzer::semantic::SemanticBudget::default();
+                    let outcome = crate::analyzer::semantic::DispatchOracle::resolve_call(
+                        &oracle,
+                        &handle,
+                        &mut crate::analyzer::semantic::SemanticRequest::new(&mut budget, &live),
+                    )
+                    .expect("Java external dispatch");
+                    let result = outcome
+                        .available_value()
+                        .expect("dispatch retains a result");
+                    targets.extend(
+                        result
+                            .boundaries()
+                            .iter()
+                            .filter_map(|boundary| boundary.unmaterialized_external_target())
+                            .filter(|target| matches!(target.member(), "trim" | "strip"))
+                            .cloned(),
+                    );
+                }
+            }
+            let exact = targets
+                .iter()
+                .filter(|target| target.has_resolver_owned_call_shape())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                exact.len(),
+                1,
+                "{module} has one exact JDK call: {targets:#?}"
+            );
+            assert_eq!(exact[0].member(), selected_member);
+            assert!(
+                targets
+                    .iter()
+                    .filter(|target| !target.has_resolver_owned_call_shape())
+                    .all(|target| target.selected_jdk_artifact().is_none()),
+                "syntax-only targets cannot inherit JDK applicability"
+            );
+            let home = config
+                .standard_library_discovery
+                .source_toolchains
+                .iter()
+                .find(|binding| binding.source_root() == Path::new(module))
+                .unwrap()
+                .jdk_home();
+            assert_eq!(
+                exact[0].selected_jdk_artifact(),
+                mapping.get(home),
+                "semantic dispatch preserves the full resolver-proven JDK row"
+            );
+        }
     }
 
     #[test]
@@ -4348,6 +5095,7 @@ mod tests {
             standard_library_discovery: JvmStandardLibraryDiscoveryConfig {
                 jdk_homes: vec![relative_home],
                 discover_java_home: false,
+                ..Default::default()
             },
             ..JvmAnalyzerConfig::default()
         };
@@ -4432,6 +5180,7 @@ mod tests {
             standard_library_discovery: JvmStandardLibraryDiscoveryConfig {
                 jdk_homes: vec![home.clone()],
                 discover_java_home: false,
+                ..Default::default()
             },
             ..JvmAnalyzerConfig::default()
         };
@@ -4617,6 +5366,7 @@ mod tests {
             standard_library_discovery: JvmStandardLibraryDiscoveryConfig {
                 jdk_homes: vec![home.to_path_buf()],
                 discover_java_home: false,
+                ..Default::default()
             },
             ..JvmAnalyzerConfig::default()
         }
@@ -4800,6 +5550,7 @@ mod tests {
             standard_library_discovery: JvmStandardLibraryDiscoveryConfig {
                 jdk_homes: vec![home],
                 discover_java_home: false,
+                ..Default::default()
             },
             ..JvmAnalyzerConfig::default()
         };

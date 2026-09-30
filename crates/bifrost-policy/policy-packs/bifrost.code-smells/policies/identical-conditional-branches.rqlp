@@ -1,0 +1,26 @@
+; Report structurally equivalent arms only when compared references have
+; proven identities. Java field and method selectors require one exact indexed
+; target and equivalent receivers; unresolved members remain open.
+(policy
+  :schema-version 1
+  :id "bifrost.correctness.identical-conditional-branches"
+  :name "Identical conditional branches"
+  :message "two branches of this conditional have equivalent bodies under proven reference identities"
+  :severity warning
+  :description "Two arms of the same ordered conditional have equivalent structured bodies under proven reference identities. This may be a copy/paste error or redundant control flow. Inspect the condition and branch intent; removing the conditional requires preserving condition evaluation, bindings, and scope. Ordinary local or parameter references and calls through the same lexical callee binding qualify. Java fields and calls qualify only with one exact indexed target, equivalent receivers, and equivalent arguments. Unresolved or ambiguous callees, other property operations, and unresolved binding identities remain open."
+  :help-uri "https://bifrost.brokk.ai/static-analysis-policies/#built-in-code-smell-pack"
+  :tags ["correctness" "conditional" "code-smell"]
+  :analysis (analysis
+    :type assertion
+    (bind :name branch
+      :query (rql :schema-version 1
+        (filter :where ((verdict eq proven))
+          (branch-relations :relation [identical-bodies]
+            (union
+              (language java (if))
+              (language javascript (if))
+              (language typescript (if))
+              (language python (if)))))))
+    (group :name by-branch :by (branch.id)
+      (aggregate :name violations :op count))
+    (assert :group by-branch :value violations :cardinality (exactly 0))))

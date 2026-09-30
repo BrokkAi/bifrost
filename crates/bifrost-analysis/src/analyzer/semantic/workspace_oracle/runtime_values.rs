@@ -599,6 +599,46 @@ fn runtime_syntax_facts(
 
 pub(super) type RuntimeReadCache = CompleteValueCache<ProcedureHandle, RuntimeKeyedReadResult>;
 
+/// Pure frontend facts, before model activation or procedure-local projection.
+/// A complete census can still describe invalid syntax; consumers must retain
+/// that coverage boundary instead of treating the snapshot as semantic proof.
+#[derive(Debug)]
+pub(crate) struct RuntimeSyntaxSnapshot {
+    facts: RuntimeSyntaxFacts,
+    has_error: bool,
+    work: SemanticWork,
+}
+
+pub(crate) type RuntimeSyntaxCache = CompleteValueCache<StableDigest, RuntimeSyntaxSnapshot>;
+
+pub(crate) fn runtime_syntax_cache() -> RuntimeSyntaxCache {
+    CompleteValueCache::new(8 * 1024 * 1024, |_, value: &Arc<RuntimeSyntaxSnapshot>| {
+        let facts = &value.facts;
+        let weight = std::mem::size_of::<RuntimeSyntaxSnapshot>()
+            + facts.reads.capacity() * std::mem::size_of::<RuntimeSyntaxRead>()
+            + facts.writes.capacity() * std::mem::size_of::<String>();
+        facts
+            .reads
+            .iter()
+            .fold(
+                facts.writes.iter().fold(weight, |total, write| {
+                    total.saturating_add(write.capacity())
+                }),
+                |total, read| {
+                    total.saturating_add(
+                        read.root_name.capacity()
+                            + read.container.capacity()
+                            + match &read.key {
+                                Ok(RuntimeAccessKey::Property(key)) => key.capacity(),
+                                _ => 0,
+                            },
+                    )
+                },
+            )
+            .min(u32::MAX as usize) as u32
+    })
+}
+
 /// The runtime initialization and mutation footprint of every other
 /// JavaScript or TypeScript module in the workspace.
 ///
@@ -675,6 +715,137 @@ pub(super) fn runtime_read_cache() -> RuntimeReadCache {
 }
 
 impl WorkspaceSemanticOracle<'_> {
+    fn runtime_syntax_for_source(
+        &self,
+        dialect: LanguageDialect,
+        source: &str,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<SemanticOutcome<Arc<RuntimeSyntaxSnapshot>>, SemanticProviderError> {
+        let mut identity = LengthDelimitedDigest::new(b"bifrost.runtime-syntax.v1");
+        identity.push(dialect.stable_label().as_bytes());
+        identity.push(source.as_bytes());
+        let key = identity.finish();
+        let (acquisition, _) = self.runtime_syntax.acquire(&key, request.cancellation);
+        let permit = match acquisition {
+            CompleteValueAcquisition::Cached { value } => {
+                let repeat = request.budget.has_charged_artifact(key);
+                let work = if repeat {
+                    SemanticWork {
+                        nested_entries: 1,
+                        ..SemanticWork::default()
+                    }
+                } else {
+                    value.work
+                };
+                if let Err(exceeded) = request.budget.charge_complete_artifact_hit(key, value.work)
+                {
+                    return Ok(SemanticOutcome::ExceededBudget {
+                        partial: None,
+                        exceeded,
+                        work,
+                    });
+                }
+                // The execution ledger measures traversal actually performed;
+                // reuse imports the census but only performs one lookup.
+                if !request.charge_execution_traversal(1) {
+                    return Ok(SemanticOutcome::Unproven {
+                        partial: value,
+                        work,
+                    });
+                }
+                return Ok(SemanticOutcome::Complete { value, work });
+            }
+            CompleteValueAcquisition::Leader { permit } => permit,
+            CompleteValueAcquisition::Cancelled => {
+                return Ok(SemanticOutcome::Cancelled {
+                    partial: None,
+                    work: SemanticWork::default(),
+                });
+            }
+            CompleteValueAcquisition::Rejected => {
+                unreachable!("runtime syntax never rejects a flight")
+            }
+        };
+        let mut work = SemanticWork {
+            source_bytes: source.len(),
+            ..SemanticWork::default()
+        };
+        if let Err(exceeded) = request.budget.charge(work) {
+            return Ok(SemanticOutcome::ExceededBudget {
+                partial: None,
+                exceeded,
+                work,
+            });
+        }
+        let grammar = parser_language_for_dialect(dialect)
+            .ok_or_else(|| SemanticProviderError::internal("runtime-read dialect has no parser"))?;
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&grammar)
+            .map_err(|error| SemanticProviderError::internal(error.to_string()))?;
+        let mut input = |offset: usize, _| &source.as_bytes()[offset..];
+        let mut progress = |_: &tree_sitter::ParseState| request.cancellation.is_cancelled();
+        let tree = parser.parse_with_options(
+            &mut input,
+            None,
+            Some(tree_sitter::ParseOptions::new().progress_callback(&mut progress)),
+        );
+        if request.cancellation.is_cancelled() {
+            return Ok(SemanticOutcome::Cancelled {
+                partial: None,
+                work,
+            });
+        }
+        let Some(tree) = tree else {
+            return Ok(SemanticOutcome::Unknown {
+                partial: None,
+                work,
+            });
+        };
+        let facts = runtime_syntax_facts(
+            dialect.language(),
+            tree.root_node(),
+            source,
+            request.budget.remaining().nested_entries,
+        );
+        let fact_work = SemanticWork {
+            nested_entries: facts
+                .visited_nodes
+                .saturating_add(facts.reads.len())
+                .saturating_add(facts.writes.len()),
+            ..SemanticWork::default()
+        };
+        work = work.conservative_add(fact_work);
+        if let Err(exceeded) = request.budget.charge(fact_work) {
+            return Ok(SemanticOutcome::ExceededBudget {
+                partial: None,
+                exceeded,
+                work,
+            });
+        }
+        if request.cancellation.is_cancelled() {
+            return Ok(SemanticOutcome::Cancelled {
+                partial: None,
+                work,
+            });
+        }
+        let traversed = request.charge_execution_traversal(facts.visited_nodes);
+        let value = Arc::new(RuntimeSyntaxSnapshot {
+            facts,
+            has_error: tree.root_node().has_error(),
+            work,
+        });
+        if !traversed || !value.facts.complete {
+            return Ok(SemanticOutcome::Unproven {
+                partial: value,
+                work,
+            });
+        }
+        request.budget.record_charged_artifact(key);
+        permit.publish_complete(Arc::clone(&value));
+        Ok(SemanticOutcome::Complete { value, work })
+    }
+
     /// Inspect every other JavaScript or TypeScript module once per captured
     /// oracle for the runtime-root writes the pristine-input model names.
     ///
@@ -727,7 +898,6 @@ impl WorkspaceSemanticOracle<'_> {
         let files = project
             .all_files_shared()
             .map_err(|error| SemanticProviderError::internal(error.to_string()))?;
-        let mut parser = tree_sitter::Parser::new();
         for file in files.iter() {
             // Only a module of the same language can spell a write to this
             // runtime root: the exposure's binder is that language's own.
@@ -737,53 +907,29 @@ impl WorkspaceSemanticOracle<'_> {
             if request.cancellation.is_cancelled() {
                 return Ok((WorkspaceRuntimeWriteFootprint::CoverageLimited, work));
             }
-            let max_bytes = request.budget.remaining().source_bytes;
+            // A previously paid source must still be readable for exact identity
+            // validation after its allowance has been consumed. The syntax cache
+            // charges any new content before parsing or returning its facts.
+            let max_bytes = request.budget.limits().source_bytes;
             let snapshot = project
                 .read_source_snapshot_limited(file, max_bytes)
                 .map_err(|error| SemanticProviderError::internal(error.to_string()))?;
             let Some(snapshot) = snapshot else {
                 return Ok((WorkspaceRuntimeWriteFootprint::CoverageLimited, work));
             };
-            let source = snapshot.source().to_owned();
-            let file_work = SemanticWork {
-                source_bytes: source.len(),
-                ..SemanticWork::default()
+            let outcome = self.runtime_syntax_for_source(
+                LanguageDialect::for_path(file.language(), file.rel_path()),
+                snapshot.source(),
+                request,
+            )?;
+            work = work.conservative_add(outcome.work());
+            let SemanticOutcome::Complete { value, .. } = outcome else {
+                return Ok((WorkspaceRuntimeWriteFootprint::CoverageLimited, work));
             };
-            work = work.conservative_add(file_work);
-            if request.budget.charge(file_work).is_err() {
+            if value.has_error {
                 return Ok((WorkspaceRuntimeWriteFootprint::CoverageLimited, work));
             }
-            let dialect = LanguageDialect::for_path(file.language(), file.rel_path());
-            let Some(grammar) = parser_language_for_dialect(dialect) else {
-                return Ok((WorkspaceRuntimeWriteFootprint::CoverageLimited, work));
-            };
-            parser
-                .set_language(&grammar)
-                .map_err(|error| SemanticProviderError::internal(error.to_string()))?;
-            let mut input = |offset: usize, _| &source.as_bytes()[offset..];
-            let Some(tree) = parser.parse_with_options(&mut input, None, None) else {
-                return Ok((WorkspaceRuntimeWriteFootprint::CoverageLimited, work));
-            };
-            if tree.root_node().has_error() {
-                return Ok((WorkspaceRuntimeWriteFootprint::CoverageLimited, work));
-            }
-            let facts = runtime_syntax_facts(
-                file.language(),
-                tree.root_node(),
-                &source,
-                request.budget.remaining().nested_entries,
-            );
-            let fact_work = SemanticWork {
-                nested_entries: facts
-                    .visited_nodes
-                    .saturating_add(facts.reads.len())
-                    .saturating_add(facts.writes.len()),
-                ..SemanticWork::default()
-            };
-            work = work.conservative_add(fact_work);
-            if request.budget.charge(fact_work).is_err() || !facts.complete {
-                return Ok((WorkspaceRuntimeWriteFootprint::CoverageLimited, work));
-            }
+            let facts = &value.facts;
             if !facts.writes.is_empty() {
                 footprint = WorkspaceRuntimeWriteFootprint::RuntimeRootWrite;
             }
@@ -829,9 +975,9 @@ impl WorkspaceSemanticOracle<'_> {
         let source = exact_source_for_procedure(
             self.workspace,
             procedure,
-            request.budget.remaining().source_bytes,
+            request.budget.limits().source_bytes,
         );
-        match source {
+        let (file, source) = match source {
             Err(SemanticProviderError::InvalidIdentity(_)) => {
                 return Ok(SemanticOutcome::Unproven {
                     partial: RuntimeKeyedReadResult {
@@ -848,8 +994,8 @@ impl WorkspaceSemanticOracle<'_> {
                     work: SemanticWork::default(),
                 });
             }
-            Ok(Some(_)) => {}
-        }
+            Ok(Some(source)) => source,
+        };
         let (acquisition, _) = self.runtime_reads.acquire(procedure, request.cancellation);
         let permit = match acquisition {
             CompleteValueAcquisition::Cached { value } => {
@@ -886,7 +1032,7 @@ impl WorkspaceSemanticOracle<'_> {
                 });
             }
         };
-        let outcome = self.build_runtime_reads(procedure, request)?;
+        let outcome = self.build_runtime_reads(procedure, &file, &source, request)?;
         if let SemanticOutcome::Complete { value, .. } = &outcome {
             permit.publish_complete(Arc::new(value.clone()));
         }
@@ -896,23 +1042,12 @@ impl WorkspaceSemanticOracle<'_> {
     fn build_runtime_reads(
         &self,
         procedure: &ProcedureHandle,
+        file: &ProjectFile,
+        source: &str,
         request: &mut SemanticRequest<'_>,
     ) -> Result<SemanticOutcome<RuntimeKeyedReadResult>, SemanticProviderError> {
         let mut result = RuntimeKeyedReadResult::default();
-        let max_bytes = request.budget.remaining().source_bytes;
-        let Some((file, source)) =
-            exact_source_for_procedure(self.workspace, procedure, max_bytes)?
-        else {
-            result
-                .limitations
-                .push(RuntimeReadLimitation::MaterializationIncomplete);
-            return Ok(SemanticOutcome::Unproven {
-                partial: result,
-                work: SemanticWork::default(),
-            });
-        };
         let mut work = SemanticWork {
-            source_bytes: source.len(),
             procedures: 1,
             ..SemanticWork::default()
         };
@@ -928,7 +1063,7 @@ impl WorkspaceSemanticOracle<'_> {
         // TypeScript module is inspected for the runtime-root writes that the
         // reviewed `pristine-input-until-write` model names; an unreadable or
         // unparseable sibling keeps the answer incomplete instead of clean.
-        let (footprint, footprint_work) = self.workspace_runtime_write_footprint(&file, request)?;
+        let (footprint, footprint_work) = self.workspace_runtime_write_footprint(file, request)?;
         work = work.conservative_add(footprint_work);
         // A footprint that is not closed still reports the read's own typed
         // limitation. The extraction below keeps every candidate so a query
@@ -942,69 +1077,55 @@ impl WorkspaceSemanticOracle<'_> {
                 Some(RuntimeReadLimitation::CoverageLimited)
             }
         };
-        let grammar = parser_language_for_dialect(procedure.artifact().key().language())
-            .ok_or_else(|| SemanticProviderError::internal("runtime-read dialect has no parser"))?;
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&grammar)
-            .map_err(|error| SemanticProviderError::internal(error.to_string()))?;
-        let mut input = |offset: usize, _| &source.as_bytes()[offset..];
-        let mut progress = |_: &tree_sitter::ParseState| request.cancellation.is_cancelled();
-        let tree = parser.parse_with_options(
-            &mut input,
-            None,
-            Some(tree_sitter::ParseOptions::new().progress_callback(&mut progress)),
-        );
-        if request.cancellation.is_cancelled() {
-            return Ok(SemanticOutcome::Cancelled {
-                partial: None,
-                work,
-            });
-        }
-        let Some(tree) = tree else {
-            result
-                .limitations
-                .push(RuntimeReadLimitation::MaterializationIncomplete);
-            return Ok(SemanticOutcome::Unproven {
-                partial: result,
-                work,
-            });
+        let syntax =
+            self.runtime_syntax_for_source(procedure.artifact().key().language(), source, request)?;
+        work = work.conservative_add(syntax.work());
+        let snapshot = match syntax {
+            SemanticOutcome::Complete { value, .. } => value,
+            SemanticOutcome::Unproven { partial, .. } => {
+                if partial.facts.complete {
+                    result
+                        .limitations
+                        .push(RuntimeReadLimitation::BudgetExhausted);
+                    return Ok(SemanticOutcome::Unproven {
+                        partial: result,
+                        work,
+                    });
+                }
+                result
+                    .limitations
+                    .push(RuntimeReadLimitation::CoverageLimited);
+                partial
+            }
+            SemanticOutcome::ExceededBudget { exceeded, .. } => {
+                return Ok(SemanticOutcome::ExceededBudget {
+                    partial: None,
+                    exceeded,
+                    work,
+                });
+            }
+            SemanticOutcome::Cancelled { .. } => {
+                return Ok(SemanticOutcome::Cancelled {
+                    partial: None,
+                    work,
+                });
+            }
+            _ => {
+                result
+                    .limitations
+                    .push(RuntimeReadLimitation::MaterializationIncomplete);
+                return Ok(SemanticOutcome::Unproven {
+                    partial: result,
+                    work,
+                });
+            }
         };
-        let facts = runtime_syntax_facts(
-            procedure.artifact().key().language().language(),
-            tree.root_node(),
-            &source,
-            request.budget.remaining().nested_entries,
-        );
-        let fact_work = SemanticWork {
-            nested_entries: facts
-                .visited_nodes
-                .saturating_add(facts.reads.len())
-                .saturating_add(facts.writes.len()),
-            ..SemanticWork::default()
-        };
-        work = work.conservative_add(fact_work);
-        if let Err(exceeded) = request.budget.charge(fact_work) {
-            return Ok(SemanticOutcome::ExceededBudget {
-                partial: None,
-                exceeded,
-                work,
-            });
-        }
-        if !request.charge_execution_traversal(facts.visited_nodes) {
-            result
-                .limitations
-                .push(RuntimeReadLimitation::BudgetExhausted);
-            return Ok(SemanticOutcome::Unproven {
-                partial: result,
-                work,
-            });
-        }
-        if !facts.complete || tree.root_node().has_error() {
+        if snapshot.has_error {
             result
                 .limitations
                 .push(RuntimeReadLimitation::CoverageLimited);
         }
+        let facts = &snapshot.facts;
         for read in &facts.reads {
             let loads = loads_at_range(procedure, read.range);
             if loads.is_empty() {
@@ -1057,7 +1178,7 @@ impl WorkspaceSemanticOracle<'_> {
             }
             // Model selection and effect closure must precede publication. This
             // helper binds only contracts from the captured activation snapshot.
-            self.bind_runtime_read_contract(procedure, &file, read, key, &loads[0], &mut result)?;
+            self.bind_runtime_read_contract(procedure, file, read, key, &loads[0], &mut result)?;
         }
         // Every runtime-shaped read in the closed footprint needs a modeled
         // effect contract. An unmodeled sibling may mutate the selected root.
@@ -1614,3 +1735,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod cache_tests;

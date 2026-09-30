@@ -781,6 +781,23 @@ impl JsTsLexicalBindingIndex {
             })
     }
 
+    /// The target-identifier start bytes of every assignment, update, and
+    /// `for (binding of/in ...)` write to the active lexical binding of `name`
+    /// at `byte`, in any nested scope that does not shadow it. Declarations
+    /// are not writes; see [`Self::binding_identifier_ranges_at`].
+    pub fn binding_write_sites_at(&self, name: &str, byte: usize) -> Vec<usize> {
+        let Some(scope) = self.binding_scope_at(name, byte) else {
+            return Vec::new();
+        };
+        self.assignments_by_name
+            .get(name)
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|assignment| self.binding_scope_at(name, *assignment) == Some(scope))
+            .collect()
+    }
+
     /// Whether an assignment or update rebinds the active lexical binding of
     /// `name` before its use at `byte`.
     pub fn is_binding_reassigned_before_at(&self, name: &str, byte: usize) -> bool {
@@ -2827,6 +2844,56 @@ fn enclosing_lexical_scope(node: Node<'_>) -> Option<JsTsLexicalBindingScope> {
 
 pub fn slice<'a>(node: Node<'_>, source: &'a str) -> &'a str {
     brokk_bifrost_core::analyzer::common::node_source_text(node, source)
+}
+
+/// The runtime operand of a TypeScript type-only wrapper. `x as T`,
+/// `x satisfies T`, `x!` and the legacy `<T>x` all evaluate to `x`.
+///
+/// The grammar names no fields on these nodes. `<T>x` is its `type_arguments`
+/// followed by the operand; the other three begin with the operand. `None` for
+/// any other node kind, and for a recovered wrapper whose operand is missing.
+pub fn ts_type_wrapper_operand(node: Node<'_>) -> Option<Node<'_>> {
+    let mut cursor = node.walk();
+    let mut children = node
+        .named_children(&mut cursor)
+        .filter(|child| !child.is_extra());
+    match node.kind() {
+        "as_expression" | "satisfies_expression" | "non_null_expression" => children.next(),
+        "type_assertion" => {
+            let type_arguments = children.next()?;
+            if type_arguments.kind() != "type_arguments" {
+                return None;
+            }
+            children.next()
+        }
+        _ => None,
+    }
+}
+
+/// The asserted type of `x as T`, `x satisfies T` or `<T>x`. `None` for
+/// `x as const`, whose `const` is not a type node.
+pub fn ts_type_wrapper_type(node: Node<'_>) -> Option<Node<'_>> {
+    let mut cursor = node.walk();
+    let mut children = node
+        .named_children(&mut cursor)
+        .filter(|child| !child.is_extra());
+    match node.kind() {
+        "as_expression" | "satisfies_expression" => children.nth(1),
+        "type_assertion" => {
+            let type_arguments = children
+                .next()
+                .filter(|child| child.kind() == "type_arguments")?;
+            let mut cursor = type_arguments.walk();
+            let mut types = type_arguments
+                .named_children(&mut cursor)
+                .filter(|child| !child.is_extra());
+            match (types.next(), types.next()) {
+                (Some(asserted), None) => Some(asserted),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
 }
 
 /// The module specifier an `import_statement` or `export_statement` names, read

@@ -74,6 +74,9 @@ pub struct CompiledPackManifest {
     /// Exact native C/C++ portability evidence retained at pack scope.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpp_portability: Option<CppPortabilityEvidence>,
+    /// Exact Python cross-artifact correspondence retained at pack scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub python_correspondence: Option<PythonCorrespondenceEvidence>,
     pub semantic_sha256: String,
     pub content_sha256: String,
     pub shards: Vec<CompiledShardDescriptor>,
@@ -109,6 +112,10 @@ pub struct CompiledShard {
     /// envelope so a shard remains self-describing after extraction.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) cpp_portability: Option<CppPortabilityEvidence>,
+    /// The pack-level Python correspondence evidence is repeated in each
+    /// shard wire envelope so a shard remains self-describing after extraction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) python_correspondence: Option<PythonCorrespondenceEvidence>,
     pub(crate) payload: CompiledPayload,
 }
 
@@ -247,6 +254,8 @@ pub struct CompiledProcedureSummary {
     pub normal_result_count: Option<u32>,
     pub locations: Vec<CompiledSummaryLocation>,
     pub transfers: Vec<CompiledSummaryTransfer>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub transfer_partitions: Vec<NormalResultTransferPartition>,
     pub effects: Vec<CompiledSummaryEffect>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub concurrency_effects: Vec<CompiledConcurrencyEffect>,
@@ -262,6 +271,8 @@ pub struct CompiledProcedureSummary {
     pub preconditions: Option<Vec<CompiledOperationPrecondition>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub result_contracts: Vec<CompiledResultContract>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub result_use_obligations: Vec<CompiledResultUseObligation>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conditional_result_refinements: Vec<CompiledConditionalResultRefinement>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -352,6 +363,15 @@ pub struct CompiledResultContract {
     pub result_success_predicate: Option<CompiledResultPredicate>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub member_contracts: Vec<CompiledResultMemberContract>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompiledResultUseObligation {
+    pub result_ordinal: u32,
+    pub kind: ResultUseObligationKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_predicate: Option<CompiledResultPredicate>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -865,6 +885,8 @@ struct WireCompiledShard {
     conditional_type_refinements: Option<ConditionalTypeRefinementsPayload>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cpp_portability: Option<CppPortabilityEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    python_correspondence: Option<PythonCorrespondenceEvidence>,
     payload: CompiledPayload,
 }
 
@@ -1250,6 +1272,7 @@ fn compiled_from_wire(wire: WireCompiledShard) -> CompiledShard {
         deferred_yields: wire.deferred_yields,
         conditional_type_refinements: wire.conditional_type_refinements,
         cpp_portability: wire.cpp_portability,
+        python_correspondence: wire.python_correspondence,
         payload: wire.payload,
     }
 }
@@ -1443,6 +1466,8 @@ pub(crate) fn semantic_digest(shard: &CompiledShard) -> Result<String, ArtifactE
         conditional_type_refinements: &'a Option<ConditionalTypeRefinementsPayload>,
         #[serde(skip_serializing_if = "Option::is_none")]
         cpp_portability: &'a Option<CppPortabilityEvidence>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        python_correspondence: &'a Option<PythonCorrespondenceEvidence>,
         payload: &'a CompiledPayload,
     }
     let bytes = canonical_json(&SemanticView {
@@ -1461,6 +1486,7 @@ pub(crate) fn semantic_digest(shard: &CompiledShard) -> Result<String, ArtifactE
         deferred_yields: &shard.deferred_yields,
         conditional_type_refinements: &shard.conditional_type_refinements,
         cpp_portability: &shard.cpp_portability,
+        python_correspondence: &shard.python_correspondence,
         payload: &shard.payload,
     })?;
     Ok(digest_hex(SEMANTIC_HASH_DOMAIN, &bytes))
@@ -1481,6 +1507,8 @@ pub(crate) fn manifest_semantic_digest(
         safety: &'a Safety,
         #[serde(skip_serializing_if = "Option::is_none")]
         cpp_portability: &'a Option<CppPortabilityEvidence>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        python_correspondence: &'a Option<PythonCorrespondenceEvidence>,
         shards: Vec<(&'a str, &'a str)>,
     }
     let bytes = canonical_json(&ManifestSemanticView {
@@ -1493,6 +1521,7 @@ pub(crate) fn manifest_semantic_digest(
         completeness: manifest.completeness,
         safety: &manifest.safety,
         cpp_portability: &manifest.cpp_portability,
+        python_correspondence: &manifest.python_correspondence,
         shards: manifest
             .shards
             .iter()
@@ -1520,6 +1549,8 @@ pub(crate) fn manifest_content_digest(
         safety: &'a Safety,
         #[serde(skip_serializing_if = "Option::is_none")]
         cpp_portability: &'a Option<CppPortabilityEvidence>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        python_correspondence: &'a Option<PythonCorrespondenceEvidence>,
         #[serde(skip_serializing_if = "<[String]>::is_empty")]
         carried_sources: &'a [String],
         semantic_sha256: &'a str,
@@ -1538,6 +1569,7 @@ pub(crate) fn manifest_content_digest(
         completeness: manifest.completeness,
         safety: &manifest.safety,
         cpp_portability: &manifest.cpp_portability,
+        python_correspondence: &manifest.python_correspondence,
         carried_sources: &manifest.carried_sources,
         semantic_sha256: &manifest.semantic_sha256,
         shards: &manifest.shards,
@@ -1784,6 +1816,7 @@ fn authored_pack_from_wire(shard: &WireCompiledShard) -> AuthoredSemanticModelPa
         safety: shard.safety.clone(),
         carried_sources: Vec::new(),
         cpp_portability: shard.cpp_portability.clone(),
+        python_correspondence: shard.python_correspondence.clone(),
         shards: vec![AuthoredShard {
             id: shard.shard_id.clone(),
             activation: shard.activation.clone(),
@@ -1794,6 +1827,41 @@ fn authored_pack_from_wire(shard: &WireCompiledShard) -> AuthoredSemanticModelPa
             deferred_yields: shard.deferred_yields.clone(),
             conditional_type_refinements: shard.conditional_type_refinements.clone(),
         }],
+    }
+}
+
+pub(crate) fn authored_pack_from_decoded_shards(
+    manifest: &CompiledPackManifest,
+    shards: &[CompiledShard],
+) -> AuthoredSemanticModelPack {
+    AuthoredSemanticModelPack {
+        schema_version: manifest.schema_version,
+        pack_id: manifest.pack_id.clone(),
+        version: manifest.version.clone(),
+        producer: manifest.producer.clone(),
+        language: manifest.language.clone(),
+        ecosystem: manifest.ecosystem.clone(),
+        compatibility: manifest.compatibility.clone(),
+        provenance: manifest.provenance.clone(),
+        license: manifest.license.clone(),
+        completeness: manifest.completeness,
+        safety: manifest.safety.clone(),
+        carried_sources: manifest.carried_sources.clone(),
+        cpp_portability: manifest.cpp_portability.clone(),
+        python_correspondence: manifest.python_correspondence.clone(),
+        shards: shards
+            .iter()
+            .map(|shard| AuthoredShard {
+                id: shard.shard_id.clone(),
+                activation: shard.activation.clone(),
+                payload: authored_payload_from_compiled(&shard.payload),
+                runtime_values: shard.runtime_values.clone(),
+                runtime_contracts: shard.runtime_contracts.clone(),
+                collection_flows: shard.collection_flows.clone(),
+                deferred_yields: shard.deferred_yields.clone(),
+                conditional_type_refinements: shard.conditional_type_refinements.clone(),
+            })
+            .collect(),
     }
 }
 
@@ -1864,6 +1932,7 @@ fn authored_procedure_summary_from_compiled(
                     .map(authored_summary_value_transfer_from_compiled),
             })
             .collect(),
+        transfer_partitions: summary.transfer_partitions.clone(),
         effects: summary
             .effects
             .iter()
@@ -1927,6 +1996,17 @@ fn authored_procedure_summary_from_compiled(
                             .collect(),
                     })
                     .collect(),
+            })
+            .collect(),
+        result_use_obligations: summary
+            .result_use_obligations
+            .iter()
+            .map(|obligation| AuthoredResultUseObligation {
+                result_ordinal: obligation.result_ordinal,
+                kind: obligation.kind,
+                failure_predicate: obligation
+                    .failure_predicate
+                    .map(authored_result_predicate_from_compiled),
             })
             .collect(),
         conditional_result_refinements: summary
@@ -2414,6 +2494,100 @@ mod tests {
         include_bytes!("../../../testdata/semantic-model-packs/declarations-v1.json");
     const PROCEDURE_SUMMARIES: &[u8] =
         include_bytes!("../../../testdata/semantic-model-packs/procedure-summaries-v1.json");
+
+    #[test]
+    fn reviewed_result_use_obligation_round_trips_and_rejects_unsupported_claims() {
+        let mut authored: AuthoredSemanticModelPack =
+            serde_json::from_slice(PROCEDURE_SUMMARIES).unwrap();
+        authored.schema_version = RESULT_USE_OBLIGATIONS_MIN_SCHEMA_VERSION;
+        let AuthoredPayload::ProcedureSummaries { summaries } = &mut authored.shards[0].payload
+        else {
+            unreachable!()
+        };
+        let summary = &mut summaries[1];
+        summary.effects.clear();
+        summary.ordinary_heap_unchanged = true;
+        summary.normal_result_count = Some(1);
+        summary.result_use_obligations = vec![AuthoredResultUseObligation {
+            result_ordinal: 0,
+            kind: ResultUseObligationKind::PureTransformationValue,
+            failure_predicate: None,
+        }];
+        let expected = summary.clone();
+
+        let compiled = compile_pack(&authored, &CompilerOptions::default()).unwrap();
+        let decoded = decode_shard_for_manifest(
+            &compiled.manifest,
+            &compiled.shards[0].descriptor,
+            &compiled.shards[0].bytes,
+            &DecodeLimits::default(),
+        )
+        .unwrap();
+        let observed = &decoded.payload().procedure_summaries().unwrap()[1];
+        assert_eq!(observed.result_use_obligations.len(), 1);
+        assert_eq!(authored_procedure_summary_from_compiled(observed), expected);
+
+        let mut rejected = authored.clone();
+        rejected.schema_version = RESULT_USE_OBLIGATIONS_MIN_SCHEMA_VERSION - 1;
+        assert!(
+            compile_pack(&rejected, &CompilerOptions::default())
+                .unwrap_err()
+                .iter()
+                .any(|diagnostic| diagnostic.code == "summary.result_use_obligations_schema")
+        );
+        rejected.schema_version = RESULT_USE_OBLIGATIONS_MIN_SCHEMA_VERSION;
+        if let AuthoredPayload::ProcedureSummaries { summaries } = &mut rejected.shards[0].payload {
+            summaries[1].result_use_obligations[0].result_ordinal = 1;
+        } else {
+            unreachable!()
+        }
+        assert!(
+            compile_pack(&rejected, &CompilerOptions::default())
+                .unwrap_err()
+                .iter()
+                .any(|diagnostic| diagnostic.code == "summary.result_ordinal_out_of_range")
+        );
+        if let AuthoredPayload::ProcedureSummaries { summaries } = &mut rejected.shards[0].payload {
+            summaries[1].result_use_obligations[0].result_ordinal = 0;
+            summaries[1].ordinary_heap_unchanged = false;
+        } else {
+            unreachable!()
+        }
+        assert!(
+            compile_pack(&rejected, &CompilerOptions::default())
+                .unwrap_err()
+                .iter()
+                .any(|diagnostic| diagnostic.code
+                    == "summary.pure_result_has_unreviewed_heap_effects")
+        );
+
+        let mut status = authored.clone();
+        if let AuthoredPayload::ProcedureSummaries { summaries } = &mut status.shards[0].payload {
+            summaries[1].ordinary_heap_unchanged = false;
+            summaries[1].result_use_obligations[0] = AuthoredResultUseObligation {
+                result_ordinal: 0,
+                kind: ResultUseObligationKind::FallibleStatus,
+                failure_predicate: Some(AuthoredResultPredicate::False),
+            };
+            summaries[1].completeness = Completeness::Partial;
+            summaries[1].transfers.clear();
+        } else {
+            unreachable!()
+        }
+        assert!(compile_pack(&status, &CompilerOptions::default()).is_ok());
+        if let AuthoredPayload::ProcedureSummaries { summaries } = &mut status.shards[0].payload {
+            summaries[1].result_use_obligations[0].failure_predicate = None;
+        } else {
+            unreachable!()
+        }
+        assert!(
+            compile_pack(&status, &CompilerOptions::default())
+                .unwrap_err()
+                .iter()
+                .any(|diagnostic| diagnostic.code
+                    == "summary.fallible_status_needs_failure_predicate")
+        );
+    }
 
     #[test]
     fn control_only_normal_continuation_absence_round_trips() {

@@ -35,7 +35,7 @@ use super::semantic_adaptation::{
     scala_nominal_types_match,
 };
 
-const ADAPTER_VERSION: &[u8] = b"scala-value-semantics-v14";
+const ADAPTER_VERSION: &[u8] = b"scala-value-semantics-v16";
 
 /// Bound on the expression nodes examined while proving that a result
 /// expression already carries the callable's declared result type. The

@@ -1,0 +1,25 @@
+; Identify exactly complementary Boolean-literal returns on two immediate paths.
+; This rule is diagnostic-only: it does not prove a safe expression rewrite.
+(policy
+  :schema-version 1
+  :id "bifrost.correctness.redundant-boolean-branches"
+  :name "Redundant Boolean return branches"
+  :message "the conditional paths return complementary Boolean literals"
+  :severity warning
+  :description "The conditional's two immediate paths return opposite Boolean literals with no intervening work. The second path is an else arm or an adjacent return in the same block. The relation records whether the true path returns true or false. Review the intended result; no automatic replacement with the condition is implied because truthiness, conversions, and condition effects require separate proof."
+  :help-uri "https://bifrost.brokk.ai/static-analysis-policies/#built-in-code-smell-pack"
+  :tags ["correctness" "conditional" "code-smell"]
+  :analysis (analysis
+    :type assertion
+    (bind :name branch
+      :query (rql :schema-version 1
+        (filter :where ((verdict eq proven))
+          (branch-relations :relation [redundant-boolean-return]
+            (union
+              (language java (if))
+              (language javascript (if))
+              (language typescript (if))
+              (language python (if)))))))
+    (group :name by-branch :by (branch.id)
+      (aggregate :name violations :op count))
+    (assert :group by-branch :value violations :cardinality (exactly 0))))

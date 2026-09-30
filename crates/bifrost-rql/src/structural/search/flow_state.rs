@@ -413,6 +413,10 @@ fn classify_reason(reason: &FlowStateIncompleteReason) -> (CodeQueryDiagnosticCo
             CodeQueryDiagnosticCode::FlowStateDerivationIncomplete,
             "the lowering declares a local binding it never establishes",
         ),
+        BindingStateNotClosed { .. } => (
+            CodeQueryDiagnosticCode::FlowStateDerivationIncomplete,
+            "aliasing, capture, or ownership transfer leaves the binding's read/write state open",
+        ),
         PropertyProviderUnavailable => (
             CodeQueryDiagnosticCode::FlowStateDerivationIncomplete,
             "the structured property-reaching provider was unavailable",
@@ -658,7 +662,7 @@ pub(super) fn public_flow_relation(
     }
 }
 
-fn state_event_ref(
+pub(super) fn state_event_ref(
     procedure_id: &str,
     row: &StateEventRow,
     range: CodeQueryRange,

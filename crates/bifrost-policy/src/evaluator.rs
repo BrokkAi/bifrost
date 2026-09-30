@@ -2730,10 +2730,14 @@ fn executable_match_query(
             | QueryValueKind::CallBinding
             | QueryValueKind::CallEffect
             | QueryValueKind::CallResultContract
+            | QueryValueKind::CallResultObligation
             | QueryValueKind::ResultContractUse
             | QueryValueKind::ResultContractFailureUse
             | QueryValueKind::NilnessOperation
             | QueryValueKind::SwitchCoverage
+            | QueryValueKind::AssignmentRelation
+            | QueryValueKind::LoopRelation
+            | QueryValueKind::StatementReachability
             | QueryValueKind::ConcurrentAccessConflict
             | QueryValueKind::ClassSetRow
             | QueryValueKind::AbsentMemberFinding
@@ -2754,6 +2758,8 @@ fn executable_match_query(
             | QueryValueKind::StateEvent
             | QueryValueKind::FlowRelation
             | QueryValueKind::ControlRelation
+            | QueryValueKind::BranchRelation
+            | QueryValueKind::FailureHandlerState
             | QueryValueKind::Guard
             | QueryValueKind::SourceSet
             | QueryValueKind::BuildTarget
@@ -4249,6 +4255,10 @@ fn match_domain(domain: DetailedCodeQueryDomain) -> Option<MatchResultDomain> {
         DetailedCodeQueryDomain::StateEvent
         | DetailedCodeQueryDomain::FlowRelation
         | DetailedCodeQueryDomain::ControlRelation
+        | DetailedCodeQueryDomain::BranchRelation
+        | DetailedCodeQueryDomain::LoopRelation
+        | DetailedCodeQueryDomain::FailureHandlerState
+        | DetailedCodeQueryDomain::StatementReachability
         | DetailedCodeQueryDomain::Guard
         | DetailedCodeQueryDomain::SourceSet
         | DetailedCodeQueryDomain::BuildTarget
@@ -4273,10 +4283,12 @@ fn match_domain(domain: DetailedCodeQueryDomain) -> Option<MatchResultDomain> {
         | DetailedCodeQueryDomain::CallBinding
         | DetailedCodeQueryDomain::CallEffect
         | DetailedCodeQueryDomain::CallResultContract
+        | DetailedCodeQueryDomain::CallResultObligation
         | DetailedCodeQueryDomain::ResultContractUse
         | DetailedCodeQueryDomain::ResultContractFailureUse
         | DetailedCodeQueryDomain::NilnessOperation
         | DetailedCodeQueryDomain::SwitchCoverage
+        | DetailedCodeQueryDomain::AssignmentRelation
         | DetailedCodeQueryDomain::ConcurrentAccessConflict
         | DetailedCodeQueryDomain::ClassSetRow
         | DetailedCodeQueryDomain::AbsentMemberFinding
@@ -4469,6 +4481,26 @@ fn weak_finding_key(evidence: &UnitRowEvidence, path: &WorkspaceRelativePath) ->
             update_hash(&mut hasher, relation.as_bytes());
             update_hash(&mut hasher, certainty.as_bytes());
         }
+        DetailedCodeQueryKey::BranchRelation {
+            id,
+            owner_id,
+            relation,
+            verdict,
+        } => {
+            update_hash(&mut hasher, id.as_bytes());
+            update_hash(&mut hasher, owner_id.as_bytes());
+            update_hash(&mut hasher, relation.as_bytes());
+            update_hash(&mut hasher, verdict.as_bytes());
+        }
+        DetailedCodeQueryKey::FailureHandlerState {
+            id,
+            catch_ast_id,
+            verdict,
+        } => {
+            update_hash(&mut hasher, id.as_bytes());
+            update_hash(&mut hasher, catch_ast_id.as_bytes());
+            update_hash(&mut hasher, verdict.as_bytes());
+        }
         DetailedCodeQueryKey::Guard {
             id,
             procedure_id,
@@ -4568,7 +4600,8 @@ fn weak_finding_key(evidence: &UnitRowEvidence, path: &WorkspaceRelativePath) ->
         | DetailedCodeQueryKey::CallArgumentGroup { id, site_id }
         | DetailedCodeQueryKey::CallBinding { id, site_id }
         | DetailedCodeQueryKey::CallEffect { id, site_id }
-        | DetailedCodeQueryKey::CallResultContract { id, site_id } => {
+        | DetailedCodeQueryKey::CallResultContract { id, site_id }
+        | DetailedCodeQueryKey::CallResultObligation { id, site_id } => {
             update_hash(&mut hasher, id.as_bytes());
             update_hash(&mut hasher, site_id.as_bytes());
         }
@@ -4579,6 +4612,9 @@ fn weak_finding_key(evidence: &UnitRowEvidence, path: &WorkspaceRelativePath) ->
         }
         DetailedCodeQueryKey::NilnessOperation { id, procedure_id }
         | DetailedCodeQueryKey::SwitchCoverage { id, procedure_id }
+        | DetailedCodeQueryKey::AssignmentRelation { id, procedure_id }
+        | DetailedCodeQueryKey::LoopRelation { id, procedure_id }
+        | DetailedCodeQueryKey::StatementReachability { id, procedure_id }
         | DetailedCodeQueryKey::DetachedTaskTransfer { id, procedure_id } => {
             update_hash(&mut hasher, id.as_bytes());
             update_hash(&mut hasher, procedure_id.as_bytes());
@@ -4789,6 +4825,10 @@ pub(super) fn incomplete_reason_for_code(code: &CodeQueryDiagnosticCode) -> Poli
         | CodeQueryDiagnosticCode::RewriteDomainUnsupported
         | CodeQueryDiagnosticCode::RewritePathDerivationIncomplete
         | CodeQueryDiagnosticCode::ControlRelationDerivationIncomplete
+        | CodeQueryDiagnosticCode::BranchRelationDerivationIncomplete
+        | CodeQueryDiagnosticCode::LoopRelationDerivationIncomplete
+        | CodeQueryDiagnosticCode::FailureHandlerDerivationIncomplete
+        | CodeQueryDiagnosticCode::StatementReachabilityDerivationIncomplete
         | CodeQueryDiagnosticCode::ControlRelationExitPartitionPartial
         // The build model behind a topology row could not be read in full, or
         // no provider answers the axis at all. Either way the absence of a row
@@ -4807,7 +4847,8 @@ pub(super) fn incomplete_reason_for_code(code: &CodeQueryDiagnosticCode) -> Poli
         // and it is the same reason a plan that binds the shape row itself
         // already reports (#1949).
         | CodeQueryDiagnosticCode::CallShapeCoverageIncomplete
-        | CodeQueryDiagnosticCode::ResultContractDerivationIncomplete => {
+        | CodeQueryDiagnosticCode::ResultContractDerivationIncomplete
+        | CodeQueryDiagnosticCode::ResultObligationDerivationIncomplete => {
             PolicyIncompleteReason::CapabilityIncomplete
         }
         CodeQueryDiagnosticCode::OccurrenceRowBudgetExhausted

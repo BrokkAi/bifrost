@@ -18,6 +18,14 @@ use brokk_bifrost_core::hash::{HashMap, HashSet};
 use std::sync::LazyLock;
 use tree_sitter::{Node, Tree};
 
+/// A primary reading plus evidence for whether a C tag reading can differ.
+/// The witness covers the complete visitor, including recovery.
+#[derive(Debug)]
+pub struct CppPrimaryReading {
+    pub parsed: ParsedFile,
+    pub c_tag_scope_witness: bool,
+}
+
 /// The file extension `CppAdapter` reports. `Language::Cpp` also covers `.c`,
 /// `.cc`, `.cxx` and the header spellings; this is only the canonical one.
 pub const CPP_FILE_EXTENSION: &str = "cpp";
@@ -77,6 +85,7 @@ pub fn parse_cpp_file_with_object_macro_fields(
         object_macro_fields,
         &orphaned_namespaces,
     )
+    .parsed
 }
 
 /// Extract `file` under an explicitly named dialect.
@@ -102,7 +111,7 @@ pub fn parse_cpp_file_in_dialect(
     let root = tree.root_node();
     let ancestry = ParentIndex::new(root);
     let orphaned_namespaces = OrphanedNamespaceScopeIndex::build(root, source);
-    parse_cpp_reading(file, source, root, dialect, &ancestry, &orphaned_namespaces)
+    parse_cpp_reading(file, source, root, dialect, &ancestry, &orphaned_namespaces).parsed
 }
 
 /// Extract `file` under the dialect its own path selects, asking its ancestor
@@ -125,21 +134,24 @@ pub fn parse_cpp_file_with_ancestry<'tree>(
         ancestry,
         &orphaned_namespaces,
     )
+    .parsed
 }
 
-/// Extract the primary reading using caller-owned recovery state.
+/// Extract the primary reading and its C tag-scope execution witness using
+/// caller-owned recovery state.
 ///
 /// The recovery index is a property of the tree and source, rather than of a
 /// dialect reading. Callers that need both the C++ and C readings should build
 /// it once and pass it to this function and
-/// [`parse_cpp_c_reading_with_orphaned_namespaces`].
+/// [`parse_cpp_c_reading_with_orphaned_namespaces`]. The witness remains
+/// sticky across the root walk, all recovery work, and every queued reparse.
 pub fn parse_cpp_file_with_ancestry_and_orphaned_namespaces<'tree>(
     file: &ProjectFile,
     source: &str,
     root: Node<'tree>,
     ancestry: &ParentIndex<'tree>,
     orphaned_namespaces: &OrphanedNamespaceScopeIndex,
-) -> ParsedFile {
+) -> CppPrimaryReading {
     parse_cpp_reading(
         file,
         source,
@@ -201,6 +213,7 @@ pub fn parse_cpp_c_reading_with_orphaned_namespaces<'tree>(
             source,
             parsed: &mut parsed,
             c_tag_semantics: true,
+            c_tag_scope_witness: false,
             recovered_class_sibling_scopes: HashMap::default(),
             consumed_fragment_regions: Vec::new(),
             orphaned_namespaces,
@@ -244,7 +257,7 @@ fn parse_cpp_reading<'tree>(
     dialect: LanguageDialect,
     ancestry: &ParentIndex<'tree>,
     orphaned_namespaces: &OrphanedNamespaceScopeIndex,
-) -> ParsedFile {
+) -> CppPrimaryReading {
     parse_cpp_reading_with_object_macro_fields(
         file,
         source,
@@ -264,18 +277,20 @@ fn parse_cpp_reading_with_object_macro_fields<'tree>(
     ancestry: &ParentIndex<'tree>,
     object_macro_fields: HashMap<String, ObjectMacroReplacement>,
     orphaned_namespaces: &OrphanedNamespaceScopeIndex,
-) -> ParsedFile {
+) -> CppPrimaryReading {
     let mut parsed = ParsedFile::new(String::new());
 
     collect_cpp_includes(root, source, &mut parsed);
     collect_cpp_identifiers(root, source, &mut parsed.type_identifiers);
 
+    let c_tag_scope_witness;
     {
         let mut visitor = CppVisitor {
             file,
             source,
             parsed: &mut parsed,
             c_tag_semantics: dialect == LanguageDialect::CppC,
+            c_tag_scope_witness: false,
             recovered_class_sibling_scopes: HashMap::default(),
             consumed_fragment_regions: Vec::new(),
             orphaned_namespaces,
@@ -287,13 +302,17 @@ fn parse_cpp_reading_with_object_macro_fields<'tree>(
             ambiguous_object_macro_fields: HashSet::default(),
         };
         visitor.visit_container(root, ancestry, "", None, None, None, Vec::new());
+        c_tag_scope_witness = visitor.c_tag_scope_witness;
     }
     // A line scan over the source rather than a tree walk: it recovers the
     // quoted directives a parse error hid from the tree, skipping any snippet
     // the sweep above already recorded.
     recover_quoted_includes(source, &mut parsed);
     parsed.finalize_deferred_replacements();
-    parsed
+    CppPrimaryReading {
+        parsed,
+        c_tag_scope_witness,
+    }
 }
 
 /// Whether two readings of one blob disagree about any identity-bearing
@@ -439,7 +458,7 @@ mod tests {
     /// if sharing were unsound.
     #[test]
     fn a_shared_reading_publishes_what_an_independent_one_publishes() {
-        let fixtures: &[(&str, &str)] = &[
+        let fixtures: &[(&str, &str, bool, bool)] = &[
             (
                 "nested tag inside an aggregate, plus a nested include",
                 r#"
@@ -449,7 +468,9 @@ struct outer {
     struct inner { int v; } i;
 };
 struct inner *p;
-"#,
+                "#,
+                true,
+                true,
             ),
             (
                 "a quoted include only the line scan can recover",
@@ -458,7 +479,9 @@ struct inner *p;
 class Broken {
     void method(
 #include "hidden.h"
-"#,
+                "#,
+                false,
+                false,
             ),
             (
                 "forward declarations replaced by their definitions",
@@ -473,7 +496,9 @@ struct tag1 {
 };
 struct tag0 { int second; };
 }
-"#,
+                "#,
+                true,
+                true,
             ),
             (
                 "a fragmented export-macro class body",
@@ -501,11 +526,62 @@ class SIMPLECPP_LIB Token {
   }
 };
 }
+                "#,
+                true,
+                true,
+            ),
+            (
+                "nested struct, union, and enum tags",
+                r#"
+struct StructOwner { struct StructTag { int value; }; };
+struct UnionOwner { union UnionTag { int value; }; };
+struct EnumOwner { enum EnumTag { value }; };
 "#,
+                true,
+                true,
+            ),
+            (
+                "C++ class and anonymous tag near misses",
+                r#"
+struct Owner {
+    class NestedClass { int value; };
+    struct { int anonymous_value; } anonymous_member;
+};
+struct TopLevel { int value; };
+"#,
+                false,
+                false,
+            ),
+            (
+                "tag reparsed under a recovered export class",
+                r#"
+namespace api {
+
+/**
+* Doc comment
+*/
+class PROJECT_PUBLIC_API(2, 0) RecoveryOwner : public virtual BaseKey {
+   public:
+      /** Construct from a point. */
+      RecoveryOwner(const Group& group, const Point& point) : BaseKey(group, point) {}
+
+#if defined(PROJECT_HAS_LEGACY_POINT)
+      /** Construct from a legacy point. */
+      RecoveryOwner(const Group& group, const LegacyPoint& point) : BaseKey(group, point) {}
+#endif
+
+      struct RecoveredTag { int value; };
+      std::string algo_name() const override;
+      AlgorithmIdentifier algorithm_identifier() const override;
+};
+}
+"#,
+                true,
+                true,
             ),
         ];
 
-        for (name, source) in fixtures {
+        for (name, source, expected_witness, expected_differs) in fixtures {
             let file = ProjectFile::new(
                 std::env::current_dir().expect("test working directory must be available"),
                 "src/widget.h",
@@ -516,21 +592,133 @@ class SIMPLECPP_LIB Token {
             let independent_primary = parse_cpp_file(&file, source, &tree);
             let independent_c =
                 parse_cpp_file_in_dialect(&file, source, &tree, LanguageDialect::CppC);
+            let independent_primary_facts = published_facts(&independent_primary);
+            let independent_c_facts = published_facts(&independent_c);
+            let independent_differs = cpp_projections_differ(&independent_primary, &independent_c);
+            assert_eq!(
+                independent_differs,
+                *expected_differs,
+                "independent C/C++ projection difference for {name}; root.has_error()={}; CST={}; C++ declarations={:#?}; C declarations={:#?}; C++ facts: {independent_primary_facts:#?}; C facts: {independent_c_facts:#?}",
+                root.has_error(),
+                root.to_sexp(),
+                independent_primary.declarations(),
+                independent_c.declarations(),
+            );
 
             let ancestry = ParentIndex::new(root);
-            let shared_primary = parse_cpp_file_with_ancestry(&file, source, root, &ancestry);
-            let shared_c = parse_cpp_c_reading(&file, source, root, &ancestry, &shared_primary);
+            let orphaned_namespaces = OrphanedNamespaceScopeIndex::build(root, source);
+            let primary = parse_cpp_file_with_ancestry_and_orphaned_namespaces(
+                &file,
+                source,
+                root,
+                &ancestry,
+                &orphaned_namespaces,
+            );
+            let c_tag_scope_witness = primary.c_tag_scope_witness;
+            let shared_primary = primary.parsed;
+
+            if *name == "tag reparsed under a recovered export class" {
+                assert!(
+                    root.has_error(),
+                    "the recovery fixture must parse with errors"
+                );
+                let recovered_owner = independent_primary
+                    .declarations()
+                    .iter()
+                    .find(|unit| unit.is_class() && unit.fq_name() == "api.RecoveryOwner")
+                    .expect("the malformed export-class head must recover its owner");
+                let owner_range = independent_primary
+                    .ranges
+                    .get(recovered_owner)
+                    .and_then(|ranges| ranges.first())
+                    .expect("the recovered owner must retain its class range");
+                let mut pending = vec![root];
+                let mut recognized_recovery = false;
+                while let Some(node) = pending.pop() {
+                    if crate::declarations::recovered_fragmented_class_has_body(
+                        node,
+                        source,
+                        "RecoveryOwner",
+                        owner_range,
+                    ) {
+                        recognized_recovery = true;
+                        break;
+                    }
+                    let mut cursor = node.walk();
+                    pending.extend(node.named_children(&mut cursor));
+                }
+                assert!(
+                    recognized_recovery,
+                    "the fixture must enter the fragmented export-class recovery path"
+                );
+                let mut pending = vec![root];
+                let mut tag = None;
+                while let Some(node) = pending.pop() {
+                    if matches!(
+                        node.kind(),
+                        "struct_specifier" | "union_specifier" | "enum_specifier"
+                    ) && node.child_by_field_name("name").is_some_and(|name| {
+                        name.utf8_text(source.as_bytes())
+                            .is_ok_and(|text| text == "RecoveredTag")
+                    }) {
+                        tag = Some(node);
+                        break;
+                    }
+                    let mut cursor = node.walk();
+                    pending.extend(node.named_children(&mut cursor));
+                }
+                let tag = tag.expect("the original recovered fixture exposes its tag node");
+                let mut ancestor = ancestry.parent(tag);
+                while let Some(node) = ancestor {
+                    assert!(
+                        !matches!(
+                            node.kind(),
+                            "class_specifier" | "struct_specifier" | "union_specifier"
+                        ),
+                        "the original CST must not already give RecoveredTag an aggregate owner"
+                    );
+                    ancestor = ancestry.parent(node);
+                }
+            }
 
             assert_eq!(
-                published_facts(&independent_primary),
+                c_tag_scope_witness,
+                *expected_witness,
+                "unexpected C tag-scope witness for {name}; root.has_error()={}; CST={}; C++ declarations={:#?}; C declarations={:#?}; independent C++ facts: {independent_primary_facts:#?}; independent C facts: {independent_c_facts:#?}",
+                root.has_error(),
+                root.to_sexp(),
+                independent_primary.declarations(),
+                independent_c.declarations(),
+            );
+            assert_eq!(
+                independent_primary_facts,
                 published_facts(&shared_primary),
                 "C++ reading of {name}"
             );
-            assert_eq!(
-                published_facts(&independent_c),
-                published_facts(&shared_c),
-                "C reading of {name}"
-            );
+            if *expected_witness {
+                let shared_c = parse_cpp_c_reading_with_orphaned_namespaces(
+                    &file,
+                    source,
+                    root,
+                    &ancestry,
+                    &shared_primary,
+                    &orphaned_namespaces,
+                );
+                assert_eq!(
+                    independent_c_facts,
+                    published_facts(&shared_c),
+                    "C reading of {name}"
+                );
+            } else {
+                assert_eq!(
+                    independent_primary_facts, independent_c_facts,
+                    "a false witness must imply identical complete readings for {name}"
+                );
+                assert!(
+                    !independent_differs,
+                    "a false witness must make the existing publication comparator agree for {name}"
+                );
+            }
         }
     }
 

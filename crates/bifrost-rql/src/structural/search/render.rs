@@ -125,6 +125,9 @@ pub(super) fn render_pipeline_item(
         PipelineValue::CallResultContract(value) => CodeQueryResultValue::CallResultContract {
             value: Box::new(render_call_result_contract(analyzer, &value, detail, cache)),
         },
+        PipelineValue::CallResultObligation(value) => CodeQueryResultValue::CallResultObligation {
+            value: Box::new(render_call_result_obligation(analyzer, &value, cache)),
+        },
         PipelineValue::ResultContractUse(value) => CodeQueryResultValue::ResultContractUse {
             value: Box::new(render_result_contract_use(analyzer, &value, cache)),
         },
@@ -138,6 +141,9 @@ pub(super) fn render_pipeline_item(
         },
         PipelineValue::SwitchCoverage(value) => CodeQueryResultValue::SwitchCoverage {
             value: Box::new(render_switch_coverage(analyzer, &value, cache)),
+        },
+        PipelineValue::AssignmentRelation(value) => CodeQueryResultValue::AssignmentRelation {
+            value: Box::new(render_assignment_relation(analyzer, &value, cache)),
         },
         PipelineValue::ConcurrentAccessConflict(value) => {
             CodeQueryResultValue::ConcurrentAccessConflict {
@@ -226,6 +232,20 @@ pub(super) fn render_pipeline_item(
         PipelineValue::ControlRelation(value) => CodeQueryResultValue::ControlRelation {
             value: Box::new(control_relations::public_control_relation(&value)),
         },
+        PipelineValue::FailureHandlerState(value) => CodeQueryResultValue::FailureHandlerState {
+            value: Box::new(value.row.clone()),
+        },
+        PipelineValue::BranchRelation(value) => CodeQueryResultValue::BranchRelation {
+            value: Box::new(value.row.clone()),
+        },
+        PipelineValue::LoopRelation(value) => CodeQueryResultValue::LoopRelation {
+            value: Box::new(value.row.clone()),
+        },
+        PipelineValue::StatementReachability(value) => {
+            CodeQueryResultValue::StatementReachability {
+                value: Box::new(value.row.clone()),
+            }
+        }
         PipelineValue::Guard(value) => CodeQueryResultValue::Guard {
             value: Box::new(guards::public_guard(&value)),
         },
@@ -391,6 +411,18 @@ pub(super) fn render_provenance(
                             coverage: rendered.coverage,
                         }
                     }
+                    PipelineTraceValue::CallResultObligation(value) => {
+                        let rendered = render_call_result_obligation(analyzer, value, cache);
+                        CodeQueryResultRef::CallResultObligation {
+                            id: rendered.id,
+                            site_id: rendered.site_id,
+                            path: rendered.path,
+                            range: rendered.range,
+                            obligation_kind: rendered.obligation_kind,
+                            result_use: rendered.result_use,
+                            coverage: rendered.coverage,
+                        }
+                    }
                     PipelineTraceValue::ResultContractUse(value) => {
                         let rendered = render_result_contract_use(analyzer, value, cache);
                         CodeQueryResultRef::ResultContractUse {
@@ -432,6 +464,17 @@ pub(super) fn render_provenance(
                         let rendered = render_switch_coverage(analyzer, value, cache);
                         CodeQueryResultRef::SwitchCoverage {
                             id: rendered.id,
+                            path: rendered.path,
+                            range: rendered.range,
+                            verdict: rendered.verdict,
+                            proof: rendered.proof,
+                        }
+                    }
+                    PipelineTraceValue::AssignmentRelation(value) => {
+                        let rendered = render_assignment_relation(analyzer, value, cache);
+                        CodeQueryResultRef::AssignmentRelation {
+                            id: rendered.id,
+                            procedure_id: rendered.procedure_id,
                             path: rendered.path,
                             range: rendered.range,
                             verdict: rendered.verdict,
@@ -600,6 +643,16 @@ pub(super) fn render_provenance(
                     }
                     PipelineTraceValue::ControlRelation(value) => {
                         control_relations::control_relation_ref(value)
+                    }
+                    PipelineTraceValue::BranchRelation(value) => {
+                        branch_relations::result_ref(value)
+                    }
+                    PipelineTraceValue::LoopRelation(value) => loop_relations::result_ref(value),
+                    PipelineTraceValue::FailureHandlerState(value) => {
+                        failure_handler_state::result_ref(value)
+                    }
+                    PipelineTraceValue::StatementReachability(value) => {
+                        statement_reachability::result_ref(value)
                     }
                     PipelineTraceValue::Guard(value) => guards::guard_ref(value),
                     PipelineTraceValue::SourceSet(value) => topology_rows::source_set_ref(value),
@@ -3013,6 +3066,33 @@ pub(super) fn render_call_result_contract(
     }
 }
 
+pub(super) fn render_call_result_obligation(
+    analyzer: &dyn IAnalyzer,
+    value: &effects::CallResultObligationValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryCallResultObligation {
+    CodeQueryCallResultObligation {
+        id: value.id.clone(),
+        site_id: value.site_id.clone(),
+        site_ast_id: value.site_ast_id.clone(),
+        path: rel_path_string(&value.file),
+        language: crate::analyzer::common::language_for_file(&value.file).config_label(),
+        range: render_source_range(analyzer, &value.file, &value.range, cache),
+        result_ordinal: value.result_ordinal,
+        obligation_kind: value.obligation_kind,
+        failure_predicate: value.failure_predicate,
+        result_use: value.result_use,
+        coverage: value.coverage.label(),
+        reason: value.reason,
+        pack_id: value.pack_id.clone(),
+        model_id: value.model_id.clone(),
+        summary_id: value.summary_id.clone(),
+        arm_count: value.arm_count,
+        modeled_arm_count: value.modeled_arm_count,
+        terminal: value.terminal,
+    }
+}
+
 pub(super) fn render_result_contract_use(
     analyzer: &dyn IAnalyzer,
     value: &effects::ResultContractUseValue,
@@ -3101,6 +3181,41 @@ pub(super) fn render_switch_coverage(
         verdict: value.verdict,
         proof: value.proof,
         reason: value.reason,
+    }
+}
+
+pub(super) fn render_assignment_relation(
+    analyzer: &dyn IAnalyzer,
+    value: &effects::AssignmentRelationValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryAssignmentRelation {
+    CodeQueryAssignmentRelation {
+        id: value.id.clone(),
+        procedure_id: value.procedure_id.clone(),
+        assignment_point_id: value.assignment_point_id.clone(),
+        target_value_id: value.target_value_id,
+        rhs_value_id: value.rhs_value_id,
+        ast_id: value.ast_id.clone(),
+        path: rel_path_string(&value.file),
+        language: crate::analyzer::common::language_for_file(&value.file).config_label(),
+        range: render_source_range(analyzer, &value.file, &value.range, cache),
+        relation_kind: value.relation_kind,
+        storage_kind: value.storage_kind,
+        verdict: value.verdict,
+        proof: value.proof,
+        coverage: value.coverage.label(),
+        reason: value.reason,
+        replacement_events: value
+            .replacement_events
+            .iter()
+            .map(|event| {
+                flow_state::state_event_ref(
+                    &value.procedure_id,
+                    event,
+                    render_source_range(analyzer, &event.site.file, &event.site.range, cache),
+                )
+            })
+            .collect(),
     }
 }
 
@@ -3842,9 +3957,14 @@ pub(super) fn render_match(
         .iter()
         .map(|capture| CodeQueryCapture {
             name: capture.name.clone(),
-            text: snippet(capture.span.text(facts.source())),
-            start_line: facts.line_of_byte(capture.span.start_byte),
-            range: full_detail.then(|| range_for_span(facts, capture.span)),
+            text: snippet(&capture.text),
+            start_line: capture.start_line,
+            range: full_detail.then_some(CodeQueryRange {
+                start_line: capture.start_line,
+                start_column: capture.start_column,
+                end_line: capture.end_line,
+                end_column: capture.end_column,
+            }),
             kind: if full_detail {
                 capture.kind.map(|kind| kind.label())
             } else {
@@ -3853,7 +3973,7 @@ pub(super) fn render_match(
             ast_id: full_detail
                 .then_some(capture.node)
                 .flatten()
-                .map(|node| super::super::occurrence_rows::ast_id(facts.source_identity(), node)),
+                .map(|node| super::super::occurrence_rows::ast_id(capture.source_identity, node)),
         })
         .collect();
     let node_range = full_detail.then(|| range_for_span(facts, fact.span()));

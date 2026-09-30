@@ -25,11 +25,12 @@ use brokk_bifrost_core::analyzer::structural::materialization::{
     GenerationKind, MaterializationRecord,
 };
 use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
+use brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path;
 use brokk_bifrost_core::analyzer::tree_walk::{
     NodeKindIds, ParentIndex, WalkControl, children_iter, named_children_iter,
     push_children_reversed, push_named_children_reversed, walk_named_tree_preorder,
 };
-use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
+use brokk_bifrost_core::analyzer::{CodeUnit, Language, ProjectFile};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 use regex::Regex;
 use tree_sitter::{Node, Parser, Tree};
@@ -260,6 +261,109 @@ pub fn cpp_member_fq(package_name: &str, short_name: &str) -> FqName {
             fq.push(cpp_segment(member, SegmentKind::Member));
         }
         None => fq.push(cpp_segment(short_name, SegmentKind::Member)),
+    }
+    fq
+}
+
+/// Structured name for a rendered C++ qualified name supplied at the input
+/// edge, such as an `Analyzer::definitions("ns.Outer$Inner")` argument.
+///
+/// The shared client-path splitter only knows `::`, `.`, `\`, `/` and `+`, so
+/// it hands back one component for a nested-class chain (`Outer$Inner`). An
+/// exact-name lookup then asks the store for owner `ns` with identifier
+/// `Outer$Inner`, while the declaration persists as a
+/// [`SegmentKind::Type`]/[`SegmentKind::Nested`] pair whose identifier is the
+/// class's own name (`Inner`). Rebuilding the `$` split from the same rule that
+/// emits it ([`cpp_push_type_chain`]) keeps the query's owner/terminal
+/// boundary identical to the persisted one. A `$` that is *not* a nesting join
+/// (gcc `$`-identifiers, #2140) cannot be told apart from this spelling here,
+/// and stays reachable through the identifier fallback, which seeks the whole
+/// component text as one spelling.
+pub fn cpp_rendered_name_fq(rendered: &str) -> FqName {
+    let mut fq = FqName::new();
+    for component in parse_symbol_path(Language::Cpp, rendered) {
+        // fqname-M4: sanctioned input-edge interning bridge: this BUILDS the FqName's
+        // Type/Nested split from the legacy `$`-joined nested-class chain, at the same
+        // construction boundary `cpp_push_type_chain` owns for extraction.
+        let mut first = true;
+        for part in component.split('$').filter(|part| !part.is_empty()) {
+            let kind = if first {
+                // A client-typed head claims no kind, exactly as
+                // `parse_symbol_path_fq` records it.
+                SegmentKind::Unknown
+            } else {
+                SegmentKind::Nested
+            };
+            fq.push(cpp_segment(part, kind));
+            first = false;
+        }
+    }
+    fq
+}
+
+/// Fully-kinded identities a C++ source spelling joined only by `::` can name.
+///
+/// [`parse_symbol_path`] records every component as [`SegmentKind::Unknown`],
+/// and `Unknown` re-renders with `.`. `Top::Only` therefore compares as
+/// `Top.Only`, and the exact-name retain drops the persisted nested identity
+/// `Top$Only` (`Type` + `Nested`). These interpretations are the kind
+/// placements extraction stores, so each exact query's parent and terminal
+/// match a persisted row and the structural retain keeps it.
+///
+/// A spelling that already uses `.` or `$` is a canonical rendering (#3520)
+/// and stays on [`cpp_rendered_name_fq`] alone. `base::android.ScopedJavaGlobalRef`
+/// is one of those: the `::` there is the package join the canonical name
+/// already spells.
+pub fn cpp_colon_source_aliases(rendered: &str) -> Vec<FqName> {
+    if !rendered.contains("::") || rendered.contains('.') || rendered.contains('$') {
+        return Vec::new();
+    }
+    let texts = parse_symbol_path(Language::Cpp, rendered);
+    if texts.len() < 2 {
+        return Vec::new();
+    }
+    cpp_qualified_kind_interpretations(&texts)
+}
+
+/// Every namespace / type / member boundary a `::`-joined source spelling can
+/// persist as. `packages` is the number of leading [`SegmentKind::Package`]
+/// segments.
+fn cpp_qualified_kind_interpretations(texts: &[String]) -> Vec<FqName> {
+    let len = texts.len();
+    let mut names = Vec::new();
+    names.push(cpp_fq_with_kinds(texts, vec![SegmentKind::Package; len]));
+    for packages in 0..len {
+        let rest = len - packages;
+        let mut type_chain = Vec::with_capacity(len);
+        type_chain.extend(std::iter::repeat_n(SegmentKind::Package, packages));
+        type_chain.push(SegmentKind::Type);
+        type_chain.extend(std::iter::repeat_n(SegmentKind::Nested, rest - 1));
+        names.push(cpp_fq_with_kinds(texts, type_chain));
+        if rest >= 2 {
+            let mut member = Vec::with_capacity(len);
+            member.extend(std::iter::repeat_n(SegmentKind::Package, packages));
+            member.push(SegmentKind::Type);
+            member.extend(std::iter::repeat_n(SegmentKind::Nested, rest - 2));
+            member.push(SegmentKind::Member);
+            names.push(cpp_fq_with_kinds(texts, member));
+        } else if packages >= 1 {
+            let mut function = vec![SegmentKind::Package; packages];
+            function.push(SegmentKind::Member);
+            names.push(cpp_fq_with_kinds(texts, function));
+        }
+    }
+    names
+}
+
+fn cpp_fq_with_kinds(texts: &[String], kinds: Vec<SegmentKind>) -> FqName {
+    assert_eq!(
+        texts.len(),
+        kinds.len(),
+        "a qualified interpretation names every segment"
+    );
+    let mut fq = FqName::new();
+    for (text, kind) in texts.iter().zip(kinds) {
+        fq.push(cpp_segment(text, kind));
     }
     fq
 }
@@ -3749,6 +3853,9 @@ pub struct CppVisitor<'a> {
     /// same shape a nested class `outer::inner`. Headers carry no compilation
     /// language of their own and keep the conservative C++ interpretation.
     pub c_tag_semantics: bool,
+    /// Sticky evidence that this C++ walk reached a declaration whose scope
+    /// would change under C tag semantics, including visitor recovery work.
+    pub(crate) c_tag_scope_witness: bool,
     pub recovered_class_sibling_scopes: HashMap<usize, ScopeInfo>,
     /// Byte regions whose contents were re-owned by a fragmented export-class
     /// recovery (#938): the scattered members between the fragmented
@@ -5582,13 +5689,12 @@ impl<'a> CppVisitor<'a> {
         scope: &ScopeInfo,
         ancestry: &ParentIndex<'_>,
     ) -> bool {
-        self.c_tag_semantics
-            && scope.class_unit.is_some()
-            && class_like_name(declaration_node, self.source, ancestry).is_some()
+        scope.class_unit.is_some()
             && matches!(
                 declaration_node.kind(),
                 "struct_specifier" | "union_specifier" | "enum_specifier"
             )
+            && class_like_name(declaration_node, self.source, ancestry).is_some()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -5627,16 +5733,20 @@ impl<'a> CppVisitor<'a> {
         // below still owns its members, so fields and enumerators are
         // unaffected.
         let c_tag_scope;
-        let scope =
-            if self.mints_tag_at_enclosing_c_scope(declaration_node, &recovered_scope, ancestry) {
-                c_tag_scope = ScopeInfo {
-                    class_unit: None,
-                    ..recovered_scope.clone()
-                };
-                &c_tag_scope
-            } else {
-                &recovered_scope
+        let c_tag_scope_applies =
+            self.mints_tag_at_enclosing_c_scope(declaration_node, &recovered_scope, ancestry);
+        if !self.c_tag_semantics && c_tag_scope_applies {
+            self.c_tag_scope_witness = true;
+        }
+        let scope = if self.c_tag_semantics && c_tag_scope_applies {
+            c_tag_scope = ScopeInfo {
+                class_unit: None,
+                ..recovered_scope.clone()
             };
+            &c_tag_scope
+        } else {
+            &recovered_scope
+        };
         let short_name = if let Some(parent) = &scope.class_unit {
             cpp_join_nested_short(parent.short_name(), &name)
         } else {
@@ -7186,8 +7296,12 @@ impl<'a> CppVisitor<'a> {
         let Some(function) = extract_function_info(declarator, self.source, scope) else {
             return;
         };
-        let code_unit =
-            function.code_unit_with_synthetic(self.file.clone(), scope.class_unit.is_some());
+        // An in-class member prototype is a real source declaration, not a
+        // generated or recovery-only unit, so it keeps the ordinary code-unit
+        // identity (#3508). #3493 recorded its callable modifiers, which is
+        // what a canonical procedure key needs; a synthetic unit would still
+        // refuse that key on identity grounds alone.
+        let code_unit = function.code_unit(self.file.clone());
         if self.parsed.contains_declaration(&code_unit) {
             self.parsed
                 .record_navigation_range(code_unit, cpp_declaration_range(declaration_node));
@@ -8623,13 +8737,23 @@ fn looks_like_quoted_include_line(line: &str) -> bool {
 
 fn extract_cpp_supertypes(node: Node<'_>, source: &str) -> Vec<String> {
     let mut raw = Vec::new();
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if child.kind() == "base_class_clause" {
-            collect_cpp_base_nodes(child, source, &mut raw);
-        }
+    if let Some(bases) = cpp_class_like_base_clause(node) {
+        collect_cpp_base_nodes(bases, source, &mut raw);
     }
     raw
+}
+
+/// The `base_class_clause` a class-like node writes, if it writes one.
+///
+/// The pinned grammar exposes the clause as a named child rather than a field,
+/// so the question is asked by kind. A base clause is the only place a C++
+/// class body records that some other class may declare a member, which is
+/// what [`cpp_callable_dispatch_extensibility`] reads it for.
+fn cpp_class_like_base_clause<'tree>(class_like: Node<'tree>) -> Option<Node<'tree>> {
+    let mut cursor = class_like.walk();
+    class_like
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "base_class_clause")
 }
 
 fn collect_cpp_base_nodes(node: Node<'_>, source: &str, raw: &mut Vec<String>) {
@@ -11732,14 +11856,23 @@ fn cpp_callable_scope<'tree>(
         }
         current = ancestry.parent(node);
     }
-    if function_declarator
-        .and_then(cpp_function_declarator_name_node)
-        .is_some_and(|name| name.kind() == "qualified_identifier")
-    {
+    if cpp_callable_declarator_is_qualified(function_declarator) {
         CppCallableScope::Qualified
     } else {
         CppCallableScope::Unqualified
     }
+}
+
+/// Whether the declarator's own written name carries a `::` qualifier.
+///
+/// A qualified declaration written outside every class body
+/// (`long Client::send(int) {}`) names a member whose class body this file may
+/// not contain, which is what [`cpp_callable_scope`] calls `Qualified` and the
+/// reason [`cpp_callable_dispatch_extensibility`] refuses to answer for one.
+fn cpp_callable_declarator_is_qualified(function_declarator: Option<Node<'_>>) -> bool {
+    function_declarator
+        .and_then(cpp_function_declarator_name_node)
+        .is_some_and(|name| name.kind() == "qualified_identifier")
 }
 
 /// The access one class-body member declaration is written under.
@@ -11897,9 +12030,13 @@ fn cpp_signature_metadata<'tree>(
             visibility: DeclaredVisibility::Unknown,
         },
     };
-    let enrich = |metadata: SignatureMetadata| {
+    let enrich = |mut metadata: SignatureMetadata| {
+        // #3507: a qualified definition repeats none of the class body's
+        // dispatch facts, so this row publishes none either.
+        if let Some(dispatch) = dispatch {
+            metadata = metadata.with_dispatch_extensibility(dispatch);
+        }
         metadata
-            .with_dispatch_extensibility(dispatch)
             .with_callable_linkage(linkage)
             .with_callable_modifiers(
                 modifiers.is_static,
@@ -12381,11 +12518,38 @@ fn cpp_callable_lexical_scope<'tree>(
     groups.into_iter().flatten().collect()
 }
 
+/// Whether a call on this callable's static target can select another body.
+///
+/// C++ says this where the member is *declared*, not where it is defined, and
+/// that is the whole difficulty of the question: virtual-ness is inherited
+/// (`struct Derived : Base { void run(); }` makes `Derived::run` virtual when
+/// `Base::run` is), an out-of-line definition repeats none of it, and whether
+/// a definition's qualifier names a class or a namespace is a class-table
+/// question. So a row answers `Closed` only when its own node proves it:
+///
+/// * a written `final` is the one specifier that ends the family here, and it
+///   is the only thing that closes a member of a class that has a base clause;
+/// * a class-body member is `Closed` otherwise only when its class body writes
+///   no base clause at all, because a base clause is the only evidence in this
+///   file that some base may declare this member virtual;
+/// * anything with a virtual-family boundary, a template head, or a
+///   preprocessor or error region is `Open`;
+/// * a qualified declaration outside every class body answers `None`: its
+///   class body, which is where the fact is written, may be in another file.
+///
+/// The analyzer joins the `None` rows with the include-visible class-body rows
+/// of the same logical callable (#3507), the same join #3509 makes for a
+/// definition's declared access; a row that keeps `None` after that join stays
+/// unknown and no dispatch proof may be built on it.
 fn cpp_callable_dispatch_extensibility<'tree>(
     function_declarator: Node<'tree>,
     ancestry: &ParentIndex<'tree>,
-) -> DispatchExtensibility {
+) -> Option<DispatchExtensibility> {
     let mut declaration = None;
+    // The first class body this declarator is written in. The upward walk
+    // visits it anyway, so only the one step from the body to its class node
+    // is extra, and only for a class-body member.
+    let mut class_body = None;
     let mut current = Some(function_declarator);
     while let Some(node) = current {
         match node.kind() {
@@ -12395,9 +12559,12 @@ fn cpp_callable_dispatch_extensibility<'tree>(
             | "preproc_else"
             | "preproc_elif"
             | "preproc_call"
-            | "ERROR" => return DispatchExtensibility::Open,
+            | "ERROR" => return Some(DispatchExtensibility::Open),
             "declaration" | "field_declaration" | "function_definition" => {
                 declaration.get_or_insert(node);
+            }
+            "field_declaration_list" => {
+                class_body.get_or_insert(node);
             }
             "translation_unit" => break,
             _ => {}
@@ -12405,7 +12572,7 @@ fn cpp_callable_dispatch_extensibility<'tree>(
         current = ancestry.parent(node);
     }
     let Some(declaration) = declaration else {
-        return DispatchExtensibility::Open;
+        return Some(DispatchExtensibility::Open);
     };
 
     let mut saw_virtual_boundary = false;
@@ -12413,7 +12580,7 @@ fn cpp_callable_dispatch_extensibility<'tree>(
     while let Some(node) = stack.pop() {
         match node.kind() {
             "compound_statement" | "field_declaration_list" => continue,
-            "final" | "final_specifier" => return DispatchExtensibility::Closed,
+            "final" | "final_specifier" => return Some(DispatchExtensibility::Closed),
             "virtual"
             | "override"
             | "virtual_specifier"
@@ -12429,10 +12596,28 @@ fn cpp_callable_dispatch_extensibility<'tree>(
     }
 
     if saw_virtual_boundary {
-        DispatchExtensibility::Open
-    } else {
-        DispatchExtensibility::Closed
+        return Some(DispatchExtensibility::Open);
     }
+    if let Some(body) = class_body {
+        // C++ inherits virtual-ness, so a member written without a `virtual`
+        // keyword is still virtual when a base declares it. Whether some base
+        // does is not decidable here, so a base clause keeps the answer open.
+        let has_base_clause = ancestry
+            .parent(body)
+            .and_then(cpp_class_like_base_clause)
+            .is_some();
+        return Some(if has_base_clause {
+            DispatchExtensibility::Open
+        } else {
+            DispatchExtensibility::Closed
+        });
+    }
+    if cpp_callable_declarator_is_qualified(Some(function_declarator)) {
+        return None;
+    }
+    // A namespace or file scope callable is reached by name, never through a
+    // receiver, so no other body can be selected for a call to it.
+    Some(DispatchExtensibility::Closed)
 }
 
 fn cpp_callable_linkage<'tree>(
@@ -17390,6 +17575,76 @@ mod tests {
         parse_cpp_file(&file, source, &tree)
     }
 
+    /// #3520: the input-edge rebuild of a rendered C++ name must render back to
+    /// exactly the spelling it was given, with the nested-class `$` recorded as
+    /// a [`SegmentKind::Nested`] join and a member as its own tail segment.
+    #[test]
+    fn rendered_name_fq_round_trips_nested_class_spellings() {
+        assert!(cpp_rendered_name_fq("").is_empty());
+        for rendered in [
+            "Only",
+            "Top$Only",
+            "ns.Outer$Inner",
+            "Top$Only.b",
+            "ns.Outer$Inner.a",
+            "Buck$Stop",
+        ] {
+            let fq = cpp_rendered_name_fq(rendered);
+            assert_eq!(
+                fq.display_native(Language::Cpp, segment_interner()),
+                rendered,
+                "native round trip for {rendered}"
+            );
+        }
+        let kinds: Vec<SegmentKind> = cpp_rendered_name_fq("ns.Outer$Inner")
+            .segments()
+            .iter()
+            .map(|segment| segment_interner().resolve(*segment).1)
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                SegmentKind::Unknown,
+                SegmentKind::Unknown,
+                SegmentKind::Nested
+            ]
+        );
+    }
+
+    /// #3631: a `::`-only source spelling must name the nested `$` identity
+    /// and the namespace `.` identity. Canonical `.` / `$` spellings stay on
+    /// the single rendered-name parse.
+    #[test]
+    fn colon_source_aliases_name_nested_and_namespace_identities() {
+        let native = |rendered: &str| {
+            cpp_colon_source_aliases(rendered)
+                .into_iter()
+                .map(|fq| fq.display_native(Language::Cpp, segment_interner()))
+                .collect::<Vec<_>>()
+        };
+        let top = native("Top::Only");
+        assert!(top.contains(&"Top$Only".to_string()), "{top:?}");
+        assert!(top.contains(&"Top.Only".to_string()), "{top:?}");
+        assert!(top.contains(&"Top::Only".to_string()), "{top:?}");
+        let nested = native("ns::Outer::Inner");
+        assert!(nested.contains(&"ns.Outer$Inner".to_string()), "{nested:?}");
+        assert!(
+            nested.contains(&"ns::Outer.Inner".to_string()),
+            "{nested:?}"
+        );
+        let member = native("Top::Only::b");
+        assert!(member.contains(&"Top$Only.b".to_string()), "{member:?}");
+        assert!(cpp_colon_source_aliases("Top$Only").is_empty());
+        assert!(cpp_colon_source_aliases("ns.Outer$Inner").is_empty());
+        assert!(cpp_colon_source_aliases("base::android.ScopedJavaGlobalRef").is_empty());
+        assert!(cpp_colon_source_aliases("Only").is_empty());
+        assert!(cpp_colon_source_aliases("Top::Only").iter().all(|fq| {
+            fq.segments()
+                .iter()
+                .all(|segment| segment_interner().resolve(*segment).1 != SegmentKind::Unknown)
+        }));
+    }
+
     #[test]
     fn displaced_terminator_ignores_nested_initializer_endif() {
         let source = "#ifdef ENABLE_ITEMS\n\
@@ -17546,6 +17801,7 @@ namespace internal {
             source,
             parsed: &mut recovered_parsed,
             c_tag_semantics: false,
+            c_tag_scope_witness: false,
             recovered_class_sibling_scopes: HashMap::default(),
             consumed_fragment_regions: Vec::new(),
             orphaned_namespaces: &index,
@@ -20698,7 +20954,7 @@ ABSL_NAMESPACE_END
 
         ancestry.reset_parent_query_count_for_test();
         assert_eq!(
-            DispatchExtensibility::Closed,
+            Some(DispatchExtensibility::Closed),
             cpp_callable_dispatch_extensibility(function_declarator, &ancestry)
         );
         assert_eq!(
@@ -20728,6 +20984,60 @@ ABSL_NAMESPACE_END
             ancestor_count + 1,
             ancestry.parent_query_count_for_test(),
             "constructor ancestry bypassed the parent index"
+        );
+    }
+
+    /// #3507: the one row-level dispatch fact C++ can state is stated only
+    /// where the language states it -- in the class body.
+    ///
+    /// A call's exactness is not readable from a definition row: an
+    /// out-of-line definition repeats no `virtual`, no `final`, and no base
+    /// clause, and C++ inherits virtual-ness from a base that declares the
+    /// member. Each shape below therefore has to answer for itself, and only
+    /// a class body with no base clause at all can close a member that writes
+    /// nothing.
+    #[test]
+    fn callable_dispatch_extensibility_comes_from_the_class_body() {
+        const SOURCE: &str = "\
+class Plain { public: long send(long order); };
+class Derived : public Base { public: long send(long order); };
+class Sealed : public Base { public: long send(long order) final; };
+class Hiding : public Base { public: long send(long order) { return order; } };
+class Virtual { public: virtual long send(long order); };
+namespace shop { long free_call(long order); }
+long Plain::send(long order) { return order; }
+";
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_cpp::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(SOURCE, None).unwrap();
+        let root = tree.root_node();
+        let ancestry = ParentIndex::new(root);
+        let mut answers = Vec::new();
+        walk_named_tree_preorder(root, true, |node| {
+            if node.kind() != "function_declarator" {
+                return WalkControl::Continue;
+            }
+            let name = cpp_function_declarator_name_node(node).expect("declarator name");
+            answers.push((
+                node_text(name, SOURCE).to_string(),
+                cpp_callable_dispatch_extensibility(node, &ancestry),
+            ));
+            WalkControl::Continue
+        });
+        assert_eq!(
+            answers,
+            vec![
+                ("send".to_string(), Some(DispatchExtensibility::Closed)),
+                ("send".to_string(), Some(DispatchExtensibility::Open)),
+                ("send".to_string(), Some(DispatchExtensibility::Closed)),
+                ("send".to_string(), Some(DispatchExtensibility::Open)),
+                ("send".to_string(), Some(DispatchExtensibility::Open)),
+                ("free_call".to_string(), Some(DispatchExtensibility::Closed)),
+                ("Plain::send".to_string(), None),
+            ],
+            "the class body states the fact; a qualified definition states none"
         );
     }
 
@@ -22725,8 +23035,11 @@ enum After { Value };
         assert_eq!(
             recorded_callable_modifiers(&parsed),
             vec![
-                "accumulate static=false constructor=false visibility=Unknown".to_string(),
-                "total static=false constructor=false visibility=Unknown".to_string(),
+                "accumulate decl_only=false static=false constructor=false \
+                 visibility=Unknown"
+                    .to_string(),
+                "total decl_only=false static=false constructor=false visibility=Unknown"
+                    .to_string(),
             ],
         );
     }
@@ -22738,8 +23051,11 @@ enum After { Value };
     /// its access is the one the body's specifier ladder is under. The
     /// out-of-line definitions state neither -- C++ forbids them from repeating
     /// `static` and they write no access specifier -- which is why
-    /// `Client::count` is recorded static only at the `[in class]` declaration
-    /// its `static` is actually written on.
+    /// `Client::count` is recorded static only on the declaration-only row, the
+    /// one whose `static` is actually written. An in-class prototype and the
+    /// out-of-line definition completing it in this translation unit are two
+    /// rows of one code unit (#3508), so their rows share the unit's name and
+    /// `decl_only` is what separates them.
     #[test]
     fn callable_metadata_records_cpp_receiver_contracts_structurally() {
         const SOURCE: &str = concat!(
@@ -22773,28 +23089,45 @@ enum After { Value };
         assert_eq!(
             recorded_callable_modifiers(&parsed),
             vec![
-                "shop.Client.Client [in class] static=false constructor=true visibility=Public"
+                "shop.Client.Client decl_only=false static=false constructor=true \
+                 visibility=Unknown"
                     .to_string(),
-                "shop.Client.Client static=false constructor=true visibility=Unknown".to_string(),
-                "shop.Client.audit static=false constructor=false visibility=Protected".to_string(),
-                "shop.Client.count [in class] static=true constructor=false visibility=Public"
+                "shop.Client.Client decl_only=true static=false constructor=true \
+                 visibility=Public"
                     .to_string(),
-                "shop.Client.count static=false constructor=false visibility=Unknown".to_string(),
-                "shop.Client.send [in class] static=false constructor=false visibility=Public"
+                "shop.Client.audit decl_only=false static=false constructor=false \
+                 visibility=Protected"
                     .to_string(),
-                "shop.Client.send static=false constructor=false visibility=Unknown".to_string(),
-                "shop.Client.tally static=false constructor=false visibility=Private".to_string(),
-                "shop.Ledger.record static=false constructor=false visibility=Public".to_string(),
-                "shop.total static=false constructor=false visibility=Unknown".to_string(),
+                "shop.Client.count decl_only=false static=false constructor=false \
+                 visibility=Unknown"
+                    .to_string(),
+                "shop.Client.count decl_only=true static=true constructor=false \
+                 visibility=Public"
+                    .to_string(),
+                "shop.Client.send decl_only=false static=false constructor=false \
+                 visibility=Unknown"
+                    .to_string(),
+                "shop.Client.send decl_only=true static=false constructor=false \
+                 visibility=Public"
+                    .to_string(),
+                "shop.Client.tally decl_only=false static=false constructor=false \
+                 visibility=Private"
+                    .to_string(),
+                "shop.Ledger.record decl_only=false static=false constructor=false \
+                 visibility=Public"
+                    .to_string(),
+                "shop.total decl_only=false static=false constructor=false visibility=Unknown"
+                    .to_string(),
             ],
         );
     }
 
     /// One readable row per recorded callable signature entry.
     ///
-    /// A member's in-class declaration and its out-of-line definition are two
-    /// code units; the walk marks the body-less in-class one synthetic, and the
-    /// row says so, because the two state different modifier facts.
+    /// An in-class prototype and the out-of-line definition completing it are
+    /// two entries -- of one code unit when one translation unit holds both
+    /// (#3508) -- and the two state different modifier facts, so the row says
+    /// which declaration role it read.
     fn recorded_callable_modifiers(parsed: &ParsedFile) -> Vec<String> {
         let mut rows = parsed
             .signature_metadata
@@ -22807,13 +23140,9 @@ enum After { Value };
                         unit.fq_name()
                     );
                     format!(
-                        "{}{} static={} constructor={} visibility={:?}",
+                        "{} decl_only={} static={} constructor={} visibility={:?}",
                         unit.fq_name(),
-                        if unit.is_synthetic() {
-                            " [in class]"
-                        } else {
-                            ""
-                        },
+                        metadata.is_declaration_only(),
                         metadata.callable_is_static(),
                         metadata.callable_is_constructor(),
                         metadata

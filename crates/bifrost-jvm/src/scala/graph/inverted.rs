@@ -42,11 +42,12 @@ use super::syntax::{
     ScalaPackageContextIndex, ScalaParameterTypeIdentity, ScalaQualifiedStableTypeRole,
     ScalaSourceFacts, ScalaTypeExpressionPath, call_arities_for_reference_with_parents,
     call_site_shape_for_reference_with_parents, enclosing_template_declarations_with_parents,
-    intermediate_field_qualifier_reference, invocation_function_reference,
-    is_bare_companion_method_value_reference, is_call_function_reference_with_parents,
-    is_constructor_like_reference, is_declaration_name, is_enclosing_template_qualifier_reference,
-    is_extractor_reference_with_parents, is_field_expression_value, is_identifier_node,
-    is_infix_pattern_operator, is_owner_qualified_this, is_qualified_stable_root_with_parents,
+    field_expression_for_member_with_parents, intermediate_field_qualifier_reference,
+    invocation_function_reference, is_bare_companion_method_value_reference,
+    is_call_function_reference_with_parents, is_constructor_like_reference, is_declaration_name,
+    is_enclosing_template_qualifier_reference, is_extractor_reference_with_parents,
+    is_field_expression_value, is_identifier_node, is_infix_pattern_operator,
+    is_owner_qualified_this, is_qualified_stable_root_with_parents,
     is_scala_case_pattern_binder_with_parents, is_scala_class_reference_with_parents,
     is_scala_named_argument_assignment, is_scala_object_reference, is_semantic_call_argument,
     is_stable_type_qualifier_with_parents, is_terminal_stable_field_reference,
@@ -10321,14 +10322,7 @@ fn record_reference(
             if let ScalaMethodValueContext::Function(shape) =
                 companion_method_value_context(node, token, ctx, bindings)
             {
-                let call_shape = ScalaCallSiteShape {
-                    lists: Vec::new(),
-                    leading_literal_argument_types: None,
-                    method_value_arity: Some(shape.arity),
-                    method_value_parameter_types: shape.parameter_types,
-                    method_value_parameter_types_authoritative: shape.parameter_types_authoritative,
-                    type_arguments_only: false,
-                };
+                let call_shape = ScalaCallSiteShape::method_value(Some(shape));
                 if record_lexically_visible_call(node, token, name, &call_shape, ctx) {
                     return;
                 }
@@ -10521,17 +10515,24 @@ fn record_reference(
                     .parent()
                     .and_then(|expression| expression.child_by_field_name("value"))
             {
-                let method_value_expression = node.parent().filter(|expression| {
-                    expression.kind() == "field_expression"
-                        && expression.child_by_field_name("field") == Some(node)
-                });
+                // The member token is only the NAME inside its reference. The
+                // position that states the expected function type belongs to
+                // the whole `field_expression`, and to the `_` and type
+                // argument wrappers the shared derivation then extends unless
+                // it starts from that expression (#3512). Hand it the
+                // structured reference rather than the token this scan
+                // visited, so `val f: A => B = x.m` and `x.m _` state their
+                // expectation here just as a direct call argument already
+                // does.
+                let method_value_expression =
+                    field_expression_for_member_with_parents(node, ctx.parents);
                 let method_value_argument = method_value_expression.filter(|expression| {
                     expression
                         .parent()
                         .is_some_and(|parent| parent.kind() == "arguments")
                 });
                 let method_value_context = companion_method_value_context(
-                    method_value_argument.unwrap_or(node),
+                    method_value_expression.unwrap_or(node),
                     token,
                     ctx,
                     bindings,

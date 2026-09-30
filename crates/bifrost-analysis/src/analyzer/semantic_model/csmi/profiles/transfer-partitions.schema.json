@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://csmi.brokk.ai/schema/profiles/transfer-partitions/0.1/schema.json",
+  "title": "CSMI transfer partition coverage scope 0.1.0",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["callable", "exit", "destination", "source"],
+  "properties": {
+    "callable": { "type": "string", "minLength": 1 },
+    "exit": { "const": "normal" },
+    "destination": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["phase", "role", "position"],
+      "properties": {
+        "phase": { "const": "output" },
+        "role": { "const": "result" },
+        "position": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "source": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind"],
+          "properties": { "kind": { "const": "all-inputs" } }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "root"],
+          "properties": {
+            "kind": { "const": "input-root" },
+            "root": {
+              "oneOf": [
+                {
+                  "type": "object", "additionalProperties": false,
+                  "required": ["phase", "role"],
+                  "properties": { "phase": { "const": "input" }, "role": { "const": "receiver" } }
+                },
+                {
+                  "type": "object", "additionalProperties": false,
+                  "required": ["phase", "role", "position"],
+                  "properties": { "phase": { "const": "input" }, "role": { "const": "parameter" },
+                    "position": { "type": "integer", "minimum": 0 } }
+                },
+                {
+                  "type": "object", "additionalProperties": false,
+                  "required": ["phase", "role", "symbol"],
+                  "properties": { "phase": { "const": "input" }, "role": { "const": "capture" },
+                    "symbol": { "type": "string", "minLength": 1 } }
+                }
+              ]
+            }
+          }
+        }
+      ]
+    }
+  }
+}

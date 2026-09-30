@@ -1684,10 +1684,30 @@ pub(super) fn render_definition_lookup(
                             .map(|target| overlay.symbols_named(target))
                     })
                     .unwrap_or_else(|| overlay.symbols_with_id(target));
-                if matched.records.is_empty() {
-                    matched = overlay.symbols_named(target);
+                // A visible explicit import names the binding. Its absence
+                // from the overlay must not select an unrelated declaration
+                // that merely shares the imported name (#3500).
+                let jvm_reference = matches!(
+                    language_for_file(file),
+                    Language::Java | Language::Kotlin | Language::Scala
+                );
+                if matched.records.is_empty() && imported_model_target.is_none() {
+                    if jvm_reference {
+                        // The JVM name index is discovery, not import evidence.
+                        // Let the language's boundary ladder name the external
+                        // identity before consulting its model records.
+                        if let (_, Some(external_target)) =
+                            crate::analyzer::usages::get_definition::boundary_evidence(
+                                analyzer, file, target,
+                            )
+                        {
+                            matched = overlay.symbols_named(&external_target);
+                        }
+                    } else {
+                        matched = overlay.symbols_named(target);
+                    }
                 }
-                if matched.records.is_empty() && target.contains("::") {
+                if !jvm_reference && matched.records.is_empty() && target.contains("::") {
                     let dotted_target = target.replace("::", ".");
                     if language_for_file(file) == Language::Rust {
                         let crates = crate::analyzer::RustOverlayCrates::new(Some(&overlay));
@@ -1701,7 +1721,7 @@ pub(super) fn render_definition_lookup(
                         matched = overlay.symbols_named(&dotted_target);
                     }
                 }
-                if matched.records.is_empty() && target.contains('#') {
+                if !jvm_reference && matched.records.is_empty() && target.contains('#') {
                     matched = overlay.symbols_named(&target.replace('#', "."));
                 }
                 if language_for_file(file) == Language::Rust {

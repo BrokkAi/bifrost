@@ -10,7 +10,9 @@ use crate::analyzer::semantic_model::{
 };
 use crate::analyzer::tree_walk::named_children_iter;
 use crate::hash::{HashMap, HashSet};
-use brokk_bifrost_jvm::java::declarations::{determine_package_name, node_text, parse_tree};
+use brokk_bifrost_jvm::java::declarations::{
+    determine_package_name, java_modifier_keywords, node_text, parse_tree,
+};
 use jclassfile::attributes::{Attribute, NestedClassFlags};
 use jclassfile::class_file::{ClassFile, ClassFlags};
 use jclassfile::constant_pool::ConstantPool;
@@ -547,6 +549,7 @@ fn finish_production(
             safety: request.safety.clone(),
             carried_sources: carried_source_paths(&shards),
             cpp_portability: None,
+            python_correspondence: None,
             shards,
         }),
         completeness,
@@ -713,6 +716,8 @@ fn curated_jdk_formal_name(
         "member.system.getenv-string" => Some("name"),
         "member.runtime.exec-string" => Some("command"),
         "member.statement.execute" => Some("sql"),
+        "member.files.delete-if-exists-path" => Some("path"),
+        "member.string.trim" | "member.string.strip" => None,
         _ => unreachable!("reviewed JDK member IDs have reviewed formal names"),
     }
 }
@@ -724,7 +729,20 @@ fn curated_jdk_member_ids(
     name: &str,
     parameter_types: &[TypeRef],
 ) -> Option<&'static str> {
-    if kind != MemberKind::Method || parameter_types.len() != 1 {
+    if kind != MemberKind::Method {
+        return None;
+    }
+    if parameter_types.is_empty() {
+        // Java SE 21 declares exactly these no-argument String families. Keep
+        // the review attached to the owner, receiver form, and arity; source
+        // parsing alone cannot certify a complete overload family.
+        return match (owner, is_static, name) {
+            ("java.lang.String", false, "trim") => Some("member.string.trim"),
+            ("java.lang.String", false, "strip") => Some("member.string.strip"),
+            _ => None,
+        };
+    }
+    if parameter_types.len() != 1 {
         return None;
     }
     let TypeRef::Named {
@@ -735,13 +753,22 @@ fn curated_jdk_member_ids(
     else {
         return None;
     };
-    if !arguments.is_empty() || parameter_type != "java.lang.String" {
+    if !arguments.is_empty() {
         return None;
     }
-    match (owner, is_static, name) {
-        ("java.lang.System", true, "getenv") => Some("member.system.getenv-string"),
-        ("java.lang.Runtime", false, "exec") => Some("member.runtime.exec-string"),
-        ("java.sql.Statement", false, "execute") => Some("member.statement.execute"),
+    match (owner, is_static, name, parameter_type.as_str()) {
+        ("java.lang.System", true, "getenv", "java.lang.String") => {
+            Some("member.system.getenv-string")
+        }
+        ("java.lang.Runtime", false, "exec", "java.lang.String") => {
+            Some("member.runtime.exec-string")
+        }
+        ("java.sql.Statement", false, "execute", "java.lang.String") => {
+            Some("member.statement.execute")
+        }
+        ("java.nio.file.Files", true, "deleteIfExists", "java.nio.file.Path") => {
+            Some("member.files.delete-if-exists-path")
+        }
         _ => None,
     }
 }
@@ -804,10 +831,10 @@ pub(super) fn source_api_types(
         } else {
             Visibility::Package
         };
-        let declared_visibility = source_visibility(node, source, default_visibility);
+        let declared_visibility = source_visibility(node, default_visibility);
         let visibility = restrict_visibility(declared_visibility, parent_visibility);
         let type_kind = source_type_kind(node.kind()).expect("stack holds Java types");
-        let modifiers = source_modifiers(node, source);
+        let modifiers = java_modifier_keywords(node).collect::<Vec<_>>();
         let type_parameters = source_type_parameters(node, source);
         let hierarchy = source_hierarchy(
             node,
@@ -844,7 +871,7 @@ pub(super) fn source_api_types(
                 visibility,
                 is_abstract: modifiers.contains(&"abstract")
                     || matches!(type_kind, TypeKind::Interface | TypeKind::Annotation),
-                is_sealed: modifiers.contains(&"final"),
+                is_sealed: modifiers.contains(&"final") || modifiers.contains(&"sealed"),
                 type_parameters,
                 hierarchy,
                 locator: Locator::Source {
@@ -937,7 +964,7 @@ fn source_members(
                 } else {
                     Visibility::Package
                 };
-                let visibility = source_visibility(node, source, default_visibility);
+                let visibility = source_visibility(node, default_visibility);
                 if !matches!(visibility, Visibility::Public | Visibility::Protected) {
                     continue;
                 }
@@ -993,7 +1020,7 @@ fn source_members(
                     );
                     continue;
                 }
-                let modifiers = source_modifiers(node, source);
+                let modifiers = java_modifier_keywords(node).collect::<Vec<_>>();
                 if !take_record(remaining_records, record_limit_hit) {
                     break;
                 }
@@ -1007,7 +1034,10 @@ fn source_members(
                     visibility,
                     is_static: modifiers.contains(&"static"),
                     is_abstract: modifiers.contains(&"abstract")
-                        || interface_owner && !modifiers.contains(&"default"),
+                        || interface_owner
+                            && !modifiers.contains(&"default")
+                            && !modifiers.contains(&"static")
+                            && !modifiers.contains(&"private"),
                     is_virtual: !constructor
                         && !modifiers.contains(&"static")
                         && !modifiers.contains(&"final"),
@@ -1049,11 +1079,11 @@ fn source_members(
                 } else {
                     Visibility::Package
                 };
-                let visibility = source_visibility(node, source, default_visibility);
+                let visibility = source_visibility(node, default_visibility);
                 if !matches!(visibility, Visibility::Public | Visibility::Protected) {
                     continue;
                 }
-                let modifiers = source_modifiers(node, source);
+                let modifiers = java_modifier_keywords(node).collect::<Vec<_>>();
                 for declarator in named_children_iter(node) {
                     if declarator.kind() != "variable_declarator" {
                         continue;
@@ -1553,7 +1583,7 @@ fn source_type_ref(
                 })
                 .collect::<Option<Vec<_>>>()?;
             Some(TypeRef::Named {
-                name: resolution.resolve(&name)?,
+                name: resolution.resolve_at(node, source, &name)?,
                 arguments,
                 nullable: false,
             })
@@ -1610,7 +1640,7 @@ fn source_type_ref(
                 Some(TypeRef::TypeParameter { name })
             } else {
                 Some(TypeRef::Named {
-                    name: resolution.resolve(&name)?,
+                    name: resolution.resolve_at(node, source, &name)?,
                     arguments: Vec::new(),
                     nullable: false,
                 })
@@ -1624,7 +1654,11 @@ fn source_type_ref(
             })
         }
         "scoped_type_identifier" => Some(TypeRef::Named {
-            name: resolution.resolve(&compact_type_name(node_text(node, source)))?,
+            name: resolution.resolve_at(
+                node,
+                source,
+                &compact_type_name(node_text(node, source)),
+            )?,
             arguments: Vec::new(),
             nullable: false,
         }),
@@ -1661,21 +1695,8 @@ fn source_type_parameters(node: Node<'_>, source: &str) -> Vec<String> {
         .collect()
 }
 
-fn source_modifiers<'a>(node: Node<'_>, source: &'a str) -> Vec<&'a str> {
-    let Some(modifiers) = (0..node.named_child_count())
-        .filter_map(|index| node.named_child(index))
-        .find(|child| child.kind() == "modifiers")
-    else {
-        return Vec::new();
-    };
-    node_text(modifiers, source)
-        .split(|character: char| !character.is_ascii_alphabetic())
-        .filter(|modifier| !modifier.is_empty())
-        .collect()
-}
-
-fn source_visibility(node: Node<'_>, source: &str, default: Visibility) -> Visibility {
-    let modifiers = source_modifiers(node, source);
+fn source_visibility(node: Node<'_>, default: Visibility) -> Visibility {
+    let modifiers = java_modifier_keywords(node).collect::<Vec<_>>();
     if modifiers.contains(&"public") {
         Visibility::Public
     } else if modifiers.contains(&"protected") {
@@ -1777,7 +1798,50 @@ impl<'a> SourceTypeResolution<'a> {
         }
     }
 
-    fn resolve(&self, name: &str) -> Option<String> {
+    fn resolve_at(&self, node: Node<'_>, source: &str, name: &str) -> Option<String> {
+        // A member type in the nearest enclosing declaration takes precedence
+        // over imported or package types with the same spelling. Keep the
+        // lexical owners structured; a qualified spelling is not a substitute
+        // for the declaration node that introduces each scope.
+        let mut owners = Vec::new();
+        let mut ancestor = node.parent();
+        while let Some(current) = ancestor {
+            if source_type_kind(current.kind()).is_some() {
+                let contains = |container: Node<'_>| {
+                    container.start_byte() <= node.start_byte()
+                        && node.end_byte() <= container.end_byte()
+                };
+                let in_scope = current.child_by_field_name("body").is_some_and(contains)
+                    || current.kind() == "record_declaration"
+                        && current
+                            .child_by_field_name("parameters")
+                            .is_some_and(contains);
+                owners.push((
+                    node_text(current.child_by_field_name("name")?, source),
+                    in_scope,
+                ));
+            }
+            ancestor = current.parent();
+        }
+        let mut scope_ends = Vec::with_capacity(owners.len());
+        let mut candidate = self.package_name.clone();
+        for (owner, in_scope) in owners.iter().rev() {
+            if !candidate.is_empty() {
+                candidate.push('.');
+            }
+            candidate.push_str(owner);
+            if *in_scope {
+                scope_ends.push(candidate.len());
+            }
+        }
+        for end in scope_ends.into_iter().rev() {
+            candidate.truncate(end);
+            candidate.push('.');
+            candidate.push_str(name);
+            if self.known_types.contains(&candidate) {
+                return Some(candidate);
+            }
+        }
         if name.contains('.') {
             return Some(name.to_owned());
         }
@@ -2211,7 +2275,11 @@ fn class_api_type(
         type_kind,
         visibility,
         is_abstract: flags.contains(ClassFlags::ACC_ABSTRACT),
-        is_sealed: flags.contains(ClassFlags::ACC_FINAL),
+        is_sealed: flags.contains(ClassFlags::ACC_FINAL)
+            || class_file
+                .attributes()
+                .iter()
+                .any(|attribute| matches!(attribute, Attribute::PermittedSubclasses { .. })),
         type_parameters,
         hierarchy,
         locator: Locator::Artifact {
@@ -2846,6 +2914,67 @@ mod tests {
     const DOLLAR_SOURCE: &str = "package fixture.api; public class Dollar$Type { public Dollar$Type self() { return this; } }\n";
 
     #[test]
+    fn curated_string_transformations_require_the_exact_zero_argument_jdk_member() {
+        let string = named_type("java.lang.String".to_owned());
+        assert_eq!(
+            curated_jdk_member_ids("java.lang.String", MemberKind::Method, false, "trim", &[]),
+            Some("member.string.trim")
+        );
+        assert_eq!(
+            curated_jdk_member_ids("java.lang.String", MemberKind::Method, false, "strip", &[]),
+            Some("member.string.strip")
+        );
+        for (owner, static_member, parameters) in [
+            ("fixture.String", false, Vec::new()),
+            ("java.lang.String", true, Vec::new()),
+            ("java.lang.String", false, vec![string]),
+        ] {
+            assert_eq!(
+                curated_jdk_member_ids(
+                    owner,
+                    MemberKind::Method,
+                    static_member,
+                    "trim",
+                    &parameters,
+                ),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn curated_delete_if_exists_requires_the_exact_static_path_overload() {
+        let path = named_type("java.nio.file.Path".to_owned());
+        let string = named_type("java.lang.String".to_owned());
+        assert_eq!(
+            curated_jdk_member_ids(
+                "java.nio.file.Files",
+                MemberKind::Method,
+                true,
+                "deleteIfExists",
+                std::slice::from_ref(&path),
+            ),
+            Some("member.files.delete-if-exists-path")
+        );
+        for (owner, is_static, parameter) in [
+            ("other.Files", true, path.clone()),
+            ("java.nio.file.Files", false, path),
+            ("java.nio.file.Files", true, string),
+        ] {
+            assert_eq!(
+                curated_jdk_member_ids(
+                    owner,
+                    MemberKind::Method,
+                    is_static,
+                    "deleteIfExists",
+                    &[parameter],
+                ),
+                None
+            );
+        }
+    }
+
+    #[test]
     fn curated_jdk_member_identity_requires_exact_owner_receiver_and_string_overload() {
         let string = named_type("java.lang.String".to_owned());
         let string_array = TypeRef::Array {
@@ -3358,6 +3487,87 @@ mod tests {
     fn signature_cursor_is_depth_bounded() {
         let mut cursor = SignatureCursor::new(b"[[[[I", 3);
         assert!(cursor.parse_type(0).is_none());
+    }
+
+    #[test]
+    fn source_interface_contract_distinguishes_abstract_static_and_sealed() {
+        let source = r#"package fixture;
+            import other.Closed;
+            public interface Action {
+                @SuppressWarnings("static") void run();
+                static Action make() { return () -> {}; }
+                default int size() { return 1; }
+                sealed interface Closed permits Open { void call(); }
+                non-sealed interface Open extends Closed {}
+                interface Own extends Action { interface Action {} }
+            }
+        "#;
+        let limits = ArtifactProducerLimits::default();
+        let mut diagnostics = BoundedProducerDiagnostics::new(&limits);
+        let mut remaining = limits.max_records;
+        let mut exhausted = false;
+        let names = source_declared_type_names(source).into_iter().collect();
+        let types = source_api_types(
+            "fixture/Action.java",
+            source,
+            &names,
+            limits.max_signature_depth,
+            &mut remaining,
+            &mut exhausted,
+            &mut diagnostics,
+        );
+        assert!(!exhausted);
+        let (diagnostics, suppressed) = diagnostics.finish();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert_eq!(suppressed.total(), 0, "{suppressed:?}");
+        let action = types.iter().find(|ty| ty.name == "fixture.Action").unwrap();
+        assert!(!action.is_sealed);
+        let run = action
+            .members
+            .iter()
+            .find(|member| member.name == "run")
+            .unwrap();
+        assert!(run.is_abstract && !run.is_static);
+        assert!(run.signature.as_ref().unwrap().returns.is_none());
+        let make = action
+            .members
+            .iter()
+            .find(|member| member.name == "make")
+            .unwrap();
+        assert!(make.is_static && !make.is_abstract);
+        assert!(make.signature.as_ref().unwrap().returns.is_some());
+        let size = action
+            .members
+            .iter()
+            .find(|member| member.name == "size")
+            .unwrap();
+        assert!(!size.is_static && !size.is_abstract);
+        for (owner, target) in [
+            ("fixture.Action.Open", "fixture.Action.Closed"),
+            ("fixture.Action.Own", "fixture.Action"),
+        ] {
+            let declaration = types.iter().find(|ty| ty.name == owner).unwrap();
+            assert!(
+                matches!(declaration.hierarchy.as_slice(), [HierarchyFact {
+                target: TypeRef::Named { name, .. }, ..
+            }] if name == target),
+                "{declaration:?}"
+            );
+        }
+        assert!(
+            types
+                .iter()
+                .find(|ty| ty.name == "fixture.Action.Closed")
+                .unwrap()
+                .is_sealed
+        );
+        assert!(
+            !types
+                .iter()
+                .find(|ty| ty.name == "fixture.Action.Open")
+                .unwrap()
+                .is_sealed
+        );
     }
 
     /// JLS 8.10.3: an explicit accessor, canonical constructor, `equals`,

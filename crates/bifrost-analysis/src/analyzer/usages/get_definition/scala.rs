@@ -45,10 +45,11 @@ use brokk_bifrost_jvm::scala::graph::syntax::{
     applied_expression_for_reference, call_arities_for_reference, call_site_shape_for_reference,
     enclosing_template_declarations, is_enclosing_template_qualifier_reference,
     is_extractor_reference, is_infix_type_operator_reference, is_scala_case_pattern_binder,
-    is_scala_class_reference, is_scala_named_argument_assignment, named_argument_invocation_owner,
-    qualified_stable_type_reference, scala_callable_alternative_is_candidate,
-    scala_callable_alternative_matches, scala_callable_alternative_mismatch,
-    scala_callable_completes_call, scala_definition_binder_names, scala_pattern_binder_names,
+    is_scala_class_reference, is_scala_named_argument_assignment, is_semantic_call_argument,
+    named_argument_invocation_owner, qualified_stable_type_reference,
+    scala_callable_alternative_is_candidate, scala_callable_alternative_matches,
+    scala_callable_alternative_mismatch, scala_callable_completes_call,
+    scala_definition_binder_names, scala_method_value_site, scala_pattern_binder_names,
     scala_source_facts, template_self_types,
 };
 use std::cell::{Cell, RefCell};
@@ -3785,26 +3786,17 @@ fn bounded_scala_import_visible_at(
     let Some(path) = import.path.as_ref() else {
         return Some(true);
     };
-    if path.declaration_start_byte > ctx.reference_byte {
-        return Some(false);
-    }
-    if !path.lexical_prefixes.is_empty()
-        && path.lexical_prefixes.last() != ctx.package_prefixes.last()
-    {
-        return Some(false);
-    }
-    if path.lexical_scopes.len() > ctx.lexical_scopes.len() {
-        return Some(false);
-    }
-    for (import_scope, active_scope) in path.lexical_scopes.iter().zip(&ctx.lexical_scopes) {
+    for _ in path.lexical_scopes.iter().zip(&ctx.lexical_scopes) {
         if !ctx.walk.step() {
             return None;
         }
-        if import_scope != active_scope {
-            return Some(false);
-        }
     }
-    Some(true)
+    Some(scala_import_visible_at(
+        import,
+        &ctx.package_prefixes,
+        &ctx.lexical_scopes,
+        ctx.reference_byte,
+    ))
 }
 
 fn bounded_scala_import_member_fqns(
@@ -5248,11 +5240,41 @@ fn resolve_scala_focused_qualified_path(
             // The receiver-position caret of a written `Owner.member` path:
             // `Collections` in `Collections.sort`. The owner is what did not
             // resolve, and the member it qualifies is what decides whether the
-            // pair left the workspace (#2287). A caret further left in a longer
-            // path qualifies another owner segment rather than a member, so it
-            // keeps the plain miss.
+            // pair left the workspace (#2287).
+            //
+            // A one-segment prefix is a term, not an owner: `unescMap` in
+            // `unescMap.get` is the field a wildcard import of a nested object
+            // binds (#3518). Explicit selectors are answered above by
+            // `resolve_member`. Enclosing and package-clause terms outrank
+            // that import.
             ScalaNameResolution::Unresolved if path.focus_index + 2 == names.len() => {
+                if prefix.len() == 1
+                    && !path.focus_owns_a_projection_selector()
+                    && let Some(outcome) =
+                        scala_receiver_prefix_term_outcome(ctx, token, resolver, node, root_name)
+                {
+                    return Some(outcome);
+                }
                 scala_focused_owner_boundary(ctx, token, &names, &display)
+            }
+            // The same one-segment prefix heads a call-free chain of three or
+            // more segments: `unescMap` in `unescMap.keys.size` still has no
+            // owner segment written to its left, and the path stops at the
+            // selection chain, so the head consults the same tier (#3518).
+            // When nothing binds it, the caret keeps the plain miss a longer
+            // path always gave; the owner-boundary answer above stays reserved
+            // for the two-segment `Owner.member` pair whose member decides
+            // whether that pair left the workspace.
+            ScalaNameResolution::Unresolved
+                if path.focus_index == 0 && !path.focus_owns_a_projection_selector() =>
+            {
+                match scala_receiver_prefix_term_outcome(ctx, token, resolver, node, root_name) {
+                    Some(outcome) => outcome,
+                    None => no_definition(
+                        "no_indexed_definition",
+                        format!("`{display}` did not resolve to an indexed Scala owner"),
+                    ),
+                }
             }
             ScalaNameResolution::Unresolved => no_definition(
                 "no_indexed_definition",
@@ -5260,6 +5282,70 @@ fn resolve_scala_focused_qualified_path(
             ),
         },
     )
+}
+
+/// Term named by the single prefix of a selection once owner lookup has missed.
+///
+/// `import Escapes._` binds `unescMap` as a field of the nested object. The
+/// caret on that field in `unescMap.get` is this prefix. A definition already
+/// in the enclosing template, including one inherited there, outranks the
+/// import. A wildcard that does not export the name leaves the caller to
+/// report the owner boundary.
+fn scala_receiver_prefix_term_outcome(
+    ctx: ScalaLookupCtx<'_>,
+    token: QueryToken<'_>,
+    resolver: &ScalaNameResolver<'_>,
+    node: Node<'_>,
+    name: &str,
+) -> Option<DefinitionLookupOutcome> {
+    if let Some(owner) =
+        scala_enclosing_class(ctx.analyzer, ctx.support, ctx.file, node.start_byte())
+    {
+        match scala_exact_owner_member_candidate_units(ctx, token, &owner, name, false) {
+            ScalaExactMemberResolution::Found(mut candidates) => {
+                candidates.retain(|unit| {
+                    !ctx.scala.is_type_alias(unit)
+                        && !scala_constructor_only_callable(ctx.scala, unit)
+                });
+                if !candidates.is_empty() {
+                    return Some(candidates_outcome(candidates));
+                }
+            }
+            ScalaExactMemberResolution::Ambiguous(contenders) => {
+                return Some(scala_ambiguous_outcome(
+                    "ambiguous_scala_enclosing_member",
+                    contenders,
+                    format!("`{name}` has multiple physical enclosing-owner definitions"),
+                ));
+            }
+            ScalaExactMemberResolution::NoMatch => {}
+        }
+    }
+    match scala_self_type_member_candidate_units(ctx, token, resolver, node, name) {
+        ScalaExactMemberResolution::Found(candidates) if !candidates.is_empty() => {
+            return Some(candidates_outcome(candidates));
+        }
+        ScalaExactMemberResolution::Ambiguous(contenders) => {
+            return Some(scala_ambiguous_outcome(
+                "ambiguous_scala_self_type_member",
+                contenders,
+                format!("`{name}` has multiple physical self-type member definitions"),
+            ));
+        }
+        ScalaExactMemberResolution::Found(_) | ScalaExactMemberResolution::NoMatch => {}
+    }
+    if let Some(unit) =
+        resolve_in_enclosing_scopes(ctx.analyzer, ctx.file, name, node.start_byte(), |unit| {
+            unit.is_field()
+                && !ctx
+                    .scala
+                    .structural_parent_of(unit)
+                    .is_some_and(|owner| owner.is_class())
+        })
+    {
+        return Some(candidates_outcome(vec![unit]));
+    }
+    scala_wildcard_imported_member_outcome(ctx, token, resolver, name, None)
 }
 
 /// What a caret on the owner of a written `Owner.member` path reports when the
@@ -5403,13 +5489,35 @@ fn scala_exact_qualified_terminal_outcome(
             if let Some(exact_owner) =
                 scala_exact_bound_stable_owner(ctx, token, resolver, root, node, owner_segments)
             {
-                return scala_terminal_candidates_outcome(scala_exact_terminal_member_candidates(
+                let candidates = scala_exact_terminal_member_candidates(
                     ctx.scala,
                     ctx.support,
                     &exact_owner,
                     member,
                     role,
-                ));
+                );
+                // A caret on the terminal of `value.member` names the same
+                // site the applied member route resolves, so a method value
+                // whose written function type states the arity selects its
+                // overload here too (#3512). The guard keeps every applied
+                // call and every site without a written function type on its
+                // previous path, where the declaration family is the
+                // denotation. A filtered set that admits no candidate is
+                // empty, so such a site falls through to the routes below
+                // instead of answering a family its written arity refuted.
+                let call_shape = scala_call_site_shape(ctx, token, root, node);
+                if call_shape.as_ref().is_some_and(|call_shape| {
+                    call_shape.lists.is_empty() && call_shape.method_value_arity.is_some()
+                }) {
+                    let applicable = scala_filter_callable_units(
+                        ctx.scala,
+                        candidates,
+                        call_shape.as_ref(),
+                        ScalaCallableSiteRole::Ordinary,
+                    );
+                    return scala_terminal_candidates_outcome(applicable);
+                }
+                return scala_terminal_candidates_outcome(candidates);
             }
             let root_name = owner_segments.first()?;
             let bindings = scala_bindings_before(ctx, token, resolver, root, node.start_byte());
@@ -7148,7 +7256,19 @@ fn scala_call_site_shape(
     root: Node<'_>,
     reference: Node<'_>,
 ) -> Option<ScalaCallSiteShape> {
-    let shape = call_site_shape_for_reference(reference)?;
+    let Some(shape) = call_site_shape_for_reference(reference) else {
+        // No argument list is written. Where a value is expected the site is a
+        // method value: Scala eta-expands the callable the reference names,
+        // and the expected function type -- not a written list -- states the
+        // arity (#3512). Anywhere else there is no callable site to measure.
+        let site = scala_method_value_site(reference)?;
+        let arity = site
+            .written_arity
+            .or_else(|| scala_forward_method_value_arity(ctx, token, root, site.expression));
+        return Some(ScalaCallSiteShape::method_value(
+            arity.map(ScalaFunctionParameterShape::arity_only),
+        ));
+    };
     let method_value_arity = applied_expression_for_reference(reference)
         .and_then(|expression| scala_forward_method_value_arity(ctx, token, root, expression));
     Some(shape.with_method_value_arity(method_value_arity))
@@ -7157,7 +7277,7 @@ fn scala_call_site_shape(
 fn scala_forward_method_value_arity(
     ctx: ScalaLookupCtx<'_>,
     token: QueryToken<'_>,
-    _root: Node<'_>,
+    root: Node<'_>,
     expression: Node<'_>,
 ) -> Option<usize> {
     let arguments = expression
@@ -7166,6 +7286,7 @@ fn scala_forward_method_value_arity(
     let mut arguments_cursor = arguments.walk();
     let parameter_index = arguments
         .named_children(&mut arguments_cursor)
+        .filter(|argument| is_semantic_call_argument(*argument))
         .position(|argument| argument == expression)?;
     let call = arguments.parent().filter(|parent| {
         parent.kind() == "call_expression"
@@ -7180,38 +7301,8 @@ fn scala_forward_method_value_arity(
     if function.kind() == "generic_function" {
         function = function.child_by_field_name("function")?;
     }
-    if !matches!(function.kind(), "identifier" | "operator_identifier") {
-        return None;
-    }
-    let function_name = scala_node_text(function, ctx.source).trim();
-    if function_name.is_empty() {
-        return None;
-    }
     let call_arities = call_arities_for_reference(function)?;
-    let mut methods = Vec::new();
-    if let Some(method) = resolve_in_enclosing_scopes(
-        ctx.analyzer,
-        ctx.file,
-        function_name,
-        function.start_byte(),
-        CodeUnit::is_function,
-    ) {
-        methods.push(method);
-    }
-    let enclosing_owner =
-        scala_enclosing_class(ctx.analyzer, ctx.support, ctx.file, function.start_byte());
-    if methods.is_empty()
-        && let Some(owner) = enclosing_owner.as_ref()
-        && let ScalaExactMemberResolution::Found(candidates) =
-            scala_exact_owner_member_candidate_units(ctx, token, owner, function_name, false)
-    {
-        methods.extend(candidates);
-    }
-    if methods.is_empty() && enclosing_owner.is_none() {
-        methods.extend(scala_same_file_root_function_units(ctx, function_name));
-    }
-    methods.sort();
-    methods.dedup();
+    let methods = scala_forward_method_value_callee_units(ctx, token, root, function);
     let mut resolved = None;
     let actual = ScalaCallSiteShape::ordinary(&call_arities);
     for method in methods {
@@ -7246,6 +7337,118 @@ fn scala_forward_method_value_arity(
         resolved = Some(arity);
     }
     resolved
+}
+
+/// The declarations the callee of one method-value site names.
+///
+/// A written argument's expected type belongs to the callee's parameter
+/// (#3512), so the arity this site has to measure sits on a declaration of the
+/// callee, not on the reference. The callee spells either a plain name in
+/// lexical scope or a member selection whose receiver the ordinary receiver
+/// rules already type, so both tiers reuse the helpers the applied member
+/// lookup uses rather than reading the callee's spelling as text.
+fn scala_forward_method_value_callee_units(
+    ctx: ScalaLookupCtx<'_>,
+    token: QueryToken<'_>,
+    root: Node<'_>,
+    function: Node<'_>,
+) -> Vec<CodeUnit> {
+    match function.kind() {
+        "identifier" | "operator_identifier" => {
+            let function_name = scala_node_text(function, ctx.source).trim();
+            if function_name.is_empty() {
+                return Vec::new();
+            }
+            let mut methods = Vec::new();
+            if let Some(method) = resolve_in_enclosing_scopes(
+                ctx.analyzer,
+                ctx.file,
+                function_name,
+                function.start_byte(),
+                CodeUnit::is_function,
+            ) {
+                methods.push(method);
+            }
+            let enclosing_owner =
+                scala_enclosing_class(ctx.analyzer, ctx.support, ctx.file, function.start_byte());
+            if methods.is_empty()
+                && let Some(owner) = enclosing_owner.as_ref()
+                && let ScalaExactMemberResolution::Found(candidates) =
+                    scala_exact_owner_member_candidate_units(
+                        ctx,
+                        token,
+                        owner,
+                        function_name,
+                        false,
+                    )
+            {
+                methods.extend(candidates);
+            }
+            if methods.is_empty() && enclosing_owner.is_none() {
+                methods.extend(scala_same_file_root_function_units(ctx, function_name));
+            }
+            methods.sort();
+            methods.dedup();
+            methods
+        }
+        "field_expression" => scala_forward_member_callee_units(ctx, token, root, function),
+        _ => Vec::new(),
+    }
+}
+
+/// The member declarations a `receiver.member` callee names, resolved through
+/// the same receiver tiers as an applied member access: exact owners by
+/// declaration, name-typed owners by member lookup.
+fn scala_forward_member_callee_units(
+    ctx: ScalaLookupCtx<'_>,
+    token: QueryToken<'_>,
+    root: Node<'_>,
+    expression: Node<'_>,
+) -> Vec<CodeUnit> {
+    let (Some(receiver), Some(field)) = (
+        expression.child_by_field_name("value"),
+        expression.child_by_field_name("field"),
+    ) else {
+        return Vec::new();
+    };
+    let member = scala_node_text(field, ctx.source).trim();
+    if member.is_empty() {
+        return Vec::new();
+    }
+    let Some((package_prefixes, lexical_scopes)) = scala_lexical_context_at(
+        ctx.session,
+        root,
+        ctx.source,
+        expression,
+        expression.start_byte(),
+    ) else {
+        return Vec::new();
+    };
+    let resolver = ScalaNameResolver::for_file(ctx.scala, token, ctx.support, ctx.file)
+        .with_lexical_context(package_prefixes, lexical_scopes, expression.start_byte());
+    let bindings = matches!(receiver.kind(), "identifier" | "type_identifier")
+        .then(|| scala_bindings_before(ctx, token, &resolver, root, expression.start_byte()));
+    let owner = match bindings.as_ref() {
+        Some(bindings) => {
+            scala_receiver_owner_with_bindings(ctx, token, &resolver, receiver, bindings)
+        }
+        None => scala_non_identifier_receiver_type_fqn(ctx, token, &resolver, receiver)
+            .map(ScalaReceiverOwner::Logical),
+    };
+    match owner {
+        Some(ScalaReceiverOwner::Exact(owner)) => {
+            match scala_exact_owner_member_candidate_units(ctx, token, &owner, member, false) {
+                ScalaExactMemberResolution::Found(candidates) => candidates,
+                ScalaExactMemberResolution::NoMatch | ScalaExactMemberResolution::Ambiguous(_) => {
+                    Vec::new()
+                }
+            }
+        }
+        Some(ScalaReceiverOwner::Logical(owner_fqn)) => {
+            scala_member_candidate_units(ctx, token, &owner_fqn, member, false)
+        }
+        None => Vec::new(),
+    }
 }
 
 fn resolve_scala_type(
@@ -10634,7 +10837,13 @@ fn scala_candidate_applicability(
             .iter()
             .map(
                 |unit| match scala_unit_mismatch(scala, unit, call_shape, site_role, facts) {
-                    None if call_shape.is_some() => {
+                    // A method value whose expected function type is not in
+                    // this workspace measured nothing on the callable axis
+                    // either: it wrote no argument list and read no arity.
+                    None if call_shape.is_some_and(|call_shape| {
+                        !call_shape.lists.is_empty() || call_shape.method_value_arity.is_some()
+                    }) =>
+                    {
                         CandidateApplicability::applicable(unit.clone())
                     }
                     None => CandidateApplicability::unknown(unit.clone()),
@@ -10846,13 +11055,22 @@ fn scala_unit_mismatch(
     if !unit.is_function() {
         return Some(ScalaCallableMismatch::Role);
     }
-    // A reference that writes no argument list is not a call, and a `def` that
-    // shares a `val`'s name in one template must take parameters. The competing
-    // term field therefore withdraws the method-value premise: a parameterized
-    // `def` is refused, while a paren-less one still admits the read on its own
-    // and stays a genuine tie (#2170).
-    let unique_callable =
-        facts.unique_callable && !(call_shape.is_none() && facts.term_field_candidate);
+    // A reference that writes no argument list denotes the callable itself:
+    // Scala eta-expands a method value, and a paren-less `def` is read
+    // directly. Neither reading needs the written argument list that tells a
+    // partial application apart from a complete one, so an overload set is no
+    // reason to refuse -- the family is the denotation, and the caller reports
+    // it as one (#3512). A `def` that shares a `val`'s name in one template
+    // must take parameters, so a competing term field still withdraws the
+    // method-value premise: the parameterized `def` is refused, while a
+    // paren-less one admits the read on its own and stays a genuine tie
+    // (#2170).
+    let unapplied = call_shape.is_none_or(|call_shape| call_shape.lists.is_empty());
+    let unique_callable = if unapplied {
+        !facts.term_field_candidate
+    } else {
+        facts.unique_callable
+    };
     let alternatives = scala_forward_callable_source_alternatives(scala, unit);
     if !alternatives.is_empty() {
         let mut mismatches = Vec::new();
@@ -11098,11 +11316,13 @@ fn scala_wildcard_imported_member_outcome(
     // same units, and a name exported by one object is not ambiguous however
     // many times the file imports that object.
     let mut exporters: Vec<Vec<CodeUnit>> = Vec::new();
-    for import in ctx.scala.import_info_of(token, ctx.file) {
+    // Only imports in scope at the reference. A wildcard in a sibling template
+    // exports the same simple name without binding this site.
+    for import in resolver.visible_imports() {
         if !import.is_wildcard {
             continue;
         }
-        let Some(path) = scala_import_path(&import) else {
+        let Some(path) = scala_import_path(import) else {
             continue;
         };
         // A relative wildcard base (`import Registry._` nested in a

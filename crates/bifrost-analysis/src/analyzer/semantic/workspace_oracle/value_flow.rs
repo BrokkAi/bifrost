@@ -1579,9 +1579,105 @@ fn stated_member_contents(
     Ok(bases)
 }
 
+/// The catch-binding events of `procedure` whose call cannot throw anything
+/// the bound catch parameter catches, keyed by point and event index.
+///
+/// A lowering binds a call's thrown value to the catch parameter of the
+/// handler its exceptional continuation reaches, as an `Assignment` and a
+/// local `ValueFlow` at that continuation point. The IR carries no exception
+/// types, so the binding is published for every such call. A language's own
+/// typing rules can prove that a call never throws what the catch clause
+/// catches: a Java callee that declares no `throws` clause cannot deliver a
+/// checked exception. Dropping that binding keeps the parameter's origin the
+/// throws that can reach it, so a field read through the parameter still
+/// observes the thrown object (#2192).
+///
+/// Fails closed: a language without the proof, an unavailable source, or an
+/// unmapped span refutes nothing.
+fn refuted_catch_bindings(
+    workspace: &crate::analyzer::WorkspaceAnalyzer,
+    procedure: &ProcedureHandle,
+    request: &SemanticRequest<'_>,
+) -> Result<HashSet<(ProgramPointId, usize)>, SemanticProviderError> {
+    let semantics = procedure.semantics();
+    let mut candidates = Vec::new();
+    for call in semantics.call_sites() {
+        let (Some(thrown), crate::analyzer::semantic::ControlContinuation::Target(point)) =
+            (call.thrown, call.exceptional_continuation)
+        else {
+            continue;
+        };
+        let Some(row) = semantics.point(point) else {
+            continue;
+        };
+        for (index, event) in row.events.iter().enumerate() {
+            let binder = match event.effect {
+                SemanticEffect::Assignment { target, value } if value == thrown => target,
+                SemanticEffect::ValueFlow {
+                    kind: ValueFlowKind::Local,
+                    source,
+                    target,
+                } if source == thrown => target,
+                _ => continue,
+            };
+            candidates.push((call, binder, point, index));
+        }
+    }
+    let mut refuted = HashSet::new();
+    if candidates.is_empty() {
+        return Ok(refuted);
+    }
+    let crate::analyzer::LanguageDialect::Standard(language) =
+        procedure.artifact().key().language()
+    else {
+        return Ok(refuted);
+    };
+    let Some(support) = crate::analyzer::languages::language_support(language) else {
+        return Ok(refuted);
+    };
+    let Some((file, source)) = super::exact_source_for_procedure(
+        workspace,
+        procedure,
+        request.budget.remaining().source_bytes,
+    )?
+    else {
+        return Ok(refuted);
+    };
+    let span = |mapping| {
+        semantics.source_mapping(mapping).map(|mapping| {
+            let span = mapping.locator.anchor().span();
+            span.start_byte() as usize..span.end_byte() as usize
+        })
+    };
+    let mut answers = HashMap::new();
+    for (call, binder, point, index) in candidates {
+        let refutes = *answers.entry((call.id, binder)).or_insert_with(|| {
+            let Some(call_span) = span(call.source) else {
+                return false;
+            };
+            let Some(binder_span) = semantics.value(binder).and_then(|value| span(value.source))
+            else {
+                return false;
+            };
+            support.call_cannot_reach_catch_parameter(
+                workspace.analyzer(),
+                &file,
+                &source,
+                call_span,
+                binder_span,
+            )
+        });
+        if refutes {
+            refuted.insert((point, index));
+        }
+    }
+    Ok(refuted)
+}
+
 fn procedure_value_facts(
     procedure: &ProcedureHandle,
     seeded: &HashMap<ValueId, LoadOrigin>,
+    refuted: &HashSet<(ProgramPointId, usize)>,
     cancellation: &crate::CancellationToken,
     mut charge: impl FnMut(SemanticWork) -> Result<(), Interruption>,
 ) -> Result<ProcedureValueFacts, Interruption> {
@@ -1619,7 +1715,7 @@ fn procedure_value_facts(
         } else {
             HashSet::new()
         };
-        for event in &point.events {
+        for (event_index, event) in point.events.iter().enumerate() {
             if cancellation.is_cancelled() {
                 return Err(Interruption::Cancelled);
             }
@@ -1627,6 +1723,9 @@ fn procedure_value_facts(
                 events: 1,
                 ..SemanticWork::default()
             })?;
+            if refuted.contains(&(point.id, event_index)) {
+                continue;
+            }
             let origin = match event.effect {
                 SemanticEffect::Assignment { target, value } => {
                     charge(SemanticWork {
@@ -4008,6 +4107,14 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
             }
         }
 
+        // Catch bindings the language proves a call cannot reach are neither
+        // origins nor relations (#2192).
+        let refuted_bindings = if interrupted.is_none() {
+            refuted_catch_bindings(self.workspace, procedure, request)?
+        } else {
+            HashSet::new()
+        };
+
         // #2446: derived before the access-path origins, because a handler
         // binding is one of them. Nothing is derived for a procedure whose
         // adapter already selected every handler.
@@ -4033,6 +4140,7 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
             match procedure_value_facts(
                 procedure,
                 handler_bindings.binder_origins(),
+                &refuted_bindings,
                 request.cancellation,
                 |work| staged.charge(work),
             ) {
@@ -4098,6 +4206,9 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                     break 'points;
                 }
 
+                if refuted_bindings.contains(&(point.id, event_index)) {
+                    continue;
+                }
                 let mut access_path = None;
                 let mut alternative_access_paths = Vec::new();
                 let mut alternative_paths_truncated = false;
@@ -6747,8 +6858,14 @@ func arrayCopy() int {
                 "{procedure} must publish a transfer: {:#?}",
                 handle.semantics()
             );
-            let facts = procedure_value_facts(&handle, &HashMap::new(), &cancellation, |_| Ok(()))
-                .expect("unbudgeted local origin derivation completes");
+            let facts = procedure_value_facts(
+                &handle,
+                &HashMap::new(),
+                &HashSet::new(),
+                &cancellation,
+                |_| Ok(()),
+            )
+            .expect("unbudgeted local origin derivation completes");
             transferred
                 .into_iter()
                 .map(|target| {
@@ -6846,8 +6963,14 @@ func shifted(dynamic int) int {
             })
             .and_then(|procedure| artifact.procedure_handle(procedure.id()))
             .expect("shifted procedure");
-        let facts = procedure_value_facts(&procedure, &HashMap::new(), &cancellation, |_| Ok(()))
-            .expect("unbudgeted local origin derivation completes");
+        let facts = procedure_value_facts(
+            &procedure,
+            &HashMap::new(),
+            &HashSet::new(),
+            &cancellation,
+            |_| Ok(()),
+        )
+        .expect("unbudgeted local origin derivation completes");
         let exact_integer = |value| {
             exact_unsigned_integer_origin(procedure.semantics(), &facts.load_origins, value)
         };

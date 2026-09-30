@@ -102,8 +102,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     pub(super) fn emit_local_bindings(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
+        entry: ProgramPointId,
         body: Node<'tree>,
     ) -> Result<(), TsLoweringError> {
+        let mut hoisted = Vec::new();
         try_walk_named_tree_preorder(body, true, |node| {
             if self.session.cancellation().is_cancelled() {
                 return Err(TsLoweringError::Cancelled(Box::new(
@@ -180,10 +182,47 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                             scope_end,
                             value,
                         });
+                    // Function-scoped `var` exists as undefined before the
+                    // body runs. Module bindings need separate global rules.
+                    if node.kind() == "variable_declarator"
+                        && node
+                            .parent()
+                            .is_some_and(|parent| parent.kind() == "variable_declaration")
+                        && body.kind() != "program"
+                    {
+                        hoisted.push(value);
+                    }
                 }
             }
             Ok(WalkControl::Continue)
-        })
+        })?;
+        if !hoisted.is_empty() {
+            let undefined = self.value(
+                builder,
+                entry,
+                SemanticValueKind::LanguageDefined("js.undefined".into()),
+            )?;
+            for target in hoisted {
+                self.append_effect(
+                    builder,
+                    entry,
+                    SemanticEffect::Assignment {
+                        target,
+                        value: undefined,
+                    },
+                )?;
+                self.append_effect(
+                    builder,
+                    entry,
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::Local,
+                        source: undefined,
+                        target,
+                    },
+                )?;
+            }
+        }
+        Ok(())
     }
 
     /// Identify locals that hold a proven allocation for their whole extent,
@@ -202,6 +241,71 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     /// nor invalidates: it names no member, so it cannot retract the identity
     /// of an access that already ran, and it hands the object to a callee, so
     /// it records an `escapes_after` bound for the accesses that follow it.
+    /// A nested callable that assigns one of this procedure's locals or
+    /// parameters rebinds it whenever the callable runs. This procedure's IR
+    /// has no capture edge for that write, so publish it on the binding: a
+    /// consumer that carries local facts across a call or suspension must
+    /// treat the binding as rebindable there.
+    pub(super) fn emit_nested_rebind_gaps(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        entry: ProgramPointId,
+        body: Node<'tree>,
+    ) -> Result<(), TsLoweringError> {
+        let mut bindings = self
+            .locals
+            .iter()
+            .flat_map(|(name, locals)| {
+                locals
+                    .iter()
+                    .map(|local| (name.clone(), local.binding.start_byte, local.value))
+            })
+            .chain(
+                self.parameters
+                    .iter()
+                    .map(|(name, value)| (name.clone(), body.start_byte(), *value)),
+            )
+            .collect::<Vec<_>>();
+        bindings.sort_unstable_by_key(|(_, _, value)| *value);
+        bindings.dedup_by_key(|(_, _, value)| *value);
+        let root = self.prepared.tree().root_node();
+        for (name, byte, value) in bindings {
+            let nested = self
+                .lexical_bindings
+                .binding_write_sites_at(&name, byte)
+                .into_iter()
+                .any(|site| {
+                    let Some(mut node) = root.descendant_for_byte_range(site, site + name.len())
+                    else {
+                        return false;
+                    };
+                    while node.id() != body.id() {
+                        if is_js_ts_nested_execution_boundary(node, body) {
+                            return true;
+                        }
+                        let Some(parent) = node.parent() else {
+                            return false;
+                        };
+                        node = parent;
+                    }
+                    false
+                });
+            if nested {
+                self.session.add_gap_with_impacts_and_discharge(
+                    builder,
+                    entry,
+                    SemanticGapSubject::Value(value),
+                    SemanticCapability::Captures,
+                    SemanticGapImpacts::NONE,
+                    SemanticGapKind::Unsupported,
+                    SemanticGapDischarge::RebindAtCallOrSuspension,
+                    "a nested callable rebinds this binding when it runs",
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn collect_plain_object_locals(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
@@ -1020,12 +1124,16 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     }
 
     pub(super) fn local_at(&self, name: &str, byte: usize) -> Option<ValueId> {
+        self.local_binding_at(name, byte)
+            .map(|binding| binding.value)
+    }
+
+    pub(super) fn local_binding_at(&self, name: &str, byte: usize) -> Option<&LocalBinding> {
         self.locals
             .get(name)?
             .iter()
             .filter(|binding| binding.scope_start <= byte && byte < binding.scope_end)
             .min_by_key(|binding| binding.scope_end - binding.scope_start)
-            .map(|binding| binding.value)
     }
 
     pub(super) fn stable_binding_value(&self, binding: &Range) -> Option<ValueId> {
@@ -1130,6 +1238,17 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         Ok(value)
     }
 
+    /// The value of one expression node, minted with the kind its syntax
+    /// fixes. Every lowering path that reaches the node agrees on that kind.
+    pub(super) fn node_value(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+    ) -> Result<ValueId, TsLoweringError> {
+        let kind = expression_value_kind(self.prepared.source(), node);
+        self.expression_value(builder, node, kind)
+    }
+
     /// Reuse one procedure-local value for each structurally constant decimal
     /// array index. Dynamic, string, and noncanonical numeric expressions
     /// intentionally retain their own values, so their access paths remain
@@ -1140,7 +1259,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         node: Node<'tree>,
     ) -> Result<ValueId, TsLoweringError> {
         let Some(index) = constant_array_index(self.prepared.source(), node) else {
-            return self.expression_value(builder, node, expression_value_kind(node));
+            return self.node_value(builder, node);
         };
         if let Some(value) = self.constant_index_values.get(&index) {
             self.expression_values.insert(node.id(), *value);
@@ -1244,7 +1363,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         self.session.add_node_mapping(builder, node)
     }
 
-    fn value_mapping(
+    pub(super) fn value_mapping(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
         node: Node<'tree>,

@@ -227,6 +227,7 @@ impl DependencyPackAdapter for PhpDependencyPackAdapter {
                 },
                 carried_sources: Vec::new(),
                 cpp_portability: None,
+                python_correspondence: None,
                 shards: vec![AuthoredShard {
                     id: "declarations.php.external".to_owned(),
                     activation,
@@ -431,6 +432,7 @@ impl ComposerPackagePackProducer {
                 safety: request.safety.clone(),
                 carried_sources: Vec::new(),
                 cpp_portability: None,
+                python_correspondence: None,
                 shards: vec![AuthoredShard {
                     id: "declarations.php.external".to_owned(),
                     activation,
@@ -701,6 +703,7 @@ impl PhpDeclarationStubPackProducer {
                 safety: request.safety.clone(),
                 carried_sources: Vec::new(),
                 cpp_portability: None,
+                python_correspondence: None,
                 shards: vec![AuthoredShard {
                     id: "declarations.php.builtin".to_owned(),
                     activation,

@@ -766,6 +766,8 @@ pub struct AnalyzerSnapshotCaches {
     java_usage_evidence:
         Arc<crate::analyzer::usages::java_usage_evidence_cache::SnapshotJavaUsageEvidenceCache>,
     semantic_models: crate::analyzer::semantic_model::SemanticModelRuntimeCache,
+    /// Pure content- and dialect-keyed facts outlive per-root semantic oracles.
+    runtime_syntax: OnceLock<crate::analyzer::semantic::workspace_oracle::RuntimeSyntaxCache>,
 }
 
 impl AnalyzerSnapshotCaches {
@@ -787,6 +789,7 @@ impl AnalyzerSnapshotCaches {
             semantic_models: crate::analyzer::semantic_model::SemanticModelRuntimeCache::new(
                 derived_layer_budget_bytes,
             ),
+            runtime_syntax: OnceLock::new(),
         }
     }
 
@@ -807,6 +810,7 @@ impl AnalyzerSnapshotCaches {
             semantic_models: crate::analyzer::semantic_model::SemanticModelRuntimeCache::new(
                 self.derived_layers.max_retained_bytes(),
             ),
+            runtime_syntax: self.runtime_syntax.clone(),
         }
     }
 
@@ -832,6 +836,13 @@ impl AnalyzerSnapshotCaches {
         &self,
     ) -> &crate::analyzer::semantic_model::SemanticModelRuntimeCache {
         &self.semantic_models
+    }
+
+    pub(crate) fn runtime_syntax(
+        &self,
+    ) -> &crate::analyzer::semantic::workspace_oracle::RuntimeSyntaxCache {
+        self.runtime_syntax
+            .get_or_init(crate::analyzer::semantic::workspace_oracle::runtime_syntax_cache)
     }
 
     fn semantic_model_overlay(

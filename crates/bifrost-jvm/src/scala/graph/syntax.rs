@@ -159,6 +159,22 @@ impl ScalaCallSiteShape {
         }
     }
 
+    /// The shape of a *method value*: the callable is named but no argument
+    /// list is written, so Scala eta-expands it and the expected function type
+    /// -- when it is knowable -- states the arity instead of a written list.
+    pub fn method_value(shape: Option<ScalaFunctionParameterShape>) -> Self {
+        Self {
+            lists: Vec::new(),
+            leading_literal_argument_types: None,
+            method_value_arity: shape.as_ref().map(|shape| shape.arity),
+            method_value_parameter_types_authoritative: shape
+                .as_ref()
+                .is_some_and(|shape| shape.parameter_types_authoritative),
+            method_value_parameter_types: shape.and_then(|shape| shape.parameter_types),
+            type_arguments_only: false,
+        }
+    }
+
     pub fn with_method_value_arity(mut self, arity: Option<usize>) -> Self {
         self.method_value_arity = arity;
         self.method_value_parameter_types = None;
@@ -1287,6 +1303,82 @@ pub fn is_bare_companion_method_value_reference(node: Node<'_>) -> bool {
         "val_definition" | "var_definition" => parent.child_by_field_name("value") == Some(node),
         _ => false,
     }
+}
+
+/// Where a Scala *method value* stands, and the arity the site itself states.
+pub struct ScalaMethodValueSite<'tree> {
+    /// The outermost expression occupying the value position: the reference
+    /// with its member qualifier, type arguments, and `_` wrapper.
+    pub expression: Node<'tree>,
+    /// The parameter count of the function type the site writes, when the site
+    /// writes one. An argument's expected type belongs to the callee instead,
+    /// so it is `None` here and the caller resolves it.
+    pub written_arity: Option<usize>,
+}
+
+/// The method-value site this reference occupies, or `None` when it occupies
+/// none.
+///
+/// A reference that writes no argument list still denotes the callable it
+/// names: Scala eta-expands `m`, `m[T]` and `m _` where a function value is
+/// expected. Two positions state that expectation structurally -- an argument
+/// of a call, whose parameter type the callee declares, and a `val`/`var`/`def`
+/// that writes a `function_type`. A definition that writes some other type
+/// expects a plain value, so a reference in it is a read, not an
+/// eta-expansion.
+///
+/// A reference that *is* applied occupies no method-value site: its enclosing
+/// `call_expression` stands in those positions, not the reference, so the
+/// written argument lists remain the site's shape.
+pub fn scala_method_value_site(node: Node<'_>) -> Option<ScalaMethodValueSite<'_>> {
+    scala_method_value_site_with_parents(node, &ParentIndex::unindexed())
+}
+
+pub fn scala_method_value_site_with_parents<'tree>(
+    node: Node<'tree>,
+    parents: &ParentIndex<'tree>,
+) -> Option<ScalaMethodValueSite<'tree>> {
+    let mut expression = field_expression_for_member_with_parents(node, parents).unwrap_or(node);
+    while let Some(generic) = parents.parent(expression).filter(|generic| {
+        generic.kind() == "generic_function"
+            && generic.child_by_field_name("function") == Some(expression)
+    }) {
+        expression = generic;
+    }
+    // `m _` is one `method_value` node around the reference (SLS 6.7).
+    if let Some(method_value) = parents
+        .parent(expression)
+        .filter(|parent| parent.kind() == "method_value")
+    {
+        expression = method_value;
+    }
+    let parent = parents.parent(expression)?;
+    let written_type = match parent.kind() {
+        "arguments" => {
+            return is_semantic_call_argument(expression).then_some(ScalaMethodValueSite {
+                expression,
+                written_arity: None,
+            });
+        }
+        "val_definition" | "var_definition"
+            if parent.child_by_field_name("value") == Some(expression) =>
+        {
+            parent.child_by_field_name("type")?
+        }
+        "function_definition" if parent.child_by_field_name("body") == Some(expression) => {
+            parent.child_by_field_name("return_type")?
+        }
+        _ => return None,
+    };
+    if written_type.kind() != "function_type" {
+        return None;
+    }
+    let parameter_types = written_type.child_by_field_name("parameter_types")?;
+    let mut cursor = parameter_types.walk();
+    Some(ScalaMethodValueSite {
+        expression,
+        written_arity: Some(parameter_types.named_children(&mut cursor).count()),
+    })
 }
 
 pub fn is_type_like_reference(node: Node<'_>, source: &str) -> bool {

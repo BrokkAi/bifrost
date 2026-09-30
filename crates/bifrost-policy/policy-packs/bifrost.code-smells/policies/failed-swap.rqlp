@@ -1,0 +1,27 @@
+; Two adjacent assignments copy the first write back into the second local.
+; The finding suggests a probable failed swap.
+(policy
+  :schema-version 1
+  :id "bifrost.correctness.failed-swap"
+  :name "Failed local swap"
+  :message "the second assignment copies back the first assignment's value"
+  :severity warning
+  :description "Two adjacent ordinary local assignments have crossed exact binding identities: a = b followed by b = a. Exact reaching evidence proves the second read receives the first write, which can indicate a failed swap. Intent is not inferred and no automatic fix is offered."
+  :help-uri "https://bifrost.brokk.ai/static-analysis-policies/#built-in-code-smell-pack"
+  :tags ["correctness" "assignment"]
+  :analysis (analysis
+    :type assertion
+    (bind :name failed-swap
+      :query (rql :schema-version 1
+        (filter :where ((relation_kind eq failed_swap)
+                        (storage_kind eq ordinary_local)
+                        (verdict eq failed_swap)
+                        (proof eq exact)
+                        (coverage eq exhaustive))
+          (language java javascript typescript python
+            (assignment-relations :relation [failed-swap]
+              (procedure-of
+                (callable)))))))
+    (group :name by-assignment-pair :by (failed-swap.id)
+      (aggregate :name failed-swaps :op count))
+    (assert :group by-assignment-pair :value failed-swaps :cardinality (exactly 0))))

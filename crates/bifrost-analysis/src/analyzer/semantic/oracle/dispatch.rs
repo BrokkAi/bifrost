@@ -13,6 +13,7 @@ use super::relation::{
     collect_candidate_provenance, validate_retained_relation_arenas,
 };
 use crate::analyzer::languages::{LanguageSupport, language_support};
+use crate::analyzer::semantic_model::SemanticModelActivationEvidence;
 use crate::analyzer::{CallableArity, Language, SignatureMetadata};
 use brokk_bifrost_core::path_utils::path_suffix_key;
 use std::borrow::Cow;
@@ -533,6 +534,10 @@ pub struct UnmaterializedExternalTarget {
     has_receiver: bool,
     resolver_owned_call_shape: bool,
     normalized_static_owner: Option<Box<str>>,
+    /// Exact JDK artifact selected for the Java source module and verified
+    /// against the selected external declaration. Model and dispatch
+    /// applicability still require separate proofs.
+    selected_jdk_artifact: Option<SemanticModelActivationEvidence>,
     locator: SemanticLocator,
 }
 
@@ -577,6 +582,7 @@ impl UnmaterializedExternalTarget {
             has_receiver,
             resolver_owned_call_shape: false,
             normalized_static_owner,
+            selected_jdk_artifact: None,
             locator,
         }
     }
@@ -588,11 +594,39 @@ impl UnmaterializedExternalTarget {
         member: impl Into<Box<str>>,
         arity: u32,
         has_receiver: bool,
+        selected_jdk_artifact: Option<SemanticModelActivationEvidence>,
         locator: SemanticLocator,
     ) -> Self {
         let mut target = Self::new(owner_fqn, member, arity, has_receiver, locator);
         target.resolver_owned_call_shape = true;
+        debug_assert!(
+            selected_jdk_artifact.is_none()
+                || target.language() == SemanticLanguage::Standard(Language::Java)
+        );
+        debug_assert!(selected_jdk_artifact.as_ref().is_none_or(|evidence| {
+            evidence.language == "java"
+                && evidence.ecosystem == "jdk"
+                && evidence.artifact_sha256.is_some()
+        }));
+        target.selected_jdk_artifact = selected_jdk_artifact;
         target
+    }
+
+    pub fn selected_jdk_artifact(&self) -> Option<&SemanticModelActivationEvidence> {
+        self.selected_jdk_artifact.as_ref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_selected_jdk_for_test(
+        mut self,
+        evidence: SemanticModelActivationEvidence,
+    ) -> Self {
+        assert_eq!(self.language(), SemanticLanguage::Standard(Language::Java));
+        assert_eq!(evidence.ecosystem, "jdk");
+        assert!(evidence.artifact_sha256.is_some());
+        self.resolver_owned_call_shape = true;
+        self.selected_jdk_artifact = Some(evidence);
+        self
     }
 
     pub fn owner_fqn(&self) -> &str {
@@ -617,8 +651,11 @@ impl UnmaterializedExternalTarget {
         if self.has_receiver {
             return false;
         }
-        if self.language() == SemanticLanguage::Standard(Language::Python)
-            && self.resolver_owned_call_shape
+        if self.resolver_owned_call_shape
+            && matches!(
+                self.language(),
+                SemanticLanguage::Standard(Language::Python | Language::Java)
+            )
         {
             return true;
         }
@@ -631,7 +668,7 @@ impl UnmaterializedExternalTarget {
         }
     }
 
-    pub(crate) const fn has_resolver_owned_call_shape(&self) -> bool {
+    pub const fn has_resolver_owned_call_shape(&self) -> bool {
         self.resolver_owned_call_shape
     }
 

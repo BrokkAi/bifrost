@@ -267,7 +267,7 @@ Semantic materialization is lazy and request-scoped. It has separate finite limi
 
 This CFG surface is a procedure-local inspection API. It does not cross call boundaries and does not provide an ICFG, data-flow, taint, typestate, finding, or witness engine. The registered typestate adapter below is the only typestate entry point.
 
-Schema v5 adds `inside-decl`: containment that can match an enclosing callable itself, but stops before searching beyond a non-matching nested function, method, constructor, or lambda. Ordinary `inside` remains lexical and can cross those boundaries.
+Schema v5 adds `inside-decl`: containment that can match an enclosing callable itself, but stops before searching beyond a non-matching nested function, method, constructor, or lambda. For a Rust method declared in an `impl`, it can also match the resolved type declaration that owns the impl. Ordinary `inside` remains lexical and can cross those boundaries.
 
 Schema v6 adds `(value-flow :plan-ref namespace:name query)`, mapping procedure rows to diagnostic-neutral flow endpoints backed by a host-registered `ValueFlowPlan`. `(witness ...)` also accepts flow endpoints and returns retained bounded flow paths. Endpoint reachability, exact/may certainty, and ambiguity remain explicit; one public `status` plus optional `reason` preserves semantic, solver, and query termination detail. The status labels and meanings are defined in the [JSON CodeQuery value-domain table](/code-query-json/#registered-value-flow-endpoints-and-witnesses). There is no `must` column until must analysis exists, and no policy classification is implied.
 

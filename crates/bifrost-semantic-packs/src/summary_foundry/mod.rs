@@ -579,6 +579,7 @@ fn round_trip(
         },
         carried_sources: Vec::new(),
         cpp_portability: None,
+        python_correspondence: None,
         shards: vec![AuthoredShard {
             id: format!("summaries.{}", corpus.as_str()),
             // The language-intrinsic activation form: the corpus names classes

@@ -63,7 +63,7 @@ fn enclosing_binding(source: &str, node: Node<'_>) -> Option<EnclosingBinding> {
                 return None;
             }
             "as_expression" | "satisfies_expression" | "non_null_expression" | "type_assertion" => {
-                if first_named_child(parent).is_some_and(|child| child.id() == value.id()) {
+                if ts_type_wrapper_operand(parent).is_some_and(|child| child.id() == value.id()) {
                     value = parent;
                     continue;
                 }
@@ -627,13 +627,152 @@ pub(super) fn body_contains_free_this(
     Ok(found)
 }
 
-pub(super) fn expression_value_kind(node: Node<'_>) -> SemanticValueKind {
+/// The value kind one expression node mints. A value is minted once per node,
+/// so every lowering path must agree on it: a literal whose value the source
+/// fixes publishes that value, including a negated numeric literal.
+pub(super) fn expression_value_kind(source: &str, node: Node<'_>) -> SemanticValueKind {
     match node.kind() {
         kind if is_callable_kind(kind) => SemanticValueKind::Callable,
-        "number" | "string" | "template_string" | "true" | "false" | "null" | "undefined" => {
-            SemanticValueKind::Constant
+        "null" => SemanticValueKind::Null,
+        "true" => SemanticValueKind::Boolean(true),
+        "false" => SemanticValueKind::Boolean(false),
+        // BigInt, legacy octal and infinite tokens keep the payload-free kind.
+        "number" => {
+            signed_numeric_literal_kind(source, node).unwrap_or(SemanticValueKind::Constant)
         }
+        "unary_expression" => {
+            signed_numeric_literal_kind(source, node).unwrap_or(SemanticValueKind::Temporary)
+        }
+        "string" | "template_string" | "undefined" => SemanticValueKind::Constant,
         _ => SemanticValueKind::Temporary,
+    }
+}
+
+/// The typed constant a numeric literal, optionally under one direct unary
+/// minus, denotes. An integer within the exact safe range publishes as an
+/// integer; every other finite Number publishes its binary64 bits. `-0` is the
+/// integer zero: it differs from `+0` only under division and `Object.is`,
+/// which publish no scalar fact.
+pub(super) fn signed_numeric_literal_kind(
+    source: &str,
+    node: Node<'_>,
+) -> Option<SemanticValueKind> {
+    const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
+    let value = signed_numeric_literal_value(source, node)?;
+    if !value.is_finite() {
+        return None;
+    }
+    Some(if value.fract() == 0.0 && value.abs() <= MAX_SAFE_INTEGER {
+        if value >= 0.0 {
+            SemanticValueKind::UnsignedInteger(value as u128)
+        } else {
+            SemanticValueKind::SignedInteger(value as i128)
+        }
+    } else {
+        SemanticValueKind::FloatingPoint {
+            bits: value.to_bits(),
+        }
+    })
+}
+
+/// The identifier operand and exact offset of `x + c`, `c + x` or `x - c`,
+/// where `c` is an integer literal (optionally directly negated). On a Number
+/// operand the result is the operand plus the offset; any other operand
+/// converts or concatenates, which a consumer that computes offsets only on
+/// known integer facts never mistakes for addition.
+pub(super) fn integer_offset_operand<'tree>(
+    source: &str,
+    node: Node<'tree>,
+) -> Option<(Node<'tree>, SignedIntegerMagnitude)> {
+    if node.kind() != "binary_expression" {
+        return None;
+    }
+    let left = node.child_by_field_name("left")?;
+    let right = node.child_by_field_name("right")?;
+    let subtract = match node.child_by_field_name("operator")?.kind() {
+        "+" => false,
+        "-" => true,
+        _ => return None,
+    };
+    let (operand, literal) = match (left.kind() == "identifier", right.kind() == "identifier") {
+        (true, false) => (left, right),
+        (false, true) if !subtract => (right, left),
+        _ => return None,
+    };
+    let constant = integer_literal_value(source, literal)?;
+    Some((
+        operand,
+        integer_offset(if subtract { -constant } else { constant }),
+    ))
+}
+
+/// The exact safe integer a numeric literal (optionally directly negated)
+/// denotes.
+pub(super) fn integer_literal_value(source: &str, node: Node<'_>) -> Option<i128> {
+    match signed_numeric_literal_kind(source, node)? {
+        SemanticValueKind::UnsignedInteger(value) => {
+            Some(i128::try_from(value).expect("a safe integer literal fits i128"))
+        }
+        SemanticValueKind::SignedInteger(value) => Some(value),
+        _ => None,
+    }
+}
+
+pub(super) fn integer_offset(offset: i128) -> SignedIntegerMagnitude {
+    SignedIntegerMagnitude::new(offset < 0, offset.unsigned_abs())
+}
+
+/// Whether `node` is a literal of a primitive value. Converting a primitive
+/// to a number or primitive runs no user code.
+pub(super) fn is_primitive_literal(source: &str, node: Node<'_>) -> bool {
+    matches!(node.kind(), "number" | "string" | "true" | "false" | "null")
+        || signed_numeric_literal_value(source, node).is_some()
+}
+
+/// The Number value of a numeric literal, or of one directly negated with
+/// unary minus (`-5`, not `-(5)`).
+pub(super) fn signed_numeric_literal_value(source: &str, node: Node<'_>) -> Option<f64> {
+    match node.kind() {
+        "number" => numeric_literal_value(source, node),
+        "unary_expression"
+            if node
+                .child_by_field_name("operator")
+                .is_some_and(|operator| operator.kind() == "-") =>
+        {
+            numeric_literal_value(source, node.child_by_field_name("argument")?).map(|value| -value)
+        }
+        _ => None,
+    }
+}
+
+/// The Number value of one `number` token under ECMAScript numeric-literal
+/// semantics: numeric separators, `0x`/`0o`/`0b` integers and decimal
+/// literals with fraction and exponent, each rounded to binary64 the way the
+/// language does (Rust's float parsing and integer conversion both round to
+/// nearest, ties to even). A BigInt (`10n`) is not a Number, and a
+/// leading-zero decimal (`017`, `08`) is a sloppy-mode legacy form, so both
+/// return `None`; so does a non-decimal integer wider than 128 bits.
+pub(super) fn numeric_literal_value(source: &str, node: Node<'_>) -> Option<f64> {
+    if node.kind() != "number" {
+        return None;
+    }
+    let text = node_text(source, node)?;
+    if text.ends_with('n') {
+        return None;
+    }
+    let without_separators = |digits: &str| digits.replace('_', "");
+    let radix = match text.as_bytes() {
+        [b'0', b'x' | b'X', ..] => Some(16),
+        [b'0', b'o' | b'O', ..] => Some(8),
+        [b'0', b'b' | b'B', ..] => Some(2),
+        [b'0', next, ..] if next.is_ascii_digit() || *next == b'_' => return None,
+        _ => None,
+    };
+    match radix {
+        Some(radix) => u128::from_str_radix(&without_separators(&text[2..]), radix)
+            .ok()
+            .map(|value| value as f64),
+        None => without_separators(text).parse::<f64>().ok(),
     }
 }
 
@@ -755,15 +894,14 @@ pub(super) fn continuous_optional_chain(mut node: Node<'_>) -> bool {
                     None => return false,
                 }
             }
-            "non_null_expression"
-            | "as_expression"
-            | "satisfies_expression"
-            | "type_assertion"
-            | "instantiation_expression" => match node
-                .child_by_field_name("expression")
-                .or_else(|| first_named_child(node))
-            {
-                Some(expression) => expression,
+            "non_null_expression" | "as_expression" | "satisfies_expression" | "type_assertion" => {
+                match ts_type_wrapper_operand(node) {
+                    Some(expression) => expression,
+                    None => return false,
+                }
+            }
+            "instantiation_expression" => match node.child_by_field_name("function") {
+                Some(function) => function,
                 None => return false,
             },
             // Parentheses deliberately terminate propagation. `(value?.x).y`
@@ -840,9 +978,13 @@ pub(super) fn operation_can_throw_implicitly(node: Node<'_>) -> bool {
     match node.kind() {
         "unary_expression"
         | "update_expression"
-        | "binary_expression"
         | "augmented_assignment_expression"
         | "template_string" => true,
+        // Intrinsic strict comparison neither coerces operands nor dispatches
+        // user code. Operand evaluation still has its own exception gaps.
+        "binary_expression" => node
+            .child_by_field_name("operator")
+            .is_none_or(|operator| !matches!(operator.kind(), "===" | "!==")),
         "assignment_expression" => node.child_by_field_name("left").is_some_and(|left| {
             matches!(left.kind(), "member_expression" | "subscript_expression")
         }),

@@ -784,6 +784,7 @@ mod authored_override_residual_tests {
             call_contexts: vec![super::super::dispatch::DispatchCallContext {
                 caller: None,
                 caller_is_exact: false,
+                unnamed_boundaries: vec!["unresolved"],
             }],
             unnamed_boundaries: vec!["unresolved"],
         };

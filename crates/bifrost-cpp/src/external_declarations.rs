@@ -158,6 +158,17 @@ pub struct CppExternalDeclarationSet {
     pub types: Vec<CppExternalType>,
     pub members: Vec<CppExternalMember>,
     pub completeness: CppExternalDeclarationCompleteness,
+    /// Whether every declaration the header's own syntax states was extracted:
+    /// the parse needed no error recovery and no record was dropped by the
+    /// limit.
+    ///
+    /// This is narrower than `completeness`, which also turns partial for any
+    /// preprocessing. Conditional compilation does not hide a written
+    /// declaration from this extractor: every branch is parsed and extracted,
+    /// and a macro definition is extracted under its own name. A declaration
+    /// that only a macro expansion writes is not in the header's syntax at all
+    /// and is outside what this reports.
+    pub syntax_complete: bool,
     pub diagnostics: Vec<CppExternalDeclarationDiagnostic>,
 }
 
@@ -259,6 +270,8 @@ pub fn extract_external_declarations(
         });
     }
 
+    let mut syntax_complete = parse_errors.is_empty();
+
     let parsed = parse_cpp_file(&file, source, &tree);
     let mut parent_by_child = HashMap::default();
     for (parent, children) in &parsed.children {
@@ -284,6 +297,7 @@ pub fn extract_external_declarations(
     for declaration in declarations {
         if types.len().saturating_add(members.len()) >= limits.max_records {
             completeness = CppExternalDeclarationCompleteness::Partial;
+            syntax_complete = false;
             diagnostics.push(CppExternalDeclarationDiagnostic {
                 code: "cpp.external.record_limit",
                 message: format!(
@@ -404,6 +418,7 @@ pub fn extract_external_declarations(
         types,
         members,
         completeness,
+        syntax_complete,
         diagnostics,
     }
 }

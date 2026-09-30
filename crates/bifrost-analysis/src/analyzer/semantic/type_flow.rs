@@ -456,7 +456,7 @@ pub fn validate_prepared_syntax_for_procedure(
 /// Validate source identity without requiring indexed declaration access.
 /// Bounded structural queries retain exact-source trees; their bytes, dialect,
 /// mount, revision and current indexed snapshot must still match the artifact.
-pub(crate) fn validate_prepared_syntax_source_for_procedure(
+pub fn validate_prepared_syntax_source_for_procedure(
     workspace: &WorkspaceAnalyzer,
     procedure: &ProcedureHandle,
     file: &ProjectFile,

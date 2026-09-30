@@ -532,9 +532,12 @@ impl UnitRowKeyBuilder {
     }
 
     fn declaration_value(self, value: &DeclarationValue) -> Self {
-        self.declaration(&value.unit)
-            .range(value.range)
-            .optional(value.structural_kind.map(NormalizedKind::label))
+        // A declaration's stable row identity is the declaration and the range
+        // it covers. The optional leaf kind a structural projection proved is
+        // presentation metadata the executor merges into the surviving row, so
+        // projecting it here would key two spellings of one declaration apart
+        // again at the unit boundary.
+        self.declaration(&value.unit).range(value.range)
     }
 
     fn call_site_value(self, value: &CallSiteValue) -> Self {
@@ -630,12 +633,14 @@ pub(super) fn unit_row_key(key_value: &PipelineKey) -> UnitRowKey {
         PipelineKey::CallBinding(id) => key("call_binding").text(id).finish(),
         PipelineKey::CallEffect(id) => key("call_effect").text(id).finish(),
         PipelineKey::CallResultContract(id) => key("call_result_contract").text(id).finish(),
+        PipelineKey::CallResultObligation(id) => key("call_result_obligation").text(id).finish(),
         PipelineKey::ResultContractUse(id) => key("result_contract_use").text(id).finish(),
         PipelineKey::ResultContractFailureUse(id) => {
             key("result_contract_failure_use").text(id).finish()
         }
         PipelineKey::NilnessOperation(id) => key("nilness_operation").text(id).finish(),
         PipelineKey::SwitchCoverage(id) => key("switch_coverage").text(id).finish(),
+        PipelineKey::AssignmentRelation(id) => key("assignment_relation").text(id).finish(),
         PipelineKey::DetachedTaskTransfer(id) => key("detached_task_transfer").text(id).finish(),
         PipelineKey::ProcedureEffect(id) => key("procedure_effect").text(id).finish(),
         PipelineKey::CallableSignature(id) => key("callable_signature").text(id).finish(),
@@ -714,6 +719,10 @@ pub(super) fn unit_row_key(key_value: &PipelineKey) -> UnitRowKey {
             .text(&relation.procedure)
             .number(relation.index)
             .finish(),
+        PipelineKey::BranchRelation(id) => key("branch_relation").text(id).finish(),
+        PipelineKey::LoopRelation(id) => key("loop_relation").text(id).finish(),
+        PipelineKey::FailureHandlerState(id) => key("failure_handler_state").text(id).finish(),
+        PipelineKey::StatementReachability(id) => key("statement_reachability").text(id).finish(),
         PipelineKey::Guard(guard) => key("guard")
             .text(&guard.procedure)
             .number(guard.guard.index())
@@ -1405,6 +1414,10 @@ impl UnitRowItemTerminal {
             | CodeQueryResultValue::RewritePath { .. }
             | CodeQueryResultValue::FlowRelation { .. }
             | CodeQueryResultValue::ControlRelation { .. }
+            | CodeQueryResultValue::BranchRelation { .. }
+            | CodeQueryResultValue::LoopRelation { .. }
+            | CodeQueryResultValue::FailureHandlerState { .. }
+            | CodeQueryResultValue::StatementReachability { .. }
             | CodeQueryResultValue::Guard { .. }
             | CodeQueryResultValue::ReferenceEdge { .. }
             | CodeQueryResultValue::QualifiedPath { .. }
@@ -1437,10 +1450,12 @@ impl UnitRowItemTerminal {
             | CodeQueryResultValue::CallBinding { .. }
             | CodeQueryResultValue::CallEffect { .. }
             | CodeQueryResultValue::CallResultContract { .. }
+            | CodeQueryResultValue::CallResultObligation { .. }
             | CodeQueryResultValue::ResultContractUse { .. }
             | CodeQueryResultValue::ResultContractFailureUse { .. }
             | CodeQueryResultValue::NilnessOperation { .. }
             | CodeQueryResultValue::SwitchCoverage { .. }
+            | CodeQueryResultValue::AssignmentRelation { .. }
             | CodeQueryResultValue::DetachedTaskTransfer { .. }
             | CodeQueryResultValue::ProcedureEffect { .. }
             | CodeQueryResultValue::CallableSignature { .. }
@@ -1486,6 +1501,10 @@ fn row_path(value: &CodeQueryResultValue) -> &str {
         CodeQueryResultValue::RewritePath { value } => &value.path,
         CodeQueryResultValue::FlowRelation { value } => &value.path,
         CodeQueryResultValue::ControlRelation { value } => &value.path,
+        CodeQueryResultValue::BranchRelation { value } => &value.path,
+        CodeQueryResultValue::LoopRelation { value } => &value.path,
+        CodeQueryResultValue::FailureHandlerState { value } => &value.path,
+        CodeQueryResultValue::StatementReachability { value } => &value.path,
         CodeQueryResultValue::Guard { value } => &value.path,
         CodeQueryResultValue::ReferenceEdge { value } => &value.path,
         CodeQueryResultValue::QualifiedPath { value } => &value.path,
@@ -1518,10 +1537,12 @@ fn row_path(value: &CodeQueryResultValue) -> &str {
         CodeQueryResultValue::CallBinding { value } => &value.path,
         CodeQueryResultValue::CallEffect { value } => &value.path,
         CodeQueryResultValue::CallResultContract { value } => &value.path,
+        CodeQueryResultValue::CallResultObligation { value } => &value.path,
         CodeQueryResultValue::ResultContractUse { value } => &value.path,
         CodeQueryResultValue::ResultContractFailureUse { value } => &value.path,
         CodeQueryResultValue::NilnessOperation { value } => &value.path,
         CodeQueryResultValue::SwitchCoverage { value } => &value.path,
+        CodeQueryResultValue::AssignmentRelation { value } => &value.path,
         CodeQueryResultValue::DetachedTaskTransfer { value } => &value.path,
         CodeQueryResultValue::ProcedureEffect { value } => &value.path,
         CodeQueryResultValue::CallableSignature { value } => &value.path,

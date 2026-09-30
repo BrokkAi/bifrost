@@ -5,6 +5,7 @@ use std::time::Duration;
 use crate::CancellationToken;
 use crate::analyzer::DependencyPackEcosystem;
 use crate::analyzer::canonical_hash::{CanonicalHasher, is_lower_sha256, lower_hex_string};
+use crate::analyzer::semantic::StableDigest;
 use crate::analyzer::topology::DependencyScope;
 use crate::hash::{HashSet, set_with_capacity};
 
@@ -19,6 +20,8 @@ use super::{
 };
 
 const DEPENDENCY_INPUT_DOMAIN: &[u8] = b"bifrost.semantic-pack.dependency-input.v1";
+const DEPENDENCY_BEHAVIOR_INPUT_DOMAIN: &[u8] =
+    b"bifrost.semantic-pack.dependency-behavior-input.v1";
 const DEPENDENCY_SOURCE_IDENTITY_DOMAIN: &[u8] =
     b"bifrost.semantic-pack.dependency-source-identity.v1";
 const GENERATED_PRODUCTION_LOCK_RETRY: Duration = Duration::from_millis(10);
@@ -608,6 +611,71 @@ pub fn generated_production_key(
         input_digest,
         producer.name,
         producer.version,
+        SEMANTIC_MODEL_SCHEMA_VERSION,
+    )
+}
+
+/// Input frame for a generated behavior production, kept distinct from the
+/// declaration artifact key above. This is a production-cache input, not a
+/// replacement for the common procedure-summary identity owned by #2445.
+///
+/// The composing host must mint each digest from an immutable, canonical
+/// projection. In particular, `source_input` is the conservative full-input
+/// digest returned by source derivation (#3654), which includes selected
+/// entrypoint, all supplied source bytes, model/configuration identities and
+/// derivation budgets. `resolution_universe` must include sorted positive and
+/// negative resolver candidates, so a previously absent import becoming
+/// available changes the key. Paths within those projections are portable
+/// package-relative paths, never checkout roots or modification times.
+///
+/// The host also supplies the exact requested callable/partition identity,
+/// resolver and runtime conditions, active callee-summary set, required CSMI
+/// profiles, and callable correspondence. `compilation_contract` binds the
+/// canonical CSMI serialization and importer/schema epoch, vocabulary support,
+/// selected target language, and all `CompilerOptions` that can alter the
+/// native artifact. The final `output_limits` digest covers any remaining
+/// producer bounds not already included in `source_input`. A digest does not
+/// itself certify that the host supplied a complete closure; publication must
+/// separately validate that contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DependencyBehaviorCacheInputs {
+    pub source_input: StableDigest,
+    pub resolution_universe: StableDigest,
+    pub requested_partition: StableDigest,
+    pub runtime_configuration: StableDigest,
+    pub active_summaries: StableDigest,
+    pub required_profiles: StableDigest,
+    pub callable_correspondence: StableDigest,
+    pub compilation_contract: StableDigest,
+    pub output_limits: StableDigest,
+}
+
+/// Build a domain-separated key for one behavior production using the catalog's
+/// existing lock, installation, and verified-lookup identity. This only mints
+/// an input key; it does not assert that a declaration pack covers behavior or
+/// that the paired canonical CSMI and compiled representation were published.
+pub fn generated_behavior_production_key(
+    inputs: &DependencyBehaviorCacheInputs,
+    producer: &Producer,
+) -> Result<GeneratedProductionKey, CatalogError> {
+    let mut hasher = CanonicalHasher::new(DEPENDENCY_BEHAVIOR_INPUT_DOMAIN);
+    for (name, digest) in [
+        ("source_input", inputs.source_input),
+        ("resolution_universe", inputs.resolution_universe),
+        ("requested_partition", inputs.requested_partition),
+        ("runtime_configuration", inputs.runtime_configuration),
+        ("active_summaries", inputs.active_summaries),
+        ("required_profiles", inputs.required_profiles),
+        ("callable_correspondence", inputs.callable_correspondence),
+        ("compilation_contract", inputs.compilation_contract),
+        ("output_limits", inputs.output_limits),
+    ] {
+        hasher.field(name, digest.as_bytes());
+    }
+    GeneratedProductionKey::new(
+        lower_hex_string(&hasher.finish()),
+        producer.name.as_str(),
+        producer.version.as_str(),
         SEMANTIC_MODEL_SCHEMA_VERSION,
     )
 }

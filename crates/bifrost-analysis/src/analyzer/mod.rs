@@ -1,4 +1,17 @@
 mod analyzer_definition_lookup;
+mod assignment_facts;
+mod loop_facts;
+pub use assignment_facts::{
+    OverwrittenLocalCandidate, OverwrittenLocalCandidates, OverwrittenLocalSourceKind,
+    PlainAssignmentCandidate, PlainAssignmentCandidates, PlainAssignmentVerdict,
+    java_overwritten_local_candidates, js_ts_overwritten_local_candidates,
+    plain_assignment_candidates,
+};
+pub use loop_facts::{
+    JavaLoopCandidate, JavaLoopCandidates, JavaLoopCoordinates, JavaLoopKind, JavaLoopSite,
+    java_loop_candidates,
+};
+pub mod branch_boolean;
 mod clone_detection;
 pub mod cognitive_complexity;
 #[cfg(test)]
@@ -9,6 +22,9 @@ pub mod configuration;
 pub mod content_identity;
 pub mod correspondence;
 mod cpp;
+pub use cpp::expression_branch_facts::{
+    CAssignmentCandidate, CAssignmentCandidates, CAssignmentSyntaxVerdict, c_assignment_candidates,
+};
 mod csharp;
 pub mod declaration_range;
 pub(crate) mod exception_handling;
@@ -25,6 +41,7 @@ mod i_analyzer;
 mod index_warmer;
 pub mod invalidation;
 mod java;
+pub mod java_integral_parameter;
 mod javascript;
 mod js_ts;
 pub(crate) mod jvm;
@@ -87,6 +104,11 @@ pub(crate) use definition_lookup::{
     RelationalDefinitionResult, RelationalDefinitionValue, RelationalFrontierOutcome, sort_units,
 };
 
+/// The damaged-tree namespace index, for the root suites' index-level
+/// regressions over corpus-derived C++ fixtures that stay private.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub use brokk_bifrost_cpp::graph::resolver::OrphanedNamespaceScopeIndex;
 pub(crate) use brokk_bifrost_cpp::imports::{
     include_paths as cpp_include_paths, resolve_include_targets, resolve_include_targets_with_index,
 };
@@ -105,8 +127,9 @@ pub use config::{
     GoDependencyDiscoveryConfig, GoDependencyDiscoveryMode, JsTsAnalyzerConfig,
     JsTsDependencyDiscoveryConfig, JvmAnalyzerConfig, JvmDependencyDiscoveryConfig,
     JvmDependencyDiscoveryMode, JvmExternalArtifact, JvmExternalArtifactOrigin,
-    JvmExternalDependencies, JvmMavenCoordinate, JvmStandardLibraryDiscoveryConfig,
-    PhpAnalyzerConfig, PhpDependencyApiEvidence, PythonAnalyzerConfig, PythonEnvironmentConfig,
+    JvmExternalDependencies, JvmMavenCoordinate, JvmSourceToolchainBinding,
+    JvmSourceToolchainSelectionOpen, JvmStandardLibraryDiscoveryConfig, PhpAnalyzerConfig,
+    PhpDependencyApiEvidence, PythonAnalyzerConfig, PythonEnvironmentConfig,
     PythonEnvironmentLimits, RubyAnalyzerConfig, RubyDependencyApiEvidence, RubyGemApiArtifact,
     RustAnalyzerConfig, RustDependencyApiEvidence, RustPackageApiArtifact, RustSelectedTarget,
     ensure_global_rayon_pool,
@@ -168,7 +191,7 @@ pub use i_analyzer::{AnalyzerQueryScope, InformationTier, QueryScope, QueryToken
 #[cfg(any(test, feature = "test-support"))]
 pub use i_analyzer::{AnalyzerTestHooks, NoOpAnalyzerTestHooks};
 pub use index_warmer::IndexWarmer;
-pub use java::JavaAnalyzer;
+pub use java::{JavaAnalyzer, JavaCallResultUse, JavaCallResultUseIndex, JavaCallResultUseOpen};
 pub use javascript::JavascriptAnalyzer;
 pub(crate) use js_ts::{AliasResolver, resolve_js_ts_module_specifier};
 pub use js_ts::{

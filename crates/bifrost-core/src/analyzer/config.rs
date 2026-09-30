@@ -1,6 +1,8 @@
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
+
+use super::model::ProjectFile;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AnalyzerConfig {
@@ -337,6 +339,11 @@ pub struct JvmStandardLibraryDiscoveryConfig {
     /// Exact JDK homes to inspect before the process environment. Relative
     /// paths are resolved against the project root.
     pub jdk_homes: Vec<PathBuf>,
+    /// Assign an exact JDK home to source trees that use it. A binding is
+    /// required before a JDK-specific reviewed model can apply to a call in a
+    /// mixed-toolchain workspace; the unscoped `jdk_homes` list only discovers
+    /// candidates and does not select one for a source file.
+    pub source_toolchains: Vec<JvmSourceToolchainBinding>,
     /// Inspect the process `JAVA_HOME` after configured homes.
     pub discover_java_home: bool,
 }
@@ -345,8 +352,149 @@ impl Default for JvmStandardLibraryDiscoveryConfig {
     fn default() -> Self {
         Self {
             jdk_homes: Vec::new(),
+            source_toolchains: Vec::new(),
             discover_java_home: true,
         }
+    }
+}
+
+/// A workspace-relative source tree and the JDK home used to compile it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JvmSourceToolchainBinding {
+    source_root: PathBuf,
+    jdk_home: PathBuf,
+}
+
+impl JvmSourceToolchainBinding {
+    pub fn new(source_root: PathBuf, jdk_home: PathBuf) -> Self {
+        assert!(
+            !source_root.is_absolute(),
+            "JVM source root must be relative"
+        );
+        assert!(
+            !source_root
+                .components()
+                .any(|part| matches!(part, Component::ParentDir | Component::Prefix(_))),
+            "JVM source root cannot leave the workspace"
+        );
+        assert!(!jdk_home.as_os_str().is_empty(), "JDK home must be named");
+        Self {
+            source_root,
+            jdk_home,
+        }
+    }
+
+    pub fn source_root(&self) -> &Path {
+        &self.source_root
+    }
+
+    pub fn jdk_home(&self) -> &Path {
+        &self.jdk_home
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JvmSourceToolchainSelectionOpen {
+    MissingBinding,
+    ConflictingBindings,
+}
+
+impl JvmStandardLibraryDiscoveryConfig {
+    /// Select the deepest source-tree binding. Equally specific bindings to
+    /// different homes are ambiguous, even if both homes report one version.
+    pub fn selected_jdk_home_for_file(
+        &self,
+        file: &ProjectFile,
+    ) -> Result<&Path, JvmSourceToolchainSelectionOpen> {
+        let mut selected: Option<(&Path, usize)> = None;
+        let mut conflict = false;
+        for binding in &self.source_toolchains {
+            let root = binding.source_root();
+            if root != Path::new(".") && !file.rel_path().starts_with(root) {
+                continue;
+            }
+            let depth = root
+                .components()
+                .filter(|part| *part != Component::CurDir)
+                .count();
+            match selected {
+                Some((_, previous_depth)) if depth < previous_depth => {}
+                Some((previous_home, previous_depth)) if depth == previous_depth => {
+                    conflict |= previous_home != binding.jdk_home();
+                }
+                _ => {
+                    selected = Some((binding.jdk_home(), depth));
+                    conflict = false;
+                }
+            }
+        }
+        if conflict {
+            return Err(JvmSourceToolchainSelectionOpen::ConflictingBindings);
+        }
+        selected
+            .map(|(home, _)| home)
+            .ok_or(JvmSourceToolchainSelectionOpen::MissingBinding)
+    }
+}
+
+#[cfg(test)]
+mod jvm_source_toolchain_tests {
+    use super::{
+        JvmSourceToolchainBinding, JvmSourceToolchainSelectionOpen,
+        JvmStandardLibraryDiscoveryConfig,
+    };
+    use crate::analyzer::ProjectFile;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn source_modules_select_their_own_jdk_and_conflicts_stay_open() {
+        let java21 = JvmSourceToolchainBinding::new(
+            PathBuf::from("module-21"),
+            PathBuf::from("toolchains/jdk-21"),
+        );
+        let java22 = JvmSourceToolchainBinding::new(
+            PathBuf::from("module-22"),
+            PathBuf::from("toolchains/jdk-22"),
+        );
+        let nested = JvmSourceToolchainBinding::new(
+            PathBuf::from("module-21/preview"),
+            PathBuf::from("toolchains/jdk-22"),
+        );
+        let workspace = JvmStandardLibraryDiscoveryConfig {
+            source_toolchains: vec![java21.clone(), java22.clone(), nested],
+            ..Default::default()
+        };
+        let file = |relative| ProjectFile::new(std::env::temp_dir(), relative);
+        assert_eq!(
+            workspace.selected_jdk_home_for_file(&file("module-21/src/Main.java")),
+            Ok(Path::new("toolchains/jdk-21"))
+        );
+        assert_eq!(
+            workspace.selected_jdk_home_for_file(&file("module-22/src/Main.java")),
+            Ok(Path::new("toolchains/jdk-22"))
+        );
+        assert_eq!(
+            workspace.selected_jdk_home_for_file(&file("module-21/preview/src/Main.java")),
+            Ok(Path::new("toolchains/jdk-22"))
+        );
+        assert_eq!(
+            workspace.selected_jdk_home_for_file(&file("module-210/src/Main.java")),
+            Err(JvmSourceToolchainSelectionOpen::MissingBinding)
+        );
+        let conflicting = JvmStandardLibraryDiscoveryConfig {
+            source_toolchains: vec![
+                java21,
+                JvmSourceToolchainBinding::new(
+                    PathBuf::from("module-21"),
+                    PathBuf::from("toolchains/other-jdk-21"),
+                ),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            conflicting.selected_jdk_home_for_file(&file("module-21/src/Main.java")),
+            Err(JvmSourceToolchainSelectionOpen::ConflictingBindings)
+        );
     }
 }
 

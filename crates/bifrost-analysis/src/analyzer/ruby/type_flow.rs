@@ -27,6 +27,7 @@ use crate::analyzer::semantic_model::{
 };
 use crate::analyzer::usages::get_definition::{
     BoundedResolution, DefinitionLookupStatus, resolve_ruby_bounded,
+    ruby_modeled_result_class_bounded,
 };
 use crate::analyzer::usages::get_type::{
     TypeLookupStatus, resolve_type_at_reference_site_with_budget,
@@ -238,7 +239,7 @@ impl TypeFlowAdapter for RubyTypeFlowAdapter {
     }
 
     fn semantics_version(&self) -> AdapterSemanticsVersion {
-        AdapterSemanticsVersion::hash_bytes("ruby-type-flow", b"ruby-type-flow-open-runtime-v4")
+        AdapterSemanticsVersion::hash_bytes("ruby-type-flow", b"ruby-type-flow-open-runtime-v5")
             .expect("adapter name is non-empty")
     }
 
@@ -282,6 +283,34 @@ impl TypeFlowAdapter for RubyTypeFlowAdapter {
         };
         if method.utf8_text(prepared.source().as_bytes()).ok() != Some("new") {
             return ClassSeed::NotApplicable;
+        }
+
+        match ruby_modeled_result_class_bounded(
+            workspace.analyzer(),
+            &file,
+            prepared.source(),
+            prepared.tree(),
+            construction,
+            INTERACTIVE_TYPE_LOOKUP_BUDGET,
+            None,
+        ) {
+            BoundedResolution::Complete {
+                value: Some(class), ..
+            } => {
+                return if ruby_analyzer(workspace).indexed_source_matches(&file, prepared.source())
+                {
+                    ClassSeed::ClassWithOpenBound(class)
+                } else {
+                    ClassSeed::Unknown(UnknownReason::UncertainFlow)
+                };
+            }
+            BoundedResolution::Complete { value: None, .. } => {}
+            BoundedResolution::Exceeded { .. } => {
+                return ClassSeed::Unknown(UnknownReason::SemanticBudget);
+            }
+            BoundedResolution::Cancelled { .. } => {
+                return ClassSeed::Unknown(UnknownReason::UncertainFlow);
+            }
         }
 
         match resolve_ruby_bounded(

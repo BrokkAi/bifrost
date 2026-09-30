@@ -533,6 +533,7 @@ fn pack_source(
         },
         carried_sources: Vec::new(),
         cpp_portability: None,
+        python_correspondence: None,
         shards: vec![AuthoredShard {
             id: "summaries.fixture".to_owned(),
             activation: vec![ActivationSelector {
@@ -567,11 +568,13 @@ fn pack_source(
                     normal_result_count: None,
                     locations: Vec::new(),
                     transfers: entry.transfers.clone(),
+                    transfer_partitions: Vec::new(),
                     effects: Vec::new(),
                     concurrency_effects: Vec::new(),
                     declared_effects: Vec::new(),
                     preconditions: None,
                     result_contracts: Vec::new(),
+                    result_use_obligations: Vec::new(),
                     conditional_result_refinements: Vec::new(),
                     conditional_indirect_writes: Vec::new(),
                     normal_return_refinements: Vec::new(),

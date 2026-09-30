@@ -6,29 +6,25 @@
 
 use super::*;
 use crate::analyzer::clone_detection::{CloneCandidateData, compact_clone_excerpt};
-use brokk_bifrost_jvm::java::clones::{
-    build_java_clone_ast_signature, normalized_clone_tokens_java,
-};
+use brokk_bifrost_jvm::java::clones::prepare_java_clone;
 
 pub(super) fn build_clone_candidate_data(
     analyzer: &JavaAnalyzer,
     code_unit: &CodeUnit,
     weights: CloneSmellWeights,
 ) -> Option<CloneCandidateData> {
-    analyzer
+    let source = analyzer
         .get_source(code_unit, false)
         .map(|source| source.trim().to_string())
-        .filter(|source| !source.is_empty())
-        .and_then(|source| {
-            let normalized_tokens = normalized_clone_tokens_java(&source);
-            if normalized_tokens.len() < weights.min_normalized_tokens.max(0) as usize {
-                return None;
-            }
-            Some(CloneCandidateData {
-                unit: code_unit.clone(),
-                normalized_tokens,
-                ast_signature: build_java_clone_ast_signature(&source),
-                excerpt: compact_clone_excerpt(&source),
-            })
-        })
+        .filter(|source| !source.is_empty());
+    let source = source?;
+
+    let preparation = prepare_java_clone(&source, weights.min_normalized_tokens.max(0) as usize);
+    let preparation = preparation?;
+    Some(CloneCandidateData {
+        unit: code_unit.clone(),
+        normalized_tokens: preparation.normalized_tokens,
+        ast_signature: preparation.ast_signature,
+        excerpt: compact_clone_excerpt(&source),
+    })
 }

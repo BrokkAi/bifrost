@@ -586,6 +586,59 @@ fn control_relation_constrained_values_report_their_allowed_set() {
     assert_eq!(&rql[diagnostic.range.clone()], ":certainty");
 }
 
+#[test]
+fn assignment_relation_option_help_and_invalid_value_are_range_precise() {
+    let rql = "(assignment-relations :relation [self-assignment failed-swap overwritten-unread] (procedure-of (function)))";
+    for token in ["assignment-relations", ":relation"] {
+        let offset = rql.find(token).expect("declared assignment relation token");
+        let help = query_source_help_at(rql, offset)
+            .unwrap_or_else(|| panic!("no assignment relation help for {token}"));
+        assert_eq!(&rql[help.range], token);
+        assert!(!help.description.is_empty());
+    }
+    assert!(validate_query_source(rql).is_empty(), "{rql}");
+
+    let invalid = "(assignment-relations :relation [swapped] (procedure-of (function)))";
+    let diagnostic = validate_query_source(invalid)
+        .into_iter()
+        .find(|diagnostic| diagnostic.message.contains("swapped"))
+        .expect("invalid assignment relation diagnostic");
+    assert_eq!(&invalid[diagnostic.range.clone()], "swapped");
+    for allowed in ["self_assignment", "failed_swap", "overwritten_unread"] {
+        assert!(diagnostic.message.contains(allowed), "{diagnostic:?}");
+    }
+}
+
+#[test]
+fn loop_relation_help_and_invalid_option_are_range_precise() {
+    let rql = "(loop-relations (procedure-of (function)))";
+    let offset = rql.find("loop-relations").expect("step token");
+    let help = query_source_help_at(rql, offset).expect("loop relation help");
+    assert_eq!(&rql[help.range], "loop-relations");
+    assert!(validate_query_source(rql).is_empty(), "{rql}");
+    let invalid = "(loop-relations :relation [repeat] (procedure-of (function)))";
+    let diagnostic = validate_query_source(invalid)
+        .into_iter()
+        .next()
+        .expect("unrecognized option");
+    assert_eq!(&invalid[diagnostic.range.clone()], ":relation");
+}
+
+#[test]
+fn statement_reachability_help_and_invalid_option_are_range_precise() {
+    let rql = "(statement-reachability (procedure-of (function)))";
+    let offset = rql.find("statement-reachability").expect("step token");
+    let help = query_source_help_at(rql, offset).expect("statement reachability help");
+    assert_eq!(&rql[help.range], "statement-reachability");
+    assert!(validate_query_source(rql).is_empty(), "{rql}");
+    let invalid = "(statement-reachability :relation [dead] (procedure-of (function)))";
+    let diagnostic = validate_query_source(invalid)
+        .into_iter()
+        .next()
+        .expect("unrecognized option");
+    assert_eq!(&invalid[diagnostic.range.clone()], ":relation");
+}
+
 /// Hover help and validation ranges for the three project-topology steps
 /// (#2448), in RQL source.
 ///
@@ -1640,4 +1693,77 @@ fn configuration_key_validation_matches_the_decoder() {
         "{diagnostics:#?}"
     );
     assert!(crate::structural::CodeQuery::from_sexp(&oversized).is_err());
+}
+
+#[test]
+fn branch_relation_help_and_validation_are_range_precise() {
+    let rql = "(branch-relations :relation [identical-bodies] (if))";
+    for token in ["branch-relations", ":relation"] {
+        let offset = rql.find(token).unwrap();
+        let help = query_source_help_at(rql, offset).expect("branch relation help");
+        assert_eq!(&rql[help.range], token);
+        assert!(!help.description.is_empty());
+    }
+    assert!(validate_query_source(rql).is_empty(), "{rql}");
+
+    let invalid = "(branch-relations :relation [clone] (if))";
+    let diagnostic = validate_query_source(invalid)
+        .into_iter()
+        .find(|diagnostic| diagnostic.message.contains("clone"))
+        .expect("invalid relation diagnostic");
+    assert_eq!(&invalid[diagnostic.range], "clone");
+    assert!(diagnostic.message.contains("identical_bodies"));
+}
+
+#[test]
+fn failure_handler_state_help_and_validation_are_range_precise() {
+    let rql = "(failure-handler-state (language java (catch)))";
+    let token = "failure-handler-state";
+    let offset = rql.find(token).unwrap();
+    let help = query_source_help_at(rql, offset).expect("failure-handler-state help");
+    assert_eq!(&rql[help.range.clone()], token);
+    assert!(help.description.contains("catch body"), "{help:?}");
+    assert!(validate_query_source(rql).is_empty(), "{rql}");
+
+    let borrowed = "(failure-handler-state :relation [empty] (catch))";
+    let diagnostic = validate_query_source(borrowed)
+        .into_iter()
+        .find(|diagnostic| diagnostic.code == "wrong-value-shape")
+        .expect("the step takes no relation option");
+    assert!(diagnostic.message.contains(token), "{diagnostic:?}");
+}
+
+#[test]
+fn call_result_obligation_help_and_validation_are_range_precise() {
+    for token in ["call-result-obligations", "call_result_obligations"] {
+        let source = format!("({token} (call-shape (call)))");
+        let help = query_source_help_at(&source, 1).expect("result-obligation help");
+        assert_eq!(&source[help.range], token);
+        assert!(help.description.contains("selected JDK artifact"));
+        assert!(validate_query_source(&source).is_empty(), "{source}");
+    }
+    let invalid = "(call-result-obligations true)";
+    let diagnostics = validate_query_source(invalid);
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == "wrong-value-shape")
+        .unwrap_or_else(|| panic!("wrong input kind diagnostic: {diagnostics:#?}"));
+    assert_eq!(&invalid[diagnostic.range.clone()], "true");
+}
+
+#[test]
+fn explicit_enum_row_literal_help_and_error_ranges_are_precise() {
+    let source = "(filter :where ((failure_predicate eq (enum false))) (call-result-obligations (call-shape (call))))";
+    assert!(validate_query_source(source).is_empty());
+    let offset = source.find("enum").unwrap();
+    let help = query_source_help_at(source, offset).expect("explicit enum help");
+    assert_eq!(&source[help.range], "enum");
+    assert!(help.description.contains("Boolean"));
+    let invalid = source.replace("(enum false)", "(enum false true)");
+    let diagnostics = validate_query_source(&invalid);
+    let diagnostic = diagnostics
+        .iter()
+        .find(|d| d.message.contains("exactly one label"))
+        .unwrap_or_else(|| panic!("expected invalid enum: {diagnostics:?}"));
+    assert_eq!(&invalid[diagnostic.range.clone()], "(enum false true)");
 }

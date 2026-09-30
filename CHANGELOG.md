@@ -7,7 +7,47 @@ projection and its commit history does not contain every source commit.
 
 ## Unreleased
 
+## [0.12.0] - 2026-09-30
+
 ### Added
+
+- Java analyzer and policy surfaces now carry exact selected-JDK artifact evidence
+  through external calls and result-use obligations. Same-version JDK homes remain
+  distinct, reviewed obligations retain their result predicates, and unsupported
+  dispatch or incomplete applicability stays typed rather than becoming a clean
+  result.
+
+- Java semantic analysis now qualifies lambda value captures, assertion control,
+  and bounded loop repetition across native and transported policy paths, while
+  deferred, unsupported, and unresolved cases remain explicit.
+
+- Dependency behavior generation now has a Python CSMI distribution and
+  correspondence foundation plus versioned semantic-pack cache inputs and
+  reusable production epochs. Relevant artifact, resolver, model, and budget
+  changes invalidate generated behavior, while failed preparation reasons remain
+  visible to policy reports.
+
+- New correctness policies detect identical branch bodies, stable repeated
+  conditions, local self-assignment, likely failed swaps, proven fixed
+  conditional outcomes, and redundant Boolean-return branches in supported
+  Java, JavaScript, TypeScript, and Python cases. Findings use structured
+  binding and control-flow evidence; unsupported conversions, dynamic lookup,
+  and incomplete flow remain inconclusive. These policies offer no autofixes.
+
+- Java correctness policies now report ordinary local values overwritten before
+  any modeled read and reachable loop bodies that cannot reach their next
+  iteration. A separate policy flags structurally empty Java catch bodies,
+  retaining malformed syntax as incomplete. Branch comparison recognizes field/receiver identities
+  and corresponding arm-local bindings; scalar checks support qualified
+  short-circuit predicates and signed decimal integer bounds. Unresolved
+  effects and unsupported forms retain incomplete results, and no automatic
+  removal or rewrite is offered.
+
+- Ruby locals and chained calls now retain the result type declared by an
+  activated external constructor or factory model. The reviewed `Net::HTTP`
+  model covers instance `request` calls at one and two arguments and ordinary
+  client construction without opening a connection. Receiver mode, argument
+  applicability, workspace shadowing, and uncertain writes remain proof guards.
 
 - C# resolution now reads an external declaration surface with two halves: the
   decoded assembly index it always had, plus the declaration facts the
@@ -111,6 +151,20 @@ projection and its commit history does not contain every source commit.
   recover static and access facts from exact include-visible class declarations,
   with overloads kept distinct and missing declarations left uncertain.
 
+- A C call to a function that a system or library header declares at file
+  scope, such as POSIX `connect` or libcurl `curl_easy_perform`, can now bind a
+  reviewed procedure summary. The generated C/C++ header pack publishes each
+  file-scope declaration under its declaring header instead of dropping it, and
+  a bare call in a `.c` file binds the one such function that its
+  compile-database include closure declares at the written arity. The key is
+  the header's include path without its extension, the name, the written arity
+  and no receiver, so a reviewed summary names it as `path: sys/socket.h`,
+  `symbol: connect`. A second reached declaration of the name, a same-named
+  macro, a workspace function of that name, an unprovable written arity, or a
+  header that needed parse recovery leaves the call open rather than bound.
+  Calls from C++ files stay open, and generated header packs are rebuilt once
+  (#3535).
+
 - The network-effect policy ships its reviewed Kotlin row, reading the shared
   Java/JVM JDK model one-way instead of a second JDK model. A Kotlin call site
   that reaches `java.net.URL.openConnection()` through a concrete receiver
@@ -124,12 +178,235 @@ projection and its commit history does not contain every source commit.
   name binds its own declaration, and an unresolved helper keeps the run open
   instead of clean.
 
+### Changed
+
+- Semantic-model catalog and policy evaluation surfaces now preserve generated
+  cache generations, live incomplete-scan diagnostics, and exact dependency
+  coverage instead of silently discarding rejected or superseded results.
+
+- Ruby modeled receiver types now propagate through completed conditionals,
+  instance variables, factory returns, and method parameters, while preserving
+  workspace shadows, conflicting callers, unknown writes, and bounded
+  incompleteness.
+- Release qualification now requires complete benchmark evidence and exact
+  verified artifact identity before open-core projection or publication.
+
 ### Fixed
+
+- Scala forward navigation now reads a method reference against the expected
+  function type the callable's declaration states, and the Scala usage scan
+  derives that same expectation for a member method value wherever the
+  reference stands: handed to a call, written into a function-typed `val`, or
+  eta-expanded with `_`. A reference such as `byteStrFormat.map(this.apply)`
+  was already a proven usage hit, but forward lookup measured the site as a
+  call with no written argument list and accepted a parameterized callable
+  only when a single overload existed, so an overloaded `apply` was refused.
+  The two surfaces now agree. An ordinary call keeps its arity filter, a
+  member the receiver does not declare stays unresolved and is not attributed
+  to another member, and a site whose expected type lies outside the
+  workspace reports the whole candidate family as ambiguous instead of
+  claiming one overload (#3512).
+
+- Java external-member calls now publish a structured call identity, not only
+  the canonical `owner.member` name, so an activated model's declared effect,
+  result contract or summary can bind such a call. A call receives that
+  identity only when the class-file declaration surface proves the declaring
+  owner, the member, the receiver shape, and exactly one applicable
+  non-variadic signature at the written argument count: `values.size()` on a
+  jar that declares `List.size()` now binds the modeled identity, while a
+  wrong argument count, an ambiguous overload family, a variadic method, a
+  workspace declaration of the same member, and an unknown receiver keep the
+  canonical name without any identity. A chained receiver whose inner call
+  has no applicable declaration stays unproved as well. The evidence is
+  produced at query time, so no extraction epoch changes (#3522).
+
+- C++ exact-name definition lookup now answers for nested terminal types whose
+  canonical identity joins a class to its nested struct with `$`, such as
+  `Top$Only` and `ns.Outer$Inner`. The identifier index always held these
+  declarations and the owner and member lookups around them worked, but the
+  exact-name request built its owner and terminal segments with the shared
+  client-path splitter, which does not know the `$` nested-class join, so the
+  store was asked for one `Top$Only` terminal that never matched the persisted
+  `Type` + `Nested` pair. The C++ adapter now splits rendered names on the same
+  `$` boundary extraction emits, and every rendered-name question in definition
+  lookup routes through the language's own provider, so exact, normalized, and
+  prefetch lookups all ask with the persisted owner and terminal boundary
+  (#3520).
+
+- C++ exact-name definition lookup now answers a nested type's source
+  spelling, not only its canonical `$` identity. `struct Top { struct Only {
+  int b; }; };` is stored as `Top$Only`, and `definitions("Top$Only")` already
+  returned it, but `definitions("Top::Only")` returned nothing: the client
+  path split both names into untyped segments, those re-rendered as
+  `Top.Only`, and the exact-name comparison dropped `Top$Only`. A `::`-only
+  query now also asks for the namespace, nested-type, and member identities
+  extraction stores, so `Top::Only`, `Top::Mid::Only`, `Top::Only::b`,
+  `ns::Outer::Inner`, and `ns::Outer::method` resolve to `Top$Only`,
+  `Top$Mid$Only`, `Top$Only.b`, `ns.Outer$Inner`, and `ns.Outer.method`. When
+  a namespace and a class share the spelling, both rows come back. The C++
+  provider supplies these names through the definition-lookup hook, so
+  `definitions`, the multi-language lookup's `fqn`, its batched prefetches,
+  and `get_symbol_locations` give the same answer. Canonical `.` and `$`
+  spellings are unchanged, and no extraction epoch changes (#3631).
+
+- In a damaged C++ file, a namespace whose head parse recovery collapsed now
+  stops owning declarations at its own closing brace. When recovery placed
+  that brace inside a larger damaged construct, such as a preprocessor
+  `#else` branch that runs on to the end of the file, every namespace and
+  function written after the close was published under the collapsed
+  namespace, for example `type_tests::validate_tests` instead of
+  `validate_tests`. Only a close that the file's brace pairing proves ends
+  the namespace; when pairing cannot be proven, the recovered namespace keeps
+  its best-effort scope as before. A parsed namespace whose own opening and
+  closing braces survived also keeps its declarations when recovery reports
+  an empty namespace path over them. The C and C++ extraction epoch rotates,
+  so a warm analyzer cache re-extracts C and C++ declarations once (#3633).
+
+- `usage_graph` no longer drops the outbound edges of a C++ function or member
+  that is declared in a header and defined in a source file. Such a node's
+  primary declaration is the header prototype, and a reference inside the
+  definition's body was not joined to the node, so its edge was omitted with
+  an `ambiguous_reference_target` reason. At `depth` above 1, a node reached
+  this way also scans every file that declares it, so its definition's edges
+  are found instead of silently missing from a complete result (#3671).
+
+- A C# method that reads a property or an element can again be a complete
+  callee on its exceptional return. The uncertainty that such an access can
+  run accessor, indexer, or type-initializer code is now published as a call
+  gap, not as an unlowered exceptional route that left every caller's
+  exceptional return unproven. The C# semantic adapter version changes, so
+  persisted C# procedure semantics are rebuilt once (#3679).
+
+- Java taint analysis again follows a value stored in an exception object
+  that is thrown and read back in its `catch` clause. Since the lowering
+  started binding each call's thrown exception to the catch parameter, calls
+  in the `try` block that cannot throw the caught type made the parameter's
+  origin ambiguous, so the read through the parameter lost the thrown object
+  and the flow was missed. A call's binding is now dropped when Java proves
+  the call cannot deliver the caught type: the catch type is a checked
+  exception class, and every resolved callee, including an implicit default
+  constructor, declares no `throws` clause. Broad or unchecked catch types,
+  callees with a `throws` clause, and unresolved calls keep the binding (#2192).
+
+- RQL declaration rows now identify the declaration itself -- the code unit and
+  the covered range -- rather than also keying on the optional structural leaf
+  kind a projection proved. Intersecting a member projection with an
+  enclosing-declaration selection therefore keeps the shared declaration in
+  either branch order, distinct declarations stay distinct, and a declaration
+  publishes one stable row key. The leaf kind is presentation evidence the
+  executor merges into the surviving row, so an inexact projection cannot
+  erase the leaf kind an exact projection proved (#3513).
+
+- Taint runs through recursive call cycles are now decisive in C#,
+  JavaScript, Python, and TypeScript when the only open coverage was the
+  unlowered implicit exceptions of operators. A gap whose abrupt throw can
+  only unwind out of its procedure -- no handler frame and no cleanup region
+  on the route -- now carries the non-rejoining exceptional-exit discharge
+  the value-flow plan already trusts, so the matched exceptional return and
+  the exceptional-exit boundary no longer keep the run inconclusive (#3528).
+  A throw route that can enter a catch, finally, or unresolved dynamic target
+  keeps its discharge closed and the run stays honestly inconclusive with any
+  retained finding.
+
+  Those same four adapters now also lower an implicit abort as a real route
+  from the operation to its enclosing handler, cleanup region, or exceptional
+  exit, so the route rather than a discharge answers whether the abort can
+  carry a store and whether a caller may keep a proven exceptional return. A
+  handler-guarded operator whose catch arm carries the operator's operand
+  reaches the sink as a complete result in JavaScript and TypeScript, while
+  Python and C# keep their separate unresolved procedure-semantics family and
+  an unresolved target or access effect keeps its typed uncertainty (#3528).
+
+- Python resolves an absolute import written against a source root below the
+  project root, instead of reporting it as an import that leaves the indexed
+  workspace (#3506). A module name is path-derived and relative to a `sys.path`
+  entry, so one file has one valid name per ancestor directory on that path
+  while the index holds only one of them: a shared distribution under
+  `dependency/` that `PYTHONPATH` adds is written as `core.lib.common` and
+  indexed as `dependency.core.lib.common`, and a distribution directory holding
+  a same-named package is written as `rtdetr_pose.config` and indexed as
+  `rtdetr_pose.rtdetr_pose.config`. A specifier no indexed name spells is now
+  matched against the end of every workspace module's project-root name, and it
+  resolves when the workspace's own structure establishes the root that
+  spelling implies. A packaging manifest (`tool.setuptools.packages.find.where`,
+  `package_dir`) establishes the root it declares, and it is authoritative:
+  `where = ["."]` declares the project root exactly as `where = ["source"]`
+  declares `source/`, so a shorter spelling below a declared root names a
+  different arrangement of the same directories and does not bind. The
+  double-nested distribution directory is the one shape a declaration leaves
+  open, because there the specifier writes the implied root's own name again
+  before the module's path -- `rtdetr_pose.config` from `rtdetr_pose/` names the
+  module in the same-named package that directory holds -- and the repeated
+  name is still not that evidence. The import works only when the package the
+  specifier starts from states the nested directory is on its search path, the
+  way the pinned YOLOZU `rtdetr_pose/__init__.py` appends
+  `os.path.join(os.path.dirname(__file__), "rtdetr_pose")` to `__path__`; that
+  statement is read from the marker as structure, is required before the
+  declaration admits the spelling, and has to be one the interpreter runs and
+  keeps -- an append behind `if False:`, or one a later `__path__ = ...`
+  replaces, is not that statement, and the membership guard it hangs under has
+  to be module-level itself, so a guard another branch holds states nothing
+  either -- and an empty marker above a directory whose name merely repeats
+  leaves the candidate in the resolution gap.
+  Without a declaration the evidence has to be the package chain itself: a
+  complete `__init__.py` chain from the implied root down to that one module.
+  A tail match alone is not a root: it proves the file *could* carry the name
+  if its implied root were on the path, so a candidate that no
+  declaration or package chain establishes keeps the module unresolved and
+  appears in the diagnostic as the spelling the workspace indexes instead, as
+  do two modules that share the written tail. Module identity is unchanged;
+  only the lookup learned the other spellings. A specifier that names several
+  modules, and one whose member the resolved module does not declare, report a
+  resolution gap naming those indexed spellings rather than a boundary claim,
+  because the module is inside the workspace either way. A single-component
+  specifier is unaffected -- every top-level workspace module is already named
+  from the project root -- so a stdlib `typing` import keeps its boundary claim.
+
+- Rust `inside-decl` selectors can qualify an associated function by the exact
+  workspace declaration owning its `impl`, including generic trait impls,
+  imported aliases, and owners declared in another file. Lexical `inside`
+  remains lexical, external owners do not bind workspace namesakes, and scan
+  and posting execution return the same selection (#3490).
+
+- Nested symbol lookup preserves same-named declarations from different files
+  and returns complete ambiguity candidates instead of silently choosing one
+  (#3504). File anchors, unique answers, and C++ declaration/definition families
+  retain their existing selection behavior.
+
+- Scala package-object references retain enclosing imports and companion `apply`
+  calls. Unbound JVM names no longer navigate to unrelated semantic-model types
+  with the same simple name; external model identities follow the JVM import
+  and boundary resolver.
+
+- Rust definition lookup now resolves imported enum variants through their
+  lexical owner, including direct and grouped imports, aliases, and inline
+  modules. External import diagnostics retain qualified identities such as
+  `std.fmt` and `std.ops.Range`, so unrelated workspace declarations with the
+  same name do not contradict the reported boundary.
 
 - Scala navigation resolves imports through indexed enclosing owners and typed
   values while keeping inherited type aliases distinct from imported terms.
   Abstract val/var fields and package-object members retain their declarations,
   and Scala 2 calls named `export` preserve their enclosing class.
+
+- A call-target batch now carries whatever its language resolver proved about
+  the call, for every language. The batch route used to send only the
+  languages on a hand-kept list -- JavaScript, TypeScript, PHP, Python and
+  Ruby -- through the branch that retains a resolver's exact external call
+  proof and its resolver-owned external callee identity, and flattened both to
+  absent for every other language one layer above the resolver that produced
+  them. Ruby's boundary proof was discarded that way until Ruby was added to
+  the list, and Java, Rust, C#, Scala, Kotlin and C/C++ were still on the
+  discarding route, so the next resolver proof in any of them would have been
+  lost the same silent way. The list is gone: one general route answers every
+  language that is not Go or C/C++, the C/C++ navigation route carries the
+  same evidence instead of discarding it, and a resolver that proved nothing
+  reports that itself rather than having it decided for it. A call-target
+  batch for Java, Rust, C#, Scala or Kotlin also stops publishing its
+  declarations' fact digests in place of its file reads, so an edited callee
+  invalidates a caller's cached unit by the callee's file rather than by
+  workspace scope. No language's resolved answers change; the route can no
+  longer lose one.
 
 - The shipped JDK, Kotlin and Scala standard-library packs are selectable
   again on hosts that do not run the one build each pack was extracted from.
@@ -164,6 +441,26 @@ projection and its commit history does not contain every source commit.
   longer lend each other their members and report each other's fields as
   absent. The persisted Python type-flow adapter semantics move from v50 to
   v51 because stored class-set facts change.
+
+- Printed definition selectors now round-trip from `get_summaries` to
+  `get_symbol_sources` for declarations whose own name ends in `$`. A Scala
+  `object Foo$` next to `object Foo` prints both spellings and each selector
+  reaches its own declaration, because the display name is read from the
+  structured name: only Bifrost's companion decoration comes off, never a `$`
+  the source wrote. C# nested types that share one arity-free display name
+  with their generic sibling now print distinct selectors instead of one
+  ambiguous spelling, and a lookup prefers the candidate whose recorded name
+  segments match the query exactly, so `run` and `run$` stay distinct. Query
+  time only: no stored fact or extraction epoch changes (#3505).
+
+- A summary target that names an existing workspace file is now read as that
+  whole file before any `#` in it is taken as a selector anchor. A file whose
+  name contains `#` is chosen by the repository, not by Bifrost, so
+  `targets: ["src/Outer.Part#one.cs"]` lists that file instead of looking for
+  a symbol inside `src/Outer.Part`, and `src/Outer.Part#one.cs#Demo.Outer.Inner`
+  still resolves the symbol in it by the longest real-file anchor. Plain
+  `path#symbol` selectors, raw identifiers such as `src/lib.rs#r#type`, and
+  the whole-file reading of every ordinary path are unchanged (#3505).
 
 ## [0.11.5] - 2026-09-16
 

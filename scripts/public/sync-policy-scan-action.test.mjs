@@ -6,7 +6,7 @@
 // would point at a file:// bare repository; nothing ever did.
 
 import assert from "node:assert/strict";
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -539,7 +539,7 @@ exit 2
     assert.ok(args.includes('--policy-timings'));
     assert.match(fs.readFileSync(path.join(nested, 'report.sarif.stderr.log'), 'utf8'), /fake analyzer diagnostic/);
     assert.ok(args.includes('--diff-base'));
-    assert.match(fs.readFileSync(output, 'utf8'), /exit-code=2\nsarif-file=nested root\/report.sarif\nhas-sarif=true/u);
+    assert.match(fs.readFileSync(output, 'utf8'), /exit-code=2\nstderr-capture-code=0\nsarif-file=nested root\/report.sarif\nhas-sarif=true/u);
     runActionScript('Run policies', { ...scanEnv, MANAGED_CACHE: 'false', POLICY_TIMINGS: 'false' }, dir);
     const unmanaged = fs.readFileSync(capture, 'utf8').split('\n');
     assert.deepEqual(unmanaged.slice(1, 3), ['inherited root', 'inherited exact']);
@@ -570,7 +570,7 @@ test('scan evidence includes policy incompleteness and is retained before gating
     assert.match(gate.stdout, /python.rule/);
     const action = fs.readFileSync('.github/actions/policy-scan/action.yml', 'utf8');
     assert.ok(action.indexOf('name: Retain SARIF report') < action.indexOf('name: Gate on the exit code'));
-    assert.match(action, /name: Retain SARIF report\n\s+if: always\(\)/);
+    assert.match(action, /name: Retain SARIF report and diagnostics\n\s+if: always\(\)/);
     assert.match(action, /name: Save analyzer cache\n\s+if: always\(\).*cache-hit != 'true'.*has-sarif == 'true'/);
     assert.match(action, /path: \$\{\{ steps\.analyzer-cache-identity\.outputs\.cache-path \}\}/);
     assert.match(action, /key: \$\{\{ steps\.analyzer-cache\.outputs\.cache-primary-key \}\}/);
@@ -594,4 +594,167 @@ test('a supplied semantic-pack executable bypasses Cargo and preserves arguments
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+
+// Exercise the action's actual shell with a hand-written process, including a
+// stderr handshake that cannot complete if diagnostics are buffered until exit.
+function policyCaptureFixture() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'policy capture '));
+  const binary = path.join(dir, 'fake analyzer');
+  fs.writeFileSync(binary, `#!/usr/bin/env bash
+printf 'analyzer stdout\\n'
+printf 'diagnostic before exit\\n' >&2
+if [ "\${AWAIT_INPUT:-false}" = true ]; then read -r release || exit 143; fi
+printf 'diagnostic at exit\\n' >&2
+exit "\${ANALYZER_STATUS:-0}"
+`, { mode: 0o755 });
+  return {
+    dir,
+    env: {
+      ...process.env,
+      WORKDIR: dir, BIFROST_BIN: binary, GITHUB_OUTPUT: path.join(dir, 'outputs'),
+      SARIF_FILE: 'report.sarif', FAIL_ON: 'warning', POLICY_PACKS: '', POLICY_IDS: '',
+      POLICY_CATEGORIES: '', POLICY_FILES: '', DIFF_BASE: '', MANAGED_CACHE: 'false',
+      MANAGED_CACHE_ROOT: '', POLICY_TIMINGS: 'true',
+    },
+    outputs() {
+      return Object.fromEntries(fs.readFileSync(path.join(dir, 'outputs'), 'utf8')
+        .trimEnd().split('\n').map(line => {
+          const separator = line.indexOf('=');
+          return [line.slice(0, separator), line.slice(separator + 1)];
+        }));
+    },
+  };
+}
+
+test('policy stderr streams before exit and completely drains without mixing stdout', async () => {
+  const fixture = policyCaptureFixture();
+  const child = spawn('bash', ['-c', actionScript('Run policies')], {
+    cwd: fixture.dir, env: { ...fixture.env, AWAIT_INPUT: 'true', ANALYZER_STATUS: '17' },
+    detached: process.platform !== 'win32',
+  });
+  let stdout = '';
+  let stderr = '';
+  child.stdout.on('data', chunk => { stdout += chunk; });
+  child.stderr.on('data', chunk => { stderr += chunk; });
+  let closed = false;
+  const completion = new Promise((resolve, reject) => {
+    child.once('error', reject);
+    child.once('close', (code, signal) => { closed = true; resolve({ code, signal }); });
+  });
+  async function waitForCompletion() {
+    let timer;
+    try {
+      return await Promise.race([
+        completion,
+        new Promise((_, reject) => {
+          timer = setTimeout(() => reject(new Error('policy capture process did not close')), 5000);
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  try {
+    await new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error('stderr was not streamed before exit')), 5000);
+      child.stderr.on('data', () => {
+        if (stderr.includes('diagnostic before exit')) {
+          clearTimeout(timeout);
+          resolve();
+        }
+      });
+      child.once('error', error => { clearTimeout(timeout); reject(error); });
+      child.once('close', () => { clearTimeout(timeout); reject(new Error('analyzer exited before handshake')); });
+    });
+    assert.equal(fixture.outputs()['exit-code'], undefined);
+    child.stdin.end('finish\n');
+    assert.deepEqual(await waitForCompletion(), { code: 0, signal: null });
+    assert.equal(stdout, 'analyzer stdout\n');
+    assert.equal(stderr, 'diagnostic before exit\ndiagnostic at exit\n');
+    assert.equal(fs.readFileSync(path.join(fixture.dir, 'report.sarif.stderr.log'), 'utf8'), stderr);
+    assert.equal(fixture.outputs()['exit-code'], '17');
+    assert.equal(fixture.outputs()['stderr-capture-code'], '0');
+    assert.equal(fixture.outputs()['has-sarif'], 'false');
+  } finally {
+    child.stdin.end();
+    try {
+      if (!closed && child.pid !== undefined) {
+        if (process.platform === 'win32') {
+          const killed = spawnSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], {
+            encoding: 'utf8', timeout: 5000,
+          });
+          assert.equal(killed.status, 0, killed.stderr + killed.stdout);
+        } else {
+          try {
+            // The detached child owns this process group; include tee and any
+            // inherited pipe writers so an FD regression cannot hang cleanup.
+            process.kill(-child.pid, 'SIGKILL');
+          } catch (error) {
+            if (error.code !== 'ESRCH') throw error;
+          }
+        }
+      }
+      await waitForCompletion();
+    } finally {
+      child.stdin.destroy();
+      child.stdout.destroy();
+      child.stderr.destroy();
+      fs.rmSync(fixture.dir, { recursive: true, force: true });
+    }
+  }
+});
+
+test('policy logger failures remain distinct from analyzer failures', () => {
+  const fixture = policyCaptureFixture();
+  try {
+    const bin = path.join(fixture.dir, 'bin');
+    fs.mkdirSync(bin);
+    fs.writeFileSync(path.join(bin, 'tee'), '#!/usr/bin/env bash\ncat >&2\nexit 73\n', { mode: 0o755 });
+    for (const analyzerStatus of ['0', '17']) {
+      const result = spawnSync('bash', ['-c', actionScript('Run policies')], {
+        cwd: fixture.dir, encoding: 'utf8', timeout: 5000,
+        env: { ...fixture.env, ANALYZER_STATUS: analyzerStatus, PATH: `${bin}${path.delimiter}${process.env.PATH}` },
+      });
+      assert.equal(result.status, 1, result.stderr + result.stdout);
+      assert.equal(fixture.outputs()['exit-code'], analyzerStatus);
+      assert.equal(fixture.outputs()['stderr-capture-code'], '73');
+      assert.match(result.stdout, /capture or drain failed with status 73/);
+      assert.match(result.stderr, /diagnostic at exit/);
+    }
+  } finally {
+    fs.rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test('log creation failure retains analyzer status and live diagnostics', () => {
+  const fixture = policyCaptureFixture();
+  try {
+    const result = spawnSync('bash', ['-c', actionScript('Run policies')], {
+      cwd: fixture.dir, encoding: 'utf8', timeout: 5000,
+      env: { ...fixture.env, SARIF_FILE: 'missing/report.sarif', ANALYZER_STATUS: '17' },
+    });
+    assert.equal(result.status, 1, result.stderr + result.stdout);
+    assert.equal(fixture.outputs()['exit-code'], '17');
+    assert.equal(fixture.outputs()['stderr-capture-code'], '1');
+    assert.match(result.stderr, /diagnostic before exit/);
+    assert.match(result.stdout, /streaming stderr without file retention/);
+  } finally {
+    fs.rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test('partial policy diagnostics remain uploadable when SARIF and step outputs are absent', () => {
+  const action = fs.readFileSync('.github/actions/policy-scan/action.yml', 'utf8');
+  const start = action.indexOf('    - name: Retain SARIF report and diagnostics');
+  const end = action.indexOf('    - name: Summarize policy execution', start);
+  const retention = action.slice(start, end);
+  assert.match(retention, /if: always\(\) && inputs.artifact-name != ''/);
+  assert.doesNotMatch(retention, /steps.run.outputs/);
+  assert.match(retention, /inputs.working-directory.*inputs.sarif-file.*\.stderr.log/);
+  assert.match(retention, /if-no-files-found: error/);
+  const gate = runGate({ code: 0 });
+  assert.equal(gate.status, 1);
+  assert.match(gate.stdout, /did not emit a SARIF report/);
 });

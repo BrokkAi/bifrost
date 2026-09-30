@@ -101,6 +101,23 @@ pub enum OracleRelationKind {
     LanguageDefined,
 }
 
+impl OracleRelationKind {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::DispatchCandidate => "dispatch_candidate",
+            Self::DispatchBoundary => "dispatch_boundary",
+            Self::ValueFlow => "value_flow",
+            Self::CallBinding => "call_binding",
+            Self::PointsTo => "points_to",
+            Self::Location => "location",
+            Self::Alias => "alias",
+            Self::Publication => "publication",
+            Self::Escape => "escape",
+            Self::LanguageDefined => "language_defined",
+        }
+    }
+}
+
 /// The structured fact identified by one relation record when its role needs
 /// more precision than the query-scoped arena owner provides.
 ///

@@ -21,8 +21,7 @@ use super::ir::{
     TransferOperation, ValueFlowKind,
 };
 use super::{
-    DispatchBoundaryKind, IcfgBoundary, IcfgBoundaryKind, IcfgEdge, IcfgLimitKind, IcfgNodeKey,
-    IcfgSnapshot,
+    DispatchBoundaryKind, IcfgBoundary, IcfgBoundaryKind, IcfgEdge, IcfgNodeKey, IcfgSnapshot,
 };
 
 const TRUNCATION_RESERVE: usize = 160;
@@ -532,6 +531,12 @@ fn write_value(writer: &mut dyn fmt::Write, value: &SemanticValue) -> fmt::Resul
         }
         SemanticValueKind::UnsignedInteger(value) => {
             write!(writer, " :unsigned-value {value}")?;
+        }
+        SemanticValueKind::SignedInteger(value) => {
+            write!(writer, " :signed-value {value}")?;
+        }
+        SemanticValueKind::FloatingPoint { bits } => {
+            write!(writer, " :float-value {:?}", f64::from_bits(*bits))?;
         }
         SemanticValueKind::ConstantString(payload) => {
             write!(writer, " :constant-string {}", quoted(payload))?;
@@ -1295,15 +1300,7 @@ fn write_icfg_boundary(
         IcfgBoundaryKind::Dispatch(dispatch) => {
             write!(writer, "{}", quoted(dispatch_boundary_label(dispatch)))?
         }
-        IcfgBoundaryKind::Limit(limit) => write!(
-            writer,
-            "{}",
-            quoted(match limit {
-                IcfgLimitKind::CallDepth => "call_depth_limit",
-                IcfgLimitKind::Nodes => "node_limit",
-                IcfgLimitKind::Edges => "edge_limit",
-            })
-        )?,
+        IcfgBoundaryKind::Limit(limit) => write!(writer, "{}", quoted(limit.label()))?,
         IcfgBoundaryKind::Continuation { kind, state } => write!(
             writer,
             "{} :continuation-state {}",

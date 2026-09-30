@@ -453,6 +453,29 @@ impl WorkspaceUsageCatalog {
         self.indices_by_id.get(id).copied()
     }
 
+    /// Join each non-primary member of a merged node to the cataloged node its
+    /// primary heads, keyed `member id -> node id`.
+    ///
+    /// A catalog grouped from node primaries alone knows only primary ids, but
+    /// a C++ or C# node merges redeclarations across files: a header prototype
+    /// is the primary of its `.cpp` definition, whose body holds the sites. A
+    /// site inside that definition must still join to the node (#3671).
+    pub(crate) fn join_members(&mut self, members: &HashMap<DeclarationId, DeclarationId>) {
+        for (member, node_id) in members {
+            let index = self.index_for_id(node_id).unwrap_or_else(|| {
+                panic!("merged member {member:?} names uncataloged node {node_id:?}")
+            });
+            let previous = self.indices_by_id.insert(member.clone(), index);
+            assert!(
+                previous.is_none_or(|previous| previous == index),
+                "one declaration ID belongs to one graph node: {member:?}"
+            );
+            if previous.is_none() {
+                self.nodes[index].declaration_ids.push(member.clone());
+            }
+        }
+    }
+
     fn indices_for_fqn(&self, ecosystem: UsageEcosystem, fqn: &str) -> Vec<usize> {
         self.nodes
             .iter()

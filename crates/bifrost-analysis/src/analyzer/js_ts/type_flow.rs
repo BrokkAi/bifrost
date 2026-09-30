@@ -750,8 +750,9 @@ fn constant_class(
         "string" => exact_external_seed(workspace, "String"),
         "template_string" if is_untagged_template(node) => exact_external_seed(workspace, "String"),
         "true" | "false" => exact_external_seed(workspace, "Boolean"),
-        // Both grammars use `number` for Number and BigInt tokens. The
-        // payload-free semantic Constant cannot distinguish them.
+        // A Number literal is published as a typed numeric value; the
+        // `number` tokens still reaching here are BigInt, legacy octal and
+        // infinite literals, whose payload-free Constant names no class.
         "number" | "null" => ClassSeed::Unknown(UnknownReason::OpenTypeBound),
         "undefined" => {
             let lexical =
@@ -769,11 +770,18 @@ fn retained_value_class(
     procedure: &ProcedureHandle,
     value: &SemanticValue,
 ) -> ClassSeed {
-    if !matches!(
-        value.kind,
-        SemanticValueKind::Callable | SemanticValueKind::Temporary
-    ) {
-        return ClassSeed::NotApplicable;
+    match value.kind {
+        // These structured scalar values no longer enter through Constant.
+        // A caller can still pass one to an untyped parameter, so the
+        // receiver bound must stay open beside any known class callers.
+        SemanticValueKind::Null
+        | SemanticValueKind::UnsignedInteger(_)
+        | SemanticValueKind::SignedInteger(_)
+        | SemanticValueKind::FloatingPoint { .. } => {
+            return ClassSeed::Unknown(UnknownReason::OpenTypeBound);
+        }
+        SemanticValueKind::Callable | SemanticValueKind::Temporary => {}
+        _ => return ClassSeed::NotApplicable,
     }
     let Some(mapping) = procedure.semantics().source_mapping(value.source) else {
         return ClassSeed::NotApplicable;
@@ -2354,6 +2362,16 @@ macro_rules! impl_js_ts_type_flow_adapter {
             ) -> ClassHierarchy {
                 class_hierarchy(workspace, $language, class)
             }
+
+            // ToBoolean has no hook: no getter, `valueOf`, proxy trap or
+            // symbol method runs when any value is tested for truth.
+            fn truthiness_is_pure(
+                &self,
+                _workspace: &WorkspaceAnalyzer,
+                _class: &ClassIdentity,
+            ) -> bool {
+                true
+            }
         }
     };
 }
@@ -2362,13 +2380,13 @@ impl_js_ts_type_flow_adapter!(
     JavascriptSupport,
     Language::JavaScript,
     "javascript-type-flow",
-    b"javascript-type-flow-closed-surface-v3"
+    b"javascript-type-flow-closed-surface-v4"
 );
 impl_js_ts_type_flow_adapter!(
     TypescriptSupport,
     Language::TypeScript,
     "typescript-type-flow",
-    b"typescript-type-flow-closed-surface-v3"
+    b"typescript-type-flow-closed-surface-v4"
 );
 
 #[cfg(test)]

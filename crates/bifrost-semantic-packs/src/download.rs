@@ -8,10 +8,10 @@
 //! after the hook returns, so a downloaded bundle cannot bypass catalog
 //! validation.
 //!
-//! One release archive carries every shipped pack and every shipped generated
-//! production, so the request never selects an asset: it decides whether to
-//! fetch at all, and then names what installing the bundle was supposed to
-//! make available.
+//! One release archive carries every shipped pack and generated production.
+//! Acquisition verifies the whole archive envelope, then installs the packs
+//! relevant to the request; explicit release verification and installation
+//! remain exhaustive.
 
 use std::collections::HashSet;
 use std::error::Error;
@@ -61,7 +61,7 @@ const MAX_ARCHIVE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_EXTRACTED_BYTES: u64 = 512 * 1024 * 1024;
 // Rotate when acquisition or reader compatibility changes without a schema,
 // generated-cache, or release identity change.
-const ABSENCE_RECEIPT_CLIENT_EPOCH: u32 = 2;
+const ABSENCE_RECEIPT_CLIENT_EPOCH: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct AttemptKey {
@@ -527,9 +527,10 @@ fn acquire_with_transport(
         let _scope = brokk_bifrost_analysis::profiling::scope(
             "semantic_pack.acquire_bundle.verify_download",
         );
-        crate::release_bundle::verify_release_bundle_for_install(&bundle_root).map_err(|error| {
-            DownloadError::new(format!("verify downloaded semantic-pack bundle: {error}"))
-        })?
+        crate::release_bundle::verify_release_bundle_for_acquisition(&bundle_root, &receipt_request)
+            .map_err(|error| {
+                DownloadError::new(format!("verify downloaded semantic-pack bundle: {error}"))
+            })?
     };
     if let Err(error) = fs::rename(&bundle_root, &cache_dir) {
         // A concurrent process may have published the same content-addressed
@@ -546,10 +547,11 @@ fn acquire_with_transport(
         }
     }
 
-    let proof = crate::release_bundle::install_verified_release_bundle_with_proof(
-        verified, catalog, &release,
-    )
-    .map_err(|error| DownloadError::new(format!("install semantic-pack bundle: {error}")))?;
+    let proof =
+        crate::release_bundle::install_verified_acquisition_bundle(verified, catalog, &release)
+            .map_err(|error| {
+                DownloadError::new(format!("install semantic-pack bundle: {error}"))
+            })?;
     finish_acquisition(
         catalog,
         request,
@@ -576,10 +578,9 @@ fn cache_dir(catalog_root: &Path, archive_digest: &str) -> PathBuf {
 ///
 /// This is the cached-archive path: the bytes on disk were written by another
 /// process, so installation begins by fully re-verifying the bundle
-/// immediately before catalog mutation. Supported curated packs and current
-/// generated entries are installed either way. The request only decides what
-/// counts as a hit, and this check is advisory: analysis re-reads the catalog
-/// through its own verified path and remains authoritative.
+/// immediately before catalog mutation. Only the verified request slice is
+/// installed. Analysis re-reads the catalog through its own verified path and
+/// remains authoritative.
 fn verify_and_install_bundle(
     bundle_root: &Path,
     catalog: &SemanticPackCatalog,
@@ -591,8 +592,13 @@ fn verify_and_install_bundle(
     let proof = {
         let _scope =
             brokk_bifrost_analysis::profiling::scope("semantic_pack.acquire_bundle.install");
-        crate::release_bundle::install_release_bundle_with_proof(bundle_root, catalog, release)
-            .map_err(|error| DownloadError::new(format!("install semantic-pack bundle: {error}")))?
+        crate::release_bundle::install_acquisition_bundle(
+            bundle_root,
+            catalog,
+            release,
+            receipt_request,
+        )
+        .map_err(|error| DownloadError::new(format!("install semantic-pack bundle: {error}")))?
     };
     finish_acquisition(
         catalog,
@@ -609,9 +615,10 @@ fn finish_acquisition(
     request: &AcquisitionRequest<'_>,
     receipt_request: &AcquisitionReceiptRequest,
     release: &AcquisitionReceiptRelease,
-    proof: crate::release_bundle::BundleInstallationProof,
+    proof: crate::release_bundle::AcquisitionInstallationProof,
     negative_cache: &NegativeCacheIdentity<'_>,
 ) -> Result<(), DownloadError> {
+    assert_eq!(proof.request(), receipt_request);
     let satisfied = match request {
         AcquisitionRequest::GeneratedProduction(key) => catalog
             .generated_production(key)
@@ -629,8 +636,11 @@ fn finish_acquisition(
     if satisfied {
         return Ok(());
     }
+    let Some(sources) = proof.sources() else {
+        return Err(unsatisfied_error(request));
+    };
     match catalog
-        .record_acquisition_absence(receipt_request, release, &proof.sources)
+        .record_acquisition_absence(receipt_request, release, sources)
         .map_err(|error| DownloadError::new(format!("record acquisition absence: {error}")))?
     {
         AcquisitionReceiptLookup::Satisfied => Ok(()),
@@ -943,11 +953,12 @@ mod tests {
     use crate::release_bundle::{
         PACK_SPEC_SCHEMA_VERSION, PinnedArtifact, PinnedJdkSourceLayout, PinnedLookupQuery,
         PinnedPackKind, PinnedPackSpec, ReleaseBundleIndex, generate_release_bundle,
+        merge_release_bundles, verify_release_bundle_for_acquisition,
     };
     use brokk_bifrost_analysis::analyzer::semantic_model::{
-        ActivationSelector, CatalogCoordinate, CatalogOpenMode, Compatibility,
-        GeneratedProductionKey, NameSelector, Provenance, Safety, SemanticPackSelectorQuery,
-        VersionConstraint,
+        ActivationSelector, ArtifactProducerLimits, CatalogCoordinate, CatalogOpenMode,
+        Compatibility, GeneratedProductionKey, NameSelector, Provenance, Safety,
+        SemanticPackSelectorQuery, VersionConstraint, read_exact_source_set,
     };
     use flate2::Compression;
     use flate2::write::GzEncoder;
@@ -1190,6 +1201,115 @@ mod tests {
         }
     }
 
+    fn mixed_language_bundle_fixture() -> GeneratedBundleFixture {
+        let jdk = generated_bundle_fixture();
+        let directory = tempdir().unwrap();
+        let jdk_root = safe_extract_archive(&jdk.archive, directory.path()).unwrap();
+        let stubs = directory.path().join("stubs");
+        fs::create_dir(&stubs).unwrap();
+        fs::write(stubs.join("sample.pyi"), "class Widget: ...\n").unwrap();
+        fs::write(directory.path().join("NOTICE.txt"), "fixture notice\n").unwrap();
+        let artifact_sha256 = read_exact_source_set(
+            &stubs,
+            &[PathBuf::from("sample.pyi")],
+            100_000,
+            64,
+            &ArtifactProducerLimits::default(),
+        )
+        .unwrap()
+        .sha256()
+        .to_owned();
+        let activation = ActivationSelector {
+            package: Some(NameSelector {
+                name: "sample".to_owned(),
+                version: Some("=1.0.0".to_owned()),
+            }),
+            module: None,
+            toolchain: Some(NameSelector {
+                name: "python".to_owned(),
+                version: Some("=3.12.0".to_owned()),
+            }),
+            targets: Vec::new(),
+            configurations: Vec::new(),
+            artifact_sha256: None,
+        };
+        let pinned = PinnedPackSpec {
+            schema_version: PACK_SPEC_SCHEMA_VERSION,
+            pack_id: "python-sample-fixture".to_owned(),
+            pack_version: "1.0.0".to_owned(),
+            ecosystem: "pypi".to_owned(),
+            kind: PinnedPackKind::PythonStub {
+                stubs: vec!["sample.pyi".to_owned()],
+            },
+            artifact: PinnedArtifact {
+                file_name: "stubs".to_owned(),
+                sha256: artifact_sha256,
+                url: Some("https://example.invalid/stubs".to_owned()),
+                container: None,
+            },
+            compatibility: Compatibility {
+                bifrost: format!("={RELEASE_VERSION}"),
+                toolchains: vec![VersionConstraint {
+                    name: "python".to_owned(),
+                    requirement: "=3.12.0".to_owned(),
+                }],
+            },
+            activation: vec![activation.clone()],
+            provenance: Provenance {
+                source: "fixture".to_owned(),
+                revision: Some("fixture-v1".to_owned()),
+            },
+            license: "Apache-2.0".to_owned(),
+            safety: Safety {
+                generated_code_only: false,
+                review_required: false,
+            },
+            notices: vec!["NOTICE.txt".to_owned()],
+            measurement_activation: activation,
+            measurement_queries: vec![PinnedLookupQuery::Type {
+                name: "sample.Widget".to_owned(),
+            }],
+        };
+        let spec = directory.path().join("python.json");
+        fs::write(&spec, serde_json::to_vec(&pinned).unwrap()).unwrap();
+        let python_root = directory.path().join("python-bundle");
+        generate_release_bundle(
+            &python_root,
+            &[crate::release_bundle::BundleInput {
+                spec_path: spec,
+                artifact_path: stubs,
+            }],
+        )
+        .unwrap();
+        let merged_root = directory.path().join("merged");
+        merge_release_bundles(&merged_root, &[jdk_root, python_root]).unwrap();
+        GeneratedBundleFixture {
+            _directory: directory,
+            key: jdk.key,
+            archive: archive_bundle(&merged_root),
+        }
+    }
+
+    fn python_pack_query() -> SemanticPackSelectorQuery {
+        SemanticPackSelectorQuery {
+            language: "python".to_owned(),
+            ecosystem: "pypi".to_owned(),
+            package: Some(CatalogCoordinate {
+                name: "sample".to_owned(),
+                version: Some(semver::Version::parse("1.0.0").unwrap()),
+            }),
+            module: None,
+            toolchain: Some(CatalogCoordinate {
+                name: "python".to_owned(),
+                version: Some(semver::Version::parse("3.12.0").unwrap()),
+            }),
+            target: None,
+            configuration: None,
+            artifact_sha256: None,
+            bifrost_version: semver::Version::parse(RELEASE_VERSION).unwrap(),
+        }
+    }
+
     /// The evidence-only query analysis builds for an artifact-less declared
     /// dependency. The bundle fixture pins `jdk` to 21.0.8, so a different
     /// version names a coordinate the bundle does not carry.
@@ -1297,12 +1417,11 @@ mod tests {
         );
     }
 
-    /// A declared dependency has no artifact and so no generated-production
-    /// key (#2957). The request names the selector query instead, the whole
-    /// bundle is still installed, and the query decides only what counts as a
-    /// hit afterwards.
+    /// A declared dependency has no generated-production key (#2957). Its
+    /// request installs curated and eligible generated packs in the matching
+    /// language and ecosystem.
     #[test]
-    fn fake_transport_installs_the_bundle_for_a_declared_pack_request() {
+    fn declared_pack_request_installs_same_language_generated_production() {
         let fixture = generated_bundle_fixture();
         let catalog = SemanticPackCatalog::open_ephemeral(Default::default()).unwrap();
         let archive_digest = hex_digest(&fixture.archive);
@@ -1328,13 +1447,182 @@ mod tests {
             &[checksum_url, archive_url]
         );
         assert!(!catalog.dependency_candidates(&query).unwrap().is_empty());
-        // Installing the bundle is the whole answer: the generated production
-        // the same bundle carries is installed too, without being asked for.
+        // Generated candidates participate in ordinary declared selection.
         assert!(
             catalog
                 .generated_production(&fixture.key)
                 .unwrap()
                 .is_some()
+        );
+        acquire_with_transport(
+            &catalog,
+            &AcquisitionRequest::GeneratedProduction(&fixture.key),
+            &transport,
+        )
+        .unwrap();
+        assert!(
+            catalog
+                .generated_production(&fixture.key)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn scoped_acquisition_matches_full_install_and_supports_later_language_request() {
+        let fixture = mixed_language_bundle_fixture();
+        let extraction = tempdir().unwrap();
+        let root = safe_extract_archive(&fixture.archive, extraction.path()).unwrap();
+        let full = SemanticPackCatalog::open_ephemeral(Default::default()).unwrap();
+        crate::release_bundle::install_release_bundle(&root, &full).unwrap();
+        let scoped = SemanticPackCatalog::open_ephemeral(Default::default()).unwrap();
+        let release = receipt_release(&hex_digest(&fixture.archive));
+        let python = python_pack_query();
+        let proof = crate::release_bundle::install_acquisition_bundle(
+            &root,
+            &scoped,
+            &release,
+            &AcquisitionReceiptRequest::declared(&python),
+        )
+        .unwrap();
+        assert!(matches!(
+            proof,
+            crate::release_bundle::AcquisitionInstallationProof::Complete { .. }
+        ));
+        let normalized = |catalog: &SemanticPackCatalog, query: &SemanticPackSelectorQuery| {
+            catalog
+                .dependency_candidates(query)
+                .unwrap()
+                .iter()
+                .map(|candidate| {
+                    (
+                        candidate.manifest_digest().to_owned(),
+                        candidate.shard_id().to_owned(),
+                        candidate.descriptor().semantic_sha256.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert!(!normalized(&full, &python).is_empty());
+        assert_eq!(normalized(&scoped, &python), normalized(&full, &python));
+        let active_hash = |catalog: &SemanticPackCatalog, query: &SemanticPackSelectorQuery| {
+            use brokk_bifrost_analysis::analyzer::semantic_model::{
+                SemanticModelActivationEvidence, SemanticModelActivationRequest,
+                SemanticModelResolutionOutcome, resolve_active_semantic_models,
+            };
+            let outcome = resolve_active_semantic_models(
+                catalog,
+                &SemanticModelActivationRequest {
+                    bifrost_version: query.bifrost_version.clone(),
+                    evidence: vec![SemanticModelActivationEvidence {
+                        language: query.language.clone(),
+                        ecosystem: query.ecosystem.clone(),
+                        package: query.package.clone(),
+                        module: query.module.clone(),
+                        toolchain: query.toolchain.clone(),
+                        target: query.target.clone(),
+                        configuration: query.configuration.clone(),
+                        artifact_sha256: query.artifact_sha256.clone(),
+                    }],
+                    controls: Vec::new(),
+                    limits: Default::default(),
+                },
+                &brokk_bifrost_analysis::CancellationToken::default(),
+            );
+            let SemanticModelResolutionOutcome::Ready(active) = outcome else {
+                panic!("fixture pack must activate: {outcome:?}");
+            };
+            active.active_model_set_hash().to_owned()
+        };
+        assert_eq!(active_hash(&scoped, &python), active_hash(&full, &python));
+        let java = declared_pack_query("21.0.8");
+        assert!(normalized(&scoped, &java).is_empty());
+        assert!(scoped.generated_production(&fixture.key).unwrap().is_none());
+        crate::release_bundle::install_acquisition_bundle(
+            &root,
+            &scoped,
+            &release,
+            &AcquisitionReceiptRequest::declared(&java),
+        )
+        .unwrap();
+        assert_eq!(normalized(&scoped, &java), normalized(&full, &java));
+        assert_eq!(active_hash(&scoped, &java), active_hash(&full, &java));
+        assert!(scoped.generated_production(&fixture.key).unwrap().is_some());
+        crate::release_bundle::install_acquisition_bundle(
+            &root,
+            &scoped,
+            &release,
+            &AcquisitionReceiptRequest::generated(&fixture.key),
+        )
+        .unwrap();
+        assert!(scoped.generated_production(&fixture.key).unwrap().is_some());
+    }
+
+    #[test]
+    fn scoped_verification_rejects_unselected_corruption_and_manifest_index_mismatch() {
+        let fixture = mixed_language_bundle_fixture();
+        let extraction = tempdir().unwrap();
+        let root = safe_extract_archive(&fixture.archive, extraction.path()).unwrap();
+        let request = AcquisitionReceiptRequest::declared(&python_pack_query());
+        let index_path = root.join("index.json");
+        let original_index = fs::read(&index_path).unwrap();
+        let index: ReleaseBundleIndex = serde_json::from_slice(&original_index).unwrap();
+        let java_shard = &index
+            .packs
+            .iter()
+            .find(|pack| pack.language == "java")
+            .unwrap()
+            .shards[0];
+        let shard_path = root.join(&java_shard.asset.path);
+        let original_shard = fs::read(&shard_path).unwrap();
+        fs::write(&shard_path, b"corrupt unselected shard").unwrap();
+        assert!(verify_release_bundle_for_acquisition(&root, &request).is_err());
+        fs::write(&shard_path, original_shard).unwrap();
+
+        let python_shard = &index
+            .packs
+            .iter()
+            .find(|pack| pack.language == "python")
+            .unwrap()
+            .shards[0];
+        let selected_path = root.join(&python_shard.asset.path);
+        let selected_bytes = fs::read(&selected_path).unwrap();
+        fs::write(&selected_path, b"corrupt selected shard").unwrap();
+        assert!(verify_release_bundle_for_acquisition(&root, &request).is_err());
+        fs::write(&selected_path, selected_bytes).unwrap();
+
+        let mut mismatched = index;
+        mismatched
+            .packs
+            .iter_mut()
+            .find(|pack| pack.language == "java")
+            .unwrap()
+            .ecosystem = "different".to_owned();
+        fs::write(&index_path, serde_json::to_vec(&mismatched).unwrap()).unwrap();
+        let checksums = root.join("SHA256SUMS");
+        let original_checksums = fs::read_to_string(&checksums).unwrap();
+        let changed = original_checksums
+            .lines()
+            .map(|line| {
+                if line.ends_with("  index.json") {
+                    format!(
+                        "{}  index.json",
+                        hex_digest(&fs::read(&index_path).unwrap())
+                    )
+                } else {
+                    line.to_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        fs::write(&checksums, changed).unwrap();
+        let error = verify_release_bundle_for_acquisition(&root, &request).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("metadata does not match manifest"),
+            "{error}"
         );
     }
 
@@ -1497,12 +1785,10 @@ mod tests {
         );
     }
 
-    /// A bundle that installs a curated pack but skips its stale generated
-    /// production leaves a durable per-catalog absence receipt. A machine-local
-    /// negative cache must carry that identity to the next fresh catalog, where
-    /// the receipt does not exist.
+    /// A stale generated production yields an empty request slice. It cannot
+    /// certify absence, even though the archive contains a curated pack.
     #[test]
-    fn negative_cache_prevents_a_second_fresh_catalog_from_fetching_the_archive() {
+    fn stale_generated_production_does_not_create_an_absence_receipt_or_negative_cache() {
         let fixture = generated_bundle_fixture();
         let extraction = tempdir().unwrap();
         let bundle_root = safe_extract_archive(&fixture.archive, extraction.path()).unwrap();
@@ -1565,6 +1851,16 @@ mod tests {
             transport.requests.lock().unwrap().as_slice(),
             &[checksum_url.clone(), archive_url.clone()]
         );
+        assert_eq!(
+            first_catalog
+                .acquisition_receipt_lookup(
+                    &receipt_request(&AcquisitionRequest::GeneratedProduction(&fixture.key)),
+                    &receipt_release(&archive_digest),
+                )
+                .unwrap(),
+            AcquisitionReceiptLookup::ReceiptMiss,
+        );
+        assert!(!negative_cache.path().join(NEGATIVE_CACHE_DIR).exists());
 
         let second_catalog = SemanticPackCatalog::open_ephemeral(Default::default()).unwrap();
         let second_transport = FakeTransport::new(HashMap::from([
@@ -1579,12 +1875,12 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            second_error.to_string().contains("known negative cache"),
+            second_error.to_string().contains("did not install"),
             "{second_error}"
         );
         assert_eq!(
             second_transport.requests.lock().unwrap().as_slice(),
-            std::slice::from_ref(&checksum_url)
+            &[checksum_url.clone(), archive_url.clone()]
         );
         assert!(
             second_catalog
@@ -1593,19 +1889,8 @@ mod tests {
                 .is_none()
         );
 
-        // The negative answer is advisory. Once it expires, acquisition retries
-        // the immutable archive and can refresh the entry.
-        let marker_directory = negative_cache.path().join(NEGATIVE_CACHE_DIR);
-        let marker_path = fs::read_dir(&marker_directory)
-            .unwrap()
-            .next()
-            .expect("first acquisition recorded one negative-cache entry")
-            .unwrap()
-            .path();
-        let mut marker: NegativeCacheEntry =
-            serde_json::from_slice(&fs::read(&marker_path).unwrap()).unwrap();
-        marker.created_at = negative_cache_now() - NEGATIVE_CACHE_TTL.as_secs() as i64 - 1;
-        fs::write(&marker_path, serde_json::to_vec(&marker).unwrap()).unwrap();
+        // A cached archive can be checked again without claiming a durable
+        // negative result from the unrelated curated source.
         let third_transport = FakeTransport::new(HashMap::from([
             (checksum_url.clone(), checksum),
             (archive_url.clone(), incompatible_archive),
@@ -1625,7 +1910,7 @@ mod tests {
         );
         assert_eq!(
             third_transport.requests.lock().unwrap().as_slice(),
-            &[checksum_url, archive_url]
+            &[checksum_url]
         );
     }
 

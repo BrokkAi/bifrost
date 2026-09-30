@@ -1,13 +1,14 @@
 use super::ir::{
-    ArityConstraint, BindingFilter, BindingSeed, CallArgumentSelector, CallIdentity,
-    CallInputSelector, CandidateFilter, CodeQuery, CodeQueryPlan, CodeQueryPlanSource,
-    CodeQuerySeed, ConfigurationCompletenessFilter, ConfigurationFactsFilter,
-    ConfigurationFactsSeed, ConfigurationNodeKindFilter, ConfigurationRouteSegmentFilter,
-    ControlRelationFilter, DeclarationStateFilter, DecoratorBindingFilter, EdgeFilter,
-    ExportFilter, ExportSeed, FlowRelationFilter, GenerationSiteFilter, GenerationSiteSeed,
-    HierarchyTraversal, KeyedReadKeySelector, OccurrenceFilter, OccurrenceSeed, PathSeed, Pattern,
-    QueryPathScope, QueryStep, ResultContractFailureUseFilter, RewritePathFilter, ScopeFilter,
-    ScopeSeed, StateEventFilter, StringPredicate, UNATTRIBUTED_TIER_LABEL,
+    ArityConstraint, AssignmentRelationFilter, BindingFilter, BindingSeed, BranchRelationFilter,
+    CallArgumentSelector, CallIdentity, CallInputSelector, CandidateFilter, CodeQuery,
+    CodeQueryPlan, CodeQueryPlanSource, CodeQuerySeed, ConfigurationCompletenessFilter,
+    ConfigurationFactsFilter, ConfigurationFactsSeed, ConfigurationNodeKindFilter,
+    ConfigurationRouteSegmentFilter, ControlRelationFilter, DeclarationStateFilter,
+    DecoratorBindingFilter, EdgeFilter, ExportFilter, ExportSeed, FlowRelationFilter,
+    GenerationSiteFilter, GenerationSiteSeed, HierarchyTraversal, KeyedReadKeySelector,
+    OccurrenceFilter, OccurrenceSeed, PathSeed, Pattern, QueryPathScope, QueryStep,
+    ResultContractFailureUseFilter, RewritePathFilter, ScopeFilter, ScopeSeed, StateEventFilter,
+    StringPredicate, UNATTRIBUTED_TIER_LABEL,
 };
 use super::schema::{
     CallTraversalCompleteness, QueryStepField, configuration_member_role_label,
@@ -371,6 +372,23 @@ pub(super) fn result_contract_failure_use_filter_to_json(
     object
 }
 
+pub(super) fn branch_relation_filter_to_json(filter: &BranchRelationFilter) -> Map<String, Value> {
+    let mut object = Map::new();
+    if !filter.relations.is_empty() {
+        object.insert(
+            QueryStepField::BranchRelations.label().to_string(),
+            Value::Array(
+                filter
+                    .relations
+                    .iter()
+                    .map(|relation| json!(relation.label()))
+                    .collect(),
+            ),
+        );
+    }
+    object
+}
+
 pub(super) fn control_relation_filter_to_json(
     filter: &ControlRelationFilter,
 ) -> Map<String, Value> {
@@ -395,6 +413,23 @@ pub(super) fn control_relation_filter_to_json(
                     .exit_partitions
                     .iter()
                     .map(|partition| json!(partition.label()))
+                    .collect(),
+            ),
+        );
+    }
+    object
+}
+
+fn assignment_relation_filter_to_json(filter: &AssignmentRelationFilter) -> Map<String, Value> {
+    let mut object = Map::new();
+    if !filter.relations.is_empty() {
+        object.insert(
+            QueryStepField::AssignmentRelations.label().to_string(),
+            Value::Array(
+                filter
+                    .relations
+                    .iter()
+                    .map(|relation| json!(relation.label()))
                     .collect(),
             ),
         );
@@ -925,6 +960,7 @@ fn query_step_to_json(step: &QueryStep) -> Value {
         | QueryStep::SourceSetOf
         | QueryStep::TopologyEdgesOf
         | QueryStep::GuardsOf
+        | QueryStep::FailureHandlerState
         | QueryStep::SegmentTarget
         | QueryStep::ReceiverOutcome
         | QueryStep::ReceiverEvidence
@@ -936,6 +972,7 @@ fn query_step_to_json(step: &QueryStep) -> Value {
         | QueryStep::CallEffects
         | QueryStep::ResultContractCalls
         | QueryStep::CallResultContracts
+        | QueryStep::CallResultObligations
         | QueryStep::ResultContractUses
         | QueryStep::ResultContractOperationUses
         | QueryStep::NilnessOperations
@@ -973,8 +1010,16 @@ fn query_step_to_json(step: &QueryStep) -> Value {
         QueryStep::ResultContractFailureUses(filter) => {
             object.extend(result_contract_failure_use_filter_to_json(filter));
         }
+        QueryStep::BranchRelations(filter) => {
+            object.extend(branch_relation_filter_to_json(filter));
+        }
+        QueryStep::LoopRelations => {}
+        QueryStep::StatementReachability => {}
         QueryStep::ControlRelations(filter) => {
             object.extend(control_relation_filter_to_json(filter));
+        }
+        QueryStep::AssignmentRelations(filter) => {
+            object.extend(assignment_relation_filter_to_json(filter));
         }
         QueryStep::RewritePathsOf(filter) => {
             object.extend(rewrite_path_filter_to_json(filter));

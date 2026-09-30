@@ -541,6 +541,7 @@ pub(super) fn resolve_cpp<'a>(
     site: &ResolvedReferenceSite,
     exact_token_focus: bool,
     operation: Option<NavigationOperation>,
+    evidence: &mut CallEvidence,
 ) -> DefinitionLookupOutcome {
     let Some(cpp) = resolve_analyzer::<CppAnalyzer>(analyzer) else {
         return no_definition("cpp_analyzer_unavailable", "C++ analyzer is unavailable");
@@ -874,7 +875,7 @@ pub(super) fn resolve_cpp<'a>(
             construction,
             operation == Some(NavigationOperation::Declaration),
         ),
-        Some(CppReferenceNode::Call(call)) => resolve_cpp_call(ctx, token, call),
+        Some(CppReferenceNode::Call(call)) => resolve_cpp_call(ctx, token, call, evidence),
         Some(CppReferenceNode::Field(field)) => resolve_cpp_field(ctx, token, field, None, None),
         Some(CppReferenceNode::Identifier(identifier)) => {
             if let Some((type_reference, member_node)) = c_offsetof_member_parts(identifier) {
@@ -5505,10 +5506,15 @@ fn cpp_navigation_type_target(
         .unwrap_or(unit)
 }
 
+/// Resolve one call expression.
+///
+/// `evidence` receives what the resolver proved about the call beyond the
+/// declarations it returns; only the C header-function route writes it.
 fn resolve_cpp_call(
     ctx: CppLookupCtx<'_, '_>,
     token: QueryToken<'_>,
     call: Node<'_>,
+    evidence: &mut CallEvidence,
 ) -> DefinitionLookupOutcome {
     let ctx_dispatch = CppDispatch::new(ctx.analyzer, ctx.visibility.token());
     let Some(function) = call.child_by_field_name("function") else {
@@ -6053,6 +6059,38 @@ fn resolve_cpp_call(
                 {
                     return outcome;
                 }
+                if let Some((header_function, arity)) =
+                    c_header_function_call(ctx, function, name, call_arity)
+                {
+                    let proof = ExactExternalCallProof::c_header_function(
+                        &header_function.header_module,
+                        name,
+                        arity,
+                    );
+                    evidence.call_application = proof.call_application();
+                    evidence.dispatch_extensibility = proof.dispatch_extensibility();
+                    evidence.exact_external_call = Some(proof);
+                    evidence.external_callee_identity =
+                        Some(ResolverOwnedExternalCalleeIdentity::new(
+                            Language::Cpp,
+                            header_function.header_module.as_str(),
+                            name,
+                        ));
+                    super::trace::record_named_boundary_with_target(
+                        name.to_owned(),
+                        header_function.symbol_id,
+                    );
+                    return boundary_unchecked(
+                        format!(
+                            "`{name}` is the file-scope function the reached header `{}` declares",
+                            header_function.header_module
+                        ),
+                        UnindexedClaim::external_boundary(
+                            name.to_owned(),
+                            ClaimSubjectRole::Member,
+                        ),
+                    );
+                }
                 super::trace::record_named_boundary(name.to_owned());
                 return boundary_unchecked(
                     format!(
@@ -6074,6 +6112,53 @@ fn resolve_cpp_call(
             ),
         ),
     }
+}
+
+/// The reached-header function a bare C call binds, with the call's written
+/// arity, when the workspace itself cannot supply the callee.
+///
+/// This runs only after every workspace channel answered nothing for the
+/// written name and an include boundary precedes the call. The route is C
+/// only: a C translation unit has no namespaces, argument-dependent lookup,
+/// overloads or member scope, so ordinary lookup of an unqualified function
+/// name can only reach a file-scope declaration. It also refuses when the
+/// workspace defines or declares a function of that name anywhere, because
+/// that body can be the one the link selects even where this translation
+/// unit sees only the header's declaration.
+///
+/// A C++ unit calling the same `extern "C"` declaration stays open.
+/// Argument-dependent lookup there can add a same-named function from the
+/// namespace of any argument's type, or a friend of that type, and nothing
+/// structured rules that out: [`cpp_expression_type`] resolves an argument
+/// type to a declaration only inside the workspace, so an external type such
+/// as `struct sockaddr` has no known namespace, and friend declarations are
+/// not lookup facts. Proving the C++ call needs both, which is the C++ row's
+/// work (#3458).
+fn c_header_function_call(
+    ctx: CppLookupCtx<'_, '_>,
+    function: Node<'_>,
+    name: &str,
+    call_arity: Option<usize>,
+) -> Option<(crate::analyzer::cpp::external::CHeaderFunction, u32)> {
+    if !is_c_source_file(ctx.file) || function.kind() != "identifier" {
+        return None;
+    }
+    let arity = u32::try_from(call_arity?).ok()?;
+    if ctx.support.fqn(name).iter().any(|unit| {
+        cpp_unit_matches_kind(ctx.analyzer, ctx.support, unit, CppTargetKind::FreeFunction)
+    }) {
+        return None;
+    }
+    let cpp = resolve_analyzer::<CppAnalyzer>(ctx.analyzer)?;
+    let overlay = ctx.analyzer.semantic_model_overlay();
+    crate::analyzer::cpp::external::reached_header_file_scope_function(
+        cpp,
+        overlay.as_deref(),
+        ctx.file,
+        name,
+        arity,
+    )
+    .map(|header_function| (header_function, arity))
 }
 
 fn cpp_bare_free_function_definition_candidates(
@@ -11619,6 +11704,7 @@ struct holder {
             &site,
             false,
             None,
+            &mut CallEvidence::default(),
         );
         let builds = CPP_BINDINGS_BUILD_COUNT.with(std::cell::Cell::get);
 

@@ -15,7 +15,7 @@ mod runtime_contract_validation;
 mod validate;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 pub use canonical::*;
 pub use export::*;
@@ -23,5 +23,7 @@ pub use identity::*;
 pub use import::*;
 pub use model::*;
 pub use pack::*;
+pub use python::{CsmiShapeAuthoringError, author_python_callable_shape_evidence};
 pub(crate) use runtime_contract_validation::validate_runtime_contract_semantics;
+pub(crate) use validate::validate_python_profile_condition;
 pub use validate::*;

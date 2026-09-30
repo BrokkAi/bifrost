@@ -78,19 +78,17 @@ jobs:
           mkdir -p smoke-fixture/clean smoke-fixture/finding
           cat > smoke-fixture/clean/main.ts <<'EOF'
           // Clean fixture. No policy in bifrost.code-smells matches this file.
+          // Keep it within complete analyzer coverage: unsupported constructs
+          // correctly make a whole-pack result unreliable rather than clean.
 
 
-          function total(values: number[]): number {
-            let result = 0;
-            for (const value of values) {
-              result = result + value;
-            }
-            return result;
+          function total(first: number, second: number, third: number): number {
+            return first + second + third;
           }
 
 
           function main(): void {
-            console.log(total([1, 2, 3]));
+            console.log(total(1, 2, 3));
           }
 
           main();

@@ -119,8 +119,9 @@ use moka::sync::Cache;
 pub(crate) use rust::{
     AnalyzerRustDefinitionProvider, RustMacroMatcherCandidateGate, RustTypeLookupCache,
     ingest_file_macro_matcher_roles, resolve_rust_bounded,
-    rust_associated_call_applicable_candidates, rust_expression_type_definition_candidates_cached,
-    rust_expression_type_definition_fqn_cached, rust_field_definition_type_candidates_cached,
+    rust_associated_call_applicable_candidates, rust_call_written_arity,
+    rust_expression_type_definition_candidates_cached, rust_expression_type_definition_fqn_cached,
+    rust_field_definition_type_candidates_cached, rust_import_binder_external_callee,
     rust_is_type_definition, rust_resolve_type_node_fqn,
 };
 use std::sync::{Arc, OnceLock};
@@ -181,7 +182,8 @@ pub(crate) use python::{
 };
 pub(crate) use resolution_session::{BoundedResolution, ResolutionSession};
 pub(crate) use ruby::{
-    RubyDefinitionProvider, resolve_ruby_bounded, ruby_type_lookup_resolution_bounded,
+    RubyDefinitionProvider, resolve_ruby_bounded, ruby_modeled_result_class_bounded,
+    ruby_type_lookup_resolution_bounded,
 };
 pub(crate) use scala::{
     ScalaDefinitionProvider, ScalaTypeLookupResolution, resolve_scala_bounded,
@@ -436,6 +438,9 @@ pub struct NavigationLookupOutcome {
     pub(crate) structure_unavailable: bool,
     pub(crate) unproven_link_unit: bool,
     pub(crate) truncated: bool,
+    /// The resolver's own call evidence for this request, retained so the
+    /// navigation route can answer a call-target batch without discarding it.
+    pub(crate) evidence: CallEvidence,
 }
 
 impl NavigationLookupOutcome {
@@ -473,6 +478,29 @@ pub struct CallTargetLookupOutcome {
     pub truncated: bool,
 }
 
+impl CallTargetLookupOutcome {
+    /// One resolver answer with every fact it proved about the call retained,
+    /// and no navigation limit reached.
+    ///
+    /// The evidence fields are copied from the resolution rather than decided
+    /// here, because only the resolver knows whether it proved anything. A
+    /// route that decides instead -- by language, as this one did until #3496
+    /// -- silently drops the proof of any language it has not been taught
+    /// about.
+    fn from_resolution(resolution: DefinitionResolution) -> Self {
+        Self {
+            outcome: resolution.outcome,
+            call_application: resolution.evidence.call_application,
+            dispatch_extensibility: resolution.evidence.dispatch_extensibility,
+            exact_external_call: resolution.evidence.exact_external_call,
+            external_callee_identity: resolution.evidence.external_callee_identity,
+            structure_unavailable: false,
+            unproven_link_unit: false,
+            truncated: false,
+        }
+    }
+}
+
 /// One resolver-owned proof for an exact external callable and its applicable
 /// call shape.
 ///
@@ -489,6 +517,10 @@ pub(crate) struct ExactExternalCallProof {
     call_application: CallApplicationKind,
     dispatch_extensibility: Option<DispatchExtensibility>,
     parameter_count: u32,
+    /// The source module's configured, prepared JDK artifact, retained only
+    /// after the selected callee declaration names the same exact artifact.
+    /// A separate model and dispatch check is still required for an obligation.
+    source_jdk_artifact: Option<crate::analyzer::semantic_model::SemanticModelActivationEvidence>,
 }
 
 impl ExactExternalCallProof {
@@ -501,6 +533,7 @@ impl ExactExternalCallProof {
             call_application: CallApplicationKind::PackageFunction,
             dispatch_extensibility: None,
             parameter_count,
+            source_jdk_artifact: None,
         }
     }
 
@@ -513,6 +546,7 @@ impl ExactExternalCallProof {
             call_application: CallApplicationKind::BoundReceiver,
             dispatch_extensibility: Some(DispatchExtensibility::Closed),
             parameter_count,
+            source_jdk_artifact: None,
         }
     }
 
@@ -534,6 +568,7 @@ impl ExactExternalCallProof {
             call_application: CallApplicationKind::PackageFunction,
             dispatch_extensibility: None,
             parameter_count,
+            source_jdk_artifact: None,
         }
     }
 
@@ -556,6 +591,7 @@ impl ExactExternalCallProof {
             call_application: CallApplicationKind::PackageFunction,
             dispatch_extensibility: None,
             parameter_count,
+            source_jdk_artifact: None,
         }
     }
 
@@ -577,6 +613,7 @@ impl ExactExternalCallProof {
             // the language has a closed dispatch universe.
             dispatch_extensibility: None,
             parameter_count,
+            source_jdk_artifact: None,
         }
     }
 
@@ -603,6 +640,54 @@ impl ExactExternalCallProof {
             call_application: CallApplicationKind::BoundReceiver,
             dispatch_extensibility: None,
             parameter_count,
+            source_jdk_artifact: None,
+        }
+    }
+
+    /// An instance call whose external declaration proved one applicable
+    /// signature for the written value receiver.
+    ///
+    /// Java instance methods can be overridden, so the selected signature does
+    /// not prove that dispatch is closed.
+    pub(crate) fn java_bound_external_member(
+        owner: &str,
+        member: &str,
+        parameter_count: u32,
+    ) -> Self {
+        assert!(
+            !owner.is_empty(),
+            "an external receiver owner must be named"
+        );
+        assert!(!member.is_empty(), "an external member must be named");
+        Self {
+            canonical_callee: format!("{owner}.{member}").into_boxed_str(),
+            call_application: CallApplicationKind::BoundReceiver,
+            dispatch_extensibility: None,
+            parameter_count,
+            source_jdk_artifact: None,
+        }
+    }
+
+    /// A type-qualifier call whose external declaration proved one static
+    /// signature. The receiver shape is the proof that no written value
+    /// participates; it does not by itself close every other declaration of
+    /// the same name.
+    pub(crate) fn java_static_external_member(
+        owner: &str,
+        member: &str,
+        parameter_count: u32,
+    ) -> Self {
+        assert!(
+            !owner.is_empty(),
+            "an external receiver owner must be named"
+        );
+        assert!(!member.is_empty(), "an external member must be named");
+        Self {
+            canonical_callee: format!("{owner}.{member}").into_boxed_str(),
+            call_application: CallApplicationKind::PackageFunction,
+            dispatch_extensibility: None,
+            parameter_count,
+            source_jdk_artifact: None,
         }
     }
 
@@ -620,11 +705,90 @@ impl ExactExternalCallProof {
             call_application: CallApplicationKind::PackageFunction,
             dispatch_extensibility: None,
             parameter_count,
+            source_jdk_artifact: None,
+        }
+    }
+
+    /// A call written as `crate::module::Owner::member(...)` whose leading
+    /// segment the Rust resolver proved names no workspace declaration.
+    ///
+    /// The Rust path is not a receiver expression: `TcpStream::connect(x)`
+    /// writes the owner as a type path, so the selected callable is bound to
+    /// no written value and the receiver contract is `PackageFunction`
+    /// (`has_receiver: false`), exactly as #2596 pinned for the summary key.
+    /// The emitted member is the path's terminal segment and the owner is the
+    /// dot-joined prefix.
+    pub(crate) fn rust_external_call(
+        canonical_callee: impl Into<Box<str>>,
+        parameter_count: u32,
+    ) -> Self {
+        let canonical_callee = canonical_callee.into();
+        assert!(
+            !canonical_callee.is_empty(),
+            "a qualified Rust callable must be named"
+        );
+        Self {
+            canonical_callee,
+            call_application: CallApplicationKind::PackageFunction,
+            dispatch_extensibility: None,
+            parameter_count,
+            source_jdk_artifact: None,
+        }
+    }
+
+    /// A bare C call whose compile-database-scoped header closure declares one
+    /// file-scope function of that name at the written arity.
+    ///
+    /// C declares `connect` at file scope, where no namespace or class owns it,
+    /// so the header that declares it is the only structured owner the callee
+    /// has. The owner is that header's module identity (`sys/socket` for
+    /// `<sys/socket.h>`), the identity a reviewed summary names through its
+    /// target `path` (#2610). The text uses the C/C++ scope separator so the
+    /// shared call-site splitter recovers exactly that pair. A C function binds
+    /// no written value, so the call shape is a package function.
+    pub(crate) fn c_header_function(
+        header_module: &str,
+        function: &str,
+        parameter_count: u32,
+    ) -> Self {
+        assert!(
+            !header_module.is_empty() && !header_module.contains("::"),
+            "a header module identity must round-trip through the C/C++ separator: {header_module:?}"
+        );
+        assert!(!function.is_empty(), "a header function must be named");
+        Self {
+            canonical_callee: format!("{header_module}::{function}").into_boxed_str(),
+            call_application: CallApplicationKind::PackageFunction,
+            dispatch_extensibility: None,
+            parameter_count,
+            source_jdk_artifact: None,
         }
     }
 
     pub(crate) fn canonical_callee(&self) -> &str {
         &self.canonical_callee
+    }
+
+    pub(crate) fn with_source_jdk_artifact(
+        mut self,
+        artifact: Option<crate::analyzer::semantic_model::SemanticModelActivationEvidence>,
+    ) -> Self {
+        debug_assert!(
+            artifact.as_ref().is_none_or(|evidence| {
+                evidence.language == "java"
+                    && evidence.ecosystem == "jdk"
+                    && evidence.artifact_sha256.is_some()
+            }),
+            "only an exact prepared Java JDK can be selected as a source toolchain"
+        );
+        self.source_jdk_artifact = artifact;
+        self
+    }
+
+    pub(crate) fn source_jdk_artifact(
+        &self,
+    ) -> Option<&crate::analyzer::semantic_model::SemanticModelActivationEvidence> {
+        self.source_jdk_artifact.as_ref()
     }
 
     pub(crate) const fn call_application(&self) -> CallApplicationKind {
@@ -657,22 +821,34 @@ pub(crate) enum CallApplicationKind {
     Unknown,
 }
 
-struct DefinitionResolution {
-    outcome: DefinitionLookupOutcome,
+/// What one language resolver proved about a call beyond the declarations it
+/// selected.
+///
+/// Every batch route carries this from [`resolve_one_with_evidence`] to the
+/// [`CallTargetLookupOutcome`] it builds, unchanged. A resolver that proves
+/// nothing leaves the default, which is the same answer the route used to
+/// hard-code for every language it did not recognise. Carrying the default
+/// rather than selecting the route by language is the point: a hand-kept list
+/// of evidence-publishing languages discarded Ruby's boundary proof for as
+/// long as Ruby was missing from it (#3459, #3496).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct CallEvidence {
     call_application: CallApplicationKind,
     dispatch_extensibility: Option<DispatchExtensibility>,
     exact_external_call: Option<ExactExternalCallProof>,
     external_callee_identity: Option<ResolverOwnedExternalCalleeIdentity>,
 }
 
+struct DefinitionResolution {
+    outcome: DefinitionLookupOutcome,
+    evidence: CallEvidence,
+}
+
 impl From<DefinitionLookupOutcome> for DefinitionResolution {
     fn from(outcome: DefinitionLookupOutcome) -> Self {
         Self {
             outcome,
-            call_application: CallApplicationKind::Unknown,
-            dispatch_extensibility: None,
-            exact_external_call: None,
-            external_callee_identity: None,
+            evidence: CallEvidence::default(),
         }
     }
 }
@@ -939,7 +1115,7 @@ fn resolve_navigation_requests<'a>(
         .iter()
         .map(|request| request.file.clone())
         .collect();
-    let outcomes = resolve_definition_requests(
+    let resolutions = resolve_definition_resolutions(
         analyzer,
         token,
         context,
@@ -947,18 +1123,20 @@ fn resolve_navigation_requests<'a>(
         cancellation,
         Some(operation),
         allow_rust_field_receiver_lexical,
+        None,
+        &mut Vec::new(),
     );
     languages
         .into_iter()
         .zip(reference_files)
-        .zip(outcomes)
-        .map(|((language, reference_file), outcome)| {
+        .zip(resolutions)
+        .map(|((language, reference_file), resolution)| {
             navigation_lookup_outcome(
                 analyzer,
                 token,
                 context,
                 &reference_file,
-                outcome,
+                resolution,
                 language,
                 operation,
             )
@@ -966,15 +1144,12 @@ fn resolve_navigation_requests<'a>(
         .collect()
 }
 
-/// Resolve one batch of requests, optionally draining the resolution trace
-/// after each one.
+/// Resolve one batch of requests for callers that need only the declarations.
 ///
-/// `trace_session` and `traces` travel together and are `None`/empty for every
-/// caller but [`trace::resolve_definition_batch_with_trace`]. They are
-/// parameters rather than context state because the drain must happen exactly
-/// at the per-request boundary, which is here and nowhere else: the recorder is
-/// append-only, so without a drain point every request would inherit the rows
-/// of the ones before it.
+/// The batch driver keeps each resolver's [`CallEvidence`]; a caller that
+/// answers a definition question has no use for it and drops it here. A
+/// caller that answers a *call* question keeps it, so that no route has to
+/// know which languages publish evidence.
 fn resolve_definition_requests<'a>(
     analyzer: &'a dyn IAnalyzer,
     token: QueryToken<'_>,
@@ -984,7 +1159,7 @@ fn resolve_definition_requests<'a>(
     operation: Option<NavigationOperation>,
     allow_rust_field_receiver_lexical: bool,
 ) -> Vec<DefinitionLookupOutcome> {
-    resolve_definition_requests_traced(
+    resolve_definition_resolutions(
         analyzer,
         token,
         context,
@@ -995,6 +1170,9 @@ fn resolve_definition_requests<'a>(
         None,
         &mut Vec::new(),
     )
+    .into_iter()
+    .map(|resolution| resolution.outcome)
+    .collect()
 }
 
 /// Record what every request in one batch probes, before any of them runs.
@@ -1161,8 +1339,22 @@ fn record_definition_probe_reads(
     }
 }
 
+/// Resolve one batch of requests, keeping each resolver's own call evidence
+/// and optionally draining the resolution trace after each one.
+///
+/// Definition, navigation, and traced batches run through here. The evidence
+/// travels with the resolution the whole way, so a route that answers a call
+/// -- C/C++ call targets reach one through [`resolve_navigation_requests`] --
+/// never has to decide in advance which languages publish any (#3496).
+///
+/// `trace_session` and `traces` travel together and are `None`/empty for every
+/// caller but [`trace::resolve_definition_batch_with_trace`]. They are
+/// parameters rather than context state because the drain must happen exactly
+/// at the per-request boundary, which is here and nowhere else: the recorder is
+/// append-only, so without a drain point every request would inherit the rows
+/// of the ones before it.
 #[allow(clippy::too_many_arguments)]
-fn resolve_definition_requests_traced<'a>(
+fn resolve_definition_resolutions<'a>(
     analyzer: &'a dyn IAnalyzer,
     token: QueryToken<'_>,
     context: &mut DefinitionBatchContext<'a>,
@@ -1172,7 +1364,7 @@ fn resolve_definition_requests_traced<'a>(
     allow_rust_field_receiver_lexical: bool,
     trace_session: Option<&trace::TraceSession>,
     traces: &mut Vec<Vec<TraceCandidate>>,
-) -> Vec<DefinitionLookupOutcome> {
+) -> Vec<DefinitionResolution> {
     let _query_scope = cancellation.map_or_else(
         || AnalyzerQueryScope::new(analyzer),
         |cancellation| AnalyzerQueryScope::with_cancellation(analyzer, cancellation),
@@ -1206,7 +1398,7 @@ fn resolve_definition_requests_traced<'a>(
                 Vec::new()
             };
             let resolve = || {
-                resolve_one(
+                resolve_one_with_evidence(
                     analyzer,
                     token,
                     context,
@@ -1214,19 +1406,20 @@ fn resolve_definition_requests_traced<'a>(
                     operation,
                     cancellation,
                     allow_rust_field_receiver_lexical,
+                    None,
                 )
             };
-            let outcome = if analyzer.read_ledger_attached() {
-                let (outcome, mut reads) =
+            let resolution = if analyzer.read_ledger_attached() {
+                let (resolution, mut reads) =
                     crate::analyzer::i_analyzer::capture_nested_reads(analyzer, resolve);
                 // Only the speculative site probes are subsumed by a
                 // successful resolution. Preserve every actual resolver read.
                 reads.extend(probes.into_iter().filter(|read| {
-                    outcome.definitions.is_empty()
+                    resolution.outcome.definitions.is_empty()
                         || !matches!(read, ReadKey::Index { .. } | ReadKey::Scope { .. })
                 }));
-                publish_definition_reads(analyzer, &outcome, reads);
-                outcome
+                publish_definition_reads(analyzer, &resolution.outcome, reads);
+                resolution
             } else {
                 resolve()
             };
@@ -1239,7 +1432,7 @@ fn resolve_definition_requests_traced<'a>(
             if let Some(session) = trace_session {
                 traces.push(session.take_request());
             }
-            outcome
+            resolution
         })
         .collect()
 }
@@ -1630,38 +1823,31 @@ pub fn resolve_call_target_batch_with_source(
                     return requests
                         .into_iter()
                         .map(|_| CallTargetLookupOutcome {
-                            outcome: no_definition(
-                                "resolution_budget_exceeded",
-                                format!(
-                                    "Go call-target namespace resolution exceeded its {} budget",
-                                    limit.as_str()
-                                ),
-                            ),
-                            call_application: CallApplicationKind::Unknown,
-                            dispatch_extensibility: None,
-                            exact_external_call: None,
-                            external_callee_identity: None,
-                            structure_unavailable: false,
-                            unproven_link_unit: false,
                             truncated: true,
+                            ..CallTargetLookupOutcome::from_resolution(
+                                no_definition(
+                                    "resolution_budget_exceeded",
+                                    format!(
+                                        "Go call-target namespace resolution exceeded its {} budget",
+                                        limit.as_str()
+                                    ),
+                                )
+                                .into(),
+                            )
                         })
                         .collect();
                 }
                 BoundedResolution::Cancelled { .. } => {
                     return requests
                         .into_iter()
-                        .map(|_| CallTargetLookupOutcome {
-                            outcome: no_definition(
-                                "cancelled",
-                                "Go call-target namespace resolution was cancelled",
-                            ),
-                            call_application: CallApplicationKind::Unknown,
-                            dispatch_extensibility: None,
-                            exact_external_call: None,
-                            external_callee_identity: None,
-                            structure_unavailable: false,
-                            unproven_link_unit: false,
-                            truncated: false,
+                        .map(|_| {
+                            CallTargetLookupOutcome::from_resolution(
+                                no_definition(
+                                    "cancelled",
+                                    "Go call-target namespace resolution was cancelled",
+                                )
+                                .into(),
+                            )
                         })
                         .collect();
                 }
@@ -1702,121 +1888,92 @@ pub fn resolve_call_target_batch_with_source(
                     ),
                 };
                 CallTargetLookupOutcome {
-                    outcome: resolution.outcome,
-                    call_application: resolution.call_application,
-                    dispatch_extensibility: resolution.dispatch_extensibility,
-                    exact_external_call: resolution.exact_external_call,
-                    external_callee_identity: resolution.external_callee_identity,
-                    structure_unavailable: false,
-                    unproven_link_unit: false,
                     truncated,
+                    ..CallTargetLookupOutcome::from_resolution(resolution)
                 }
             })
             .collect();
     }
-    if matches!(
-        language_for_file(&file),
-        Language::JavaScript
-            | Language::TypeScript
-            | Language::Php
-            | Language::Python
-            | Language::Ruby
-    ) {
-        let scope = AnalyzerQueryScope::new(analyzer);
-        let mut context = DefinitionBatchContext::new(analyzer, scope.token(), requests.len() > 1);
-        context.sources.insert(file.clone(), Ok(source));
-        debug_assert!(
-            requests.iter().all(|request| request.file == file),
-            "one call-target source batch must contain requests for that source file"
-        );
-        record_definition_batch_probe_reads(analyzer, &mut context, &requests);
-        return requests
-            .into_iter()
-            .take_while(|_| !cancellation.is_some_and(CancellationToken::is_cancelled))
-            .map(|request| {
-                let resolution = resolve_one_with_evidence(
-                    analyzer,
-                    token,
-                    &mut context,
-                    request,
-                    None,
-                    cancellation,
-                    true,
-                    None,
-                );
-                CallTargetLookupOutcome {
-                    outcome: resolution.outcome,
-                    call_application: resolution.call_application,
-                    dispatch_extensibility: resolution.dispatch_extensibility,
-                    exact_external_call: resolution.exact_external_call,
-                    external_callee_identity: resolution.external_callee_identity,
-                    structure_unavailable: false,
-                    unproven_link_unit: false,
-                    truncated: false,
-                }
-            })
-            .collect();
-    }
-    if language_for_file(&file) != Language::Cpp {
-        let outcomes = match cancellation {
-            Some(cancellation) => resolve_definition_batch_with_source_and_cancellation(
-                analyzer,
-                requests,
-                file,
-                source,
-                cancellation,
-            ),
-            None => resolve_definition_batch_with_source(analyzer, requests, file, source),
-        };
-        return outcomes
-            .into_iter()
-            .map(|outcome| CallTargetLookupOutcome {
-                outcome,
-                call_application: CallApplicationKind::Unknown,
-                dispatch_extensibility: None,
-                exact_external_call: None,
-                external_callee_identity: None,
-                structure_unavailable: false,
-                unproven_link_unit: false,
-                truncated: false,
-            })
-            .collect();
-    }
-
     let scope = AnalyzerQueryScope::new(analyzer);
     let mut context = DefinitionBatchContext::new(analyzer, scope.token(), requests.len() > 1);
-    context.sources.insert(file, Ok(source));
-    resolve_navigation_requests(
-        analyzer,
-        token,
-        &mut context,
-        requests,
-        NavigationOperation::Definition,
-        cancellation,
-        true,
-    )
-    .into_iter()
-    .map(|outcome| CallTargetLookupOutcome {
-        call_application: CallApplicationKind::Unknown,
-        dispatch_extensibility: None,
-        exact_external_call: None,
-        external_callee_identity: None,
-        structure_unavailable: outcome.structure_unavailable,
-        unproven_link_unit: outcome.unproven_link_unit,
-        truncated: outcome.truncated,
-        outcome: DefinitionLookupOutcome {
-            status: outcome.status,
-            reference: outcome.reference,
-            definitions: outcome
-                .targets
-                .into_iter()
-                .map(|target| target.code_unit)
-                .collect(),
-            lexical_definition: outcome.lexical_definition,
-            diagnostics: outcome.diagnostics,
-        },
-    })
-    .collect()
+    context.sources.insert(file.clone(), Ok(source));
+    debug_assert!(
+        requests.iter().all(|request| request.file == file),
+        "one call-target source batch must contain requests for that source file"
+    );
+
+    // C/C++ call targets are navigation answers: one call names a declaration
+    // whose defining body the link-unit selection has to choose, so the
+    // request runs the navigation route and reports what that selection could
+    // not prove.
+    if language_for_file(&file) == Language::Cpp {
+        return resolve_navigation_requests(
+            analyzer,
+            token,
+            &mut context,
+            requests,
+            NavigationOperation::Definition,
+            cancellation,
+            true,
+        )
+        .into_iter()
+        .map(|navigation| CallTargetLookupOutcome {
+            call_application: navigation.evidence.call_application,
+            dispatch_extensibility: navigation.evidence.dispatch_extensibility,
+            exact_external_call: navigation.evidence.exact_external_call,
+            external_callee_identity: navigation.evidence.external_callee_identity,
+            structure_unavailable: navigation.structure_unavailable,
+            unproven_link_unit: navigation.unproven_link_unit,
+            truncated: navigation.truncated,
+            outcome: DefinitionLookupOutcome {
+                status: navigation.status,
+                reference: navigation.reference,
+                definitions: navigation
+                    .targets
+                    .into_iter()
+                    .map(|target| target.code_unit)
+                    .collect(),
+                lexical_definition: navigation.lexical_definition,
+                diagnostics: navigation.diagnostics,
+            },
+        })
+        .collect();
+    }
+
+    // Every other language takes one route, and it keeps whatever its resolver
+    // proved. Nothing here enumerates the languages that publish evidence:
+    // that list existed, and it silently flattened Ruby's boundary proof to
+    // `None` for as long as Ruby was absent from it (#3459, #3496).
+    //
+    // A call-target batch names what it probes once, up front, and lets each
+    // resolver's own reads land on the ambient ledger, rather than running the
+    // definition route's per-request capture. The difference is visible:
+    // `publish_definition_reads` trades a resolved request's speculative index
+    // probes for its declarations' fact digests, and for an edited callee that
+    // turns the caller's unit from an exact file dependency into a
+    // whole-language scope dependency (`read_ledger_verification::
+    // an_edited_callee_invalidates_the_callees_unit`). The caller's deadline
+    // still reaches the reads below, which is what the discarded route
+    // contributed.
+    let _deadline = cancellation
+        .map(|cancellation| AnalyzerQueryScope::with_cancellation(analyzer, cancellation));
+    record_definition_batch_probe_reads(analyzer, &mut context, &requests);
+    requests
+        .into_iter()
+        .take_while(|_| !cancellation.is_some_and(CancellationToken::is_cancelled))
+        .map(|request| {
+            CallTargetLookupOutcome::from_resolution(resolve_one_with_evidence(
+                analyzer,
+                token,
+                &mut context,
+                request,
+                None,
+                cancellation,
+                true,
+                None,
+            ))
+        })
+        .collect()
 }
 
 pub fn resolve_call_reference_definition_with_source(
@@ -2448,13 +2605,10 @@ fn resolve_one_with_evidence<'a>(
         }
     }
     let _dispatch_scope = profiling::scope("get_definition::language_dispatch");
-    let mut call_application = CallApplicationKind::Unknown;
-    let mut dispatch_extensibility = None;
-    let mut exact_external_call = None;
-    let mut external_callee_identity = None;
+    let mut evidence = CallEvidence::default();
     let resolved = match language {
         Language::Rust => {
-            if let Some(cancellation) = cancellation {
+            let rust_outcome = if let Some(cancellation) = cancellation {
                 match rust::resolve_rust_cancellable(
                     analyzer,
                     context.token,
@@ -2498,7 +2652,39 @@ fn resolve_one_with_evidence<'a>(
                         )
                     },
                 )
+            };
+            let mut outcome = rust_outcome;
+            if matches!(
+                outcome.status,
+                DefinitionLookupStatus::NoDefinition
+                    | DefinitionLookupStatus::UnresolvableImportBoundary
+            ) && let Some((proof, identity)) = tree.as_ref().and_then(|tree| {
+                rust::exact_rust_external_call(
+                    analyzer,
+                    context.token,
+                    &request.file,
+                    source.as_ref(),
+                    tree,
+                    &site,
+                    cancellation,
+                )
+            }) {
+                outcome = boundary_unchecked(
+                    format!(
+                        "`{}` is declared by the activated Rust model",
+                        proof.canonical_callee()
+                    ),
+                    UnindexedClaim::external_boundary(identity.owner_fqn(), ClaimSubjectRole::Any),
+                );
+                let mut reference = outcome.reference.take().unwrap_or_else(|| site.clone());
+                reference.text = proof.canonical_callee().to_owned();
+                outcome.reference = Some(reference);
+                evidence.call_application = proof.call_application();
+                evidence.dispatch_extensibility = proof.dispatch_extensibility();
+                evidence.exact_external_call = Some(proof);
+                evidence.external_callee_identity = Some(identity);
             }
+            outcome
         }
         Language::JavaScript | Language::TypeScript => {
             let mut outcome = js_ts::resolve_js_ts(
@@ -2531,9 +2717,9 @@ fn resolve_one_with_evidence<'a>(
                 let mut reference = outcome.reference.take().unwrap_or_else(|| site.clone());
                 reference.text = proof.canonical_callee().to_owned();
                 outcome.reference = Some(reference);
-                call_application = proof.call_application();
-                dispatch_extensibility = proof.dispatch_extensibility();
-                exact_external_call = Some(proof);
+                evidence.call_application = proof.call_application();
+                evidence.dispatch_extensibility = proof.dispatch_extensibility();
+                evidence.exact_external_call = Some(proof);
             }
             outcome
         }
@@ -2585,23 +2771,27 @@ fn resolve_one_with_evidence<'a>(
                     selector.as_ref(),
                     namespace_resolution,
                 );
-                call_application = resolution.call_application;
-                dispatch_extensibility = resolution.dispatch_extensibility;
-                exact_external_call = resolution.exact_external_call;
-                external_callee_identity = resolution.external_callee_identity;
+                evidence.call_application = resolution.call_application;
+                evidence.dispatch_extensibility = resolution.dispatch_extensibility;
+                evidence.exact_external_call = resolution.exact_external_call;
+                evidence.external_callee_identity = resolution.external_callee_identity;
                 resolution.outcome
             } else {
                 no_definition("go_analyzer_unavailable", "Go analyzer is unavailable")
             }
         }
-        Language::Java => java::resolve_java(
-            analyzer,
-            context.bounded_support(),
-            &request.file,
-            &source,
-            tree.as_ref(),
-            &site,
-        ),
+        Language::Java => {
+            let resolution = java::resolve_java(
+                analyzer,
+                context.bounded_support(),
+                &request.file,
+                &source,
+                tree.as_ref(),
+                &site,
+            );
+            evidence = resolution.evidence;
+            resolution.outcome
+        }
         Language::Php => {
             let resolution = php::resolve_php(
                 analyzer,
@@ -2612,7 +2802,7 @@ fn resolve_one_with_evidence<'a>(
                 &site,
                 context.exact_token_focus,
             );
-            external_callee_identity = resolution.external_callee_identity;
+            evidence.external_callee_identity = resolution.external_callee_identity;
             resolution.outcome
         }
         Language::Python => {
@@ -2633,9 +2823,9 @@ fn resolve_one_with_evidence<'a>(
                 let mut reference = outcome.reference.take().unwrap_or_else(|| site.clone());
                 reference.text = proof.canonical_callee().to_owned();
                 outcome.reference = Some(reference);
-                call_application = proof.call_application();
-                dispatch_extensibility = proof.dispatch_extensibility();
-                exact_external_call = Some(proof);
+                evidence.call_application = proof.call_application();
+                evidence.dispatch_extensibility = proof.dispatch_extensibility();
+                evidence.exact_external_call = Some(proof);
             }
             outcome
         }
@@ -2655,17 +2845,29 @@ fn resolve_one_with_evidence<'a>(
                 )
             },
         ),
-        Language::Cpp => cpp::resolve_cpp(
-            analyzer,
-            token,
-            context,
-            &request.file,
-            &source,
-            tree.as_ref(),
-            &site,
-            context.exact_token_focus,
-            operation,
-        ),
+        Language::Cpp => {
+            let mut outcome = cpp::resolve_cpp(
+                analyzer,
+                token,
+                context,
+                &request.file,
+                &source,
+                tree.as_ref(),
+                &site,
+                context.exact_token_focus,
+                operation,
+                &mut evidence,
+            );
+            // A C call bound to a reached header's file-scope function
+            // publishes the proven identity as the boundary's callee text,
+            // exactly as every other exact external route does.
+            if let Some(proof) = &evidence.exact_external_call {
+                let mut reference = outcome.reference.take().unwrap_or_else(|| site.clone());
+                reference.text = proof.canonical_callee().to_owned();
+                outcome.reference = Some(reference);
+            }
+            outcome
+        }
         Language::Scala => scala::resolve_scala(
             analyzer,
             token,
@@ -2684,18 +2886,34 @@ fn resolve_one_with_evidence<'a>(
                 tree.as_ref(),
                 &site,
             );
-            if outcome.status == DefinitionLookupStatus::UnresolvableImportBoundary
-                && let Some((proof, identity)) = tree.as_ref().and_then(|tree| {
-                    ruby::exact_ruby_external_call(analyzer, source.as_ref(), tree, &site)
-                })
-            {
+            if matches!(
+                outcome.status,
+                DefinitionLookupStatus::NoDefinition
+                    | DefinitionLookupStatus::UnresolvableImportBoundary
+            ) && let Some((proof, identity)) = tree.as_ref().and_then(|tree| {
+                ruby::exact_ruby_external_call(
+                    analyzer,
+                    &request.file,
+                    source.as_ref(),
+                    tree,
+                    &site,
+                    cancellation,
+                )
+            }) {
+                outcome = boundary_unchecked(
+                    format!(
+                        "`{}` is declared by the activated Ruby model",
+                        proof.canonical_callee()
+                    ),
+                    UnindexedClaim::external_boundary(identity.owner_fqn(), ClaimSubjectRole::Any),
+                );
                 let mut reference = outcome.reference.take().unwrap_or_else(|| site.clone());
                 reference.text = proof.canonical_callee().to_owned();
                 outcome.reference = Some(reference);
-                call_application = proof.call_application();
-                dispatch_extensibility = proof.dispatch_extensibility();
-                exact_external_call = Some(proof);
-                external_callee_identity = Some(identity);
+                evidence.call_application = proof.call_application();
+                evidence.dispatch_extensibility = proof.dispatch_extensibility();
+                evidence.exact_external_call = Some(proof);
+                evidence.external_callee_identity = Some(identity);
             }
             outcome
         }
@@ -2724,10 +2942,7 @@ fn resolve_one_with_evidence<'a>(
 
     DefinitionResolution {
         outcome: finish_lookup_outcome(resolved, site),
-        call_application,
-        dispatch_extensibility,
-        exact_external_call,
-        external_callee_identity,
+        evidence,
     }
 }
 
@@ -2849,13 +3064,19 @@ pub fn parse_tree_for_language(
     let grammar = crate::analyzer::parser_language_for_path(language, file.rel_path())?;
     let mut parser = Parser::new();
     parser.set_language(&grammar).ok()?;
+    let tree = parser.parse(source, None)?;
     if language == Language::Cpp
         && let Some(ranges) =
-            brokk_bifrost_cpp::graph::syntax::function_macro_included_ranges(source)
+            brokk_bifrost_cpp::graph::syntax::function_macro_included_ranges(source, &tree, || {
+                false
+            })
+            .continue_value()?
     {
+        drop(tree);
         parser.set_included_ranges(&ranges).ok()?;
+        return parser.parse(source, None);
     }
-    parser.parse(source, None)
+    Some(tree)
 }
 
 fn candidates_outcome(mut candidates: Vec<CodeUnit>) -> DefinitionLookupOutcome {
@@ -2940,10 +3161,11 @@ fn navigation_lookup_outcome(
     token: QueryToken<'_>,
     context: &mut DefinitionBatchContext<'_>,
     reference_file: &ProjectFile,
-    outcome: DefinitionLookupOutcome,
+    resolution: DefinitionResolution,
     language: Language,
     operation: NavigationOperation,
 ) -> NavigationLookupOutcome {
+    let DefinitionResolution { outcome, evidence } = resolution;
     let DefinitionLookupOutcome {
         mut status,
         reference,
@@ -3085,6 +3307,7 @@ fn navigation_lookup_outcome(
         structure_unavailable,
         unproven_link_unit,
         truncated,
+        evidence,
     }
 }
 
@@ -3334,6 +3557,7 @@ fn sort_units(units: &mut [CodeUnit]) {
 mod tests {
     use super::*;
     use crate::analyzer::{Project, TestProject};
+    use crate::inline_project::InlineTestProject;
     use crate::test_support::AnalyzerFixture;
 
     #[test]
@@ -3455,6 +3679,132 @@ mod tests {
                 .all(|read| replayed_reads.contains(read)),
             "cached Python definition reads were not replayed: cached={cached_reads:?}, replayed={replayed_reads:?}"
         );
+    }
+
+    /// #3496: one call-target batch keeps whatever its resolver proved about
+    /// the call, whichever language wrote it.
+    ///
+    /// The route used to send a hand-kept list of languages through the branch
+    /// that retains `exact_external_call` and `external_callee_identity`, and
+    /// flattened every other language's evidence to `None` one layer above the
+    /// resolver that produced it. Ruby's boundary proof was discarded that way
+    /// for as long as Ruby was absent from the list (#3459). These rows read
+    /// the languages that publish a proof today back through the production
+    /// entry point, beside one that publishes none, so an absent proof stays
+    /// the resolver's own answer rather than the route's.
+    #[test]
+    fn call_target_batch_keeps_every_resolver_proof() {
+        struct Case {
+            language: Language,
+            files: &'static [(&'static str, &'static str)],
+            caller: &'static str,
+            callee: &'static str,
+            canonical_callee: Option<&'static str>,
+        }
+
+        let cases = [
+            Case {
+                language: Language::Python,
+                files: &[(
+                    "app.py",
+                    "import httpx\n\n\ndef fetch(url):\n    return httpx.get(url)\n",
+                )],
+                caller: "app.py",
+                callee: "get",
+                canonical_callee: Some("httpx.get"),
+            },
+            Case {
+                language: Language::JavaScript,
+                files: &[(
+                    "app.js",
+                    "import { get } from \"axios\";\n\nexport function fetch(url) {\n  return get(url);\n}\n",
+                )],
+                caller: "app.js",
+                callee: "get",
+                canonical_callee: Some("axios.get"),
+            },
+            Case {
+                language: Language::Java,
+                files: &[(
+                    "App.java",
+                    "class App { void run(java.util.List<String> values) { values.size(); } }",
+                )],
+                caller: "App.java",
+                callee: "size",
+                canonical_callee: None,
+            },
+        ];
+
+        for case in cases {
+            let mut project = InlineTestProject::with_language(case.language);
+            for (path, contents) in case.files {
+                project = project.file(*path, *contents);
+            }
+            let project = project.build();
+            let workspace = project.workspace_analyzer(crate::AnalyzerConfig::default());
+            let analyzer = workspace.analyzer();
+            let file = project.file(case.caller);
+            let source = Arc::<str>::from(
+                case.files
+                    .iter()
+                    .find(|(path, _)| *path == case.caller)
+                    .expect("the caller is one of the case files")
+                    .1,
+            );
+            let start_byte = source
+                .rfind(case.callee)
+                .expect("the callee token appears in the caller");
+            let scope = AnalyzerQueryScope::new(analyzer);
+            let outcomes = resolve_call_target_batch_with_source(
+                analyzer,
+                scope.token(),
+                vec![DefinitionLookupRequest {
+                    file: file.clone(),
+                    line: None,
+                    column: None,
+                    start_byte: Some(start_byte),
+                    end_byte: Some(start_byte + case.callee.len()),
+                }],
+                file,
+                source,
+                None,
+            );
+
+            let [outcome] = outcomes.as_slice() else {
+                panic!("one request answers once, got {outcomes:?}");
+            };
+            match case.canonical_callee {
+                Some(canonical) => {
+                    let proof = outcome.exact_external_call.as_ref().unwrap_or_else(|| {
+                        panic!(
+                            "{:?} published an exact external call proof the batch must carry: {outcome:?}",
+                            case.language
+                        )
+                    });
+                    assert_eq!(proof.canonical_callee(), canonical, "{outcome:?}");
+                    assert_ne!(
+                        outcome.call_application,
+                        CallApplicationKind::Unknown,
+                        "the proof's call shape travels with it: {outcome:?}"
+                    );
+                    // `call_target_boundary_evidence` reads the proof against
+                    // the reference text, so the two must name one callee.
+                    assert_eq!(
+                        outcome.outcome.resolved_reference_target(),
+                        Some(canonical),
+                        "{outcome:?}"
+                    );
+                }
+                None => {
+                    assert!(
+                        outcome.exact_external_call.is_none()
+                            && outcome.external_callee_identity.is_none(),
+                        "{:?} publishes no call proof, so the batch has none to carry: {outcome:?}",
+                        case.language
+                    );
+                }
+            }
+        }
     }
 
     #[test]

@@ -1,0 +1,78 @@
+{
+  "schema_version": 5,
+  "pack_id": "bifrost.jdk21.result-use-obligations",
+  "version": "1.0.0",
+  "producer": { "name": "bifrost", "version": "0.12.0" },
+  "language": "java",
+  "ecosystem": "jdk",
+  "compatibility": {
+    "bifrost": ">=0.12.0, <1.0.0",
+    "toolchains": [{ "name": "jdk", "requirement": ">=21.0.0, <22.0.0" }]
+  },
+  "provenance": {
+    "source": "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/lang/String.html#trim() ; https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/nio/file/Files.html#deleteIfExists(java.nio.file.Path)",
+    "revision": "java-se-21"
+  },
+  "license": "Apache-2.0",
+  "completeness": "complete",
+  "safety": { "generated_code_only": false, "review_required": false },
+  "shards": [
+    {
+      "id": "jdk21.reviewed-result-use",
+      "activation": [
+        {
+          "toolchain": { "name": "jdk", "version": ">=21.0.0, <22.0.0" },
+          "targets": ["jvm"]
+        }
+      ],
+      "payload": {
+        "kind": "procedure_summaries",
+        "summaries": [
+          {
+            "id": "java.lang.string.trim.result-use",
+            "target": {
+              "path": "java.base/java/lang/String.java",
+              "symbol": "java.lang.String.trim()",
+              "has_receiver": true,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "ordinary_heap_unchanged": true,
+            "covers_overrides": true,
+            "normal_result_count": 1,
+            "transfers": [
+              {
+                "input": { "kind": "receiver" },
+                "exit_kind": "normal",
+                "output": { "kind": "normal_return" }
+              }
+            ],
+            "effects": [],
+            "result_use_obligations": [
+              { "result_ordinal": 0, "kind": "pure_transformation_value" }
+            ]
+          },
+          {
+            "id": "java.nio.file.files.delete-if-exists.result-use",
+            "target": {
+              "path": "java.base/java/nio/file/Files.java",
+              "symbol": "java.nio.file.Files.deleteIfExists(java.nio.file.Path)",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "partial",
+            "normal_result_count": 1,
+            "transfers": [],
+            "result_use_obligations": [
+              {
+                "result_ordinal": 0,
+                "kind": "fallible_status",
+                "failure_predicate": "false"
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

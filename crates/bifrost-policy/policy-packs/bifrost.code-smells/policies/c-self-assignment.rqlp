@@ -1,0 +1,35 @@
+; Exact C self-assignment for direct ordinary primitive scalar locals.
+;
+; `assignment-relations` retains unsupported ordinary-local candidates as
+; open rows. Only a same-binding assignment with exhaustive reaching and
+; same-evaluation proof is a finding. Volatile, atomic, indirect, aggregate,
+; typedef-mediated, preprocessing-uncertain, and incomplete-flow cases cannot
+; satisfy this selector.
+; The C/C++ analyzer has one coarse language. Filter its exact procedure
+; dialect before projecting relations so a C++ procedure is outside this rule.
+(policy
+  :schema-version 1
+  :id "bifrost.correctness.c-self-assignment"
+  :name "C self-assignment"
+  :message "this assignment writes an initialized C local back to itself"
+  :severity warning
+  :description "A plain C assignment to a direct ordinary primitive scalar local has a whole bare-identifier right-hand side resolving to the same binding. The right-hand read has one exact prior reaching definition on every path, and the prepared syntax, binding, reaching, and same-evaluation evidence is exhaustive. Unsupported storage, syntax, preprocessing, and flow cases remain open instead of becoming findings."
+  :help-uri "https://bifrost.brokk.ai/static-analysis-policies/#built-in-code-smell-pack"
+  :tags ["correctness" "c" "assignment"]
+  :analysis (analysis
+    :type assertion
+    (bind :name self-assignment
+      :query (rql :schema-version 1
+        (filter :where ((relation_kind eq self_assignment)
+                        (storage_kind eq ordinary_local)
+                        (verdict eq self_assignment)
+                        (proof eq exact)
+                        (coverage eq exhaustive))
+          (language cpp
+            (assignment-relations
+              (filter :where ((dialect eq cpp-c))
+                (procedure-of
+                  (callable))))))))
+    (group :name by-assignment :by (self-assignment.id)
+      (aggregate :name self-assignments :op count))
+    (assert :group by-assignment :value self-assignments :cardinality (exactly 0))))

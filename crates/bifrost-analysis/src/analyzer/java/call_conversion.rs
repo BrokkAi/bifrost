@@ -3,7 +3,10 @@ use crate::analyzer::java::imports::JavaTypeResolution;
 use crate::analyzer::jvm::external::{
     JvmExternalDeclarationSource, JvmExternalType, JvmExternalTypeKind,
 };
-use crate::analyzer::lexical_definitions::{LexicalBindingResolution, resolve_lexical_binding};
+use crate::analyzer::lexical_definitions::{
+    LexicalBindingResolution, formal_parameter_slots_for_owner_with_nodes,
+    parameter_owner_for_range, resolve_lexical_binding,
+};
 use crate::analyzer::multi_analyzer::resolve_analyzer;
 use crate::analyzer::semantic::StableDigest;
 use crate::analyzer::semantic_model::TypeRef;
@@ -12,10 +15,10 @@ use crate::analyzer::usages::call_conversion::{
     ExternalConversionIdentity, ExternalConversionProvenance, JavaPrimitive,
     ResolvedConversionType,
 };
-use crate::analyzer::usages::get_definition::BoundedResolution;
 use crate::analyzer::usages::get_definition::java::{
     JavaResolutionSession, java_type_from_node_with_context,
 };
+use crate::analyzer::usages::get_definition::{BoundedResolution, parse_tree_for_language};
 use crate::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget;
 use crate::analyzer::{
     AnalyzerDefinitionLookup, AnalyzerQueryScope, CodeUnit, CodeUnitIndex, IAnalyzer, Language,
@@ -102,6 +105,125 @@ pub(super) fn prove_argument(
     let source_type = resolve_actual_type(java, token, packs, file, actual, source)?;
 
     classify_java_conversion(source_type, JavaConversionType::Value(target))
+}
+
+/// Read the static primitive type of one exact call argument for Java overload
+/// selection. Overload selection needs only the argument's type (JLS 15.12.2),
+/// so a numeric literal's type and a primitive cast's target type count here.
+/// The conversion prover deliberately does not accept them as a bounded
+/// source-type proof for value transfer. Other expression kinds remain
+/// undecided rather than being treated as an incompatible argument.
+pub(crate) fn primitive_actual_type(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    actual: Node<'_>,
+    source: &str,
+) -> Option<JavaPrimitive> {
+    let mut expression = actual;
+    while expression.kind() == "parenthesized_expression" {
+        expression = expression.named_child(0)?;
+    }
+    if let Some(primitive) = numeric_literal_type(expression, source) {
+        return Some(primitive);
+    }
+    if expression.kind() == "cast_expression" {
+        let target = expression.child_by_field_name("type")?;
+        expression.child_by_field_name("value")?;
+        return matches!(
+            target.kind(),
+            "integral_type" | "floating_point_type" | "boolean_type"
+        )
+        .then(|| primitive_type(target))
+        .flatten();
+    }
+    let java = resolve_analyzer::<JavaAnalyzer>(analyzer)?;
+    let scope = AnalyzerQueryScope::new(java);
+    let resolved = resolve_actual_type(
+        java,
+        scope.token(),
+        analyzer.semantic_model_overlay(),
+        file,
+        actual,
+        source,
+    )
+    .ok()?;
+    match resolved {
+        JavaConversionType::Value(ResolvedConversionType::JavaPrimitive(primitive)) => {
+            Some(primitive)
+        }
+        _ => None,
+    }
+}
+
+/// How one declared Java formal takes a primitive actual during strict
+/// invocation (JLS 15.12.2.2). A primitive actual reaches a reference formal,
+/// including an array, a varargs slot or a type variable, only by boxing,
+/// which strict invocation does not allow. A reference formal therefore needs
+/// no type resolution to be excluded from the strict phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JavaFormalShape {
+    Primitive(JavaPrimitive),
+    Reference,
+}
+
+/// Parse one Java declaring file for [`formal_shapes`]. Callers parse each
+/// file once and read every candidate it declares from the same tree.
+pub(crate) fn parse_declaring_file(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+) -> Option<(String, tree_sitter::Tree)> {
+    if file.language() != Language::Java {
+        return None;
+    }
+    let source = analyzer.indexed_source(file)?;
+    let tree = parse_tree_for_language(file, Language::Java, &source)?;
+    Some((source, tree))
+}
+
+/// Read one indexed method's ordinary formals as strict-invocation shapes from
+/// its declaring file's tree. Recovered syntax and a type spelled in a form
+/// this reader does not classify leave the whole list undecided.
+pub(crate) fn formal_shapes(
+    analyzer: &dyn IAnalyzer,
+    target: &CodeUnit,
+    root: Node<'_>,
+    source: &str,
+) -> Option<Vec<JavaFormalShape>> {
+    let ranges = analyzer.ranges_of(target);
+    let [range] = ranges.as_slice() else {
+        return None;
+    };
+    let owner = parameter_owner_for_range(Language::Java, root, range)?;
+    if owner.has_error() || owner.is_missing() {
+        return None;
+    }
+    let slots = formal_parameter_slots_for_owner_with_nodes(Language::Java, owner, source)?;
+    slots
+        .into_iter()
+        .filter(|(slot, _)| !slot.receiver)
+        .map(|(slot, formal)| {
+            if slot.variadic.is_some() {
+                return Some(JavaFormalShape::Reference);
+            }
+            let type_node = declared_type_node(formal)?;
+            if declaration_declares_array(formal, type_node) {
+                return Some(JavaFormalShape::Reference);
+            }
+            match type_node.kind() {
+                "integral_type" | "floating_point_type" | "boolean_type" => {
+                    primitive_type(type_node).map(JavaFormalShape::Primitive)
+                }
+                "type_identifier" | "scoped_type_identifier" | "generic_type" => {
+                    Some(JavaFormalShape::Reference)
+                }
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+pub(crate) fn primitive_converts(source: JavaPrimitive, target: JavaPrimitive) -> bool {
+    source == target || primitive_widens(source, target)
 }
 
 pub(crate) static CALL_ARGUMENT_CONVERSION_PROVER: JavaCallArgumentConversionProver =
@@ -678,6 +800,30 @@ fn primitive_literal(node: Node<'_>) -> Option<JavaPrimitive> {
     match node.kind() {
         "true" | "false" | "boolean_literal" => Some(JavaPrimitive::Boolean),
         "character_literal" => Some(JavaPrimitive::Char),
+        _ => None,
+    }
+}
+
+/// The static type of one numeric literal token (JLS 3.10.1, 3.10.2), fixed by
+/// its kind and the type suffix that is part of the token.
+fn numeric_literal_type(node: Node<'_>, source: &str) -> Option<JavaPrimitive> {
+    let suffix = || source.get(node.byte_range())?.chars().next_back();
+    match node.kind() {
+        "decimal_integer_literal"
+        | "hex_integer_literal"
+        | "octal_integer_literal"
+        | "binary_integer_literal" => Some(if matches!(suffix()?, 'l' | 'L') {
+            JavaPrimitive::Long
+        } else {
+            JavaPrimitive::Int
+        }),
+        "decimal_floating_point_literal" | "hex_floating_point_literal" => {
+            Some(if matches!(suffix()?, 'f' | 'F') {
+                JavaPrimitive::Float
+            } else {
+                JavaPrimitive::Double
+            })
+        }
         _ => None,
     }
 }

@@ -30,6 +30,7 @@ use brokk_bifrost_rql::{CodeQuerySeed, Pattern, StringPredicate};
 #[derive(Debug, Clone)]
 pub(crate) struct QueryPlan {
     positive_source_anchors: Vec<SourceAnchorGroup>,
+    positive_source_anchors_without_inside_decl: Vec<SourceAnchorGroup>,
     structural_access: StructuralAccessRequirements,
     features: QueryFeatures,
 }
@@ -37,7 +38,10 @@ pub(crate) struct QueryPlan {
 impl QueryPlan {
     pub(crate) fn for_query(query: &CodeQuerySeed) -> Self {
         Self {
-            positive_source_anchors: collect_positive_source_anchors(query),
+            positive_source_anchors: collect_positive_source_anchors(query, true),
+            positive_source_anchors_without_inside_decl: collect_positive_source_anchors(
+                query, false,
+            ),
             structural_access: structural_access_for_query(query),
             features: QueryFeatures::for_query(query),
         }
@@ -51,9 +55,21 @@ impl QueryPlan {
         !self.positive_source_anchors.is_empty()
     }
 
-    pub(crate) fn build_source_index(&self) -> SourceCandidateIndex<'_> {
+    pub(crate) fn has_source_anchors_for(&self, include_inside_decl: bool) -> bool {
+        !self.source_anchors(include_inside_decl).is_empty()
+    }
+
+    pub(crate) fn build_source_index(&self, include_inside_decl: bool) -> SourceCandidateIndex<'_> {
         SourceCandidateIndex {
-            required_anchors: &self.positive_source_anchors,
+            required_anchors: self.source_anchors(include_inside_decl),
+        }
+    }
+
+    fn source_anchors(&self, include_inside_decl: bool) -> &[SourceAnchorGroup] {
+        if include_inside_decl {
+            &self.positive_source_anchors
+        } else {
+            &self.positive_source_anchors_without_inside_decl
         }
     }
 
@@ -142,13 +158,16 @@ impl SourceCandidateIndex<'_> {
 /// present in the file's source) for the query's root (plus positive
 /// containment) constraints to possibly match. Empty when the query has no
 /// exact-name anchors (opaque-regex/text/kind-only queries prune nothing).
-fn collect_positive_source_anchors(query: &CodeQuerySeed) -> Vec<SourceAnchorGroup> {
+fn collect_positive_source_anchors(
+    query: &CodeQuerySeed,
+    include_inside_decl: bool,
+) -> Vec<SourceAnchorGroup> {
     let mut anchors = Vec::new();
     collect_pattern_anchors(&query.root, &mut anchors);
     if let Some(inside) = &query.inside {
         collect_pattern_anchors(inside, &mut anchors);
     }
-    if let Some(inside_decl) = &query.inside_decl {
+    if include_inside_decl && let Some(inside_decl) = &query.inside_decl {
         collect_pattern_anchors(inside_decl, &mut anchors);
     }
     // query.not_inside intentionally ignored: verifier-only.
@@ -325,11 +344,12 @@ mod tests {
             SourceAnchorGroup::new(vec!["shell".to_string(), "spawn".to_string()]),
         ];
         let plan = QueryPlan {
-            positive_source_anchors: anchors,
+            positive_source_anchors: anchors.clone(),
+            positive_source_anchors_without_inside_decl: anchors,
             structural_access: StructuralAccessRequirements::default(),
             features: QueryFeatures::default(),
         };
-        let index = plan.build_source_index();
+        let index = plan.build_source_index(true);
         assert!(index.may_match("eval(x, shell=True)"));
         assert!(index.may_match("eval(x, spawn=True)"));
         assert!(!index.may_match("eval(x)"));
@@ -337,9 +357,10 @@ mod tests {
 
         let plan = QueryPlan {
             positive_source_anchors: Vec::new(),
+            positive_source_anchors_without_inside_decl: Vec::new(),
             structural_access: StructuralAccessRequirements::default(),
             features: QueryFeatures::default(),
         };
-        assert!(plan.build_source_index().may_match("anything"));
+        assert!(plan.build_source_index(true).may_match("anything"));
     }
 }

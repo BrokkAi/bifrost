@@ -2,7 +2,7 @@ use super::inline_project::BuiltInlineTestProject;
 use super::*;
 use crate::structural::search::units::{
     CodeQueryExecutionScope, MergedUnitRows, UnitExecutionResult, execute_code_query_unit,
-    merge_unit_rows, plan_seed_files, seed_file_order,
+    merge_unit_rows, plan_seed_files, seed_file_order, unit_row_key,
 };
 
 /// Eight files so the whole execution clears the auto structural-index
@@ -691,4 +691,151 @@ fn a_callers_unit_records_the_whole_workspace_value_it_consumed() {
         )),
         "the callers answer is itself a recorded input: {keys:?}"
     );
+}
+
+fn reference_kind_fixture() -> ReferenceSiteValue {
+    let file = ProjectFile::new(std::env::temp_dir(), "reference-kind.rs");
+    let range = Range {
+        start_byte: 10,
+        end_byte: 20,
+        start_line: 2,
+        end_line: 2,
+    };
+    ReferenceSiteValue {
+        file: file.clone(),
+        range,
+        target: DeclarationValue::new(
+            CodeUnit::new(file.clone(), CodeUnitType::Function, "", "target"),
+            range,
+        ),
+        enclosing: Some(DeclarationValue::new(
+            CodeUnit::new(file, CodeUnitType::Function, "", "caller"),
+            range,
+        )),
+        usage_kind: UsageHitKind::Reference,
+        proof: UsageProof::Proven,
+        reference_kind: None,
+    }
+}
+
+#[test]
+fn reference_site_intersection_merges_both_declaration_kinds() {
+    let coarse = reference_kind_fixture();
+    let mut exact = coarse.clone();
+    exact.target = exact.target.with_structural_kind(NormalizedKind::Method);
+    exact.enclosing = exact
+        .enclosing
+        .map(|decl| decl.with_structural_kind(NormalizedKind::Method));
+    for enclosing in [false, true] {
+        let mut coarse = coarse.clone();
+        let mut exact = exact.clone();
+        if !enclosing {
+            coarse.enclosing = None;
+            exact.enclosing = None;
+        }
+        for (left, right) in [
+            (coarse.clone(), exact.clone()),
+            (exact.clone(), coarse.clone()),
+        ] {
+            let mut value = PipelineValue::ReferenceSite(left);
+            let other = PipelineValue::ReferenceSite(right);
+            let key = value.key();
+            assert_eq!(key, other.key());
+            assert_eq!(unit_row_key(&key), unit_row_key(&other.key()));
+            value.merge_intersect_evidence(other);
+            assert_eq!(value.key(), key);
+            let PipelineValue::ReferenceSite(site) = value else {
+                unreachable!()
+            };
+            assert_eq!(site.target.kind_label(), "method");
+            assert_eq!(
+                site.enclosing.as_ref().map(DeclarationValue::kind_label),
+                enclosing.then_some("method")
+            );
+        }
+    }
+}
+
+/// The reference-site unit key is a persisted identity. Kind evidence and the
+/// intersection merge must leave its recipe unchanged: the site, the target
+/// declaration and range, the enclosing declaration by id alone, then usage
+/// kind, proof and reference kind.
+#[test]
+fn reference_site_unit_key_is_independent_of_kind_evidence() {
+    let coarse = reference_kind_fixture();
+    let mut exact = coarse.clone();
+    exact.target = exact.target.with_structural_kind(NormalizedKind::Method);
+    exact.enclosing = exact
+        .enclosing
+        .map(|decl| decl.with_structural_kind(NormalizedKind::Method));
+    let rendered = |value: &PipelineValue| {
+        let key = unit_row_key(&value.key());
+        std::iter::once(key.arm())
+            .chain(key.parts().iter().map(|part| &**part))
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    };
+    let enclosing = coarse.enclosing.as_ref().unwrap();
+    let expected = vec![
+        "reference_site".to_string(),
+        "reference-kind.rs".to_string(),
+        "10:20:2:2".to_string(),
+        coarse.target.unit.declaration_id().as_str().to_string(),
+        "10:20:2:2".to_string(),
+        format!("={}", enclosing.unit.declaration_id().as_str()),
+        "reference".to_string(),
+        "proven".to_string(),
+        String::new(),
+    ];
+    for (left, right) in [
+        (coarse.clone(), exact.clone()),
+        (exact.clone(), coarse.clone()),
+    ] {
+        let mut value = PipelineValue::ReferenceSite(left);
+        assert_eq!(rendered(&value), expected);
+        value.merge_intersect_evidence(PipelineValue::ReferenceSite(right));
+        assert_eq!(rendered(&value), expected);
+    }
+
+    let key = unit_row_key(&PipelineValue::ReferenceSite(coarse.clone()).key());
+    let mut absent = coarse.clone();
+    absent.enclosing = None;
+    let mut changed_target = coarse.clone();
+    changed_target.target.range.end_byte += 1;
+    let mut changed_site = coarse;
+    changed_site.range.start_byte += 1;
+    for distinct in [absent, changed_target, changed_site] {
+        assert_ne!(
+            key,
+            unit_row_key(&PipelineValue::ReferenceSite(distinct).key())
+        );
+    }
+}
+
+#[test]
+fn reference_site_union_keeps_whole_and_sliced_evidence_equal() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("Cargo.toml", "[package]\nname = \"reference-kinds\"\nversion = \"0.1.0\"\nedition = \"2024\"\n")
+        .file("src/lib.rs", "pub mod caller;\npub struct PriceCalculator;\nimpl PriceCalculator { pub fn total() -> u64 { 42 } }\n")
+        .file("src/caller.rs", "pub fn price() -> u64 { crate::PriceCalculator::total() }\n")
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let files = seed_files_of(&workspace);
+    let members = r#"(references-of (members (enclosing-decl (class :name "PriceCalculator"))))"#;
+    let structural = r#"(references-of (enclosing-decl (method :name "total")))"#;
+    for (left, right, expected) in [
+        (members, structural, "function"),
+        (structural, members, "method"),
+    ] {
+        let query = CodeQuery::from_sexp(&format!("(union {left} {right})")).unwrap();
+        let whole = whole_execution(&workspace, &query);
+        assert_eq!(whole.result.results.len(), 1, "{:#?}", whole.result);
+        let CodeQueryResultValue::ReferenceSite { value } = &whole.result.results[0].value else {
+            panic!("expected a reference site")
+        };
+        assert_eq!(value.target.kind, expected);
+        let merged = merged(&workspace, &query, &files);
+        assert_eq!(merged.items, projected(&whole.result.results));
+        assert_eq!(merged.detailed_evidence(project.root()), whole.evidence);
+    }
 }

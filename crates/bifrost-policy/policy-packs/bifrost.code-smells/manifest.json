@@ -1,10 +1,32 @@
 {
   "schema_version": 2,
   "id": "bifrost.code-smells",
-  "version": "2.15.0",
+  "version": "2.16.0",
   "name": "Bifrost code smells",
   "description": "Curated structured RQLP checks for bug-prone and potentially expensive source patterns.",
   "policies": [
+    {
+      "path": "policies/contradictory-condition.rqlp",
+      "id": "bifrost.correctness.contradictory-condition",
+      "authored_hash": "8a5a83b875e2a2fb21a187cefacc95fc701ee0678b9675ceba199e48a0b4c679",
+      "resolved_semantic_hash": "8a5a83b875e2a2fb21a187cefacc95fc701ee0678b9675ceba199e48a0b4c679",
+      "category": "correctness",
+      "supported_languages": ["java", "javascript", "typescript", "python"],
+      "required_capabilities": ["structural-match", "branch-relations", "semantic-guard-facts", "scalar-state"],
+      "severity_rationale": "A proven constant condition outcome makes one conditional arm unreachable.",
+      "remediation": "Review the scalar assumptions and intended branch test before changing the code; no automatic rewrite is supplied."
+    },
+    {
+      "path": "policies/discarded-pure-result.rqlp",
+      "id": "bifrost.correctness.discarded-pure-result",
+      "authored_hash": "3e59b29f3bb81d915028489c301c6d93b38dd57101858ceabe3a5b3a5c25356c",
+      "resolved_semantic_hash": "3e59b29f3bb81d915028489c301c6d93b38dd57101858ceabe3a5b3a5c25356c",
+      "category": "correctness",
+      "supported_languages": ["java"],
+      "required_capabilities": ["normalized-call", "canonical-external-dispatch", "exact-result-use", "reviewed-jdk-result-obligation"],
+      "severity_rationale": "An exact JDK 21 String.trim() result is a pure transformed value and the caller discards it.",
+      "remediation": "Use or return the transformed value if intended; review why the call was made before removing it. No automatic fix is supplied."
+    },
     {
       "path": "policies/dynamic-evaluation.rqlp",
       "id": "bifrost.correctness.dynamic-evaluation",
@@ -22,6 +44,50 @@
       ],
       "severity_rationale": "Dynamic evaluation converts data into executable code and expands both correctness and security risk.",
       "remediation": "Replace dynamic evaluation with explicit dispatch, parsing, or a bounded data representation."
+    },
+    {
+      "path": "policies/identical-conditional-branches.rqlp",
+      "id": "bifrost.correctness.identical-conditional-branches",
+      "authored_hash": "ecae8e51ea4b11ad0159b1891b9df33fe2a855b6b466b129227e7e6a3f372494",
+      "resolved_semantic_hash": "ecae8e51ea4b11ad0159b1891b9df33fe2a855b6b466b129227e7e6a3f372494",
+      "category": "correctness",
+      "supported_languages": ["java", "javascript", "typescript", "python"],
+      "required_capabilities": ["structural-match", "branch-relations", "lexical-environment"],
+      "severity_rationale": "Two branch bodies have the same structured operations and proven reference identities, suggesting a copy/paste error or redundant condition.",
+      "remediation": "Review the intended behavior in each branch. Preserve condition evaluation, pattern binding and branch scope when changing code."
+    },
+    {
+      "path": "policies/ignored-status-result.rqlp",
+      "id": "bifrost.correctness.ignored-status-result",
+      "authored_hash": "66796f14a27da81e34e7bc486270ddfbcdf69f8fe63dfe1b66d1d3b05913d9de",
+      "resolved_semantic_hash": "66796f14a27da81e34e7bc486270ddfbcdf69f8fe63dfe1b66d1d3b05913d9de",
+      "category": "correctness",
+      "supported_languages": ["java"],
+      "required_capabilities": ["normalized-call", "canonical-external-dispatch", "exact-result-use", "reviewed-jdk-result-obligation"],
+      "severity_rationale": "An exact JDK 21 Files.deleteIfExists(Path) call returns a status indicating whether a file was deleted; a direct expression statement discards it.",
+      "remediation": "Handle or deliberately ignore the status according to the caller's intent. I/O exceptions are separate; no automatic fix is supplied."
+    },
+    {
+      "path": "policies/repeated-branch-condition.rqlp",
+      "id": "bifrost.correctness.repeated-branch-condition",
+      "authored_hash": "1ebe9d4f16d8cd37e4c606edbe5abb85711b9de2f96f684cbb657eb1a9932b48",
+      "resolved_semantic_hash": "1ebe9d4f16d8cd37e4c606edbe5abb85711b9de2f96f684cbb657eb1a9932b48",
+      "category": "correctness",
+      "supported_languages": ["java", "javascript", "typescript", "python"],
+      "required_capabilities": ["structural-match", "branch-relations", "lexical-environment"],
+      "severity_rationale": "A later ordered branch repeats an earlier test over stable ordinary bindings, so that later branch cannot be selected.",
+      "remediation": "Correct the repeated test or remove the unreachable branch after reviewing condition side effects and intended branch behavior."
+    },
+    {
+      "path": "policies/redundant-boolean-branches.rqlp",
+      "id": "bifrost.correctness.redundant-boolean-branches",
+      "authored_hash": "b80c30a8f84e7e086f05b7e1b5f8f3af185a12a77383b8413ac3e80385fd8ecc",
+      "resolved_semantic_hash": "b80c30a8f84e7e086f05b7e1b5f8f3af185a12a77383b8413ac3e80385fd8ecc",
+      "category": "correctness",
+      "supported_languages": ["java", "javascript", "typescript", "python"],
+      "required_capabilities": ["structural-match", "branch-relations"],
+      "severity_rationale": "Opposite Boolean-literal returns on immediate conditional paths are a verbose or mistaken outcome.",
+      "remediation": "Review the intended Boolean result and condition evaluation before changing the branch structure; no expression rewrite is supplied."
     },
     {
       "path": "policies/unsafe-deserialization.rqlp",
@@ -116,6 +182,90 @@
       ],
       "severity_rationale": "Returning an error-construction call that receives a different, provably nil error binding on an exact API failure path can hide the actual cause and may itself return nil.",
       "remediation": "Pass the reviewed API's exact failure result to the returned error-construction call, or deliberately establish and use a separate non-nil error."
+    },
+    {
+      "path": "policies/empty-failure-handler.rqlp",
+      "id": "bifrost.correctness.empty-failure-handler",
+      "authored_hash": "2a008d3b13abab4f0816628cb54c487b3cc1cc6a817da91f3ab359e2d536d2fc",
+      "resolved_semantic_hash": "2a008d3b13abab4f0816628cb54c487b3cc1cc6a817da91f3ab359e2d536d2fc",
+      "category": "correctness",
+      "supported_languages": ["java"],
+      "required_capabilities": ["structural-match", "prepared-syntax", "failure-handler-state"],
+      "severity_rationale": "An empty catch body may silently discard failures when the catch is reached; this rule reports the structural body regardless of reachability.",
+      "remediation": "Review whether to handle or propagate the exception deliberately. No automatic fix is supplied."
+    },
+    {
+      "path": "policies/c-self-assignment.rqlp",
+      "id": "bifrost.correctness.c-self-assignment",
+      "authored_hash": "613655d61b87df1aa17143ae1d8b1c4f2138300fa20d17fe09fa221bcc1b7dc9",
+      "resolved_semantic_hash": "613655d61b87df1aa17143ae1d8b1c4f2138300fa20d17fe09fa221bcc1b7dc9",
+      "category": "correctness",
+      "supported_languages": [
+        "c"
+      ],
+      "required_capabilities": [
+        "prepared-c-syntax",
+        "assignment-relations",
+        "reaching-definitions",
+        "same-evaluation"
+      ],
+      "severity_rationale": "Writing an initialized scalar local back to the same binding is usually an accidental no-op and can hide a mistaken source or target.",
+      "remediation": "Remove the assignment or replace the right-hand side or target with the intended binding."
+    },
+    {
+      "path": "policies/local-self-assignment.rqlp",
+      "id": "bifrost.correctness.local-self-assignment",
+      "authored_hash": "436c16e9b195b9fa8ccecb90d466ab62ea2beaa6ddf370a3b57805ebe0dd7951",
+      "resolved_semantic_hash": "436c16e9b195b9fa8ccecb90d466ab62ea2beaa6ddf370a3b57805ebe0dd7951",
+      "category": "correctness",
+      "supported_languages": ["java", "javascript", "typescript", "python"],
+      "required_capabilities": ["prepared-syntax", "assignment-relations", "reaching-definitions", "same-evaluation"],
+      "severity_rationale": "Writing an initialized ordinary local back to the same binding is usually an accidental no-op.",
+      "remediation": "Remove the assignment or use the intended source or target binding."
+    },
+    {
+      "path": "policies/failed-swap.rqlp",
+      "id": "bifrost.correctness.failed-swap",
+      "authored_hash": "7ea3b54aba5ce9073707ca96ace43280f9d2475e77aeea6559428e56b67ec23e",
+      "resolved_semantic_hash": "7ea3b54aba5ce9073707ca96ace43280f9d2475e77aeea6559428e56b67ec23e",
+      "category": "correctness",
+      "supported_languages": ["java", "javascript", "typescript", "python"],
+      "required_capabilities": ["prepared-syntax", "assignment-relations", "reaching-definitions", "same-evaluation"],
+      "severity_rationale": "Adjacent crossed writes copy the first assigned value back into the second local, suggesting a failed swap.",
+      "remediation": "Review the intended operation; if a swap was intended, preserve the original value in a temporary or use the language's simultaneous assignment."
+    },
+    {
+      "path": "policies/overwritten-unread-value.rqlp",
+      "id": "bifrost.correctness.overwritten-unread-value",
+      "authored_hash": "79186d88e1a8b6f7fbe9f92bd3e629f74f0beffd3ed1d508c05e25a6a343665d",
+      "resolved_semantic_hash": "79186d88e1a8b6f7fbe9f92bd3e629f74f0beffd3ed1d508c05e25a6a343665d",
+      "category": "correctness",
+      "supported_languages": ["java", "javascript", "typescript"],
+      "required_capabilities": ["prepared-syntax", "assignment-relations", "reaching-definitions"],
+      "severity_rationale": "An exact ordinary local value is replaced on every modeled continuation before any read, so its original value is unused.",
+      "remediation": "Review the original assignment and its right-hand-side effects before changing it."
+    },
+    {
+      "path": "policies/loop-body-never-repeats.rqlp",
+      "id": "bifrost.correctness.loop-body-never-repeats",
+      "authored_hash": "2cafb97f47e655c51c5516ff8516eb76a7492a908165d3d2d1ac4b2a534b35a5",
+      "resolved_semantic_hash": "2cafb97f47e655c51c5516ff8516eb76a7492a908165d3d2d1ac4b2a534b35a5",
+      "category": "correctness",
+      "supported_languages": ["java"],
+      "required_capabilities": ["prepared-syntax", "loop-relations", "semantic-control-flow"],
+      "severity_rationale": "A reachable Java loop body cannot reach the same loop's repeat edge on any modeled continuation.",
+      "remediation": "Review the early exits and whether a loop is intended; no automatic rewrite is supplied."
+    },
+    {
+      "path": "policies/unreachable-statement.rqlp",
+      "id": "bifrost.correctness.unreachable-statement",
+      "authored_hash": "d167dcdaa1ecc28768f22d10f2e4188369fdfb224facc6fc3292895169d97629",
+      "resolved_semantic_hash": "d167dcdaa1ecc28768f22d10f2e4188369fdfb224facc6fc3292895169d97629",
+      "category": "correctness",
+      "supported_languages": ["java"],
+      "required_capabilities": ["prepared-syntax", "statement-reachability", "semantic-control-flow"],
+      "severity_rationale": "All producer-authored entries to an exact Java statement are outside complete entry reachability.",
+      "remediation": "Review the preceding control flow and the intended statement before removing unreachable code."
     },
     {
       "path": "policies/loop-invariant-sort.rqlp",

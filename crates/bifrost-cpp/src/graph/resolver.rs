@@ -14304,6 +14304,12 @@ pub struct RecoveredNamespaceRegion {
     /// head collapsed into an `ERROR` reports where it is written rather than
     /// where its first member is (#3309).
     pub component_ranges: Vec<Range>,
+    /// The close the brace stack paired with each level's `{`, parallel to
+    /// `components`. A node after that close is outside the level (#3633).
+    /// `None` when the file never closes the level or the walk proved no
+    /// pairing in the file (#3328); the level then applies to the whole region
+    /// as a best-effort scope.
+    pub component_closes: Vec<Option<Range>>,
 }
 
 /// The namespaces C++ parse recovery drops from a file's tree.
@@ -14341,6 +14347,32 @@ pub struct RecoveredNamespaceRegion {
 /// evidence of any extent: [`Self::matching_close_brace`] then answers nothing
 /// and each restored level keeps the head that writes it. The namespace paths
 /// remain, as the best-effort structure recovery they are.
+///
+/// Every consumer reads a node's namespace path through one authority rule,
+/// shared by [`Self::enclosing_namespace_levels`] and
+/// [`Self::restore_enclosing_namespaces`], so declaration collection and both
+/// lookup directions agree:
+///
+/// - Outside every region, the node's parsed `namespace_definition` chain is
+///   the whole answer.
+/// - Inside a region, the region's restored levels come first and only the
+///   parsed ancestors that start inside the region follow them. The region
+///   overrides a parsed ancestor that starts before it, which is how a
+///   namespace the tree kept open past its real close gives up the
+///   declarations after that close (#3087).
+/// - A restored level stops applying at the close the stack paired with its
+///   `{`, and so does every level inside it. The walk compares a child with
+///   the stack before it descends into that child, so a run can reach past a
+///   close inside its last child. In simdjson's `tests/dom/basictests.cpp` the
+///   collapsed `namespace type_tests {` on line 1467 closes on line 1811, and
+///   recovery put that `}` inside a `preproc_else` that runs to line 2505: the
+///   region that restores `type_tests` covers the whole `preproc_else`, and
+///   without this check every namespace written after the close inherited
+///   `type_tests` (#3633). A level whose close the stack did not prove applies
+///   to the whole region, the best-effort answer #3328 leaves.
+/// - A region whose restored path is empty keeps exactly the parsed ancestors
+///   whose own `{` and `}` are both real tokens, wherever they start, and drops
+///   the others. This holds whether or not the file's pairing is proven.
 #[derive(Clone, Debug, Default)]
 pub struct OrphanedNamespaceScopeIndex {
     regions: Vec<RecoveredNamespaceRegion>,
@@ -14544,23 +14576,31 @@ impl OrphanedNamespaceScopeIndex {
                     "every recovered namespace level carries the head that writes it: {:?}",
                     region.components
                 );
+                let component_closes: Vec<_> = region
+                    .heads
+                    .iter()
+                    .map(|level| brace_closes.get(&level.open).copied())
+                    .collect();
+                let component_ranges = region
+                    .heads
+                    .iter()
+                    .zip(&component_closes)
+                    .map(|(level, close)| match close {
+                        Some(close) => Range {
+                            start_byte: level.head.start_byte,
+                            end_byte: close.end_byte,
+                            start_line: level.head.start_line,
+                            end_line: close.end_line,
+                        },
+                        None => level.head,
+                    })
+                    .collect();
                 RecoveredNamespaceRegion {
                     start: region.start,
                     end: region.end,
-                    component_ranges: region
-                        .heads
-                        .iter()
-                        .map(|level| match brace_closes.get(&level.open) {
-                            Some(close) => Range {
-                                start_byte: level.head.start_byte,
-                                end_byte: close.end_byte,
-                                start_line: level.head.start_line,
-                                end_line: close.end_line,
-                            },
-                            None => level.head,
-                        })
-                        .collect(),
                     components: region.components,
+                    component_ranges,
+                    component_closes,
                 }
             })
             .collect();
@@ -14593,6 +14633,9 @@ impl OrphanedNamespaceScopeIndex {
                     .saturating_add(std::mem::size_of::<RecoveredNamespaceRegion>())
                     .saturating_add(region.components.iter().map(String::len).sum::<usize>())
                     .saturating_add(region.component_ranges.len() * std::mem::size_of::<Range>())
+                    .saturating_add(
+                        region.component_closes.len() * std::mem::size_of::<Option<Range>>(),
+                    )
             },
         )
     }
@@ -14637,18 +14680,26 @@ impl OrphanedNamespaceScopeIndex {
                             .into_iter()
                             .map(|component| (component, range))
                             .collect(),
+                        namespace_definition_has_real_braces(parent),
                     ));
                 }
             }
             current = parent.parent();
         }
         parsed.reverse();
-        self.splice_recovered_path(parsed, node.start_byte(), |region| {
+        self.splice_recovered_path(parsed, node.start_byte(), |region, active_components| {
             region
                 .components
                 .iter()
+                .take(active_components)
                 .cloned()
-                .zip(region.component_ranges.iter().copied())
+                .zip(
+                    region
+                        .component_ranges
+                        .iter()
+                        .take(active_components)
+                        .copied(),
+                )
                 .collect()
         })
     }
@@ -14656,40 +14707,92 @@ impl OrphanedNamespaceScopeIndex {
     /// [`Self::enclosing_namespace_components`] for a caller that has already
     /// climbed the ancestor chain: `parsed` lists the node's named
     /// `namespace_definition` ancestors outermost first, each with its start
-    /// byte. A region covering the node supplies every namespace outside it;
-    /// only the parsed ancestors that start inside the region still apply.
+    /// byte and whether its own opening and closing braces survived parsing.
+    /// The answer follows the authority rule on [`OrphanedNamespaceScopeIndex`].
     pub fn restore_enclosing_namespaces(
         &self,
-        parsed: Vec<(usize, Vec<String>)>,
+        parsed: Vec<(usize, Vec<String>, bool)>,
         node_start: usize,
     ) -> Vec<String> {
-        self.splice_recovered_path(parsed, node_start, |region| region.components.clone())
+        self.splice_recovered_path(parsed, node_start, |region, active_components| {
+            region
+                .components
+                .iter()
+                .take(active_components)
+                .cloned()
+                .collect()
+        })
     }
 
     /// Splice a node's parsed namespace ancestors onto the path a recovered
-    /// region restores. Outside every region the parsed chain is the whole
-    /// answer; inside one, the region supplies every namespace enclosing it and
-    /// only the parsed ancestors beginning inside it still apply. `recovered`
-    /// reads the region in whatever shape the caller needs its levels.
+    /// region restores, by the authority rule on [`OrphanedNamespaceScopeIndex`].
+    /// `recovered` receives the region and the number of its outermost levels
+    /// still open at the node, and reads those levels in whatever shape the
+    /// caller needs.
     fn splice_recovered_path<T>(
         &self,
-        parsed: Vec<(usize, Vec<T>)>,
+        parsed: Vec<(usize, Vec<T>, bool)>,
         node_start: usize,
-        recovered: impl FnOnce(&RecoveredNamespaceRegion) -> Vec<T>,
+        recovered: impl FnOnce(&RecoveredNamespaceRegion, usize) -> Vec<T>,
     ) -> Vec<T> {
         let Some(region) = self.region_at(node_start) else {
-            return parsed.into_iter().flat_map(|(_, levels)| levels).collect();
+            return parsed
+                .into_iter()
+                .flat_map(|(_, levels, _)| levels)
+                .collect();
         };
-        recovered(region)
+        debug_assert_eq!(
+            region.components.len(),
+            region.component_closes.len(),
+            "every recovered namespace component carries its close proof: {region:?}"
+        );
+        if region.components.is_empty() {
+            return parsed
+                .into_iter()
+                .filter(|(_, _, complete)| *complete)
+                .flat_map(|(_, levels, _)| levels)
+                .collect();
+        }
+        let active_components = region
+            .component_closes
+            .iter()
+            .take_while(|close| {
+                close
+                    .as_ref()
+                    .is_none_or(|close| node_start < close.end_byte)
+            })
+            .count();
+        recovered(region, active_components)
             .into_iter()
             .chain(
                 parsed
                     .into_iter()
-                    .filter(|(start, _)| *start >= region.start)
-                    .flat_map(|(_, levels)| levels),
+                    .filter(|(start, _, _)| *start >= region.start)
+                    .flat_map(|(_, levels, _)| levels),
             )
             .collect()
     }
+}
+
+/// Whether a parsed namespace owns real AST tokens for both of its boundary
+/// braces. Recovery may damage its body while leaving this boundary usable as
+/// lexical ownership evidence.
+pub(super) fn namespace_definition_has_real_braces(namespace: Node<'_>) -> bool {
+    debug_assert_eq!(namespace.kind(), "namespace_definition");
+    let Some(body) = namespace.child_by_field_name("body") else {
+        return false;
+    };
+    let mut opening = false;
+    let mut closing = false;
+    let mut cursor = body.walk();
+    for child in body.children(&mut cursor) {
+        match child.kind() {
+            "{" if !child.is_missing() => opening = true,
+            "}" if !child.is_missing() => closing = true,
+            _ => {}
+        }
+    }
+    opening && closing
 }
 
 /// The `namespace` keyword and name components of the namespace a stray `{`
@@ -18616,6 +18719,22 @@ consteval int leading_zeroes(uint64_t input_num, int last_bit = 0) {
                  `detail`) once the macro's `{{` went missing"
             );
         }
+    }
+
+    #[test]
+    fn orphaned_namespace_scope_index_leaves_a_declaration_after_every_close_at_file_scope() {
+        // The stack proves no pairing in this file, so every restored level
+        // keeps its best-effort scope. None of it may reach a declaration the
+        // file writes after its last close.
+        let source = format!("{MACRO_OPENED_SCOPE}struct AfterAll {{}};\n");
+        let tree = parse_cpp(&source);
+        let index = OrphanedNamespaceScopeIndex::build(tree.root_node(), &source);
+        let after_all = named_node_at(&tree, &source, "struct AfterAll");
+        assert!(
+            index
+                .enclosing_namespace_components(after_all, &source)
+                .is_empty()
+        );
     }
 
     #[test]

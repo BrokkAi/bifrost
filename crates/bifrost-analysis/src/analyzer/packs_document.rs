@@ -10,6 +10,7 @@
 //! (#1868). A host may separately request the reviewed shipped packs selected
 //! by intrinsic language evidence.
 
+use std::borrow::Cow;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -623,6 +624,39 @@ pub fn open_ambient_semantic_pack_catalog(
     }
 }
 
+// Workspace construction can deliberately disable dependency discovery for a
+// lightweight host phase. Activation has its own discovery settings; retain
+// those while carrying the source bindings loaded from the workspace document.
+fn activation_config_with_source_toolchains<'a>(
+    workspace: &WorkspaceAnalyzer,
+    activation_config: &'a AnalyzerConfig,
+) -> Cow<'a, AnalyzerConfig> {
+    let Some(build_config) = workspace.config() else {
+        return Cow::Borrowed(activation_config);
+    };
+    let bindings = &build_config
+        .jvm
+        .standard_library_discovery
+        .source_toolchains;
+    if bindings.iter().all(|binding| {
+        activation_config
+            .jvm
+            .standard_library_discovery
+            .source_toolchains
+            .contains(binding)
+    }) {
+        return Cow::Borrowed(activation_config);
+    }
+    let mut config = activation_config.clone();
+    let merged = &mut config.jvm.standard_library_discovery.source_toolchains;
+    for binding in bindings {
+        if !merged.contains(binding) {
+            merged.push(binding.clone());
+        }
+    }
+    Cow::Owned(config)
+}
+
 /// Activate all semantic sources against a caller-opened catalog.
 ///
 /// Hosts that own a reviewed catalog bootstrap can register it before calling
@@ -653,7 +687,7 @@ pub fn activate_workspace_semantic_sources_in_catalog(
     // nothing to discover, and the request's workspace evidence is what
     // selects. That keeps one code path for all routes.
     let outcome = workspace.activate_dependency_packs(
-        analyzer_config,
+        &activation_config_with_source_toolchains(workspace, analyzer_config),
         &prelude.ecosystems,
         DependencyPackWorkspaceContext {
             catalog,
@@ -708,7 +742,7 @@ pub fn activate_installed_workspace_semantic_sources_in_catalog(
         limits: SemanticModelRuntimeLimits::default(),
     };
     let installed = workspace.activate_installed_dependency_packs(
-        analyzer_config,
+        &activation_config_with_source_toolchains(workspace, analyzer_config),
         &prelude.ecosystems,
         DependencyPackWorkspaceContext {
             catalog,
@@ -967,6 +1001,51 @@ mod tests {
     use std::fs;
     use std::sync::Arc;
     use tempfile::TempDir;
+
+    #[test]
+    fn activation_keeps_host_discovery_and_workspace_source_toolchains() {
+        let project = crate::inline_project::InlineTestProject::with_language(Language::Java)
+            .file("src/Main.java", "class Main {}")
+            .file(".bifrost/jvm-toolchains.json", r#"{"schema_version":1,"source_toolchains":[{"source_root":"src","jdk_home":"bound-jdk"}]}"#)
+            .file("bound-jdk/release", "JAVA_VERSION=\"21.0.2\"\n")
+            .file("activation-jdk/release", "JAVA_VERSION=\"22.0.2\"\n")
+            .build();
+        let mut config = AnalyzerConfig::default();
+        config.jvm.standard_library_discovery.discover_java_home = false;
+        let workspace = project.workspace_analyzer(config.clone());
+        config
+            .jvm
+            .standard_library_discovery
+            .jdk_homes
+            .push(PathBuf::from("activation-jdk"));
+        let activation = activate_workspace_semantic_sources(
+            &workspace,
+            &config,
+            WorkspaceActivationSources {
+                catalog_root: project.root(),
+                workspace_model_root: None,
+                config: None,
+                intrinsic_shipped_models: false,
+            },
+            &crate::CancellationToken::default(),
+        )
+        .unwrap()
+        .expect("Java activation");
+        let jvm = activation
+            .outcome
+            .ecosystems
+            .iter()
+            .find(|outcome| outcome.ecosystem == DependencyPackEcosystem::Jvm)
+            .expect("JVM discovery");
+        let mut ids = jvm
+            .discovery
+            .dependencies
+            .iter()
+            .map(|dependency| dependency.id.as_str())
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        assert_eq!(ids, ["jdk:21.0.2", "jdk:22.0.2"], "{jvm:#?}");
+    }
 
     #[test]
     fn a_valid_document_normalizes_sorted_deduplicated_ecosystems() {

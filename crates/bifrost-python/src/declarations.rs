@@ -48,7 +48,28 @@ fn python_module_fq_from_components(components: &[String]) -> FqName {
 }
 
 fn python_module_components(file: &ProjectFile) -> Vec<String> {
-    let mut components = python_package_components_for_file(file);
+    python_module_components_from_root(file, &python_import_root(file))
+}
+
+/// The module-name components `file`'s path yields when it is named from the
+/// project root, which is the longest name the workspace can give it:
+/// `dependency/core/lib/common/__init__.py` is
+/// `["dependency", "core", "lib", "common"]`.
+///
+/// A Python module name is relative to the `sys.path` entry an import of it
+/// resolves against, so one file has one valid absolute name per ancestor
+/// directory on that path, and each of them is a suffix of this one.
+/// [`python_import_root`] picks the single name that becomes the module's
+/// identity; this is what an import written against any deeper root has to be
+/// matched against (#3506).
+pub fn python_project_module_components(file: &ProjectFile) -> Vec<String> {
+    python_module_components_from_root(file, Path::new(""))
+}
+
+/// `file`'s module-name components relative to `import_root_rel`, which must be
+/// a prefix of the file's own relative path.
+fn python_module_components_from_root(file: &ProjectFile, import_root_rel: &Path) -> Vec<String> {
+    let mut components = python_package_components_for_file(file, import_root_rel);
     let module_name = file
         .rel_path()
         .file_stem()
@@ -100,13 +121,12 @@ pub fn python_import_root(file: &ProjectFile) -> PathBuf {
         .to_path_buf()
 }
 
-fn python_package_components_for_file(file: &ProjectFile) -> Vec<String> {
+fn python_package_components_for_file(file: &ProjectFile, import_root_rel: &Path) -> Vec<String> {
     let Some(parent_rel) = file.rel_path().parent() else {
         return Vec::new();
     };
-    let import_root_rel = python_import_root(file);
     let relative_package = parent_rel
-        .strip_prefix(&import_root_rel)
+        .strip_prefix(import_root_rel)
         .expect("a Python import root is a prefix of the paths it names modules for");
     path_components(relative_package)
 }
@@ -141,6 +161,64 @@ fn python_configured_import_root(file: &ProjectFile, parent_rel: &Path) -> Optio
         manifest_dir_rel = directory.parent();
     }
     None
+}
+
+/// The root a packaging manifest declares for this file, whether that root is
+/// the project root itself or a directory below it.
+///
+/// `pyproject.toml`'s `tool.setuptools.packages.find.where` and `setup.py`'s
+/// `package_dir` state where a project's packages begin: a file below one of
+/// them is named from that directory and from nowhere else. `where = ["."]`
+/// declares the project root, and a declaration of the project root is a
+/// declaration like any other: it says this project's packages begin here, so a
+/// shorter spelling below that root names a different arrangement of the same
+/// directories. Only a project whose packaging configuration does not cover
+/// this file answers `None` (#3506).
+pub fn python_declared_import_root(file: &ProjectFile) -> Option<PathBuf> {
+    let parent_rel = file.rel_path().parent()?;
+    if parent_rel.as_os_str().is_empty() {
+        return None;
+    }
+    python_configured_import_root(file, parent_rel)
+}
+
+/// The directory the package a repeated spelling starts from has to add to its
+/// own `__path__` for `source_root_rel` to be a root the specifier is written
+/// against, or `None` when the specifier does not spell that root's own path
+/// again at its head (#3506).
+///
+/// A packaging declaration states where a project's packages begin, so a
+/// shorter spelling below it normally names a different arrangement of the same
+/// directories rather than the module: `otherpkg/vendor/api.py` under
+/// `where = ["."]` is `otherpkg.vendor.api`, and `vendor.api`, whose implied
+/// root is `otherpkg`, is not another name for it. The double-nested
+/// distribution directory is the one shape a declaration leaves open, because
+/// the specifier writes the implied root's own path again before the module's
+/// path: from `rtdetr_pose/`, `rtdetr_pose.config` names `config.py` in the
+/// same-named package that directory holds, the file the workspace indexes as
+/// `rtdetr_pose.rtdetr_pose.config`.
+///
+/// The shape is a naming question only, and it is not evidence that the import
+/// works. The interpreter finds the module through the package the specifier
+/// starts from -- `rtdetr_pose/__init__.py` -- and only that package's own
+/// statement that `rtdetr_pose/rtdetr_pose` is on its search path makes the
+/// shorter spelling name the file. The repeated directory name and the empty
+/// markers that make the directories packages state nothing on their own, so
+/// this returns the directory such a statement has to name, relative to the
+/// project root, and the snapshot decides whether the marker states it.
+pub(crate) fn python_repeated_root_extension_dir(
+    file: &ProjectFile,
+    source_root_rel: &Path,
+    declared_root_rel: &Path,
+) -> Option<PathBuf> {
+    let implied_rel = source_root_rel.strip_prefix(declared_root_rel).ok()?;
+    let implied = path_components(implied_rel);
+    if implied.is_empty()
+        || !python_module_components_from_root(file, source_root_rel).starts_with(&implied)
+    {
+        return None;
+    }
+    Some(source_root_rel.join(implied_rel))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

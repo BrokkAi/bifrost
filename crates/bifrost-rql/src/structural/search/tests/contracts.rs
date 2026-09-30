@@ -494,6 +494,7 @@ fn semantic_result_contracts_serialize_render_and_retain_source_evidence() {
                         artifact_id: "aa".repeat(32),
                         path: path.to_string(),
                         language: "typescript",
+                        dialect: "typescript",
                         procedure_kind: "function",
                         range: procedure_range,
                         evidence: complete.clone(),

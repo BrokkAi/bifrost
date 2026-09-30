@@ -1016,6 +1016,7 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
         | RqlForm::CallEffects
         | RqlForm::ResultContractCalls
         | RqlForm::CallResultContracts
+        | RqlForm::CallResultObligations
         | RqlForm::ResultContractUses
         | RqlForm::ResultContractOperationUses
         | RqlForm::NilnessOperations
@@ -1040,6 +1041,7 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
                 RqlForm::CallEffects => "call_effects",
                 RqlForm::ResultContractCalls => "result_contract_calls",
                 RqlForm::CallResultContracts => "call_result_contracts",
+                RqlForm::CallResultObligations => "call_result_obligations",
                 RqlForm::ResultContractUses => "result_contract_uses",
                 RqlForm::ResultContractOperationUses => "result_contract_operation_uses",
                 RqlForm::NilnessOperations => "nilness_operations",
@@ -1504,6 +1506,10 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
         | RqlForm::StateEventsOf
         | RqlForm::FlowRelationsOf
         | RqlForm::ControlRelations
+        | RqlForm::AssignmentRelations
+        | RqlForm::LoopRelations
+        | RqlForm::StatementReachability
+        | RqlForm::BranchRelations
         | RqlForm::RewritePathsOf => {
             if items.len() < 2 || !(items.len() - 2).is_multiple_of(2) {
                 return Err(lower_error(
@@ -1557,7 +1563,8 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
         | RqlForm::TargetOf
         | RqlForm::SourceSetOf
         | RqlForm::TopologyEdgesOf
-        | RqlForm::GuardsOf => {
+        | RqlForm::GuardsOf
+        | RqlForm::FailureHandlerState => {
             expect_len(expr, items, 2, head)?;
             let op = form
                 .query_step_op()
@@ -2208,6 +2215,7 @@ fn pattern_to_json(expr: &Expr) -> LowerResult<Value> {
         | RqlForm::CallEffects
         | RqlForm::ResultContractCalls
         | RqlForm::CallResultContracts
+        | RqlForm::CallResultObligations
         | RqlForm::ResultContractUses
         | RqlForm::ResultContractOperationUses
         | RqlForm::ResultContractFailureUses
@@ -2258,8 +2266,13 @@ fn pattern_to_json(expr: &Expr) -> LowerResult<Value> {
         | RqlForm::SourceSetOf
         | RqlForm::TopologyEdgesOf
         | RqlForm::GuardsOf
+        | RqlForm::FailureHandlerState
         | RqlForm::FlowTarget
         | RqlForm::ControlRelations
+        | RqlForm::AssignmentRelations
+        | RqlForm::LoopRelations
+        | RqlForm::StatementReachability
+        | RqlForm::BranchRelations
         | RqlForm::RewritePathsOf => unreachable!("wrapper filtered above"),
         RqlForm::ConcurrentAccessConflicts => unreachable!("wrapper filtered above"),
         RqlForm::ClassSet | RqlForm::AbsentMember => {
@@ -2721,6 +2734,19 @@ fn row_literal_value(expr: &Expr) -> LowerResult<Value> {
         ExprKind::Symbol(value) => {
             literal.insert("enum".to_string(), Value::String(value.clone()));
         }
+        ExprKind::List(parts)
+            if parts.first().and_then(Expr::as_symbol)
+                == Some(super::schema::ROW_ENUM_LITERAL.label) =>
+        {
+            if parts.len() != 2 {
+                return Err(lower_error(expr, "enum literal requires exactly one label"));
+            }
+            let label = parts[1]
+                .as_symbol()
+                .or_else(|| parts[1].as_string())
+                .ok_or_else(|| lower_error(&parts[1], "enum literal requires a label"))?;
+            literal.insert("enum".to_string(), Value::String(label.to_owned()));
+        }
         ExprKind::List(_) | ExprKind::Vector(_) => {
             return Err(lower_error(
                 expr,
@@ -2805,7 +2831,10 @@ fn row_predicates_value(expr: &Expr) -> LowerResult<Value> {
                         "comparison row predicate requires an operand",
                     ));
                 };
-                let value = if let Some(field_operand) = operand.as_sequence() {
+                let value = if let Some(field_operand) = operand.as_sequence()
+                    && field_operand.first().and_then(Expr::as_symbol)
+                        != Some(super::schema::ROW_ENUM_LITERAL.label)
+                {
                     if field_operand.len() != 2 || field_operand[0].as_symbol() != Some("field") {
                         return Err(lower_error(
                             operand,

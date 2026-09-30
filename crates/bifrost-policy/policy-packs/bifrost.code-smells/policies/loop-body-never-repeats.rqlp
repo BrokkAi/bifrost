@@ -1,0 +1,22 @@
+; An exact Java loop body cannot reach its own repeat edge.
+(policy
+  :schema-version 1
+  :id "bifrost.correctness.loop-body-never-repeats"
+  :name "Loop body never repeats"
+  :message "this loop body cannot reach its next iteration"
+  :severity warning
+  :description "The exact Java loop body is reachable, but every modeled continuation leaves before its own repeat edge. An intentional do-while(false) is excluded. Review the loop structure and early exits before changing code; no automatic rewrite is supplied."
+  :help-uri "https://bifrost.brokk.ai/static-analysis-policies/#built-in-code-smell-pack"
+  :tags ["correctness" "loop" "code-smell"]
+  :analysis (analysis
+    :type assertion
+    (bind :name loop
+      :query (rql :schema-version 1
+        (filter :where ((verdict eq proven))
+          (language java
+            (loop-relations
+              (procedure-of
+                (callable)))))))
+    (group :name by-loop :by (loop.id)
+      (aggregate :name violations :op count))
+    (assert :group by-loop :value violations :cardinality (exactly 0))))

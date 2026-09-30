@@ -76,9 +76,9 @@ use crate::analyzer::jvm::retained_external_index_state;
 use crate::analyzer::languages::{
     BoundedReceiverQuery, DeadCodeBulkEdges, DeadCodeBulkPreflight, DeadCodeBulkProof,
     DeadCodeRouting, DeadCodeSupport, EdgePassId, EdgeSiteScanCtx, EdgeWeightScanCtx,
-    LanguageEdgePass, LanguageEdgeSites, LanguageEdgeWeights, LanguageSupport,
-    StructuralReceiverResolver, analyzable_file_count, candidate_fqns,
-    fqn_has_multiple_function_definitions,
+    ExternalCalleeSite, ImportedExternalCallee, LanguageEdgePass, LanguageEdgeSites,
+    LanguageEdgeWeights, LanguageSupport, StructuralReceiverResolver, analyzable_file_count,
+    candidate_fqns, fqn_has_multiple_function_definitions,
 };
 use crate::analyzer::pool_memo::{KeyedPoolSafeMemo, PoolSafeMemo};
 use crate::analyzer::usages::get_definition::{
@@ -1157,7 +1157,8 @@ impl LanguageSupport for KotlinSupport {
         analyzer: &dyn IAnalyzer,
         file: &ProjectFile,
         callee_text: &str,
-    ) -> Option<String> {
+        _site: Option<&ExternalCalleeSite<'_>>,
+    ) -> Option<ImportedExternalCallee> {
         let scope = AnalyzerQueryScope::new(analyzer);
         let kotlin = resolve_analyzer::<KotlinAnalyzer>(analyzer)?;
         kotlin
@@ -1167,7 +1168,7 @@ impl LanguageSupport for KotlinSupport {
                 file,
                 callee_text,
             )
-            .map(|member| member.fqn().to_owned())
+            .map(|member| ImportedExternalCallee::text(member.fqn()))
     }
 
     /// Kotlin's grammar names neither the callee of a call nor the member of a

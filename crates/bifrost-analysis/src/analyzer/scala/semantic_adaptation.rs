@@ -4,6 +4,11 @@
 //! procedure identities. A uniquely selected conversion is never treated as
 //! identity merely because its body is missing. An incomplete catalog walk
 //! never certifies that a candidate is unique.
+//!
+//! A `given` declares the language's conversion only when its carrier binds
+//! the Scala library declaration. A source-owned, imported, aliased, or
+//! shadowed type that happens to be spelled `Conversion` is not a carrier,
+//! exactly as a source-owned `AnyVal` is not a value-class base.
 
 use std::sync::Arc;
 
@@ -33,6 +38,10 @@ use super::{
 
 const ADAPTATION_NODE_BUDGET: usize = 256;
 const ADAPTATION_COLLECT_NODE_BUDGET: usize = 32_768;
+
+/// The Scala library trait a `given` must implement to be the language's
+/// implicit conversion mechanism.
+const LIBRARY_CONVERSION_NAME: &str = "Conversion";
 
 type NominalType = Arc<[String]>;
 type NominalTypePair = (NominalType, NominalType);
@@ -170,6 +179,7 @@ impl<'tree> ScalaAdaptationCatalog<'tree> {
         let mut type_declarations = Vec::new();
         let mut imports = Vec::new();
         let mut term_bindings = Vec::new();
+        let mut given_nodes = Vec::new();
         let mut stack = vec![root];
         let mut examined = 0_usize;
         let mut complete = true;
@@ -202,9 +212,7 @@ impl<'tree> ScalaAdaptationCatalog<'tree> {
                     }
                 }
                 "given_definition" => {
-                    if let Some(conversion) = given_conversion(node, source, procedure_targets) {
-                        conversions.push(conversion);
-                    }
+                    given_nodes.push(node);
                 }
                 "class_definition" => {
                     class_nodes.push(node);
@@ -291,6 +299,15 @@ impl<'tree> ScalaAdaptationCatalog<'tree> {
             term_bindings,
             complete,
         };
+        // A given is the language's conversion only when its carrier binds the
+        // Scala library declaration, so the candidate cannot be recognized
+        // until the walk has collected this file's type declarations, imports,
+        // and lexical bindings.
+        for node in given_nodes {
+            if let Some(conversion) = given_conversion(node, source, procedure_targets, &catalog) {
+                catalog.conversions.push(conversion);
+            }
+        }
         for class in &class_nodes {
             if scala_has_modifier(*class, "implicit")
                 && let Some(conversion) =
@@ -436,7 +453,7 @@ impl<'tree> ScalaAdaptationCatalog<'tree> {
             {
                 return Ok(ScalaTypeBinding::Declaration(declaration.node));
             }
-            if is_prelude_type_path(path) {
+            if is_library_type_path(path) {
                 return Ok(ScalaTypeBinding::Prelude);
             }
             return Err(AdaptationFailure::Unresolved);
@@ -459,7 +476,7 @@ impl<'tree> ScalaAdaptationCatalog<'tree> {
         if let Some(declaration) = unique_exact_type(declarations, path)? {
             return Ok(ScalaTypeBinding::Declaration(declaration.node));
         }
-        if is_prelude_type_path(path) {
+        if is_library_type_path(path) {
             return Ok(ScalaTypeBinding::Prelude);
         }
         Err(AdaptationFailure::Unresolved)
@@ -657,6 +674,7 @@ fn given_conversion<'tree>(
     node: Node<'tree>,
     source: &str,
     procedure_targets: &HashMap<usize, ProcedureId>,
+    catalog: &ScalaAdaptationCatalog<'tree>,
 ) -> Option<ScalaImplicitConversion<'tree>> {
     if node.child_by_field_name("type_parameters").is_some() {
         return None;
@@ -677,7 +695,7 @@ fn given_conversion<'tree>(
         ));
     }
     let return_type = node.child_by_field_name("return_type")?;
-    let (source_type, target_type) = conversion_type_pair(return_type, source)?;
+    let (source_type, target_type) = conversion_type_pair(return_type, source, catalog)?;
     let body = given_body(node)?;
     let callable = conversion_callable_from_body(body, source)?;
     Some(scala_conversion(
@@ -917,8 +935,12 @@ fn declared_result_type(callable: Node<'_>, source: &str) -> Option<Arc<[String]
     type_identity(callable.child_by_field_name("return_type")?, source)
 }
 
-fn conversion_type_pair(node: Node<'_>, source: &str) -> Option<NominalTypePair> {
-    let generic = find_conversion_generic(node, source)?;
+fn conversion_type_pair<'tree>(
+    node: Node<'tree>,
+    source: &str,
+    catalog: &ScalaAdaptationCatalog<'tree>,
+) -> Option<NominalTypePair> {
+    let generic = find_conversion_generic(node, source, catalog)?;
     let arguments = generic.child_by_field_name("type_arguments")?;
     let types = named_children(arguments);
     let [source_type, target_type] = types.as_slice() else {
@@ -930,7 +952,17 @@ fn conversion_type_pair(node: Node<'_>, source: &str) -> Option<NominalTypePair>
     ))
 }
 
-fn find_conversion_generic<'tree>(node: Node<'tree>, source: &str) -> Option<Node<'tree>> {
+/// The `Conversion[A, B]` carrier of a given's result type, when the carrier
+/// path binds the Scala library trait.
+///
+/// A type spelled `Conversion` is the language's conversion mechanism only
+/// when nothing in scope claims that spelling first, so the carrier must bind
+/// the library declaration exactly as a value-class base must bind `AnyVal`.
+fn find_conversion_generic<'tree>(
+    node: Node<'tree>,
+    source: &str,
+    catalog: &ScalaAdaptationCatalog<'tree>,
+) -> Option<Node<'tree>> {
     let mut stack = vec![node];
     let mut examined = 0_usize;
     while let Some(current) = stack.pop() {
@@ -943,7 +975,12 @@ fn find_conversion_generic<'tree>(node: Node<'tree>, source: &str) -> Option<Nod
                 .child_by_field_name("type")
                 .map(|base| scala_type_lookup_segments(base, source))
                 .unwrap_or_default();
-            if base.last().map(String::as_str) == Some("Conversion") {
+            if base.last().map(String::as_str) == Some(LIBRARY_CONVERSION_NAME)
+                && matches!(
+                    catalog.bind_nominal_type(source, &base, current),
+                    Ok(ScalaTypeBinding::Prelude)
+                )
+            {
                 return Some(current);
             }
         }
@@ -996,6 +1033,35 @@ pub(super) fn is_prelude_type_path(segments: &[String]) -> bool {
         }
         _ => false,
     }
+}
+
+/// Whether `segments` spell the Scala library's conversion carrier.
+///
+/// The trait is a member of package `scala`, which a compilation unit puts in
+/// scope without an import, so the bare spelling denotes it exactly when no
+/// closer binding claims the name. The name stays out of
+/// [`scala_default_type_name`] because that list also answers the diagnostics
+/// ladder, where a source-owned `Conversion` must keep shadowing the library
+/// type; the adaptation catalog declares only what it binds.
+fn is_library_conversion_path(segments: &[String]) -> bool {
+    match segments {
+        [name] => name == LIBRARY_CONVERSION_NAME,
+        [package, name] => package == "scala" && name == LIBRARY_CONVERSION_NAME,
+        [root, package, name] => {
+            root == "_root_" && package == "scala" && name == LIBRARY_CONVERSION_NAME
+        }
+        _ => false,
+    }
+}
+
+/// Whether `segments` can only denote a type the Scala library declares.
+///
+/// A path that passes this test binds the library declaration, because the
+/// fallback tier that consults it is reached only after every declaration,
+/// import, type parameter, and lexical binding the catalog can see fails to
+/// claim the path.
+fn is_library_type_path(segments: &[String]) -> bool {
+    is_prelude_type_path(segments) || is_library_conversion_path(segments)
 }
 
 fn unique_exact_type<'a, 'tree>(
@@ -2053,5 +2119,248 @@ object App { def wrap(raw: Int): Meter = new Meter(raw) }
                 .iter()
                 .any(|class| class.class == exact)
         );
+    }
+
+    /// The issue #3648 fixture: a source-owned trait spelled `Conversion` is
+    /// not the library trait, so its `apply` never becomes an implicit call.
+    #[test]
+    fn source_owned_conversion_is_not_language_conversion() {
+        const SOURCE: &str = r#"
+trait Conversion[A, B] { def apply(x: A): B }
+object App {
+  given Conversion[Int, String] with {
+    def apply(x: Int): String = x.toString
+  }
+  def outside(x: Int): String = x
+}
+"#;
+        let tree = parse(SOURCE);
+        let catalog = catalog(SOURCE, &tree);
+        let site =
+            function_result_site(find_named(&tree, SOURCE, "function_definition", "outside"));
+        assert!(
+            matches!(
+                catalog.bind_nominal_type(SOURCE, &["Conversion".to_owned()], site),
+                Ok(ScalaTypeBinding::Declaration(_))
+            ),
+            "the source-owned trait claims the carrier spelling"
+        );
+        assert!(
+            matches!(
+                catalog.select(SOURCE, site, &["Int".to_owned()], &["String".to_owned()]),
+                Err(AdaptationFailure::Unresolved)
+            ),
+            "a source-owned Conversion must not lower the return as a conversion"
+        );
+    }
+
+    #[test]
+    fn imported_conversion_is_not_language_conversion() {
+        const SOURCE: &str = r#"
+object Foreign { trait Conversion[A, B] { def apply(x: A): B } }
+import Foreign.Conversion
+object App {
+  given Conversion[Int, String] with {
+    def apply(x: Int): String = x.toString
+  }
+  def outside(x: Int): String = x
+}
+"#;
+        let tree = parse(SOURCE);
+        let catalog = catalog(SOURCE, &tree);
+        let site =
+            function_result_site(find_named(&tree, SOURCE, "function_definition", "outside"));
+        assert!(
+            matches!(
+                catalog.bind_nominal_type(SOURCE, &["Conversion".to_owned()], site),
+                Ok(ScalaTypeBinding::Declaration(_))
+            ),
+            "the imported workspace trait claims the carrier spelling"
+        );
+        assert!(
+            matches!(
+                catalog.select(SOURCE, site, &["Int".to_owned()], &["String".to_owned()]),
+                Err(AdaptationFailure::Unresolved)
+            ),
+            "an imported Conversion must not lower the return as a conversion"
+        );
+    }
+
+    #[test]
+    fn conversion_alias_is_not_language_conversion() {
+        const SOURCE: &str = r#"
+object App {
+  type Conversion[A, B] = scala.Conversion[A, B]
+  given Conversion[Int, String] with {
+    def apply(x: Int): String = x.toString
+  }
+  def outside(x: Int): String = x
+}
+"#;
+        let tree = parse(SOURCE);
+        let catalog = catalog(SOURCE, &tree);
+        let site =
+            function_result_site(find_named(&tree, SOURCE, "function_definition", "outside"));
+        assert!(
+            matches!(
+                catalog.select(SOURCE, site, &["Int".to_owned()], &["String".to_owned()]),
+                Err(AdaptationFailure::Unresolved)
+            ),
+            "a Conversion alias is a workspace declaration, not the library trait"
+        );
+    }
+
+    #[test]
+    fn unresolved_conversion_import_does_not_bind_the_library_trait() {
+        const SOURCE: &str = r#"
+import external.Conversion
+object App {
+  given Conversion[Int, String] with {
+    def apply(x: Int): String = x.toString
+  }
+  def outside(x: Int): String = x
+}
+"#;
+        let tree = parse(SOURCE);
+        let catalog = catalog(SOURCE, &tree);
+        let site =
+            function_result_site(find_named(&tree, SOURCE, "function_definition", "outside"));
+        assert!(
+            matches!(
+                catalog.bind_nominal_type(SOURCE, &["Conversion".to_owned()], site),
+                Err(AdaptationFailure::Unresolved)
+            ),
+            "an unfollowable import blocks the library trait"
+        );
+        assert!(
+            matches!(
+                catalog.select(SOURCE, site, &["Int".to_owned()], &["String".to_owned()]),
+                Err(AdaptationFailure::Unresolved)
+            ),
+            "an unresolved carrier must stay incomplete"
+        );
+    }
+
+    #[test]
+    fn unresolved_wildcard_does_not_certify_the_library_trait() {
+        const SOURCE: &str = r#"
+import external.*
+object App {
+  given Conversion[Int, String] with {
+    def apply(x: Int): String = x.toString
+  }
+  def outside(x: Int): String = x
+}
+"#;
+        let tree = parse(SOURCE);
+        let catalog = catalog(SOURCE, &tree);
+        let site =
+            function_result_site(find_named(&tree, SOURCE, "function_definition", "outside"));
+        assert!(
+            matches!(
+                catalog.select(SOURCE, site, &["Int".to_owned()], &["String".to_owned()]),
+                Err(AdaptationFailure::Unresolved)
+            ),
+            "a wildcard import the catalog cannot enumerate must not certify the library trait"
+        );
+    }
+
+    #[test]
+    fn foreign_qualified_conversion_is_not_language_conversion() {
+        const SOURCE: &str = r#"
+object App {
+  given other.Conversion[Int, String] with {
+    def apply(x: Int): String = x.toString
+  }
+  def outside(x: Int): String = x
+}
+"#;
+        let tree = parse(SOURCE);
+        let catalog = catalog(SOURCE, &tree);
+        let site =
+            function_result_site(find_named(&tree, SOURCE, "function_definition", "outside"));
+        assert!(
+            matches!(
+                catalog.bind_nominal_type(
+                    SOURCE,
+                    &["other".to_owned(), "Conversion".to_owned()],
+                    site
+                ),
+                Err(AdaptationFailure::Unresolved)
+            ),
+            "a foreign qualified Conversion is not the library trait"
+        );
+        assert!(
+            matches!(
+                catalog.select(SOURCE, site, &["Int".to_owned()], &["String".to_owned()]),
+                Err(AdaptationFailure::Unresolved)
+            ),
+            "a foreign qualified Conversion must not lower the return as a conversion"
+        );
+    }
+
+    #[test]
+    fn qualified_library_conversion_remains_the_language_conversion() {
+        const SOURCE: &str = r#"
+trait Conversion[A, B] { def apply(x: A): B }
+object App {
+  given scala.Conversion[Int, String] with {
+    def apply(x: Int): String = x.toString
+  }
+  def convert(x: Int): String = x
+}
+"#;
+        let tree = parse(SOURCE);
+        let catalog = catalog(SOURCE, &tree);
+        let site =
+            function_result_site(find_named(&tree, SOURCE, "function_definition", "convert"));
+        let selected = catalog
+            .select(SOURCE, site, &["Int".to_owned()], &["String".to_owned()])
+            .expect("qualified scala.Conversion is the library trait");
+        assert!(matches!(
+            selected.kind,
+            SelectedAdaptationKind::ImplicitCall { .. }
+        ));
+    }
+
+    #[test]
+    fn shadowed_scala_root_does_not_certify_the_library_trait() {
+        const SOURCE: &str = r#"
+object Foreign { trait Conversion[A, B] { def apply(x: A): B } }
+object App {
+  val scala = Foreign
+  given scala.Conversion[Int, String] with {
+    def apply(x: Int): String = x.toString
+  }
+  def outside(x: Int): String = x
+}
+object Exact {
+  given _root_.scala.Conversion[Int, String] with {
+    def apply(x: Int): String = x.toString
+  }
+  def convert(x: Int): String = x
+}
+"#;
+        let tree = parse(SOURCE);
+        let catalog = catalog(SOURCE, &tree);
+        let shadowed =
+            function_result_site(find_named(&tree, SOURCE, "function_definition", "outside"));
+        assert!(
+            matches!(
+                catalog.select(
+                    SOURCE,
+                    shadowed,
+                    &["Int".to_owned()],
+                    &["String".to_owned()]
+                ),
+                Err(AdaptationFailure::Unresolved)
+            ),
+            "a shadowed scala root must not bind the library trait"
+        );
+        let exact =
+            function_result_site(find_named(&tree, SOURCE, "function_definition", "convert"));
+        catalog
+            .select(SOURCE, exact, &["Int".to_owned()], &["String".to_owned()])
+            .expect("_root_.scala.Conversion is the library trait");
     }
 }

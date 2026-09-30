@@ -23,6 +23,7 @@ use brokk_bifrost_core::analyzer::structural::callable::CallShapeCoverage;
 use brokk_bifrost_flow::type_flow::ClassSetStatus;
 
 /// One row's coverage statement and the analysis partition it is about.
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CodeQueryRowCoverage {
     /// The producing analysis partition this row belongs to, in the family's
@@ -41,10 +42,12 @@ pub struct CodeQueryRowCoverage {
 /// `proven_subset` member: no analysis family narrows its own partition by a
 /// declared restriction today, and a deliberate restriction that does appear
 /// belongs on the query envelope where `CodeQueryCompletion` already states it.
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "extent", rename_all = "snake_case")]
 pub enum CodeQueryRowCoverageExtent {
     /// Every row of this partition that exists was returned.
+    #[cfg_attr(feature = "query-result-fixtures", default)]
     Exhaustive,
     /// Rows of this partition may be missing. The codes are the same typed
     /// causes the query would report as diagnostics.
@@ -180,10 +183,12 @@ impl CodeQueryResultValue {
             | Self::CallBinding { .. }
             | Self::CallEffect { .. }
             | Self::CallResultContract { .. }
+            | Self::CallResultObligation { .. }
             | Self::ResultContractUse { .. }
             | Self::ResultContractFailureUse { .. }
             | Self::NilnessOperation { .. }
             | Self::SwitchCoverage { .. }
+            | Self::AssignmentRelation { .. }
             | Self::DetachedTaskTransfer { .. }
             | Self::ProcedureEffect { .. }
             | Self::CallableSignature { .. }
@@ -208,6 +213,10 @@ impl CodeQueryResultValue {
             | Self::StateEvent { .. }
             | Self::FlowRelation { .. }
             | Self::ControlRelation { .. }
+            | Self::BranchRelation { .. }
+            | Self::LoopRelation { .. }
+            | Self::FailureHandlerState { .. }
+            | Self::StatementReachability { .. }
             | Self::Guard { .. }
             | Self::RewritePath { .. }
             | Self::QualifiedPath { .. }

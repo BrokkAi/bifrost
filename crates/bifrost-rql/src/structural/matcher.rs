@@ -13,6 +13,7 @@
 use super::facts::{FileFacts, RoleTarget, Span};
 use super::kinds::{NormalizedKind, Role};
 use crate::analyzer::Range;
+use crate::analyzer::semantic::ContentIdentity;
 use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
 use brokk_bifrost_rql::{CodeQuerySeed, Pattern};
 use std::cell::Cell;
@@ -31,6 +32,21 @@ pub(crate) trait CallableSignatureOracle {
     fn lookup(&self, range: Range) -> Option<CallableSignatureFacts>;
 }
 
+/// Workspace-backed semantic owner lookup for declaration containment that
+/// cannot be represented by one file's lexical fact parents. Rust impl blocks
+/// use this path because the impl's type declaration is a separate syntax
+/// tree node and can live in another file.
+pub(crate) trait DeclarationOwnerOracle {
+    fn owner_matches(
+        &self,
+        declaration: Range,
+        pattern: &Pattern,
+        captures: &mut Vec<CaptureBinding>,
+        examined_facts: &mut u64,
+        incomplete: &CallableSignatureIncomplete,
+    ) -> bool;
+}
+
 /// Flags set when a callable-signature predicate cannot be answered because
 /// the adapter did not record modifiers or parameter types.
 #[derive(Debug, Default)]
@@ -43,7 +59,13 @@ pub(crate) struct CallableSignatureIncomplete {
 pub(crate) struct CaptureBinding {
     pub name: String,
     pub span: Span,
+    pub text: String,
+    pub start_line: usize,
+    pub start_column: usize,
+    pub end_line: usize,
+    pub end_column: usize,
     pub kind: Option<NormalizedKind>,
+    pub source_identity: ContentIdentity,
     /// Facts-arena id of the captured node, when the capture bound a fact
     /// rather than a role target's raw span. Together with the file's
     /// `ContentIdentity` this is the AST identity occurrence rows join on.
@@ -76,6 +98,7 @@ pub(crate) fn match_query(
         max_matches,
         &mut examined,
         None,
+        None,
         &incomplete,
     )
 }
@@ -86,6 +109,7 @@ pub(crate) fn match_query(
 /// `examined_facts` accumulates every fact node and role edge the verifier
 /// evaluates, including containment ancestor probes and `has`/`not_has`
 /// subtree walks; posting-based callers charge execution budget from it.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn match_query_candidates(
     query: &CodeQuerySeed,
     facts: &FileFacts,
@@ -93,6 +117,7 @@ pub(crate) fn match_query_candidates(
     max_matches: usize,
     examined_facts: &mut u64,
     oracle: Option<&dyn CallableSignatureOracle>,
+    owner_oracle: Option<&dyn DeclarationOwnerOracle>,
     incomplete: &CallableSignatureIncomplete,
 ) -> Vec<FactMatch> {
     let mut matches = Vec::new();
@@ -137,6 +162,7 @@ pub(crate) fn match_query_candidates(
                 &mut captures,
                 examined_facts,
                 oracle,
+                owner_oracle,
                 incomplete,
             )
         {
@@ -195,6 +221,7 @@ fn eval_containment(
 /// Does some strict ancestor of `node` match `pattern` before a non-matching
 /// callable declaration boundary? A matching callable ancestor itself remains
 /// visible, so direct contents of a function or lambda can select that owner.
+#[allow(clippy::too_many_arguments)]
 fn eval_declaration_containment(
     pattern: &Pattern,
     facts: &FileFacts,
@@ -202,6 +229,7 @@ fn eval_declaration_containment(
     captures: &mut Vec<CaptureBinding>,
     examined_facts: &mut u64,
     oracle: Option<&dyn CallableSignatureOracle>,
+    owner_oracle: Option<&dyn DeclarationOwnerOracle>,
     incomplete: &CallableSignatureIncomplete,
 ) -> bool {
     let mut current = facts.node(node).parent;
@@ -226,7 +254,34 @@ fn eval_declaration_containment(
         }
         current = facts.node(ancestor).parent;
     }
-    false
+    let fact = facts.node(node);
+    owner_oracle.is_some_and(|oracle| {
+        oracle.owner_matches(fact.range, pattern, captures, examined_facts, incomplete)
+    })
+}
+
+/// Evaluate one declaration pattern against a fact selected by a workspace
+/// owner oracle. This deliberately reuses the exact verifier used for ordinary
+/// lexical containment, including roles, descendants, signature predicates,
+/// and captures.
+pub(crate) fn match_owner_pattern(
+    pattern: &Pattern,
+    facts: &FileFacts,
+    node: u32,
+    captures: &mut Vec<CaptureBinding>,
+    examined_facts: &mut u64,
+    oracle: Option<&dyn CallableSignatureOracle>,
+    incomplete: &CallableSignatureIncomplete,
+) -> bool {
+    eval_pattern(
+        pattern,
+        facts,
+        node,
+        captures,
+        examined_facts,
+        oracle,
+        incomplete,
+    )
 }
 
 /// Evaluate `pattern` against the fact `node`. On success the pattern's
@@ -647,17 +702,26 @@ fn add_capture(
     facts: &FileFacts,
     captures: &mut Vec<CaptureBinding>,
 ) -> bool {
+    let text = span.text(facts.source());
     if captures
         .iter()
         .filter(|capture| capture.name == label)
-        .any(|capture| capture.span.text(facts.source()) != span.text(facts.source()))
+        .any(|capture| capture.text != text)
     {
         return false;
     }
+    let (start_line, start_column) = facts.line_column_of_byte(span.start_byte);
+    let (end_line, end_column) = facts.line_column_of_byte(span.end_byte);
     captures.push(CaptureBinding {
         name: label.to_string(),
         span,
+        text: text.to_string(),
+        start_line,
+        start_column,
+        end_line,
+        end_column,
         kind,
+        source_identity: facts.source_identity(),
         node,
     });
     true

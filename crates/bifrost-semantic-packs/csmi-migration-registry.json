@@ -876,6 +876,38 @@
       "asset_role": "compiled_manifest",
       "audit_status": "pending",
       "blockers": [
+        "missing_effect_vocabulary"
+      ],
+      "classification": "blocked_missing_vocabulary",
+      "generation_strategy": "retain_until_vocabulary_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/jdk21-result-use-obligations/manifest.json",
+      "profiles": [
+        "java-jvm"
+      ],
+      "reason": "Reviewed pure-transformation and fallible-status result-use obligations have no lossless mapping in the pinned CSMI vocabulary.",
+      "source_model": "crates/bifrost-semantic-packs/models/jdk21-result-use-obligations.json"
+    },
+    {
+      "asset_role": "compiled_shard",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_effect_vocabulary"
+      ],
+      "classification": "blocked_missing_vocabulary",
+      "generation_strategy": "retain_until_vocabulary_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/jdk21-result-use-obligations/shards/jdk21.reviewed-result-use.deflate",
+      "profiles": [
+        "java-jvm"
+      ],
+      "reason": "Reviewed pure-transformation and fallible-status result-use obligations have no lossless mapping in the pinned CSMI vocabulary.",
+      "source_model": "crates/bifrost-semantic-packs/models/jdk21-result-use-obligations.json"
+    },
+    {
+      "asset_role": "compiled_manifest",
+      "audit_status": "pending",
+      "blockers": [
         "missing_generation_vocabulary"
       ],
       "classification": "blocked_missing_vocabulary",
@@ -1783,6 +1815,25 @@
       "path": "crates/bifrost-semantic-packs/models/go-testify-require.json",
       "profiles": [],
       "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence."
+    },
+    {
+      "asset_role": "authored_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_effect_vocabulary"
+      ],
+      "classification": "blocked_missing_vocabulary",
+      "embedded_paths": [
+        "crates/bifrost-semantic-packs/embedded/jdk21-result-use-obligations/manifest.json",
+        "crates/bifrost-semantic-packs/embedded/jdk21-result-use-obligations/shards/jdk21.reviewed-result-use.deflate"
+      ],
+      "generation_strategy": "retain_until_vocabulary_support",
+      "native_source_kind": "authored_semantic_model",
+      "path": "crates/bifrost-semantic-packs/models/jdk21-result-use-obligations.json",
+      "profiles": [
+        "java-jvm"
+      ],
+      "reason": "Reviewed pure-transformation and fallible-status result-use obligations have no lossless mapping in the pinned CSMI vocabulary."
     },
     {
       "asset_role": "generated_semantic_model",
@@ -2847,7 +2898,7 @@
       "native_source_kind": "authored_semantic_model",
       "path": "semantic-packs/web-network/ruby/bifrost.web-network-ruby.json",
       "profiles": [],
-      "reason": "Reviewed network-effect model for the #3387 boundary family, binding the Net::HTTP.get singleton method through Ruby's constant-path declaration identity; exportability remains pending lossless field and applicability audit."
+      "reason": "Reviewed network-effect model for the #3387 boundary family, binding Net::HTTP.get and the model-declared Net::HTTP.new result's instance request route through Ruby's declaration identity; exportability remains pending lossless field and applicability audit."
     },
     {
       "asset_role": "authored_semantic_model",

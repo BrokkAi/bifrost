@@ -17,7 +17,7 @@ pub use brokk_bifrost_core::analyzer::common::{
 // it lives.
 pub(crate) use brokk_bifrost_rust::declarations::RUST_IDENTIFIER_SIGIL;
 
-use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile};
+use crate::analyzer::{CodeUnit, FqName, IAnalyzer, Language, ProjectFile};
 use std::path::Path;
 
 pub(crate) fn rebase_project_file_to_root(file: &ProjectFile, root: &Path) -> Option<ProjectFile> {
@@ -45,47 +45,98 @@ pub(crate) fn display_symbol_name(language: Language, symbol: &str) -> String {
     )
 }
 
+/// The undecorated spelling of a structured name: [`display_symbol_name`] for
+/// a caller that holds the declaration rather than a typed string.
+///
+/// A language that answers [`LanguageSupport::undecorated_fq_name`] answers
+/// here from segment kinds, so a `$` or `.` inside a segment's own text
+/// survives; the rest fall back to the string reading, which is unchanged.
+///
+/// [`LanguageSupport::undecorated_fq_name`]: crate::analyzer::languages::LanguageSupport::undecorated_fq_name
+fn display_fq_name(language: Language, fq: &FqName, rendered: &str) -> String {
+    match crate::analyzer::languages::language_support(language)
+        .and_then(|support| support.undecorated_fq_name(fq))
+    {
+        Some(undecorated) => {
+            undecorated.display_native(language, crate::analyzer::fq_name::segment_interner())
+        }
+        None => display_symbol_name(language, rendered),
+    }
+}
+
 /// The qualified spelling a result prints for `target`: its display name when
-/// that name still addresses `target`, otherwise its indexed name.
+/// that name still addresses `target` alone, otherwise its indexed name.
 ///
 /// Display normalization exists to hide index decoration nobody writes in
 /// source (Scala's companion `$`, C#'s generic arity and nested-owner `$`,
-/// TypeScript's `$static` marker). Wherever it changes anything, the stripped
-/// spelling is also the spelling an undecorated sibling owns outright:
-/// Monocle's `object GenLens` declares `apply`, stored `GenLens$.apply` and
-/// rendered `GenLens.apply`, which is `class GenLens`'s own `apply`. Exact-fq
-/// resolution answers such a spelling with the sibling ("a printed selector is
-/// a promise", #1056/#1057), so both halves of the pair printed one selector
-/// and only the undecorated half could be reached (#3302).
+/// TypeScript's `$static` marker). A printed selector is a promise
+/// (#1056/#1057), so the undecorated spelling may only be printed when it
+/// addresses this declaration and no other. Three shapes break that promise,
+/// and each was a fuzz finding:
 ///
-/// Asking whether another declaration owns the stripped spelling is what keeps
-/// both properties: a decorated declaration whose stripped spelling is free
-/// still prints the idiomatic name, and one whose stripped spelling is taken
-/// prints the indexed name that resolves to it.
+/// * Another declaration owns the undecorated spelling as its own indexed
+///   name. Monocle's `object GenLens` declares `apply`, stored `GenLens$.apply`
+///   and undecorating to `GenLens.apply`, which is `class GenLens`'s own
+///   `apply`; exact-fq resolution answers there, so the object's half of the
+///   pair was unreachable (#3302).
+/// * Another declaration *with different segment text* would be printed under
+///   the same undecorated spelling. A C# nested type and its generic sibling
+///   are indexed ``Owner$Name`` and ``Owner$Name`1``: different names, sharing
+///   one arity-free display, so the one printed selector resolved ambiguously
+///   and addressed neither (#3505). A Scala companion pair is the opposite
+///   case -- `CharsetRange$.Atom` and `CharsetRange$.Atom$` carry the *same*
+///   segment texts and differ only in the terminal segment's kind, which is
+///   one source-written name under two decorations. `distinct_definitions`
+///   groups exactly that pair under one selector that answers with both
+///   halves (#2451), so a same-text sibling does not contest.
+/// * The undecorated spelling addresses nothing at all, because it was derived
+///   by re-reading the rendering instead of the structure. That is what
+///   [`display_fq_name`] now prevents (#3505).
+///
+/// Asking those questions of `definitions(display)` keeps the other property
+/// too: a decorated declaration whose undecorated spelling is uncontested
+/// still prints the idiomatic name.
 pub fn display_symbol_for_target(analyzer: &dyn IAnalyzer, target: &CodeUnit) -> String {
-    addressable_symbol_name(analyzer, language_for_target(target), target.fq_name())
+    addressable_symbol_name(
+        analyzer,
+        language_for_target(target),
+        target.fq(),
+        target.fq_name_str(),
+    )
 }
 
-/// The one question [`display_symbol_for_target`] asks, over an already
-/// rendered indexed name: is the display spelling of `fq_name` free, or does
-/// it name a different declaration?
+/// The one question [`display_symbol_for_target`] asks: does the undecorated
+/// spelling of `fq` address `fq` alone?
 fn addressable_symbol_name(
     analyzer: &dyn IAnalyzer,
     language: Language,
-    fq_name: String,
+    fq: &FqName,
+    fq_name: &str,
 ) -> String {
-    let display = display_symbol_name(language, &fq_name);
+    let display = display_fq_name(language, fq, fq_name);
     if display == fq_name {
-        return fq_name;
+        return display;
     }
-    // The same lookup `resolve_codeunit_exact` runs, asked of the stripped
-    // spelling: an exact fq hit there is the declaration that spelling
-    // resolves to, and it is never this one (this one's fq is `fq_name`,
-    // which differs).
-    let taken = analyzer
-        .definitions(&display)
-        .any(|other| other.fq_name() == display);
-    if taken { fq_name } else { display }
+    // The same lookup `resolve_codeunit_exact` runs, asked of the undecorated
+    // spelling. A candidate contests it when it is a different declaration
+    // (overloads share one indexed name and are meant to share one selector)
+    // and either owns that spelling outright or is a different *name* that
+    // would be printed under it too.
+    let contested = analyzer.definitions(&display).any(|other| {
+        other.fq_name_str() != fq_name
+            && (other.fq_name_str() == display
+                || (!fq.same_segment_texts(other.fq())
+                    && display_fq_name(
+                        language_for_target(&other),
+                        other.fq(),
+                        other.fq_name_str(),
+                    ) == display))
+    });
+    if contested {
+        fq_name.to_string()
+    } else {
+        display
+    }
 }
 
 /// One batched store read for the questions [`display_symbol_for_target`] is
@@ -103,8 +154,8 @@ pub(crate) fn prefetch_display_symbols<'a>(
     let names: Vec<String> = targets
         .into_iter()
         .filter_map(|target| {
-            let fq_name = target.fq_name();
-            let display = display_symbol_name(language_for_target(target), &fq_name);
+            let fq_name = target.fq_name_str();
+            let display = display_fq_name(language_for_target(target), target.fq(), fq_name);
             (display != fq_name).then_some(display)
         })
         .collect();
@@ -148,7 +199,7 @@ pub(crate) fn prefetch_display_symbols<'a>(
 /// [`FqName`]: brokk_bifrost_core::analyzer::fq_name::FqName
 /// [`FqName::render_native`]: brokk_bifrost_core::analyzer::fq_name::FqName::render_native
 /// [`SegmentKind::Companion`]: brokk_bifrost_core::analyzer::fq_name::SegmentKind::Companion
-pub(crate) fn parent_fq_name_for_target(target: &CodeUnit) -> Option<String> {
+pub(crate) fn parent_fq_for_target(target: &CodeUnit) -> Option<FqName> {
     let fq = target.fq();
     // `CodeUnit::from_fq` asserts a non-empty name whose package prefix leaves a
     // non-empty declaration tail, so the parent prefix always exists and is never
@@ -157,21 +208,36 @@ pub(crate) fn parent_fq_name_for_target(target: &CodeUnit) -> Option<String> {
     if parent_len == target.package_segment_count() {
         return None;
     }
-    Some(fq.prefix(parent_len).display_native(
-        language_for_target(target),
-        crate::analyzer::fq_name::segment_interner(),
-    ))
+    Some(fq.prefix(parent_len))
 }
 
-/// The enclosing scope of [`parent_fq_name_for_target`], spelled the way
+/// [`parent_fq_for_target`] rendered in the target's own language.
+pub(crate) fn parent_fq_name_for_target(target: &CodeUnit) -> Option<String> {
+    parent_fq_for_target(target).map(|parent| {
+        parent.display_native(
+            language_for_target(target),
+            crate::analyzer::fq_name::segment_interner(),
+        )
+    })
+}
+
+/// The enclosing scope of [`parent_fq_for_target`], spelled the way
 /// [`display_symbol_for_target`] spells the unit itself, so that a printed
 /// `parent_symbol` addresses the owner it names.
 pub(crate) fn display_parent_symbol_for_target(
     analyzer: &dyn IAnalyzer,
     target: &CodeUnit,
 ) -> Option<String> {
-    parent_fq_name_for_target(target)
-        .map(|parent_fq| addressable_symbol_name(analyzer, language_for_target(target), parent_fq))
+    let language = language_for_target(target);
+    let parent = parent_fq_for_target(target)?;
+    let parent_fq_name =
+        parent.display_native(language, crate::analyzer::fq_name::segment_interner());
+    Some(addressable_symbol_name(
+        analyzer,
+        language,
+        &parent,
+        &parent_fq_name,
+    ))
 }
 
 /// The user-facing terminal name of `target`: its recorded terminal segment,
@@ -185,9 +251,24 @@ pub(crate) fn display_parent_symbol_for_target(
 /// outlines, document symbols, completion labels and the selector an agent
 /// copies from them all pointed at a segment fragment (#2111).
 ///
+/// The undecorated spelling comes from the same structured normalization
+/// [`display_symbol_for_target`] uses, read back as the terminal segment's own
+/// span. Stripping decoration off the rendered `identifier()` instead cannot
+/// tell a Scala object's own trailing `$` from the renderer's (#3505).
+///
 /// [`FqName`]: brokk_bifrost_core::analyzer::fq_name::FqName
 pub fn display_identifier_for_target(target: &CodeUnit) -> String {
-    display_symbol_name(language_for_target(target), target.identifier())
+    let language = language_for_target(target);
+    match crate::analyzer::languages::language_support(language)
+        .and_then(|support| support.undecorated_fq_name(target.fq()))
+    {
+        Some(undecorated) => {
+            let rendered =
+                undecorated.render_native(language, crate::analyzer::fq_name::segment_interner());
+            rendered.text()[rendered.segment_start(undecorated.len() - 1)..].to_string()
+        }
+        None => display_symbol_name(language, target.identifier()),
+    }
 }
 
 pub fn source_identifier_for_target(target: &CodeUnit) -> &str {

@@ -8,7 +8,7 @@ use super::{
     MemoryLocation, MemoryLocationId, MemoryLocationKind, ProcedureSemanticsParts, ProgramPoint,
     ProgramPointId, SemanticBudget, SemanticBudgetExceeded, SemanticCallSite, SemanticEvent,
     SemanticGap, SemanticLocator, SemanticValue, SemanticWork, SourceMapping, SourceMappingId,
-    SwitchFactId, SwitchFactParts,
+    StatementEntrySite, SwitchFactId, SwitchFactParts,
 };
 
 #[derive(Debug, Clone)]
@@ -51,7 +51,8 @@ impl ProcedureCfgBuilder {
                 && parts.memory_locations.is_empty()
                 && parts.captures.is_empty()
                 && parts.call_sites.is_empty()
-                && parts.gaps.is_empty(),
+                && parts.gaps.is_empty()
+                && parts.statement_entries.is_empty(),
             "CFG builder requires side-table rows to be allocated through the builder"
         );
         let prospective_work = initial_procedure_cfg_work(
@@ -103,6 +104,33 @@ impl ProcedureCfgBuilder {
         ))?;
         self.parts.source_mappings.push(mapping);
         Ok(id)
+    }
+
+    pub(crate) fn source_mapping(&self, id: SourceMappingId) -> &SourceMapping {
+        self.parts
+            .source_mappings
+            .get(id.index())
+            .expect("a point's registered source mapping exists")
+    }
+
+    pub(crate) fn add_statement_entry(
+        &mut self,
+        site: StatementEntrySite,
+    ) -> Result<(), SemanticBudgetExceeded> {
+        assert!(
+            site.point.index() < self.points.len(),
+            "statement entry point exists"
+        );
+        assert!(
+            site.source.index() < self.parts.source_mappings.len(),
+            "statement entry source exists"
+        );
+        self.reserve(SemanticWork {
+            nested_entries: 1,
+            ..SemanticWork::default()
+        })?;
+        self.parts.statement_entries.push(site);
+        Ok(())
     }
 
     pub(crate) fn add_evidence(
@@ -539,6 +567,39 @@ impl ProcedureCfgBuilder {
                 }
                 ScopeBinding::Cleanup { region } => cleanups.push(*region),
                 ScopeBinding::Handler { .. } | ScopeBinding::Yieldable { .. } => {}
+            }
+            cursor = frame.parent;
+        }
+        None
+    }
+
+    /// Whether an abrupt throw from `scope` leaves this procedure directly:
+    /// the resolved route targets the nearest function frame's throw target
+    /// and crosses no cleanup region.
+    ///
+    /// An adapter that omits an operation's implicit-exception edge uses this
+    /// to retain the `NonRejoiningExceptionalExit` proof: such a route cannot
+    /// resume the procedure's normal evaluation, and it enters no handler or
+    /// cleanup user code. A route that lands in a handler frame, crosses a
+    /// cleanup region, or cannot resolve keeps the discharge closed.
+    pub(crate) fn throw_exits_procedure(&self, scope: ScopeFrameId) -> bool {
+        let Some(route) =
+            self.resolve_completion(scope, &CompletionRequest::new(CompletionKind::Throw, None))
+        else {
+            return false;
+        };
+        route.cleanups().is_empty()
+            && self
+                .nearest_function_throw_target(scope)
+                .is_some_and(|throw_target| route.destination().target() == throw_target)
+    }
+
+    fn nearest_function_throw_target(&self, scope: ScopeFrameId) -> Option<ProgramPointId> {
+        let mut cursor = Some(scope);
+        while let Some(id) = cursor {
+            let frame = self.scopes.get(id.index())?;
+            if let ScopeBinding::Function { throw_target, .. } = &frame.binding {
+                return Some(*throw_target);
             }
             cursor = frame.parent;
         }

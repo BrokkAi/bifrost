@@ -5,6 +5,7 @@ mod conversions;
 mod dispatch;
 mod heap;
 mod runtime_values;
+pub(crate) use runtime_values::{RuntimeSyntaxCache, runtime_syntax_cache};
 mod source;
 pub use runtime_values::{
     RuntimeAccessKey, RuntimeKeyedReadEndpoint, RuntimeKeyedReadFilter, RuntimeKeyedReadKeyKind,
@@ -62,6 +63,7 @@ use super::{DispatchHints, OracleLimits};
 pub struct WorkspaceSemanticOracle<'a> {
     workspace: &'a WorkspaceAnalyzer,
     runtime_reads: runtime_values::RuntimeReadCache,
+    runtime_syntax: runtime_values::RuntimeSyntaxCache,
     runtime_write_footprints: runtime_values::WorkspaceRuntimeWriteFootprintCache,
     limits: OracleLimits,
     hierarchy_expansion: DispatchHierarchyExpansion,
@@ -133,6 +135,12 @@ impl<'a> WorkspaceSemanticOracle<'a> {
         Self {
             workspace,
             runtime_reads: runtime_values::runtime_read_cache(),
+            runtime_syntax: workspace
+                .analyzer()
+                .snapshot_caches()
+                .map_or_else(runtime_syntax_cache, |caches| {
+                    caches.runtime_syntax().clone()
+                }),
             runtime_write_footprints: runtime_values::workspace_runtime_write_footprint_cache(),
             limits,
             hierarchy_expansion,

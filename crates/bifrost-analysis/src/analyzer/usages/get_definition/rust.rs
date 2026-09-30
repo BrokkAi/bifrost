@@ -1,6 +1,7 @@
 use super::*;
 use crate::analyzer::CodeUnitIndex;
 use crate::analyzer::QueryToken;
+use crate::analyzer::RustOverlayCrates;
 use crate::analyzer::TypeHierarchyProvider;
 use crate::analyzer::rust::rust_focused_use_path;
 use crate::analyzer::rust::{canonical_rust_hierarchy_type, usage_crate_export_targets};
@@ -12,6 +13,9 @@ use crate::analyzer::rust::{
 use crate::analyzer::rust::{
     resolve_rust_import_package_scoped, resolve_rust_module_segments_with_crate,
     rust_crate_root_package, rust_package_name,
+};
+use crate::analyzer::semantic_model::{
+    SemanticModelCallApplication, SemanticModelCallableDisposition, SemanticModelCallableKey,
 };
 use crate::analyzer::structural::resolution::{HierarchyRelation, MemberDispatchTier};
 use crate::analyzer::tree_walk::named_children_iter;
@@ -342,6 +346,339 @@ pub(crate) fn resolve_rust_bounded(
         analyzer, token, &support, file, source, tree, site, &mut cache,
     );
     session.finish(outcome)
+}
+
+/// The resolver-owned identity of one Rust external call written as a
+/// qualified path, or `None` when this file does not prove that identity.
+///
+/// A multi-segment spelling such as `std::net::TcpStream::connect(endpoint)`
+/// names the standard-library API only while its leading segment names no
+/// workspace declaration. `rust_owner_root_availability` answers that question
+/// from the same structured evidence the resolver's own path resolution uses --
+/// the enclosing module's declarations, the file's import binders, and the
+/// Cargo routes -- so a workspace `mod std` whose `TcpStream` declares no
+/// `connect` leaves the call unresolved instead of letting the spelling borrow
+/// the reviewed identity (#3484).
+///
+/// The owner must be a multi-segment path. A one-segment owner is the spelling
+/// a `use` binder expands (`Path::new`), and the implicit-prelude exclusion of
+/// #2596 (`String::from`) is preserved: no structured evidence in this file
+/// binds a bare owner to a crate root.
+///
+/// The published text keeps Rust's own separator, because every consumer of a
+/// Rust external callee cuts it back apart with `::` and re-indexes the owner
+/// dot-joined: [`crate::analyzer::semantic::split_canonical_qualified_callee`]
+/// does that for the unmaterialized external target, and the import-binder
+/// expansion (`expand_rust_imported_external_callee`) publishes the identical
+/// spelling for `TcpStream::connect` after a `use std::net::TcpStream`. Both
+/// spellings therefore mint one identity.
+pub(super) fn exact_rust_external_call(
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    file: &ProjectFile,
+    source: &str,
+    tree: &Tree,
+    site: &ResolvedReferenceSite,
+    cancellation: Option<&CancellationToken>,
+) -> Option<(ExactExternalCallProof, ResolverOwnedExternalCalleeIdentity)> {
+    let rust = resolve_analyzer::<RustAnalyzer>(analyzer)?;
+    let session = ResolutionSession::bounded(ReceiverAnalysisBudget::default(), cancellation);
+    let support = AnalyzerRustDefinitionProvider::bounded(rust, &session);
+    let focused = rust_smallest_named_node_covering(
+        &support,
+        tree.root_node(),
+        site.focus_start_byte,
+        site.focus_end_byte,
+    )?;
+    let terminal =
+        rust_enclosing_scoped_terminal_name(focused, site.focus_start_byte, site.focus_end_byte)?;
+    // The path has to be the call's callee itself. Walk only through the
+    // wrappers a callee can be written under, so a path read as a value and a
+    // path passed as an argument both name no callable here.
+    let mut callee = terminal;
+    let call = loop {
+        let parent = callee.parent()?;
+        if !support.scope_step() {
+            return None;
+        }
+        let function = parent
+            .child_by_field_name("function")
+            .filter(|function| node_within(*function, callee))?;
+        match parent.kind() {
+            "generic_function" => callee = function,
+            "call_expression" => break parent,
+            _ => return None,
+        }
+    };
+    let parameter_count = match call.child_by_field_name("arguments") {
+        Some(arguments) => {
+            let mut cursor = arguments.walk();
+            u32::try_from(arguments.named_children(&mut cursor).count()).ok()?
+        }
+        None => 0,
+    };
+    let components = rust_structured_path_components(&support, terminal, source)?;
+    let (member, owner_components) = components.split_last()?;
+    if owner_components.len() < 2 {
+        return None;
+    }
+    // A leading `::` names the extern-prelude crate at the crate root, so no
+    // enclosing module, type parameter, or local item of this file can claim
+    // its leading segment. The root question is not asked at all, and the
+    // declaration proof below is what decides the call.
+    let absolute = brokk_bifrost_rust::graph::ast::rust_path_is_leading_absolute(terminal);
+    let root = rust_scoped_path_root(terminal);
+    // The leftmost node of a leading-absolute path is still scoped: it has no
+    // `path` field, only the `::` token and its own `name`.
+    let root = match root.child_by_field_name("path") {
+        Some(_) => root,
+        None if matches!(root.kind(), "scoped_identifier" | "scoped_type_identifier") => {
+            root.child_by_field_name("name")?
+        }
+        None => root,
+    };
+    let root_name = rust_node_text(root, source).trim();
+    if root_name.is_empty() || matches!(root_name, "crate" | "self" | "super") {
+        return None;
+    }
+    if !absolute {
+        // An enclosing `mod std` does not put its own name in scope inside its
+        // body, so a path whose root matches it is unresolved rather than the
+        // extern-prelude crate. Keep it open.
+        if rust_path_root_matches_enclosing_module(root, source, root_name) {
+            return None;
+        }
+        // A type parameter or a local item of the enclosing body owns the name
+        // inside that body, so the path is not the extern-prelude crate there.
+        if rust_type_parameter_visible_from(root, source, root_name) {
+            return None;
+        }
+        if lexical_scope::local_type_item_name_shadowed_in_tree(
+            tree.root_node(),
+            source,
+            root_name,
+            site.focus_start_byte,
+        ) {
+            return None;
+        }
+        let availability = rust_owner_root_availability(
+            analyzer, token, rust, &support, file, source, site, root, root_name,
+        );
+        if availability != RustOwnerRootAvailability::Unbound {
+            return None;
+        }
+    }
+    // A matching authored summary is behavior attached to a callable. Only an
+    // activated declaration for the exact owner and one applicable receiverless
+    // callable at the written arity turns this spelling into the callable's
+    // identity; a name nothing declares stays open.
+    if !rust_external_callable_declaration(analyzer, owner_components, member, parameter_count) {
+        return None;
+    }
+    let proof = ExactExternalCallProof::rust_external_call(
+        format!("{}::{member}", owner_components.join("::")),
+        parameter_count,
+    );
+    let owner = owner_components.join(".");
+    let identity = ResolverOwnedExternalCalleeIdentity::new(Language::Rust, owner, member.as_str());
+    match session.finish((proof, identity)) {
+        BoundedResolution::Complete { value, .. } => Some(value),
+        _ => None,
+    }
+}
+
+/// Whether the activated Rust model publishes the exact owner path this call
+/// spells and one applicable receiverless callable for `member` at the written
+/// arity.
+///
+/// The crate-root gate is the same one the resolver's diagnostics and trace use
+/// ([`RustOverlayCrates::referenceable_symbol`]): the leading segment must be a
+/// published crate root, and the symbol must be unique across the activated
+/// packs. Applicability then comes from the shared callable lookup, so a pack
+/// that declares the owner but not the member, two packs that disagree about
+/// the declaration, or an overload set the written arity cannot select all
+/// leave the call open exactly as an unindexed workspace call does.
+fn rust_external_callable_declaration(
+    analyzer: &dyn IAnalyzer,
+    owner_components: &[String],
+    member: &str,
+    parameter_count: u32,
+) -> bool {
+    let Some(overlay) = analyzer.semantic_model_overlay() else {
+        return false;
+    };
+    let crates = RustOverlayCrates::new(Some(&overlay));
+    let owner = RustOverlayCrates::pack_name(owner_components);
+    if crates.referenceable_symbol(&owner).is_none() {
+        return false;
+    }
+    let callable = overlay.callable_for_application(
+        SemanticModelCallableKey::new(
+            Language::Rust.config_label(),
+            &owner,
+            member,
+            false,
+            parameter_count,
+        ),
+        &SemanticModelCallApplication::positional(parameter_count),
+    );
+    // Declaring the callable is not the same as publishing it. The member
+    // lookup answers "which decl matches this application", so a private or
+    // crate-visible member of a public owner would otherwise read as an
+    // external API the workspace can call by name. The referenceable-symbol
+    // gate above already requires the owner to be externally visible, and the
+    // member has to meet the same bar before its summary may stand for the
+    // call.
+    if !callable
+        .records
+        .iter()
+        .all(|record| record.externally_visible())
+    {
+        return false;
+    }
+    match callable.disposition {
+        SemanticModelCallableDisposition::Unique => true,
+        // Several applicable overloads that share one binding layout still
+        // leave the overload identity unresolved. That is exact callable
+        // evidence only while the activated model certifies the whole family,
+        // which is what mints the domain-separated family identity a summary
+        // can be keyed by; an uncertified overload set stays typed
+        // uncertainty and the call stays open.
+        SemanticModelCallableDisposition::CompatibleLayout => {
+            callable.callable_family_id().is_some()
+        }
+        _ => false,
+    }
+}
+
+/// The written argument count of the Rust call whose callee begins at
+/// `callee_start_byte`, read from the parsed tree.
+///
+/// The declaration proof for an imported callee has to know which call it is
+/// proving, and the written arity is the only applicability fact an
+/// unmaterialized external callee carries. Nothing here reads source text: the
+/// offset selects the callee node, the enclosing `call_expression` supplies the
+/// `arguments` field, and its named children are the written arguments.
+pub(crate) fn rust_call_written_arity(tree: &Tree, callee_start_byte: usize) -> Option<u32> {
+    let mut node = tree
+        .root_node()
+        .named_descendant_for_byte_range(callee_start_byte, callee_start_byte.saturating_add(1))?;
+    while node.kind() != "call_expression" {
+        node = node.parent()?;
+    }
+    let arguments = node.child_by_field_name("arguments")?;
+    let mut cursor = arguments.walk();
+    u32::try_from(arguments.named_children(&mut cursor).count()).ok()
+}
+
+/// The external callee one `use` binder proves for a call that writes `member`
+/// on the binder's local name, or `None` when the binder proves nothing.
+///
+/// The binder is the only evidence that names the owner of a call written with
+/// one segment (`use std::net::TcpStream;` then `TcpStream::connect(addr)`), so
+/// the expansion has to come from the parser-derived path the binder carries
+/// rather than from the spelling at the call site. This is the import-binder
+/// half of the resolver-owned identity [#3484] established for written-out
+/// scoped paths in [`exact_rust_external_call`], and it asks the same root
+/// question: the path's leading segment must name no workspace declaration in
+/// the scope that holds the `use`.
+///
+/// The answer is the same pair the written-out route publishes: the exact
+/// callable proof and the owner/member identity the activated model declares,
+/// built from the binder's structured path and the call's written arity. A
+/// matching summary is behavior attached to that callable, so the text alone
+/// never stands for it.
+///
+/// A workspace that declares its own module under that name -- or that binds
+/// one to the name through another import -- makes the binder name that module,
+/// so the call it expands stays unresolved instead of borrowing the reviewed
+/// identity of a sysroot or dependency API with the same spelling. The answer
+/// is deliberately two-sided: `Unbound` (nothing in the workspace claims the
+/// name) and `CargoBoundary` (the name is a declared dependency, whose published
+/// surface is exactly what an authored summary models) both prove the external
+/// callee, while a workspace declaration or an unresolved workspace boundary
+/// does not.
+///
+/// [#3484]: https://github.com/CodeGraph-ai/bifrost/issues/3484
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rust_import_binder_external_callee(
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    file: &ProjectFile,
+    source: &str,
+    tree: &Tree,
+    import: &crate::analyzer::ImportInfo,
+    member: &str,
+    parameter_count: u32,
+) -> Option<(ExactExternalCallProof, ResolverOwnedExternalCalleeIdentity)> {
+    let path = import.path.as_ref()?;
+    let (root_name, owner_segments) = path.segments.split_first()?;
+    if owner_segments.is_empty() || matches!(root_name.as_str(), "crate" | "self" | "super") {
+        return None;
+    }
+    let rust = resolve_analyzer::<RustAnalyzer>(analyzer)?;
+    let session = ResolutionSession::bounded(ReceiverAnalysisBudget::default(), None);
+    let support = AnalyzerRustDefinitionProvider::bounded(rust, &session);
+    // The scope question belongs to the `use`, not to the call that reads the
+    // binder: the import resolved its leading segment where it was written. One
+    // byte of the declaration is enough to select that module body, and the
+    // rest of the availability question reads the file's declarations, its
+    // import binders and the Cargo routes rather than this offset.
+    let focus_end_byte = path.declaration_start_byte.saturating_add(1);
+    let site = ResolvedReferenceSite {
+        path: root_name.clone(),
+        text: root_name.clone(),
+        range: Range {
+            start_byte: path.declaration_start_byte,
+            end_byte: focus_end_byte,
+            start_line: 0,
+            end_line: 0,
+        },
+        focus_start_byte: path.declaration_start_byte,
+        focus_end_byte,
+    };
+    let availability = rust_owner_root_availability(
+        analyzer,
+        token,
+        rust,
+        &support,
+        file,
+        source,
+        &site,
+        tree.root_node(),
+        root_name,
+    );
+    match availability {
+        RustOwnerRootAvailability::Unbound | RustOwnerRootAvailability::CargoBoundary => {}
+        RustOwnerRootAvailability::Indexed | RustOwnerRootAvailability::Boundary => return None,
+    }
+    // A binder proves the path it binds, not that the path reaches a callable:
+    // the same declaration proof the written-out route asks for is what turns
+    // the binder's owner into the callable's identity. An import of a path the
+    // activated model does not publish -- or publishes without this member or
+    // with conflicting declarations -- therefore stays open, exactly as it does
+    // for an unindexed workspace root.
+    if !rust_external_callable_declaration(analyzer, &path.segments, member, parameter_count) {
+        return None;
+    }
+    // The binder names the owner, and the call's written arity is the
+    // applicability fact, so the proof and the identity are two spellings of
+    // the one callable the activated model just proved: the text keeps Rust's
+    // own separator for the boundary, while the identity is the dot-joined
+    // owner/member pair summaries are indexed under.
+    let proof = ExactExternalCallProof::rust_external_call(
+        format!("{}::{member}", path.render_segments("::")),
+        parameter_count,
+    );
+    let identity =
+        ResolverOwnedExternalCalleeIdentity::new(Language::Rust, path.render_segments("."), member);
+    // The availability answer is only evidence while the resolver finished:
+    // an exhausted session turns every later helper into a no-op, so a root it
+    // never got to ask about must not read as unclaimed.
+    match session.finish((proof, identity)) {
+        BoundedResolution::Complete { value, .. } => Some(value),
+        _ => None,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1311,7 +1648,12 @@ fn resolve_rust_unscoped(
                         format!(
                             "`{reference}` is explicitly imported across a Rust crate/module boundary that is not indexed"
                         ),
-                        UnindexedClaim::external_boundary(reference, ClaimSubjectRole::Any),
+                        rust_explicit_import_boundary_claim(
+                            source,
+                            site.focus_start_byte,
+                            reference,
+                        )
+                        .expect("an explicit import boundary has a visible binding"),
                     );
                 }
                 RustVisibleImportResolution::GlobBoundButUnindexed => {
@@ -1523,6 +1865,42 @@ enum RustBareReferenceRole {
     Callable,
     Owner,
     Macro,
+}
+
+// A boundary concerns the import's path, not every declaration sharing its
+// local binding name. Keep parser-derived import segments in the claim (#3498).
+fn rust_explicit_import_boundary_claim(
+    source: &str,
+    reference_byte: usize,
+    reference: &str,
+) -> Option<UnindexedClaim> {
+    for binder in lexical_scope::visible_import_binders_at(source, reference_byte) {
+        let Some(binding) = binder.bindings.get(reference) else {
+            continue;
+        };
+        if !matches!(binding.kind, ImportKind::Named | ImportKind::Namespace) {
+            continue;
+        }
+        let mut segments = crate::analyzer::symbol_lookup::parse_symbol_path(
+            Language::Rust,
+            &binding.module_specifier,
+        );
+        if binding.kind == ImportKind::Named {
+            segments.push(
+                binding
+                    .imported_name
+                    .as_deref()
+                    .unwrap_or(reference)
+                    .to_string(),
+            );
+        }
+        assert!(!segments.is_empty(), "an explicit Rust import has a path");
+        return Some(UnindexedClaim::external_boundary(
+            segments.join("."),
+            ClaimSubjectRole::Any,
+        ));
+    }
+    None
 }
 
 enum RustVisibleImportResolution {
@@ -2708,7 +3086,8 @@ fn rust_resolve_matcher_bare_name(
                 format!(
                     "`{reference}` is explicitly imported across a Rust crate/module boundary that is not indexed"
                 ),
-                UnindexedClaim::external_boundary(reference, ClaimSubjectRole::Any),
+                rust_explicit_import_boundary_claim(source, site.focus_start_byte, reference)
+                    .expect("an explicit import boundary has a visible binding"),
             );
         }
         RustVisibleImportResolution::GlobBoundButUnindexed => {
@@ -2841,6 +3220,47 @@ fn rust_visible_import_resolution(
             for (local_name, binding) in &binder.bindings {
                 if local_name != reference {
                     continue;
+                }
+                // Imports can select an enum member rather than a module
+                // export. Resolve that owner before treating the binding as
+                // an unindexed module route (#3498), for both grouped and
+                // direct imports, including aliases.
+                let path = crate::analyzer::symbol_lookup::parse_symbol_path(
+                    Language::Rust,
+                    &binding.module_specifier,
+                );
+                let owner_member = match binding.kind {
+                    ImportKind::Named => Some((
+                        path.as_slice(),
+                        binding.imported_name.as_deref().unwrap_or(reference),
+                    )),
+                    ImportKind::Namespace => path
+                        .split_last()
+                        .map(|(member, owner)| (owner, member.as_str())),
+                    _ => None,
+                };
+                if let Some((owner_path, imported)) = owner_member {
+                    for owner in rust_local_import_enum_owners(
+                        rust,
+                        support,
+                        file,
+                        source,
+                        scope_start,
+                        owner_path,
+                    ) {
+                        for member in support
+                            .members_for_owner_name(&owner.fq_name(), imported)
+                            .into_iter()
+                            .filter(|member| rust_declaration_is_enum_variant(rust, member))
+                        {
+                            let fqn = member.fq_name();
+                            expected_routes
+                                .entry(fqn.clone())
+                                .or_default()
+                                .push(owner.source().clone());
+                            expected_fqns.insert(fqn);
+                        }
+                    }
                 }
                 // Scope-aware fqn for `self`/`super` specifiers: Named
                 // bindings (`use super::{X}`) resolve the package and append
@@ -3184,7 +3604,11 @@ fn rust_glob_import_exposes_candidate(
         .values()
         .filter(|binding| binding.kind == ImportKind::Glob)
         .any(|binding| {
-            if rust_local_glob_enum_owners(rust, support, file, &binding.module_specifier)
+            let owner_path = crate::analyzer::symbol_lookup::parse_symbol_path(
+                Language::Rust,
+                &binding.module_specifier,
+            );
+            if rust_local_import_enum_owners(rust, support, file, source, scope_start, &owner_path)
                 .iter()
                 .any(|local_owner| local_owner == &owner)
             {
@@ -3248,7 +3672,8 @@ fn rust_scoped_glob_forward_import_candidates(
         if let [owner_name] = segments.as_slice()
             && !matches!(owner_name.as_str(), "self" | "super")
         {
-            let local_owners = rust_local_glob_enum_owners(rust, support, file, owner_name);
+            let local_owners =
+                rust_local_import_enum_owners(rust, support, file, source, scope_start, &segments);
             if !local_owners.is_empty() {
                 saw_scoped_glob = true;
             }
@@ -3334,22 +3759,21 @@ fn rust_scoped_glob_forward_import_candidates(
     })
 }
 
-fn rust_local_glob_enum_owners(
+fn rust_local_import_enum_owners(
     rust: &RustAnalyzer,
     support: &dyn RustDefinitionProvider,
     file: &ProjectFile,
-    module_specifier: &str,
+    source: &str,
+    scope_start: usize,
+    owner_path: &[String],
 ) -> Vec<CodeUnit> {
-    let segments =
-        crate::analyzer::symbol_lookup::parse_symbol_path(Language::Rust, module_specifier);
-    let [owner_name] = segments.as_slice() else {
+    let [owner_name] = owner_path else {
         return Vec::new();
     };
-    // A bare owner in `use Enum::*` is relative to the physical module. The
-    // general path resolver can represent that owner at a crate root, but in a
-    // child file it does not prepend the file's package. Rebuild that one exact
-    // module-local identity and retain only the indexed enum declaration.
-    let package = rust_package_name(file);
+    // A bare enum import owner is relative to the import's lexical module.
+    // Module-file routes do not represent enums. Use the structured package
+    // and owner to retain only that module's indexed enum declaration.
+    let package = lexical_scope::lexical_package_at(&rust_package_name(file), source, scope_start);
     let expected_fqn = if package.is_empty() {
         owner_name.clone()
     } else {
@@ -4837,9 +5261,14 @@ fn rust_focused_terminal_scoped_declaration_outcome(
                     "Rust owner `{owner}` is explicitly imported across a crate/module boundary that is not indexed"
                 )
             };
+            // gated upstream: owner availability and Cargo-route filtering
+            // above exhausted the indexed routes for this scoped owner.
             return Some(boundary_unchecked(
                 message,
-                UnindexedClaim::external_boundary(owner, ClaimSubjectRole::Any),
+                rust_explicit_import_boundary_claim(source, site.focus_start_byte, owner_root_name)
+                    .unwrap_or_else(|| {
+                        UnindexedClaim::external_boundary(owner, ClaimSubjectRole::Any)
+                    }),
             ));
         }
     }
@@ -8216,7 +8645,7 @@ fn rust_structured_path_components(
                 components.push(text.to_string());
             }
             "scoped_type_identifier" | "scoped_identifier" => {
-                let path = current.child_by_field_name("path")?;
+                let path = current.child_by_field_name("path");
                 if !support.scope_step() {
                     return None;
                 }
@@ -8225,7 +8654,16 @@ fn rust_structured_path_components(
                     return None;
                 }
                 pending.push(name);
-                pending.push(path);
+                match path {
+                    Some(path) => pending.push(path),
+                    // A leading `::` path writes its leftmost segment with no
+                    // `path` field: the `::` token is the node's first child
+                    // and the segment is the whole node ([`rust_path_segments`]
+                    // reads it the same way). Its root is the extern prelude,
+                    // so there is no further segment to push.
+                    None if current.child(0).is_some_and(|child| child.kind() == "::") => {}
+                    None => return None,
+                }
             }
             "generic_type" | "generic_function" => {
                 let base = current

@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 use tree_sitter::{Node, Parser};
 
 const DEFAULT_SECRET_MAX_FINDINGS: i32 = 100;
@@ -20,6 +20,35 @@ const DEFAULT_SECRET_MAX_COMMITS: i32 = 2000;
 const MAX_BLOB_BYTES: usize = 1024 * 1024;
 const MAX_SECRET_SAMPLE_VALUE_CHARS: usize = 12;
 const MAX_EXCERPT_CHARS: usize = 120;
+
+// Only immutable, fully evaluated text scans enter this cache. Syntax-error
+// diagnostics are part of that value and remain incomplete in every report.
+// Never retain blob lookup failures: a missing object may arrive later.
+type TextScanCacheKey = (Oid, Option<tree_sitter::Language>, bool);
+static TEXT_SCAN_CACHE: LazyLock<moka::sync::Cache<TextScanCacheKey, Arc<TextScanResult>>> =
+    LazyLock::new(|| {
+        moka::sync::Cache::builder()
+            .max_capacity(32 * 1024 * 1024)
+            .weigher(|_: &TextScanCacheKey, result: &Arc<TextScanResult>| {
+                let bytes = 256
+                    + result.keys.capacity() * std::mem::size_of::<SecretKey>()
+                    + result
+                        .keys
+                        .iter()
+                        .map(|key| {
+                            key.path.capacity() + key.rule.capacity() + key.sample.capacity()
+                        })
+                        .sum::<usize>()
+                    + result.diagnostics.capacity() * std::mem::size_of::<SecretScanDiagnostic>()
+                    + result
+                        .diagnostics
+                        .iter()
+                        .map(|diagnostic| diagnostic.path.capacity())
+                        .sum::<usize>();
+                u32::try_from(bytes).unwrap_or(u32::MAX)
+            })
+            .build()
+    });
 
 static PLACEHOLDER_VALUES: &[&str] = &[
     "changeme",
@@ -446,7 +475,8 @@ fn scan_history(
     include_low_confidence: bool,
 ) -> HistoryScanAccumulator {
     let mut accumulator = HistoryScanAccumulator::default();
-    let mut blob_scan_cache: HashMap<Oid, BlobScanResult> = HashMap::new();
+    let mut blob_scan_cache: HashMap<(Oid, Option<tree_sitter::Language>), BlobScanResult> =
+        HashMap::new();
     let mut walker = match ctx.repo.revwalk() {
         Ok(walker) => walker,
         Err(_) => return accumulator,
@@ -494,14 +524,15 @@ fn scan_history(
                 return TreeWalkResult::Ok;
             }
             let oid = entry.id();
-            let rebased = if let Some(cached) = blob_scan_cache.get(&oid) {
+            let cache_key = (oid, assignment_grammar(&project_path));
+            let rebased = if let Some(cached) = blob_scan_cache.get(&cache_key) {
                 rebase_path(&cached.keys, &project_path)
             } else {
                 let scanned =
                     scan_blob_content(&ctx.repo, oid, &project_path, include_low_confidence);
                 let rebased = scanned.keys.clone();
                 blob_scan_cache.insert(
-                    oid,
+                    cache_key.clone(),
                     BlobScanResult {
                         keys: rebase_path(&scanned.keys, "__cache__"),
                         diagnostics: scanned.diagnostics.clone(),
@@ -519,7 +550,7 @@ fn scan_history(
                     .or_default()
                     .extend(rebased);
             }
-            let stats = blob_scan_cache.get(&oid).expect("blob cache entry");
+            let stats = blob_scan_cache.get(&cache_key).expect("blob cache entry");
             accumulator.blobs_scanned += stats.blobs_scanned;
             accumulator.missing_entries_skipped += stats.missing_entries_skipped;
             accumulator.non_text_entries_skipped += stats.non_text_entries_skipped;
@@ -578,10 +609,20 @@ fn scan_blob_content(
             non_text_entries_skipped: 1,
         };
     }
-    let scanned = scan_text_detailed(path, text, include_low_confidence);
+    let cache_key = (oid, assignment_grammar(path), include_low_confidence);
+    let scanned = TEXT_SCAN_CACHE.get_with(cache_key, || {
+        Arc::new(scan_text_detailed(path, text, include_low_confidence))
+    });
     BlobScanResult {
-        keys: scanned.keys,
-        diagnostics: scanned.diagnostics,
+        keys: rebase_path(&scanned.keys, path),
+        diagnostics: scanned
+            .diagnostics
+            .iter()
+            .map(|diagnostic| SecretScanDiagnostic {
+                path: path.to_string(),
+                kind: diagnostic.kind,
+            })
+            .collect(),
         blobs_scanned: 1,
         missing_entries_skipped: 0,
         non_text_entries_skipped: 0,
@@ -636,18 +677,10 @@ fn scan_text_detailed(path: &str, text: &str, include_low_confidence: bool) -> T
     result
 }
 
-fn add_structural_assignment_findings(
-    result: &mut TextScanResult,
-    path: &str,
-    text: &str,
-    include_low_confidence: bool,
-) {
-    if !has_credential_keyword(&text.to_lowercase()) {
-        return;
-    }
+fn assignment_grammar(path: &str) -> Option<tree_sitter::Language> {
     let path_obj = Path::new(path);
     let language = language_for_path(path);
-    let grammar = parser_language_for_path(language, path_obj).or_else(|| {
+    parser_language_for_path(language, path_obj).or_else(|| {
         match path_obj
             .extension()
             .and_then(|extension| extension.to_str())
@@ -660,7 +693,19 @@ fn add_structural_assignment_findings(
             "properties" => Some(tree_sitter_properties::LANGUAGE.into()),
             _ => None,
         }
-    });
+    })
+}
+
+fn add_structural_assignment_findings(
+    result: &mut TextScanResult,
+    path: &str,
+    text: &str,
+    include_low_confidence: bool,
+) {
+    if !has_credential_keyword(&text.to_lowercase()) {
+        return;
+    }
+    let grammar = assignment_grammar(path);
     let Some(grammar) = grammar else {
         result.diagnostics.push(SecretScanDiagnostic {
             path: path.to_string(),
@@ -1555,11 +1600,52 @@ token: "abcd123"
     }
 
     #[test]
+    fn blob_cache_preserves_grammar_confidence_and_content_identity() {
+        let (_temp, repo) = init_repo();
+        let text = "client_secret=qQ9xV7pL2mN8rT4sZ6wY";
+        let oid = repo.blob(text.as_bytes()).unwrap();
+        for path in [
+            "first.unknown",
+            "second.properties",
+            "third.unknown",
+            "fourth.properties",
+        ] {
+            let cached = scan_blob_content(&repo, oid, path, false);
+            let reference = scan_text_detailed(path, text, false);
+            assert_eq!(cached.keys, reference.keys, "{path}");
+            assert_eq!(cached.diagnostics, reference.diagnostics, "{path}");
+            if path.ends_with(".properties") {
+                assert_eq!(cached.keys.len(), 1);
+                assert!(cached.diagnostics.is_empty());
+            } else {
+                assert!(cached.keys.is_empty());
+                assert_eq!(
+                    cached.diagnostics[0].kind,
+                    SecretScanDiagnosticKind::UnsupportedAssignmentSyntax
+                );
+            }
+        }
+        let short = "client_secret=qQ9xV7";
+        let short_oid = repo.blob(short.as_bytes()).unwrap();
+        for low in [false, true, false] {
+            let cached = scan_blob_content(&repo, short_oid, "short.properties", low);
+            assert_eq!(cached.keys.len(), usize::from(low));
+        }
+        let changed = repo.blob(b"client_secret=placeholder").unwrap();
+        assert!(
+            scan_blob_content(&repo, changed, "second.properties", false)
+                .keys
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn tool_reports_cached_duplicate_blob_at_each_path() {
         let (temp, repo) = init_repo();
         let text = "client_secret: qQ9xV7pL2mN8rT4sZ6wY";
         write_file(temp.path(), "src/main/resources/first.yml", text);
         write_file(temp.path(), "src/main/resources/second.yml", text);
+        write_file(temp.path(), "src/main/resources/third.unknown", text);
         commit_all(&repo, "add duplicate blob secrets");
         let analyzer = build_analyzer(temp.path());
 
@@ -1568,11 +1654,24 @@ token: "abcd123"
             ReportSecretLikeCodeParams {
                 max_findings: 20,
                 max_commits: 5,
-                include_history_only: false,
+                include_history_only: true,
                 include_low_confidence: false,
             },
         );
 
+        assert!(
+            result
+                .findings
+                .iter()
+                .all(|finding| !finding.path.ends_with("third.unknown"))
+        );
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.path.ends_with("third.unknown")
+                    && diagnostic.kind == SecretScanDiagnosticKind::UnsupportedAssignmentSyntax)
+        );
         assert!(
             result.report.contains("src/main/resources/first.yml"),
             "{}",

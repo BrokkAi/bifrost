@@ -1,8 +1,11 @@
 {
   "schema_version": 2,
   "pack_id": "bifrost.web-network-ruby",
-  "version": "1.0.0",
-  "producer": { "name": "bifrost-reviewed-web-models", "version": "1.0.0" },
+  "version": "1.0.1",
+  "producer": {
+    "name": "bifrost-reviewed-web-models",
+    "version": "1.0.0"
+  },
   "language": "ruby",
   "ecosystem": "rubygems",
   "compatibility": {
@@ -10,16 +13,24 @@
     "toolchains": []
   },
   "provenance": {
-    "source": "Ruby standard library net/http, Net::HTTP.get",
+    "source": "Ruby standard library net/http, Net::HTTP.new, Net::HTTP.get and Net::HTTP#request",
     "revision": "ruby-3.4"
   },
   "license": "Apache-2.0",
   "completeness": "complete",
-  "safety": { "generated_code_only": false, "review_required": false },
+  "safety": {
+    "generated_code_only": false,
+    "review_required": false
+  },
   "shards": [
     {
       "id": "declarations.web-network.ruby",
-      "activation": [{ "targets": [], "configurations": [] }],
+      "activation": [
+        {
+          "targets": [],
+          "configurations": []
+        }
+      ],
       "payload": {
         "kind": "declaration_facts",
         "types": [
@@ -49,6 +60,151 @@
               "kind": "artifact",
               "path": "net/http.rb",
               "symbol": "Net::HTTP.get"
+            },
+            "signature": {
+              "parameters": [
+                {
+                  "name": "uri_or_host",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                },
+                {
+                  "name": "path_or_headers",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  },
+                  "optional": true
+                },
+                {
+                  "name": "port",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  },
+                  "optional": true
+                }
+              ]
+            }
+          },
+          {
+            "id": "member.web-network.ruby.net-http.new",
+            "owner": "type.dc6816ffe6122e40456287755fd06087d7cf7dc2d78339a08fbb118ce07e5e58",
+            "name": "new",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "aliases": [],
+            "signature": {
+              "parameters": [
+                {
+                  "name": "host",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                },
+                {
+                  "name": "port",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  },
+                  "optional": true
+                },
+                {
+                  "name": "proxy_address",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  },
+                  "optional": true
+                },
+                {
+                  "name": "proxy_port",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  },
+                  "optional": true
+                },
+                {
+                  "name": "proxy_user",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  },
+                  "optional": true
+                },
+                {
+                  "name": "proxy_password",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  },
+                  "optional": true
+                },
+                {
+                  "name": "proxy_no_proxy",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  },
+                  "optional": true
+                },
+                {
+                  "name": "proxy_use_ssl",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  },
+                  "optional": true
+                }
+              ],
+              "returns": {
+                "kind": "declared",
+                "id": "type.dc6816ffe6122e40456287755fd06087d7cf7dc2d78339a08fbb118ce07e5e58"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "net/http.rb",
+              "symbol": "Net::HTTP.new"
+            }
+          },
+          {
+            "id": "member.web-network.ruby.net-http.request",
+            "owner": "type.dc6816ffe6122e40456287755fd06087d7cf7dc2d78339a08fbb118ce07e5e58",
+            "name": "request",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "aliases": [],
+            "signature": {
+              "parameters": [
+                {
+                  "name": "req",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                },
+                {
+                  "name": "body",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  },
+                  "optional": true
+                }
+              ]
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "net/http.rb",
+              "symbol": "Net::HTTP.request"
             }
           }
         ],
@@ -57,7 +213,12 @@
     },
     {
       "id": "summaries.web-network.ruby",
-      "activation": [{ "targets": [], "configurations": [] }],
+      "activation": [
+        {
+          "targets": [],
+          "configurations": []
+        }
+      ],
       "payload": {
         "kind": "procedure_summaries",
         "summaries": [
@@ -75,8 +236,84 @@
             "transfers": [],
             "effects": [],
             "declared_effects": [
-              { "id": "bifrost.network_io", "timing": "immediate", "certainty": "definite" }
+              {
+                "id": "bifrost.network_io",
+                "timing": "immediate",
+                "certainty": "definite"
+              }
             ]
+          },
+          {
+            "id": "summary.web-network.ruby.net-http-request",
+            "target": {
+              "path": "net/http.rb",
+              "symbol": "Net::HTTP.request",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "covers_overrides": true,
+            "locations": [],
+            "transfers": [],
+            "effects": [],
+            "declared_effects": [
+              {
+                "id": "bifrost.network_io",
+                "timing": "immediate",
+                "certainty": "definite"
+              }
+            ]
+          },
+          {
+            "id": "summary.web-network.ruby.net-http-request-with-body",
+            "target": {
+              "path": "net/http.rb",
+              "symbol": "Net::HTTP.request(req, body)",
+              "has_receiver": true,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "covers_overrides": true,
+            "locations": [],
+            "transfers": [],
+            "effects": [],
+            "declared_effects": [
+              {
+                "id": "bifrost.network_io",
+                "timing": "immediate",
+                "certainty": "definite"
+              }
+            ]
+          },
+          {
+            "id": "summary.web-network.ruby.net-http-new-1",
+            "target": {
+              "path": "net/http.rb",
+              "symbol": "Net::HTTP.new(host)",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "covers_overrides": true,
+            "locations": [],
+            "transfers": [],
+            "effects": [],
+            "declared_effects": []
+          },
+          {
+            "id": "summary.web-network.ruby.net-http-new-2",
+            "target": {
+              "path": "net/http.rb",
+              "symbol": "Net::HTTP.new(host, port)",
+              "has_receiver": true,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "covers_overrides": true,
+            "locations": [],
+            "transfers": [],
+            "effects": [],
+            "declared_effects": []
           }
         ]
       }

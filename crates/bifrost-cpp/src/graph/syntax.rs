@@ -4,7 +4,7 @@ use crate::graph::resolver::{
     is_nested_type_node, qualified_owner_components,
 };
 use brokk_bifrost_core::analyzer::tree_walk::push_named_children_reversed;
-use std::ops::Range;
+use std::ops::{ControlFlow, Range};
 use tree_sitter::{Node, Parser};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -640,16 +640,21 @@ fn append_qualified_components<'tree>(node: Node<'tree>, out: &mut Vec<Node<'tre
 /// comment and read the rest of the directive as surrounding C/C++ code.
 /// Replacement analysis still reads the original source and reparses the full
 /// logical span; included ranges preserve every original byte coordinate.
-pub fn function_macro_included_ranges(source: &str) -> Option<Vec<tree_sitter::Range>> {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_cpp::LANGUAGE.into())
-        .ok()?;
-    let tree = parser.parse(source, None)?;
+/// `tree` must be the unmasked C++ grammar tree for these exact source bytes.
+/// A caller can retain that tree only after complete discovery returns `None`.
+/// Interrupted discovery never offers a partial set of included ranges.
+pub fn function_macro_included_ranges(
+    source: &str,
+    tree: &tree_sitter::Tree,
+    mut should_stop: impl FnMut() -> bool,
+) -> ControlFlow<(), Option<Vec<tree_sitter::Range>>> {
     let mut replacements = Vec::new();
     let mut comments = Vec::new();
     let mut stack = vec![tree.root_node()];
     while let Some(node) = stack.pop() {
+        if should_stop() {
+            return ControlFlow::Break(());
+        }
         if let Some(span) = function_macro_replacement_span(node, source) {
             replacements.push(span);
         }
@@ -658,19 +663,39 @@ pub fn function_macro_included_ranges(source: &str) -> Option<Vec<tree_sitter::R
         }
         push_named_children_reversed(node, &mut stack);
     }
-    comments.retain(|comment| {
-        replacements
-            .iter()
-            .any(|span| span.start <= comment.start_byte && span.end >= comment.end_byte)
-    });
+    let mut masked_comments = Vec::new();
+    for comment in comments {
+        if should_stop() {
+            return ControlFlow::Break(());
+        }
+        for span in &replacements {
+            if should_stop() {
+                return ControlFlow::Break(());
+            }
+            if span.start <= comment.start_byte && span.end >= comment.end_byte {
+                masked_comments.push(comment);
+                break;
+            }
+        }
+    }
+    let mut comments = masked_comments;
     if comments.is_empty() {
-        return None;
+        return ControlFlow::Continue(None);
+    }
+    if should_stop() {
+        return ControlFlow::Break(());
     }
     comments.sort_by_key(|range| range.start_byte);
+    if should_stop() {
+        return ControlFlow::Break(());
+    }
     let mut included = Vec::new();
     let mut start_byte = 0;
     let mut start_point = tree_sitter::Point::new(0, 0);
     for comment in comments {
+        if should_stop() {
+            return ControlFlow::Break(());
+        }
         if start_byte < comment.start_byte {
             included.push(tree_sitter::Range {
                 start_byte,
@@ -690,7 +715,7 @@ pub fn function_macro_included_ranges(source: &str) -> Option<Vec<tree_sitter::R
             end_point: tree.root_node().end_position(),
         });
     }
-    Some(included)
+    ControlFlow::Continue(Some(included))
 }
 
 #[cfg(test)]
@@ -698,7 +723,15 @@ mod tests {
     #[test]
     fn issue_3089_macro_comments_do_not_consume_caller_function() {
         let source = "#define PROCESS(handle, block) \\\ndo { /* comment */ \\\n  int event; \\\n  if (handle) block \\\n} while (0)\nstatic void caller(int handle) { PROCESS(handle, { event; }); }\n";
-        let ranges = super::function_macro_included_ranges(source).expect("macro comments");
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_cpp::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let ranges = super::function_macro_included_ranges(source, &tree, || false)
+            .continue_value()
+            .expect("complete discovery")
+            .expect("macro comments");
         let mut parser = tree_sitter::Parser::new();
         parser
             .set_language(&tree_sitter_cpp::LANGUAGE.into())
@@ -727,6 +760,92 @@ mod tests {
         );
     }
     use super::*;
+
+    fn cpp_tree(source: &str) -> tree_sitter::Tree {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_cpp::LANGUAGE.into())
+            .expect("C++ grammar");
+        parser.parse(source, None).expect("C++ fixture tree")
+    }
+
+    #[test]
+    fn function_macro_included_ranges_masks_only_replacement_comments() {
+        let source = "#define PROCESS(handle, block) \\\ndo { /* comment */ \\\n  int event; \\\n  if (handle) block \\\n} while (0)\nstatic void caller(int handle) { PROCESS(handle, { event; }); }\n";
+        let tree = cpp_tree(source);
+        let ranges = function_macro_included_ranges(source, &tree, || false)
+            .continue_value()
+            .expect("complete discovery")
+            .expect("macro comments");
+        let included = ranges
+            .iter()
+            .map(|range| &source[range.start_byte..range.end_byte])
+            .collect::<String>();
+
+        assert_eq!(included, source.replace("/* comment */", ""));
+        assert!(
+            ranges.iter().all(|range| {
+                !source[range.start_byte..range.end_byte].contains("/* comment */")
+            })
+        );
+    }
+
+    #[test]
+    fn function_macro_included_ranges_ignores_nearby_non_replacement_comment() {
+        let source = "// outside the replacement\n#define PROCESS(handle, block) \\\ndo { handle; \\\n  block \\\n} while (0)\n";
+        let tree = cpp_tree(source);
+
+        assert_eq!(
+            function_macro_included_ranges(source, &tree, || false),
+            ControlFlow::Continue(None)
+        );
+    }
+
+    #[test]
+    fn function_macro_range_discovery_never_publishes_interrupted_work() {
+        let source =
+            "#define APPLY(x) do { /* first */ x; } while (0)\nint caller() { return 1; }\n";
+        let tree = cpp_tree(source);
+        let mut visits = 0;
+        let result = function_macro_included_ranges(source, &tree, || {
+            visits += 1;
+            visits == 3
+        });
+        assert_eq!(visits, 3);
+        assert_eq!(result, ControlFlow::Break(()));
+        assert!(matches!(
+            function_macro_included_ranges(source, &tree, || false),
+            ControlFlow::Continue(Some(_))
+        ));
+    }
+
+    #[test]
+    fn function_macro_included_ranges_preserves_source_coordinates() {
+        let source = "#define PROCESS(handle, block) \\\ndo { /* first */ \\\n  int event; /* second */ \\\n  if (handle) block \\\n} while (0)\nstatic void caller(int handle) { PROCESS(handle, { event; }); }\n";
+        let tree = cpp_tree(source);
+        let ranges = function_macro_included_ranges(source, &tree, || false)
+            .continue_value()
+            .expect("complete discovery")
+            .expect("macro comments");
+        let first = source.find("/* first */").expect("first comment");
+        let second = source.find("/* second */").expect("second comment");
+        let first_end = first + "/* first */".len();
+        let second_end = second + "/* second */".len();
+
+        assert_eq!(ranges.len(), 3);
+        assert_eq!(ranges[0].start_byte, 0);
+        assert_eq!(ranges[0].end_byte, first);
+        assert_eq!(ranges[0].start_point, tree_sitter::Point::new(0, 0));
+        assert_eq!(ranges[0].end_point, tree_sitter::Point::new(1, 5));
+        assert_eq!(ranges[1].start_byte, first_end);
+        assert_eq!(ranges[1].end_byte, second);
+        assert_eq!(ranges[1].start_point, tree_sitter::Point::new(1, 16));
+        assert_eq!(ranges[1].end_point, tree_sitter::Point::new(2, 13));
+        assert_eq!(ranges[2].start_byte, second_end);
+        assert_eq!(ranges[2].end_byte, source.len());
+        assert_eq!(ranges[2].start_point, tree_sitter::Point::new(2, 25));
+        assert_eq!(ranges[2].end_point, tree.root_node().end_position());
+    }
 
     fn references(source: &str) -> Vec<MacroReplacementTypeReference> {
         let mut parser = Parser::new();

@@ -59,7 +59,11 @@ use brokk_bifrost_jvm::kotlin::value_classes::{
 /// Bumped for #2851: `@JvmInline` value-class construction, underlying
 /// projection, and JVM carrier boxing/unboxing now publish identity-separating
 /// transfers instead of ordinary local flow and a wrapper allocation.
-const ADAPTER_VERSION: &[u8] = b"kotlin-value-semantics-v6";
+///
+/// Bumped for #3664: a capture slot whose enclosing procedure publishes no
+/// binding now carries a typed `Captures` gap instead of failing the
+/// capture-contract validator.
+const ADAPTER_VERSION: &[u8] = b"kotlin-value-semantics-v7";
 
 impl_program_semantics_provider!(KotlinAnalyzer, KotlinSemanticLowerer);
 
@@ -177,21 +181,33 @@ impl ProgramSemanticsLowerer for KotlinSemanticLowerer {
             });
         };
 
+        // A nested callable's capture slot only has a lexical-parent binding
+        // when that parent publishes one while lowering its own closure
+        // creation. Kotlin lowers a local `fun` as a direct call and never
+        // creates a closure value for it, so such a target keeps its slot but
+        // reports a typed capture gap (#3664). Parents lower before children,
+        // so bindings published so far cover every target the child expects.
+        let mut bound_capture_targets = HashSet::default();
         lower_procedure_batch(
             &specs,
             initial_work,
             budget,
             cancellation,
             |spec, staged_budget, cancellation| {
-                lower_procedure(
+                let capture_binding_expected = bound_capture_targets.contains(&spec.id);
+                let lowered = lower_procedure(
                     prepared,
                     spec,
                     &procedure_targets,
                     &constructible_types,
                     &value_classes,
+                    capture_binding_expected,
                     staged_budget,
                     cancellation,
-                )
+                )?;
+                bound_capture_targets
+                    .extend(lowered.0.captures.iter().map(|capture| capture.target));
+                Ok(lowered)
             },
         )
     }

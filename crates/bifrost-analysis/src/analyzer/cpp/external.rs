@@ -12,14 +12,15 @@ use crate::analyzer::semantic_model::{
     DependencyPackDiagnostic, DependencyPackDiagnosticSeverity, DependencyPackLimits,
     DependencyPackProduction, ExactDependencyArtifact, ExplicitValueOperation,
     ExternalArtifactKind, HierarchyFact, HierarchyKind, ImplicitOperation, Locator, MemberFact,
-    MemberIdentity, MemberKind, NameSelector, Parameter, Producer, Provenance, ReceiverFact,
-    ResolvedDependency, ResolvedDependencyArtifact, Safety, SemanticModelActivationEvidence,
-    Signature, StructuredTypeExpression, TypeCopySemantics, TypeFact, TypeIdentity, TypeKind,
-    TypeMoveSemantics, TypeRef, TypeRefReferenceKind, TypeValueSemantics, Visibility,
-    WildcardVariance, member_declaration_id, type_declaration_id,
+    MemberIdentity, MemberKind, NameSelector, Parameter, ParameterPassingMode, Producer,
+    Provenance, ReceiverFact, ResolvedDependency, ResolvedDependencyArtifact, Safety,
+    SemanticModelActivationEvidence, Signature, StructuredTypeExpression, TypeCopySemantics,
+    TypeFact, TypeIdentity, TypeKind, TypeMoveSemantics, TypeRef, TypeRefReferenceKind,
+    TypeValueSemantics, Visibility, WildcardVariance, member_declaration_id, type_declaration_id,
 };
 use crate::analyzer::semantic_model::{
-    SemanticModelCompleteness, SemanticModelOriginKind, SemanticModelOverlay,
+    SemanticModelCallApplication, SemanticModelCallableDisposition, SemanticModelCallableKey,
+    SemanticModelCompleteness, SemanticModelOriginKind, SemanticModelOverlay, SemanticModelSymbol,
     SemanticModelSymbolKind,
 };
 use crate::analyzer::structural::BoundaryStatus;
@@ -444,6 +445,13 @@ fn is_basic_string_self_type(
 }
 
 /// Refine one C++ route with explicit include and activated-pack evidence.
+///
+/// A file-scope declaration never answers here. The name alone does not say
+/// which header's declaration a call binds, or whether a macro replaces it, so
+/// such a declaration is indexed for a call only through the resolver's exact
+/// header-function proof ([`reached_header_file_scope_function`]); a call the
+/// resolver did not bind stays declared-unindexed rather than reading as a
+/// resolved external target (#3535).
 pub(crate) fn external_boundary_evidence(
     analyzer: &CppAnalyzer,
     overlay: Option<&SemanticModelOverlay>,
@@ -462,8 +470,17 @@ pub(crate) fn external_boundary_evidence(
 
     let matches = overlay
         .into_iter()
-        .flat_map(|overlay| overlay.symbols_named(name).records)
-        .filter(|symbol| symbol.language == "cpp")
+        .flat_map(|overlay| {
+            overlay
+                .symbols_named(name)
+                .records
+                .into_iter()
+                .filter(|symbol| {
+                    symbol.language == "cpp"
+                        && !is_header_module(symbol)
+                        && !is_file_scope_declaration(overlay, symbol)
+                })
+        })
         .filter(|symbol| symbol_is_in_headers(symbol, resolved_headers))
         .collect::<Vec<_>>();
     match matches.as_slice() {
@@ -598,6 +615,7 @@ pub(crate) fn external_namespace_model_resolution(
             symbol.language == "cpp"
                 && symbol.owner_id.is_none()
                 && symbol.kind == SemanticModelSymbolKind::Module
+                && !is_header_module(symbol)
                 && symbol.qualified_name == qualified_name
                 && symbol_is_in_headers(symbol, headers)
                 && symbol.provenance.origin == SemanticModelOriginKind::ExactGeneratedOutput
@@ -635,6 +653,7 @@ pub(crate) fn external_member_resolution(
             .filter(|owner| {
                 owner.language == "cpp"
                     && owner.owner_id.is_none()
+                    && !is_header_module(owner)
                     && symbol_is_in_headers(owner, headers)
             })
         {
@@ -795,6 +814,164 @@ fn symbol_is_in_headers(
     })
 }
 
+/// The declaration id of the module a header's file-scope declarations are
+/// published under.
+///
+/// The id is keyed by the include root's dependency name, never by the
+/// `cpp-headers` ecosystem namespaces and classes are keyed under, so a header
+/// module can never share an id with a namespace of the same name, and one
+/// relative header path under two include roots is two modules.
+fn header_module_id(dependency_name: &str, header: &str) -> String {
+    type_declaration_id(TypeIdentity {
+        ecosystem: dependency_name,
+        name: header,
+    })
+}
+
+/// The module that owns every file-scope declaration of one header.
+///
+/// C and C++ declare a free function, a global object or a macro at file
+/// scope, where no namespace or class owns it. The header that declares it is
+/// the one structured owner such a declaration has, so the module is named by
+/// the header's module identity -- `sys/socket` for `<sys/socket.h>` -- which
+/// is also the owner a reviewed summary names through its target `path`
+/// (#2610). `None` when the include path has no module identity.
+fn header_module_fact(dependency_name: &str, header: &str) -> Option<TypeFact> {
+    let name = crate::analyzer::semantic::module_identity_owner(Path::new(header))?;
+    Some(TypeFact {
+        ambient_use: None,
+        id: header_module_id(dependency_name, header),
+        name: name.clone(),
+        type_kind: TypeKind::Module,
+        visibility: Visibility::Public,
+        is_abstract: false,
+        is_sealed: false,
+        has_explicit_type_terms: false,
+        type_parameters: Vec::new(),
+        type_parameter_constraints: Vec::new(),
+        underlying_type: None,
+        value_semantics: None,
+        embedded_types: Vec::new(),
+        hierarchy: Vec::new(),
+        aliases: Vec::new(),
+        extension_surfaces: Vec::new(),
+        guard: None,
+        locator: Locator::Artifact {
+            path: header.to_owned(),
+            symbol: name,
+        },
+    })
+}
+
+/// Whether `symbol` is the module of one header's file-scope declarations
+/// rather than a namespace or type a qualified name can spell.
+///
+/// The answer is structural: the record's id is the header-module id of the
+/// include root and header it was generated from.
+fn is_header_module(symbol: &SemanticModelSymbol) -> bool {
+    let (Some(package), Some(header)) = (
+        symbol
+            .provenance
+            .activation
+            .matched_evidence
+            .package
+            .as_ref(),
+        symbol.locator_path.as_deref(),
+    ) else {
+        return false;
+    };
+    symbol.kind == SemanticModelSymbolKind::Module
+        && symbol.owner_id.is_none()
+        && symbol.id == header_module_id(&package.name, header)
+}
+
+/// Whether `symbol` is a file-scope declaration: a member of one header's
+/// module.
+fn is_file_scope_declaration(overlay: &SemanticModelOverlay, symbol: &SemanticModelSymbol) -> bool {
+    symbol.owner_id.as_deref().is_some_and(|owner_id| {
+        overlay
+            .symbols_with_id(owner_id)
+            .records
+            .iter()
+            .any(|owner| is_header_module(owner))
+    })
+}
+
+/// The one file-scope function a C call's reached headers declare under the
+/// called name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CHeaderFunction {
+    /// The activated declaration record the call binds.
+    pub(crate) symbol_id: String,
+    /// The declaring header's module identity, which owns the function.
+    pub(crate) header_module: String,
+}
+
+/// Resolve a bare C call that no workspace declaration answers to the one
+/// file-scope function its compile-database-scoped header closure declares.
+///
+/// The closure must be proven by the compile context, and the activated
+/// generated header pack must publish exactly one file-scope declaration of
+/// `name` across every reached header. A second one -- the same function
+/// declared by another header, a macro that replaces the call, a global
+/// object -- leaves the callee unproven, because the declaring header is part
+/// of the identity. That declaration must be a function whose one declared
+/// signature accepts the written arity. Nothing here reads the spelling beyond
+/// the name the call writes.
+pub(crate) fn reached_header_file_scope_function(
+    analyzer: &CppAnalyzer,
+    overlay: Option<&SemanticModelOverlay>,
+    file: &ProjectFile,
+    name: &str,
+    written_arity: u32,
+) -> Option<CHeaderFunction> {
+    let closure = directly_reached_external_headers(analyzer, file)?;
+    let headers = closure.headers()?;
+    let overlay = overlay?;
+    let declarations = overlay
+        .symbols_named(name)
+        .records
+        .into_iter()
+        .filter(|symbol| {
+            symbol.language == "cpp"
+                && symbol.name == name
+                && symbol_is_in_headers(symbol, headers)
+                && is_file_scope_declaration(overlay, symbol)
+        })
+        .collect::<Vec<_>>();
+    let [declaration] = declarations.as_slice() else {
+        return None;
+    };
+    if declaration.kind != SemanticModelSymbolKind::Function
+        || declaration.provenance.origin != SemanticModelOriginKind::ExactGeneratedOutput
+    {
+        return None;
+    }
+    let owner = overlay.symbols_with_id(declaration.owner_id.as_deref()?);
+    let [owner] = owner.records.as_slice() else {
+        return None;
+    };
+    // The owner and member travel as one `<module>::<name>` call-site spelling,
+    // so a header path that itself contains the C++ scope separator cannot be
+    // named.
+    if owner.qualified_name.contains("::") {
+        return None;
+    }
+    let callable = overlay.callable_for_application(
+        SemanticModelCallableKey::new("cpp", &owner.qualified_name, name, false, written_arity),
+        &SemanticModelCallApplication::positional(written_arity),
+    );
+    match (callable.disposition, callable.records.as_slice()) {
+        (SemanticModelCallableDisposition::Unique, [selected]) if selected.id == declaration.id => {
+            Some(CHeaderFunction {
+                symbol_id: declaration.id.clone(),
+                header_module: owner.qualified_name.clone(),
+            })
+        }
+        _ => None,
+    }
+}
+
 impl DependencyPackAdapter for CppDependencyPackAdapter {
     fn adapter_name(&self) -> &str {
         "bifrost-cpp-headers"
@@ -847,6 +1024,7 @@ impl DependencyPackAdapter for CppDependencyPackAdapter {
         let artifact = artifacts[0];
         let mut extracted_types = Vec::new();
         let mut extracted_members = Vec::new();
+        let mut syntax_complete_headers = crate::hash::HashSet::default();
         let mut partial = false;
         for entry in artifact.source_entries() {
             if cancellation.is_some_and(CancellationToken::is_cancelled) {
@@ -884,6 +1062,9 @@ impl DependencyPackAdapter for CppDependencyPackAdapter {
                 },
             );
             partial |= extracted.completeness == CppExternalDeclarationCompleteness::Partial;
+            if extracted.syntax_complete {
+                syntax_complete_headers.insert(PathBuf::from(entry.relative_path()));
+            }
             for diagnostic in extracted.diagnostics {
                 diagnostics.warning(
                     diagnostic.code,
@@ -1071,32 +1252,53 @@ impl DependencyPackAdapter for CppDependencyPackAdapter {
             .collect::<Vec<_>>();
 
         let mut members = Vec::new();
+        let mut header_modules = HashMap::<String, TypeFact>::default();
         let mut emitted_constructor_ids =
             HashMap::<(String, BasicStringConstructorRole), String>::default();
         for (record_index, record) in extracted_members.into_iter().enumerate() {
-            let Some(owner_name) = record.owner.as_ref().map(CppExternalOwner::name) else {
-                partial = true;
-                diagnostics.warning(
-                    "cpp.member_owner_unavailable",
-                    Some(stable_path(&record.source_path)),
-                    format!(
-                        "C++ declaration `{}` has no indexed type owner",
-                        record.qualified_name
-                    ),
-                );
-                continue;
-            };
-            let Some(owner_id) = type_ids.get(owner_name) else {
-                partial = true;
-                diagnostics.warning(
-                    "cpp.member_owner_missing",
-                    Some(stable_path(&record.source_path)),
-                    format!(
-                        "C++ member `{}` has no emitted owner",
-                        record.qualified_name
-                    ),
-                );
-                continue;
+            // A namespace or class owns every scoped declaration. A file-scope
+            // declaration -- a C function such as `connect`, a global object, a
+            // macro -- has no such owner, and the header that declares it is
+            // the one structured owner it has (#3535).
+            let (owner_name, owner_id) = match record.owner.as_ref() {
+                Some(owner) => {
+                    let Some(owner_id) = type_ids.get(owner.name()) else {
+                        partial = true;
+                        diagnostics.warning(
+                            "cpp.member_owner_missing",
+                            Some(stable_path(&record.source_path)),
+                            format!(
+                                "C++ member `{}` has no emitted owner",
+                                record.qualified_name
+                            ),
+                        );
+                        continue;
+                    };
+                    (Some(owner.name()), owner_id.clone())
+                }
+                None => {
+                    let header = stable_path(&record.source_path);
+                    let module = dependency
+                        .evidence
+                        .package
+                        .as_ref()
+                        .and_then(|package| header_module_fact(&package.name, &header));
+                    let Some(module) = module else {
+                        partial = true;
+                        diagnostics.warning(
+                            "cpp.member_owner_unavailable",
+                            Some(header),
+                            format!(
+                                "C++ declaration `{}` has no header module owner",
+                                record.qualified_name
+                            ),
+                        );
+                        continue;
+                    };
+                    let owner_id = module.id.clone();
+                    header_modules.entry(header).or_insert(module);
+                    (None, owner_id)
+                }
             };
             let parameters = record
                 .parameter_types
@@ -1124,22 +1326,25 @@ impl DependencyPackAdapter for CppDependencyPackAdapter {
                 .get(&record_index)
                 .copied();
             let assignment_role = unique_assignment_roles_by_index.get(&record_index).copied();
-            let is_basic_string_constructor = basic_string_type_parameters.contains_key(owner_name)
+            let is_basic_string_constructor = owner_name
+                .is_some_and(|owner| basic_string_type_parameters.contains_key(owner))
                 && record.name == "basic_string";
+            let file_scope = owner_name.is_none();
             let member_kind = match record.kind {
                 CppExternalMemberKind::Function
                     if record.is_constructor || is_basic_string_constructor =>
                 {
                     MemberKind::Constructor
                 }
+                CppExternalMemberKind::Function if file_scope => MemberKind::Function,
                 CppExternalMemberKind::Function => MemberKind::Method,
                 CppExternalMemberKind::Field => MemberKind::Field,
                 CppExternalMemberKind::Macro => MemberKind::Macro,
             };
             let id = member_declaration_id(MemberIdentity {
-                owner_id,
+                owner_id: &owner_id,
                 kind: member_kind,
-                is_static: false,
+                is_static: file_scope,
                 parameter_arity: parameter_types.len(),
                 name: &record.name,
                 generic_arity: 0,
@@ -1160,15 +1365,24 @@ impl DependencyPackAdapter for CppDependencyPackAdapter {
                                 index >= arity.required() && index < arity.total()
                             }),
                         variadic,
-                        passing_mode: Default::default(),
+                        // C and C++ bind every argument by position.
+                        passing_mode: ParameterPassingMode::PositionalOnly,
                     })
                     .collect(),
                 returns: return_type,
             });
+            // Every declaration of one name a header writes is extracted when
+            // the header parsed without recovery, so its file-scope family is
+            // whole even when conditional compilation leaves the pack partial:
+            // every branch is extracted, and a same-named macro is published
+            // beside the function, where it competes for the call.
+            let callable_family_complete = file_scope
+                && record.kind == CppExternalMemberKind::Function
+                && syntax_complete_headers.contains(&record.source_path);
             members.push(MemberFact {
                 ambient_use: None,
                 id: id.clone(),
-                owner: owner_id.clone(),
+                owner: owner_id,
                 name: record.name,
                 member_kind,
                 visibility: match record.visibility {
@@ -1176,16 +1390,16 @@ impl DependencyPackAdapter for CppDependencyPackAdapter {
                     CppExternalVisibility::Protected => Visibility::Protected,
                     CppExternalVisibility::Private => Visibility::Private,
                 },
-                is_static: false,
+                is_static: file_scope,
                 is_abstract: false,
                 is_virtual: false,
                 implicit_operation: constructor_role
                     .map(BasicStringConstructorRole::operation)
                     .or_else(|| assignment_role.map(BasicStringAssignmentRole::operation)),
                 explicit_operation: explicit_roles_by_index.get(&record_index).copied(),
-                callable_family_complete: false,
+                callable_family_complete,
                 signature,
-                receiver: Some(ReceiverFact { pointer: false }),
+                receiver: (!file_scope).then_some(ReceiverFact { pointer: false }),
                 extension_receiver: None,
                 extension_receiver_constraints: Vec::new(),
                 aliases: Vec::new(),
@@ -1196,11 +1410,16 @@ impl DependencyPackAdapter for CppDependencyPackAdapter {
                 },
             });
             if let Some(role) = constructor_role {
+                let owner_name =
+                    owner_name.expect("a basic_string constructor role requires its class owner");
                 emitted_constructor_ids.insert((owner_name.to_owned(), role), id.clone());
             }
         }
         members.sort_by(|left, right| left.id.cmp(&right.id));
         members.dedup_by(|left, right| left.id == right.id);
+        let mut header_modules = header_modules.into_values().collect::<Vec<_>>();
+        header_modules.sort_by(|left, right| left.id.cmp(&right.id));
+        types.extend(header_modules);
 
         for type_fact in &mut types {
             let Some(parameters) = basic_string_type_parameters.get(&type_fact.name) else {
@@ -1262,6 +1481,7 @@ impl DependencyPackAdapter for CppDependencyPackAdapter {
                 },
                 carried_sources: Vec::new(),
                 cpp_portability: None,
+                python_correspondence: None,
                 shards: vec![AuthoredShard {
                     id: "declarations.external".to_owned(),
                     activation: vec![ActivationSelector {
@@ -1831,6 +2051,7 @@ mod tests {
         OverlayProject, Project, TestProject, WorkspaceAnalyzer,
     };
     use brokk_bifrost_core::analyzer::ProjectFile;
+    use brokk_bifrost_core::analyzer::model::CallableArity;
     use brokk_bifrost_core::analyzer::model::CppTemplateParameterMetadata;
     use brokk_bifrost_cpp::external_declarations::CppExternalDeclarationSet;
     use std::sync::Arc;
@@ -2612,7 +2833,7 @@ mod tests {
             },
             optional: false,
             variadic: false,
-            passing_mode: Default::default(),
+            passing_mode: ParameterPassingMode::PositionalOnly,
         };
 
         assert_eq!(
@@ -2630,7 +2851,7 @@ mod tests {
                     },
                     optional: false,
                     variadic: false,
-                    passing_mode: Default::default(),
+                    passing_mode: ParameterPassingMode::PositionalOnly,
                 },
             ],
             parameters("assign", 2),
@@ -2654,7 +2875,7 @@ mod tests {
                     },
                     optional: false,
                     variadic: false,
-                    passing_mode: Default::default(),
+                    passing_mode: ParameterPassingMode::PositionalOnly,
                 },
                 Parameter {
                     name: None,
@@ -2664,7 +2885,7 @@ mod tests {
                     },
                     optional: false,
                     variadic: true,
-                    passing_mode: Default::default(),
+                    passing_mode: ParameterPassingMode::PositionalOnly,
                 },
             ],
             parameters("log", 2),
@@ -4199,6 +4420,258 @@ mod tests {
                 external_header_parses: 2,
             },
             updated.external_header_closure_work_counts_for_test()
+        );
+    }
+
+    /// #3535: a C call binds the one file-scope function its reached system
+    /// header declares, keyed by that declaring header.
+    ///
+    /// POSIX `connect` is declared at global scope: no namespace or class owns
+    /// it. Each layer is pinned at the point that decides it.
+    ///
+    /// 1. Extraction states the declaration exactly and gives it no owner.
+    /// 2. Without the generated header pack nothing proves the callee: the call
+    ///    keeps its declared-unindexed boundary and publishes no identity, so
+    ///    the spelling `connect` alone never binds a summary.
+    /// 3. The generated header pack publishes the declaration under the module
+    ///    of its declaring header (`sys/socket`) as a receiverless function,
+    ///    and drops nothing as `cpp.member_owner_unavailable`.
+    /// 4. The call then binds that one declaration. The trace selects it as the
+    ///    external target, and the call-target lookup publishes the exact
+    ///    receiverless proof and the resolver-owned identity
+    ///    `(cpp, sys/socket, connect)` -- the key a reviewed summary on path
+    ///    `sys/socket.h`, symbol `connect` is indexed under.
+    #[test]
+    fn a_c_call_binds_the_file_scope_function_its_reached_header_declares() {
+        let project_temp = tempfile::tempdir().expect("project root");
+        let root = project_temp.path().canonicalize().expect("canonical root");
+        // The system headers live outside the workspace. That is what makes
+        // the angle include an external boundary instead of a workspace file:
+        // an include root inside the project would be indexed like any other
+        // workspace header and resolve as an ordinary local declaration.
+        let system_temp = tempfile::tempdir().expect("system root");
+        let system_root = system_temp
+            .path()
+            .canonicalize()
+            .expect("canonical system root");
+        let source = "#include <sys/socket.h>\n\nint audit_connect(int fd) {\n    return connect(fd, 0, 0);\n}\n";
+        let file = ProjectFile::new(root.clone(), "src/audit_client.c");
+        file.write(source).expect("source");
+        let header_source = "struct sockaddr;\ntypedef unsigned int socklen_t;\nextern int connect(int fd, const struct sockaddr *address, socklen_t length);\nstruct audit_socket {\n    int socket_fd;\n};\n";
+        ProjectFile::new(system_root.clone(), "sys/socket.h")
+            .write(header_source)
+            .expect("external header");
+        ProjectFile::new(root.clone(), "compile_commands.json")
+            .write(
+                serde_json::json!([{
+                    "directory": ".",
+                    "file": "src/audit_client.c",
+                    "arguments": [
+                        "clang",
+                        "-isystem",
+                        system_root,
+                        "-c",
+                        "src/audit_client.c"
+                    ]
+                }])
+                .to_string(),
+            )
+            .expect("database");
+
+        // 1. The declaration is extracted exactly, and it has no owner.
+        let declarations = extract_external_declarations(
+            &system_root,
+            Path::new("sys/socket.h"),
+            header_source,
+            CppExternalDeclarationLimits::default(),
+        );
+        assert!(declarations.syntax_complete, "{declarations:#?}");
+        let connect = declarations
+            .members
+            .iter()
+            .filter(|member| member.name == "connect")
+            .collect::<Vec<_>>();
+        let [connect] = connect.as_slice() else {
+            panic!("exactly one connect declaration: {declarations:#?}");
+        };
+        assert_eq!(CppExternalMemberKind::Function, connect.kind);
+        assert_eq!(
+            None, connect.owner,
+            "a C free function is declared at global scope: {connect:#?}"
+        );
+        assert_eq!(
+            Some(CallableArity::exact(3)),
+            connect.callable_arity,
+            "the declaration's own arity is structured: {connect:#?}"
+        );
+        assert_eq!(Path::new("sys/socket.h"), connect.source_path);
+
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(root.clone(), Language::Cpp));
+        let workspace =
+            WorkspaceAnalyzer::build_ephemeral_footgun(project, AnalyzerConfig::default())
+                .expect("ephemeral workspace should build");
+        let cancellation = CancellationToken::new();
+        let cpp = crate::analyzer::resolve_analyzer::<CppAnalyzer>(workspace.analyzer())
+            .expect("C++ analyzer");
+        let closure = directly_reached_external_headers(cpp, &file).expect("header closure");
+        let headers = closure
+            .headers()
+            .expect("the compile context proves the external root");
+        assert!(
+            headers
+                .iter()
+                .any(|header| header.relative_path == Path::new("sys/socket.h")),
+            "the call site reaches the declaring header: {headers:#?}"
+        );
+
+        let start = source.find("connect(fd").expect("call site");
+        let request = || DefinitionLookupRequest {
+            file: file.clone(),
+            line: None,
+            column: None,
+            start_byte: Some(start),
+            end_byte: Some(start + "connect".len()),
+        };
+        let call_target = || {
+            let scope = AnalyzerQueryScope::new(workspace.analyzer());
+            let [outcome] =
+                crate::analyzer::usages::get_definition::resolve_call_target_batch_with_source(
+                    workspace.analyzer(),
+                    scope.token(),
+                    vec![request()],
+                    file.clone(),
+                    Arc::from(source),
+                    Some(&cancellation),
+                )
+                .try_into()
+                .expect("one call-target outcome");
+            outcome
+        };
+
+        // 2. No activated declaration surface: the boundary stays unproven.
+        let unproven = call_target();
+        assert_eq!(
+            crate::analyzer::usages::get_definition::DefinitionLookupStatus::UnresolvableImportBoundary,
+            unproven.outcome.status,
+            "{unproven:#?}"
+        );
+        assert!(
+            unproven.exact_external_call.is_none() && unproven.external_callee_identity.is_none(),
+            "the spelling alone proves no callee: {unproven:#?}"
+        );
+
+        // 3. The generated header pack publishes the file-scope declaration
+        //    under its header's module.
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default())
+            .expect("ephemeral catalog");
+        let activation = SemanticModelActivationRequest {
+            bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION"))
+                .expect("crate version"),
+            evidence: Vec::new(),
+            controls: Vec::new(),
+            limits: SemanticModelRuntimeLimits::default(),
+        };
+        let outcome = workspace.activate_dependency_packs(
+            &AnalyzerConfig::default(),
+            &[DependencyPackEcosystem::Cpp],
+            DependencyPackWorkspaceContext {
+                catalog: &catalog,
+                persistence: None,
+                activation: &activation,
+                limits: DependencyPackLimits::default(),
+                cancellation: &cancellation,
+            },
+        );
+        let preparation = outcome
+            .ecosystems
+            .first()
+            .and_then(|ecosystem| ecosystem.preparation.as_ref())
+            .unwrap_or_else(|| panic!("the Cpp ecosystem prepares a pack: {outcome:#?}"));
+        assert!(
+            preparation.complete,
+            "no declaration of the reached header is dropped: {preparation:#?}"
+        );
+        let overlay = workspace
+            .analyzer()
+            .semantic_model_overlay()
+            .expect("C++ overlay");
+        let published = overlay
+            .symbols_named("connect")
+            .records
+            .into_iter()
+            .filter(|symbol| symbol.language == "cpp" && symbol_is_in_headers(symbol, headers))
+            .collect::<Vec<_>>();
+        let [published] = published.as_slice() else {
+            panic!(
+                "the header pack publishes one connect: {:#?}",
+                overlay.symbols()
+            );
+        };
+        assert_eq!(SemanticModelSymbolKind::Function, published.kind);
+        assert!(!published.has_receiver(), "{published:#?}");
+        assert_eq!("sys/socket.connect", published.qualified_name);
+        let owner = overlay.symbols_with_id(published.owner_id.as_deref().expect("owned"));
+        let [owner] = owner.records.as_slice() else {
+            panic!("one header module owns connect: {owner:#?}");
+        };
+        assert!(is_header_module(owner), "{owner:#?}");
+        assert_eq!("sys/socket", owner.qualified_name);
+        // The header module is the declaration's owner, not a scope a C++
+        // qualified name can spell.
+        assert_eq!(
+            None,
+            external_namespace_model_resolution(
+                cpp,
+                Some(&overlay),
+                &file,
+                &["sys/socket".to_owned()]
+            )
+        );
+
+        // 4. The call binds that one declaration. The name alone still names
+        //    nothing: only the resolver's proof indexes a file-scope record.
+        assert_eq!(
+            (BoundaryStatus::ExternalDeclaredUnindexed, None),
+            external_boundary_evidence(cpp, Some(&overlay), &file, "connect"),
+        );
+        let bound = call_target();
+        let proof = bound
+            .exact_external_call
+            .as_ref()
+            .unwrap_or_else(|| panic!("the reached header proves the callee: {bound:#?}"));
+        assert_eq!("sys/socket::connect", proof.canonical_callee());
+        assert_eq!(3, proof.parameter_count());
+        assert!(!proof.has_receiver());
+        let identity = bound
+            .external_callee_identity
+            .as_ref()
+            .expect("the resolver-owned identity travels with the proof");
+        assert_eq!(
+            (Language::Cpp, "sys/socket", "connect"),
+            (identity.language(), identity.owner_fqn(), identity.member())
+        );
+        assert_eq!(
+            Some("sys/socket::connect"),
+            bound.outcome.resolved_reference_target()
+        );
+        let [(lookup, trace)] = resolve_definition_batch_with_trace(
+            workspace.analyzer(),
+            vec![request()],
+            file.clone(),
+            Arc::from(source),
+            &cancellation,
+        )
+        .try_into()
+        .expect("one traced lookup");
+        assert!(
+            trace.candidates.iter().any(|candidate| {
+                matches!(
+                    &candidate.candidate,
+                    TraceCandidateRef::ExternalRoute { name } if name == "connect"
+                ) && candidate.boundary == BoundaryStatus::ExternalIndexed
+                    && candidate.external_target.as_deref() == Some(published.id.as_str())
+            }),
+            "lookup={lookup:#?}\ntrace={trace:#?}"
         );
     }
 }

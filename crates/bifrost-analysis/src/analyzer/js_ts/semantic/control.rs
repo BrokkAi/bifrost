@@ -59,7 +59,18 @@ pub(super) fn lower_procedure<'tree, 'targets>(
     };
     context.emit_procedure_inputs(&mut builder, spec)?;
     context.emit_capture_inputs(&mut builder, entry, spec, capture_binding_expected)?;
-    context.emit_local_bindings(&mut builder, spec.body)?;
+    context.emit_local_bindings(&mut builder, entry, spec.body)?;
+    context.emit_nested_rebind_gaps(&mut builder, entry, spec.body)?;
+    if spec.dynamic_local_observation {
+        context.add_gap(
+            &mut builder,
+            entry,
+            SemanticGapSubject::Procedure,
+            SemanticCapability::LocalFlow,
+            SemanticGapKind::Unsupported,
+            "with or possible direct eval can observe or redirect a lexical local without a projected binding event",
+        )?;
+    }
     context.collect_plain_object_locals(&mut builder, spec.body)?;
     context.collect_array_locals(&mut builder, spec.body)?;
     if spec.properties.is_generator {
@@ -114,8 +125,7 @@ pub(super) fn lower_procedure<'tree, 'targets>(
         }
     } else {
         let implicit_return = context.point(&mut builder, spec.body, Vec::new())?;
-        let source =
-            context.expression_value(&mut builder, spec.body, expression_value_kind(spec.body))?;
+        let source = context.node_value(&mut builder, spec.body)?;
         let value = context.value(&mut builder, implicit_return, SemanticValueKind::Return)?;
         context.append_effect(
             &mut builder,
@@ -174,29 +184,41 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         scope: ScopeFrameId,
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), TsLoweringError> {
-        let initializers = named_children(node)
+        let is_let = node.kind() == "lexical_declaration" && has_child_kind(node, "let");
+        // A bare `var` redeclaration does not write the binding. A bare `let`
+        // writes undefined only when execution reaches its declaration.
+        let declarations = named_children(node)
             .into_iter()
             .filter(|child| child.kind() == "variable_declarator")
             .filter_map(|declarator| {
                 let name = declarator.child_by_field_name("name")?;
-                let initializer = declarator.child_by_field_name("value")?;
-                (name.kind() == "identifier").then_some((declarator, name, initializer))
+                let initializer = declarator.child_by_field_name("value");
+                (name.kind() == "identifier" && (initializer.is_some() || is_let)).then_some((
+                    declarator,
+                    name,
+                    initializer,
+                ))
             })
             .collect::<Vec<_>>();
-        if initializers.is_empty() {
+        if declarations.is_empty() {
             return self.edge(builder, entry, next);
         }
 
-        let expression_entries = initializers
-            .iter()
-            .map(|(_, _, initializer)| self.point(builder, *initializer, Vec::new()))
-            .collect::<Result<Vec<_>, _>>()?;
-        let terminals = initializers
+        let terminals = declarations
             .iter()
             .map(|(declarator, _, _)| self.point(builder, *declarator, Vec::new()))
             .collect::<Result<Vec<_>, _>>()?;
+        let expression_entries = declarations
+            .iter()
+            .enumerate()
+            .map(|(index, (_, _, initializer))| {
+                initializer.map_or(Ok(terminals[index]), |initializer| {
+                    self.point(builder, initializer, Vec::new())
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         self.edge(builder, entry, EdgeTarget::normal(expression_entries[0]))?;
-        for (index, (_, name, initializer)) in initializers.iter().enumerate().rev() {
+        for (index, (_, name, initializer)) in declarations.iter().enumerate().rev() {
             let target_name = node_text(self.prepared.source(), *name).ok_or_else(|| {
                 TsLoweringError::Invalid("local declaration has invalid name range".into())
             })?;
@@ -205,8 +227,15 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 .ok_or_else(|| {
                     TsLoweringError::Invalid("local declaration was not preindexed".into())
                 })?;
-            let value =
-                self.expression_value(builder, *initializer, expression_value_kind(*initializer))?;
+            let value = if let Some(initializer) = initializer {
+                self.node_value(builder, *initializer)?
+            } else {
+                self.value(
+                    builder,
+                    terminals[index],
+                    SemanticValueKind::LanguageDefined("js.undefined".into()),
+                )?
+            };
             self.append_effect(
                 builder,
                 terminals[index],
@@ -227,12 +256,14 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 .map(EdgeTarget::normal)
                 .unwrap_or(next);
             self.edge(builder, terminals[index], following)?;
-            stack.push(Work::Expression {
-                node: *initializer,
-                entry: expression_entries[index],
-                next: EdgeTarget::normal(terminals[index]),
-                scope,
-            });
+            if let Some(initializer) = initializer {
+                stack.push(Work::Expression {
+                    node: *initializer,
+                    entry: expression_entries[index],
+                    next: EdgeTarget::normal(terminals[index]),
+                    scope,
+                });
+            }
         }
         Ok(())
     }
@@ -249,8 +280,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let left = required_field(node, "left")?;
         let right = required_field(node, "right")?;
         let terminal = self.point(builder, node, Vec::new())?;
-        let value = self.expression_value(builder, right, expression_value_kind(right))?;
-        let result = self.expression_value(builder, node, expression_value_kind(node))?;
+        let value = self.node_value(builder, right)?;
+        let result = self.node_value(builder, node)?;
         self.append_effect(
             builder,
             terminal,
@@ -289,14 +320,38 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             let name = node_text(self.prepared.source(), left).ok_or_else(|| {
                 TsLoweringError::Invalid("assignment has invalid target range".into())
             })?;
-            let local = self.local_at(name, left.start_byte());
-            let target = local.or_else(|| self.parameters.get(name).copied());
+            let local = self
+                .local_binding_at(name, left.start_byte())
+                .map(|binding| (binding.value, binding.binding));
+            let target = local
+                .map(|(value, _)| value)
+                .or_else(|| self.parameters.get(name).copied());
             if let Some(target) = target {
                 let kind = if local.is_some() {
                     ValueFlowKind::Local
                 } else {
                     ValueFlowKind::Parameter
                 };
+                if local.is_some_and(|(_, binding)| {
+                    lexical_write_may_fail(self.prepared.tree().root_node(), binding, left)
+                }) {
+                    self.add_gap(
+                        builder,
+                        terminal,
+                        SemanticGapSubject::Point,
+                        SemanticCapability::LocalFlow,
+                        SemanticGapKind::Unsupported,
+                        "lexical assignment may fail before establishing its binding",
+                    )?;
+                    self.add_gap(
+                        builder,
+                        terminal,
+                        SemanticGapSubject::Point,
+                        SemanticCapability::ExceptionalControlFlow,
+                        SemanticGapKind::Unsupported,
+                        "the abrupt transfer from a failed lexical assignment is not lowered",
+                    )?;
+                }
                 self.append_effect(
                     builder,
                     terminal,
@@ -316,7 +371,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         } else if left.kind() == "member_expression" {
             let object = required_field(left, "object")?;
             let property = required_field(left, "property")?;
-            let base = self.expression_value(builder, object, expression_value_kind(object))?;
+            let base = self.node_value(builder, object)?;
             let element_member = self.array_element_member_locator(left, object, property);
             let established_array_element_field = element_member.is_some();
             let member = if let Some(member) = element_member {
@@ -359,7 +414,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         } else if left.kind() == "subscript_expression" {
             let object = required_field(left, "object")?;
             let index = required_field(left, "index")?;
-            let base = self.expression_value(builder, object, expression_value_kind(object))?;
+            let base = self.node_value(builder, object)?;
             let index_value = self.index_value(builder, index)?;
             let established_array_base = self.established_array_base(left, object, index);
             let location = self.session.add_memory_location(
@@ -430,31 +485,67 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             return self.unhandled_control_syntax(builder, node, entry, next);
         }
         if operation_can_throw_implicitly(node) {
-            self.implicit_exception_gap(builder, entry, node)?;
+            self.implicit_abort_route(builder, node, entry, scope, stack)?;
         }
-        self.add_gap(
-            builder,
-            entry,
-            SemanticGapSubject::Point,
-            SemanticCapability::Calls,
-            SemanticGapKind::Unknown,
-            "augmented-assignment operator evaluation requires value refinement",
-        )?;
+        let operator = required_field(node, "operator")?.kind();
+        let arithmetic = matches!(
+            operator,
+            "+=" | "-=" | "*=" | "/=" | "%=" | "**=" | "<<=" | ">>=" | ">>>=" | "&=" | "|=" | "^="
+        );
+        // Arithmetic on two primitives converts them without user code.
+        if !(arithmetic
+            && is_primitive_literal(self.prepared.source(), right)
+            && left.kind() == "identifier"
+            && self.binding_holds_only_primitives(left))
+        {
+            self.session.add_gap_with_impacts(
+                builder,
+                entry,
+                SemanticGapSubject::Point,
+                SemanticCapability::Calls,
+                SemanticGapImpacts::CALL_EVALUATION,
+                SemanticGapKind::Unknown,
+                "augmented-assignment coercion may invoke user code and change state",
+            )?;
+        }
         // `x += y` stores a value that derives from the current target and the
         // operand, whatever the refined operator semantics turn out to be:
         // compound assignment reads the target and combines it with the
         // operand. The result stays language-defined unknown, but both sides
-        // flow into it the way they do for `x = x + y`.
+        // flow into it the way they do for `x = x + y`. `x += c` and `x -= c`
+        // with an integer literal are the exact offset on a Number target.
         let terminal = self.point(builder, node, Vec::new())?;
-        let left_value = self.expression_value(builder, left, expression_value_kind(left))?;
-        let right_value = self.expression_value(builder, right, expression_value_kind(right))?;
-        let result = self.expression_value(builder, node, expression_value_kind(node))?;
-        self.session.append_language_defined_value_flows(
-            builder,
-            terminal,
-            [left_value, right_value],
-            result,
-        )?;
+        let left_value = self.node_value(builder, left)?;
+        let right_value = self.node_value(builder, right)?;
+        let result = self.node_value(builder, node)?;
+        let offset =
+            integer_literal_value(self.prepared.source(), right).and_then(
+                |constant| match operator {
+                    "+=" => Some(constant),
+                    "-=" => Some(-constant),
+                    _ => None,
+                },
+            );
+        if let Some(offset) = offset {
+            self.append_effect(
+                builder,
+                terminal,
+                SemanticEffect::ValueFlow {
+                    kind: ValueFlowKind::IntegerOffset {
+                        offset: integer_offset(offset),
+                    },
+                    source: left_value,
+                    target: result,
+                },
+            )?;
+        } else {
+            self.session.append_language_defined_value_flows(
+                builder,
+                terminal,
+                [left_value, right_value],
+                result,
+            )?;
+        }
         self.append_assignment_target_store(builder, terminal, node, left, right, result)?;
         self.edge(builder, terminal, next)?;
         self.schedule_expressions(
@@ -465,6 +556,119 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             scope,
             stack,
         )
+    }
+
+    fn update_expression(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), TsLoweringError> {
+        let argument = required_field(node, "argument")?;
+        let operator = required_field(node, "operator")?;
+        self.implicit_abort_route(builder, node, entry, scope, stack)?;
+        // ToNumeric of a primitive runs no user code.
+        if !(argument.kind() == "identifier" && self.binding_holds_only_primitives(argument)) {
+            self.session.add_gap_with_impacts(
+                builder,
+                entry,
+                SemanticGapSubject::Point,
+                SemanticCapability::Calls,
+                SemanticGapImpacts::CALL_EVALUATION,
+                SemanticGapKind::Unknown,
+                "update coercion may invoke user code and change state",
+            )?;
+        }
+        if argument.kind() != "identifier" {
+            self.add_gap(
+                builder,
+                entry,
+                SemanticGapSubject::Point,
+                SemanticCapability::Assignments,
+                SemanticGapKind::Unknown,
+                "update target store is not yet lowered",
+            )?;
+            return self.expression_children(builder, node, entry, next, scope, stack);
+        }
+
+        let terminal = self.point(builder, node, Vec::new())?;
+        let original = self.node_value(builder, argument)?;
+        // Both forms write the original plus or minus one. A prefix update
+        // evaluates to the written value and a postfix update to the original
+        // converted to a numeric, which is the original itself on a Number.
+        // A non-Number original converts, which a consumer that computes
+        // offsets only on known integers never mistakes for arithmetic.
+        let step = if operator.kind() == "++" { 1 } else { -1 };
+        let prefix = operator.start_byte() < argument.start_byte();
+        let updated = self.value(
+            builder,
+            terminal,
+            SemanticValueKind::LanguageDefined("js.update.write".into()),
+        )?;
+        let result = self.node_value(builder, node)?;
+        for (target, offset) in [(updated, step), (result, if prefix { step } else { 0 })] {
+            self.append_effect(
+                builder,
+                terminal,
+                SemanticEffect::ValueFlow {
+                    kind: ValueFlowKind::IntegerOffset {
+                        offset: integer_offset(offset),
+                    },
+                    source: original,
+                    target,
+                },
+            )?;
+        }
+
+        let name = node_text(self.prepared.source(), argument).ok_or_else(|| {
+            TsLoweringError::Invalid("update target has invalid name range".into())
+        })?;
+        let local = self.local_at(name, argument.start_byte());
+        let target = local.or_else(|| self.parameters.get(name).copied());
+        if let Some(target) = target {
+            let kind = if local.is_some() {
+                ValueFlowKind::Local
+            } else {
+                ValueFlowKind::Parameter
+            };
+            self.append_effect(
+                builder,
+                terminal,
+                SemanticEffect::Assignment {
+                    target,
+                    value: updated,
+                },
+            )?;
+            self.append_effect(
+                builder,
+                terminal,
+                SemanticEffect::ValueFlow {
+                    kind,
+                    source: updated,
+                    target,
+                },
+            )?;
+        } else {
+            self.add_gap(
+                builder,
+                terminal,
+                SemanticGapSubject::Point,
+                SemanticCapability::Assignments,
+                SemanticGapKind::Unknown,
+                "update target has no local or parameter identity",
+            )?;
+        }
+        self.edge(builder, terminal, next)?;
+        stack.push(Work::Expression {
+            node: argument,
+            entry,
+            next: EdgeTarget::normal(terminal),
+            scope,
+        });
+        Ok(())
     }
 
     fn schedule_default_parameters(
@@ -698,10 +902,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 | "type_assertion",
                 _,
             ) => {
-                let value = node
-                    .child_by_field_name("expression")
-                    .or_else(|| first_named_child(node))
-                    .ok_or_else(|| missing_field(node, "expression"))?;
+                let value = match node.kind() {
+                    "parenthesized_expression" => first_named_child(node),
+                    _ => ts_type_wrapper_operand(node),
+                }
+                .ok_or_else(|| missing_field(node, "expression"))?;
                 stack.push(Work::Condition {
                     node: value,
                     entry,
@@ -752,27 +957,23 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             let operator = required_field(node, "operator")?.kind();
             match operator {
                 "instanceof" => {
-                    let value =
-                        self.expression_value(builder, left, expression_value_kind(left))?;
-                    let classes =
-                        self.expression_value(builder, right, expression_value_kind(right))?;
-                    let subject =
-                        self.expression_value(builder, node, expression_value_kind(node))?;
+                    let value = self.node_value(builder, left)?;
+                    let classes = self.node_value(builder, right)?;
+                    let subject = self.node_value(builder, node)?;
                     return Ok((GuardPredicate::InstanceOf { value, classes }, Some(subject)));
                 }
                 "in" => {
-                    let member =
-                        self.expression_value(builder, left, expression_value_kind(left))?;
-                    let value =
-                        self.expression_value(builder, right, expression_value_kind(right))?;
-                    let subject =
-                        self.expression_value(builder, node, expression_value_kind(node))?;
+                    let member = self.node_value(builder, left)?;
+                    let value = self.node_value(builder, right)?;
+                    let subject = self.node_value(builder, node)?;
                     return Ok((GuardPredicate::HasMember { value, member }, Some(subject)));
                 }
+                // The null guard states exactly `null`: an arm refines its
+                // subject to null or to not-null, and `undefined` is neither
+                // a published null nor excluded by a not-null fact.
                 "===" | "!==" if left.kind() == "null" || right.kind() == "null" => {
                     let value = if left.kind() == "null" { right } else { left };
-                    let subject =
-                        self.expression_value(builder, value, expression_value_kind(value))?;
+                    let subject = self.node_value(builder, value)?;
                     return Ok((
                         GuardPredicate::NullComparison {
                             null_on_true: operator == "===",
@@ -780,6 +981,32 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         Some(subject),
                     ));
                 }
+                // Loose equality with `null` also holds for `undefined`, so it
+                // cannot refine an arm to null or to not-null. As an equality
+                // with the null constant it is decided only by a subject known
+                // to be null or known to be a number or Boolean.
+                "==" | "!=" if left.kind() == "null" || right.kind() == "null" => {
+                    let (value, constant) = if left.kind() == "null" {
+                        (right, left)
+                    } else {
+                        (left, right)
+                    };
+                    let subject = self.node_value(builder, value)?;
+                    let constant = self.node_value(builder, constant)?;
+                    return Ok((
+                        GuardPredicate::ConstantEquality {
+                            negated: operator == "!=",
+                            constant,
+                        },
+                        Some(subject),
+                    ));
+                }
+                _ => {}
+            }
+            if let Some(guard) = self.numeric_guard(builder, operator, left, right)? {
+                return Ok(guard);
+            }
+            match operator {
                 "===" | "!==" => {
                     let is_typeof = |candidate: Node<'_>| {
                         candidate.kind() == "unary_expression"
@@ -793,8 +1020,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         } else if is_typeof(right) && left.kind() == "string" {
                             (right, left)
                         } else {
-                            let subject =
-                                self.expression_value(builder, node, expression_value_kind(node))?;
+                            let subject = self.node_value(builder, node)?;
                             return Ok((
                                 GuardPredicate::Opaque {
                                     digest: GuardConditionDigest::from_syntax_kind(node.kind()),
@@ -802,16 +1028,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                                 Some(subject),
                             ));
                         };
-                    let subject = self.expression_value(
-                        builder,
-                        subject_node,
-                        expression_value_kind(subject_node),
-                    )?;
-                    let constant = self.expression_value(
-                        builder,
-                        constant_node,
-                        expression_value_kind(constant_node),
-                    )?;
+                    let subject = self.node_value(builder, subject_node)?;
+                    let constant = self.node_value(builder, constant_node)?;
                     return Ok((
                         GuardPredicate::ConstantEquality {
                             negated: operator == "!==",
@@ -823,13 +1041,193 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 _ => {}
             }
         }
-        let subject = self.expression_value(builder, node, expression_value_kind(node))?;
+        let subject = self.node_value(builder, node)?;
+        // ToBoolean runs no user code, so a bare identifier read is tested
+        // for exactly the truthiness of the value it holds.
+        if node.kind() == "identifier" {
+            return Ok((GuardPredicate::Truthy { value: subject }, Some(subject)));
+        }
         Ok((
             GuardPredicate::Opaque {
                 digest: GuardConditionDigest::from_syntax_kind(node.kind()),
             },
             Some(subject),
         ))
+    }
+
+    /// Whether the binding the identifier `target` reads holds only
+    /// primitive values, so converting it runs no `valueOf` or
+    /// `Symbol.toPrimitive` code. The binding must be a procedure-local
+    /// variable (a program-scope `var` is a global property other scripts
+    /// can write) whose every declaration initializes it with a primitive
+    /// literal or nothing, and whose every write, in this procedure or a
+    /// nested closure, is an update, an arithmetic compound assignment (each
+    /// yields a primitive), or a plain assignment of a primitive literal.
+    fn binding_holds_only_primitives(&self, target: Node<'tree>) -> bool {
+        let source = self.prepared.source();
+        let root = self.prepared.tree().root_node();
+        let lexical = self.lexical_bindings;
+        let byte = target.start_byte();
+        let Some(name) = node_text(source, target) else {
+            return false;
+        };
+        if lexical.binding_scope_at(name, byte).is_none()
+            || lexical.is_program_binding_at(name, byte, root)
+        {
+            return false;
+        }
+        let identifier_at = |start: usize, end: usize| {
+            root.named_descendant_for_byte_range(start, end)
+                .filter(|node| {
+                    node.kind() == "identifier"
+                        && node.start_byte() == start
+                        && node.end_byte() == end
+                })
+        };
+        let is_field = |parent: Node<'_>, field: &str, child: Node<'_>| {
+            parent
+                .child_by_field_name(field)
+                .is_some_and(|candidate| candidate.id() == child.id())
+        };
+        let declarations = lexical.binding_identifier_ranges_at(name, byte);
+        let declarations_are_primitive = !declarations.is_empty()
+            && declarations.iter().all(|range| {
+                identifier_at(range.start_byte, range.end_byte).is_some_and(|binder| {
+                    binder.parent().is_some_and(|declarator| {
+                        declarator.kind() == "variable_declarator"
+                            && is_field(declarator, "name", binder)
+                            && declarator
+                                .child_by_field_name("value")
+                                .is_none_or(|value| is_primitive_literal(source, value))
+                    })
+                })
+            });
+        declarations_are_primitive
+            && lexical
+                .binding_write_sites_at(name, byte)
+                .into_iter()
+                .all(|start| {
+                    identifier_at(start, start + name.len()).is_some_and(|written| {
+                        written.parent().is_some_and(|write| match write.kind() {
+                            "update_expression" => is_field(write, "argument", written),
+                            "augmented_assignment_expression" => {
+                                is_field(write, "left", written)
+                                    && write.child_by_field_name("operator").is_some_and(
+                                        |operator| {
+                                            !matches!(operator.kind(), "&&=" | "||=" | "??=")
+                                        },
+                                    )
+                            }
+                            "assignment_expression" => {
+                                is_field(write, "left", written)
+                                    && write
+                                        .child_by_field_name("right")
+                                        .is_some_and(|value| is_primitive_literal(source, value))
+                            }
+                            _ => false,
+                        })
+                    })
+                })
+    }
+
+    /// The numeric guard one comparison over a plain identifier states: a
+    /// self-comparison only NaN decides, or an ordered or equality comparison
+    /// with a numeric literal (optionally under one direct unary minus). The
+    /// predicates hold only for a Number subject; a consumer refines only a
+    /// subject it already knows to hold one, so coercion and `valueOf`
+    /// dispatch on any other operand stay open.
+    fn numeric_guard(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        operator: &str,
+        left: Node<'tree>,
+        right: Node<'tree>,
+    ) -> Result<Option<(GuardPredicate, Option<ValueId>)>, TsLoweringError> {
+        let source = self.prepared.source();
+        let relation = match operator {
+            "<" => Some(IntegerComparison::LessThan),
+            "<=" => Some(IntegerComparison::LessThanOrEqual),
+            ">" => Some(IntegerComparison::GreaterThan),
+            ">=" => Some(IntegerComparison::GreaterThanOrEqual),
+            "===" | "==" | "!==" | "!=" => None,
+            _ => return Ok(None),
+        };
+        if left.kind() == "identifier"
+            && right.kind() == "identifier"
+            && node_text(source, left).is_some_and(|name| node_text(source, right) == Some(name))
+        {
+            // Two reads of one binding in one comparison observe one value.
+            // Strict self-order is false for every Number, so only equality
+            // and non-strict order separate NaN from the rest.
+            let nan_on_true = match operator {
+                "!==" | "!=" => true,
+                "===" | "==" | "<=" | ">=" => false,
+                _ => return Ok(None),
+            };
+            let subject = self.node_value(builder, left)?;
+            return Ok(Some((
+                GuardPredicate::NanComparison { nan_on_true },
+                Some(subject),
+            )));
+        }
+        let (subject_node, constant_node, literal_on_left) =
+            match (left.kind() == "identifier", right.kind() == "identifier") {
+                (true, false) => (left, right, false),
+                (false, true) => (right, left, true),
+                (true, true) | (false, false) => return Ok(None),
+            };
+        if let Some(value) = boolean_literal_condition(constant_node) {
+            let constant = match operator {
+                // IsLooselyEqual converts a Boolean operand with ToNumber, so
+                // `x == true` is exactly `x == 1` for every `x`. The literal's
+                // own value stays the Boolean it evaluates to.
+                "==" | "!=" => {
+                    let metadata = self.value_mapping(builder, constant_node)?;
+                    self.session.add_value_with_metadata(
+                        builder,
+                        metadata,
+                        SemanticValueKind::UnsignedInteger(u128::from(value)),
+                    )?
+                }
+                "===" | "!==" => self.node_value(builder, constant_node)?,
+                _ => return Ok(None),
+            };
+            let subject = self.node_value(builder, subject_node)?;
+            return Ok(Some((
+                GuardPredicate::ConstantEquality {
+                    negated: matches!(operator, "!==" | "!="),
+                    constant,
+                },
+                Some(subject),
+            )));
+        }
+        let Some(constant_kind) = signed_numeric_literal_kind(source, constant_node) else {
+            return Ok(None);
+        };
+        let floating = matches!(constant_kind, SemanticValueKind::FloatingPoint { .. });
+        let constant = self.node_value(builder, constant_node)?;
+        let subject = self.node_value(builder, subject_node)?;
+        let predicate = match relation {
+            Some(relation) => {
+                let relation = if literal_on_left {
+                    relation.reverse()
+                } else {
+                    relation
+                };
+                if floating {
+                    GuardPredicate::OrderedFloatComparison { relation, constant }
+                } else {
+                    GuardPredicate::OrderedIntegerComparison { relation, constant }
+                }
+            }
+            // Loose equality with a Number constant coerces the other operand;
+            // on a known Number subject it agrees with strict equality.
+            None => GuardPredicate::ConstantEquality {
+                negated: matches!(operator, "!==" | "!="),
+                constant,
+            },
+        };
+        Ok(Some((predicate, Some(subject))))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -901,11 +1299,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     .or_else(|| first_named_child(node))
                 {
                     let point = self.point(builder, node, Vec::new())?;
-                    let source = self.expression_value(
-                        builder,
-                        value_node,
-                        expression_value_kind(value_node),
-                    )?;
+                    let source = self.node_value(builder, value_node)?;
                     let value = self.value(builder, point, SemanticValueKind::Return)?;
                     self.append_effect(
                         builder,
@@ -951,11 +1345,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     .or_else(|| first_named_child(node))
                 {
                     let point = self.point(builder, node, Vec::new())?;
-                    let expression = self.expression_value(
-                        builder,
-                        value_node,
-                        expression_value_kind(value_node),
-                    )?;
+                    let expression = self.node_value(builder, value_node)?;
                     let value = self.value(builder, point, SemanticValueKind::Exception)?;
                     self.transfer_plain_object_identity_from_node(value_node, value);
                     self.append_effect(
@@ -1233,7 +1623,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), TsLoweringError> {
         let chain_skip = chain_skip.or_else(|| continuous_optional_chain(node).then_some(next));
-        let result = self.expression_value(builder, node, expression_value_kind(node))?;
+        let result = self.node_value(builder, node)?;
         if matches!(node.kind(), "identifier" | "this") {
             self.emit_lexical_input_flow(builder, node, entry, result)?;
         }
@@ -1342,6 +1732,28 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     SemanticGapKind::Unsupported,
                     "yield suspension and resumption are not yet lowered",
                 )?;
+                // An abrupt resumption throws or returns at the yield. With
+                // no handler or cleanup to enter, it leaves the procedure
+                // without running more of its code.
+                let discharge = if builder.throw_exits_procedure(scope) {
+                    crate::analyzer::semantic::SemanticGapDischarge::NonRejoiningExceptionalExit
+                } else {
+                    crate::analyzer::semantic::SemanticGapDischarge::None
+                };
+                self.session.add_gap_with_impacts_and_discharge(
+                    builder,
+                    terminal,
+                    SemanticGapSubject::Point,
+                    SemanticCapability::ExceptionalControlFlow,
+                    crate::analyzer::semantic::SemanticGapImpacts::NONE,
+                    SemanticGapKind::Unsupported,
+                    discharge,
+                    "abrupt generator resumption (throw or return) at a yield is not lowered",
+                )?;
+                // A normal resumption continues after the yield. The gap keeps
+                // abrupt resumption (`throw` and `return`) and non-resumption
+                // open.
+                self.edge(builder, terminal, next)?;
                 let argument = node
                     .child_by_field_name("argument")
                     .or_else(|| first_named_child(node));
@@ -1369,8 +1781,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     // expression may start a new chain whose skip target is
                     // this wrapper's normal continuation.
                     let terminal = self.point(builder, node, Vec::new())?;
-                    let inner =
-                        self.expression_value(builder, value, expression_value_kind(value))?;
+                    let inner = self.node_value(builder, value)?;
                     self.append_effect(
                         builder,
                         terminal,
@@ -1397,17 +1808,17 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             | "satisfies_expression"
             | "type_assertion"
             | "instantiation_expression" => {
-                let value = node
-                    .child_by_field_name("expression")
-                    .or_else(|| first_named_child(node));
+                let value = match node.kind() {
+                    "instantiation_expression" => node.child_by_field_name("function"),
+                    _ => ts_type_wrapper_operand(node),
+                };
                 if let Some(value) = value {
                     // These wrappers have no runtime effect: the operand's
                     // value is this node's value, exactly as parentheses do.
                     // Unlike parentheses, they do not end a continuous
                     // optional chain, so the incoming skip still propagates.
                     let terminal = self.point(builder, node, Vec::new())?;
-                    let inner =
-                        self.expression_value(builder, value, expression_value_kind(value))?;
+                    let inner = self.node_value(builder, value)?;
                     self.append_effect(
                         builder,
                         terminal,
@@ -1456,7 +1867,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             }
             "unary_expression" | "binary_expression" => {
                 if operation_can_throw_implicitly(node) {
-                    self.implicit_exception_gap(builder, entry, node)?;
+                    self.implicit_abort_route(builder, node, entry, scope, stack)?;
                 }
                 let children = named_children(node)
                     .into_iter()
@@ -1465,12 +1876,25 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 let terminal = self.point(builder, node, Vec::new())?;
                 let operands = children
                     .iter()
-                    .map(|child| {
-                        self.expression_value(builder, *child, expression_value_kind(*child))
-                    })
+                    .map(|child| self.node_value(builder, *child))
                     .collect::<Result<Vec<_>, _>>()?;
-                self.session
-                    .append_language_defined_value_flows(builder, terminal, operands, result)?;
+                if let Some((operand, offset)) =
+                    integer_offset_operand(self.prepared.source(), node)
+                {
+                    let source = self.node_value(builder, operand)?;
+                    self.append_effect(
+                        builder,
+                        terminal,
+                        SemanticEffect::ValueFlow {
+                            kind: ValueFlowKind::IntegerOffset { offset },
+                            source,
+                            target: result,
+                        },
+                    )?;
+                } else {
+                    self.session
+                        .append_language_defined_value_flows(builder, terminal, operands, result)?;
+                }
                 self.edge(builder, terminal, next)?;
                 self.schedule_expressions(
                     builder,
@@ -1520,12 +1944,12 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 // keeps the string intrinsic's own shape.
                 if node.kind() == "template_string" && substitutions.is_empty() {
                     if operation_can_throw_implicitly(node) {
-                        self.implicit_exception_gap(builder, entry, node)?;
+                        self.implicit_abort_route(builder, node, entry, scope, stack)?;
                     }
                     self.expression_children(builder, node, entry, next, scope, stack)
                 } else {
                     if operation_can_throw_implicitly(node) {
-                        self.implicit_exception_gap(builder, entry, node)?;
+                        self.implicit_abort_route(builder, node, entry, scope, stack)?;
                     }
                     // A template string derives its value from every substituted
                     // expression, and a substitution from the expression it
@@ -1541,8 +1965,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         "template-string conversion requires value refinement",
                     )?;
                     let terminal = self.point(builder, node, Vec::new())?;
-                    let result =
-                        self.expression_value(builder, node, expression_value_kind(node))?;
+                    let result = self.node_value(builder, node)?;
                     // A template string reads its substitutions; a substitution
                     // reads the expression it renders.
                     let operands = if node.kind() == "template_string" {
@@ -1555,9 +1978,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     };
                     let operand_values = operands
                         .iter()
-                        .map(|child| {
-                            self.expression_value(builder, *child, expression_value_kind(*child))
-                        })
+                        .map(|child| self.node_value(builder, *child))
                         .collect::<Result<Vec<_>, _>>()?;
                     self.session.append_language_defined_value_flows(
                         builder,
@@ -1576,8 +1997,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     )
                 }
             }
-            "update_expression"
-            | "sequence_expression"
+            "update_expression" => self.update_expression(builder, node, entry, next, scope, stack),
+            "sequence_expression"
             | "pair"
             | "spread_element"
             | "computed_property_name"
@@ -1586,7 +2007,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             | "jsx_opening_element"
             | "jsx_closing_element" => {
                 if operation_can_throw_implicitly(node) {
-                    self.implicit_exception_gap(builder, entry, node)?;
+                    self.implicit_abort_route(builder, node, entry, scope, stack)?;
                 }
                 self.expression_children(builder, node, entry, next, scope, stack)
             }
@@ -1690,13 +2111,13 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let established_array_base =
             index.is_some_and(|index| self.established_array_base(node, object, index));
         if !established_plain_base && !established_array_base && !established_array_element {
-            self.implicit_exception_gap(builder, access, node)?;
+            self.implicit_exception_gap(builder, access, scope, node)?;
         }
         if node.kind() == "subscript_expression" {
             let index = index.expect("subscript expressions have an index field");
-            let base = self.expression_value(builder, object, expression_value_kind(object))?;
+            let base = self.node_value(builder, object)?;
             let index_value = self.index_value(builder, index)?;
-            let result = self.expression_value(builder, node, expression_value_kind(node))?;
+            let result = self.node_value(builder, node)?;
             let runtime_key = brokk_bifrost_js_ts::syntax::static_runtime_keyed_access(
                 node,
                 self.lexical_bindings,
@@ -1752,8 +2173,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             }
         } else {
             let property = required_field(node, "property")?;
-            let base = self.expression_value(builder, object, expression_value_kind(object))?;
-            let result = self.expression_value(builder, node, expression_value_kind(node))?;
+            let base = self.node_value(builder, object)?;
+            let result = self.node_value(builder, node)?;
             let element_member = self.array_element_member_locator(node, object, property);
             let established_array_element_field = element_member.is_some();
             let member = if let Some(member) = element_member {
@@ -1873,10 +2294,20 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         Ok(())
     }
 
+    /// Publish the claim a property or index read makes about the runtime
+    /// behavior its access can have, and the claim an operation that does not
+    /// model its implicit abort route makes instead.
+    ///
+    /// A property or index read carries no downstream impact and a reviewed
+    /// runtime model retires it, so it never opens a caller's return evidence.
+    /// An operator that lowers its abort through
+    /// [`Self::implicit_abort_route`] publishes no claim at all: the route
+    /// answers whether the abort can carry a store.
     fn implicit_exception_gap(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
         point: ProgramPointId,
+        scope: ScopeFrameId,
         node: Node<'tree>,
     ) -> Result<(), TsLoweringError> {
         let detail = match node.kind() {
@@ -1900,14 +2331,84 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             )?;
             return Ok(());
         }
-        self.add_gap(
+        // The omitted implicit-exception edge can only unwind out of this
+        // procedure when the throw route has no handler or cleanup to enter,
+        // so it can neither resume normal evaluation nor run cleanup user
+        // code. An active handler or cleanup keeps the discharge closed.
+        let discharge = if builder.throw_exits_procedure(scope) {
+            crate::analyzer::semantic::SemanticGapDischarge::NonRejoiningExceptionalExit
+        } else {
+            crate::analyzer::semantic::SemanticGapDischarge::None
+        };
+        self.session.add_gap_with_impacts_and_discharge(
             builder,
             point,
             SemanticGapSubject::Point,
             SemanticCapability::ExceptionalControlFlow,
+            crate::analyzer::semantic::SemanticGapImpacts::NONE,
             SemanticGapKind::Unsupported,
+            discharge,
             detail,
-        )
+        )?;
+        Ok(())
+    }
+
+    /// Lower the route an operation's implicit exception takes, to the
+    /// enclosing handler or cleanup, or to the exceptional exit when this
+    /// procedure has none.
+    ///
+    /// The modeled edge is why the operations that call this publish no
+    /// implicit-exception gap: the route, not a discharge, answers whether the
+    /// abort can carry a store. A `Point`-scoped "not lowered" claim instead
+    /// left every caller's matched exceptional return unproven and partial, so
+    /// no procedure containing a coercing operator could ever be a complete
+    /// callee (#3528).
+    ///
+    /// The edge leaves `operation`, the point that carries the operation's own
+    /// effect, so every value its operands established is already live on the
+    /// abort path. The failing operation's exception object is a fresh value
+    /// this adapter does not type.
+    fn implicit_abort_route(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        operation: ProgramPointId,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), TsLoweringError> {
+        let Some(route) =
+            builder.resolve_completion(scope, &CompletionRequest::new(CompletionKind::Throw, None))
+        else {
+            return Err(TsLoweringError::Invalid(
+                "implicit abort has no matching structured continuation".into(),
+            ));
+        };
+        let abort = self.point(builder, node, Vec::new())?;
+        if let Some(binder) = self
+            .catch_binders
+            .get(&route.destination().target())
+            .copied()
+        {
+            let thrown = self.value(builder, abort, SemanticValueKind::Exception)?;
+            self.append_effect(
+                builder,
+                abort,
+                SemanticEffect::ValueFlow {
+                    kind: ValueFlowKind::Local,
+                    source: thrown,
+                    target: binder,
+                },
+            )?;
+        }
+        self.edge(
+            builder,
+            operation,
+            EdgeTarget {
+                point: abort,
+                kind: ControlEdgeKind::Exceptional,
+            },
+        )?;
+        self.route(builder, abort, &route, stack)
     }
 
     fn resource_assignment(
@@ -2647,7 +3148,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             let object = required_field(function, "object")?;
             (
                 CallableReferenceKind::BoundMethod,
-                Some(self.expression_value(builder, object, expression_value_kind(object))?),
+                Some(self.node_value(builder, object)?),
             )
         } else {
             (CallableReferenceKind::Function, None)
@@ -2698,8 +3199,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let arguments = argument_nodes
             .iter()
             .map(|argument| {
-                let value =
-                    self.expression_value(builder, *argument, expression_value_kind(*argument))?;
+                let value = self.node_value(builder, *argument)?;
                 Ok(if argument.kind() == "spread_element" {
                     SemanticCallArgument {
                         value,
@@ -2890,8 +3390,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             .ok_or_else(|| missing_field(node, "arguments"))?;
         let invoke = self.point(builder, node, Vec::new())?;
         let result = self.expression_value(builder, node, SemanticValueKind::Temporary)?;
-        let argument_value =
-            self.expression_value(builder, argument, expression_value_kind(argument))?;
+        let argument_value = self.node_value(builder, argument)?;
         self.append_effect(
             builder,
             invoke,
@@ -3508,6 +4007,58 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     }
 }
 
+/// A `var` assignment can always write its hoisted binding. A `let` write is
+/// safe only when its direct block declaration has run on every way to reach
+/// this syntax site. Switch cases, loop headers, and writes before the
+/// declaration keep an explicit gap instead of projecting a successful write.
+/// Assigning to `const` can fail even after initialization.
+fn lexical_write_may_fail(root: Node<'_>, binding: Range, write: Node<'_>) -> bool {
+    let Some(name) = root.named_descendant_for_byte_range(binding.start_byte, binding.end_byte)
+    else {
+        return true;
+    };
+    if name.start_byte() != binding.start_byte || name.end_byte() != binding.end_byte {
+        return true;
+    }
+    let Some(declarator) = name
+        .parent()
+        .filter(|parent| parent.kind() == "variable_declarator")
+    else {
+        return true;
+    };
+    let Some(declaration) = declarator.parent() else {
+        return true;
+    };
+    match declaration.kind() {
+        "variable_declaration" => false,
+        "lexical_declaration" => {
+            if has_child_kind(declaration, "const") {
+                return true;
+            }
+            declaration.parent().is_none_or(|parent| {
+                if declaration.end_byte() > write.start_byte() {
+                    return true;
+                }
+                match parent.kind() {
+                    "statement_block" => write.end_byte() > parent.end_byte(),
+                    "for_statement"
+                        if parent.child_by_field_name("initializer") == Some(declaration) =>
+                    {
+                        !["condition", "increment", "body"].into_iter().any(|field| {
+                            parent.child_by_field_name(field).is_some_and(|part| {
+                                part.start_byte() <= write.start_byte()
+                                    && write.end_byte() <= part.end_byte()
+                            })
+                        })
+                    }
+                    _ => true,
+                }
+            })
+        }
+        _ => true,
+    }
+}
+
 pub(super) fn counted_for_starts_true(
     source: &str,
     initializer: Option<Node<'_>>,
@@ -3587,11 +4138,4 @@ pub(super) fn boolean_literal_condition(node: Node<'_>) -> Option<bool> {
         "false" => Some(false),
         _ => None,
     }
-}
-
-fn numeric_literal_value(source: &str, node: Node<'_>) -> Option<f64> {
-    (node.kind() == "number")
-        .then(|| node_text(source, node))
-        .flatten()
-        .and_then(|text| text.parse::<f64>().ok())
 }

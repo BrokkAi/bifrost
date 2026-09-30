@@ -1078,6 +1078,14 @@ impl<'a> WorkspaceSemanticOracle<'a> {
         let mut final_candidates_truncated = false;
         let mut cancelled_targets_truncated = false;
         let mut materialization_quality = DispatchQuality::Complete;
+        // #3507: whether every C++ target this call retained names a member
+        // whose declaration rows all answer `closed` for dispatch. The
+        // question is a property of the declaration, not of the call, so it is
+        // read from the analyzer's joined metadata (an out-of-line definition
+        // gets its answer from the include-visible class body) and only for
+        // the definitions that actually retained a target.
+        let mut cpp_target_dispatch_closed =
+            call_language == SemanticLanguage::Standard(Language::Cpp);
         // #2480: whether every concrete (materialized-body) match this call
         // resolved to has a class-hierarchy-proven *empty* override set. A
         // concrete match starts this `true`; it becomes `false` the moment
@@ -1246,6 +1254,14 @@ impl<'a> WorkspaceSemanticOracle<'a> {
                     );
                     matched_any |= has_match;
                     final_candidates_truncated |= truncated;
+                    if has_match && cpp_target_dispatch_closed {
+                        let rows = self.workspace.analyzer().signature_metadata(&definition);
+                        cpp_target_dispatch_closed = !rows.is_empty()
+                            && rows.iter().all(|entry| {
+                                entry.dispatch_extensibility()
+                                    == Some(DispatchExtensibility::Closed)
+                            });
+                    }
                     complete_materialization = true;
                 }
                 SemanticOutcome::Ambiguous {
@@ -1717,6 +1733,15 @@ impl<'a> WorkspaceSemanticOracle<'a> {
                         &boundaries,
                         lookup.status == Some(DefinitionLookupStatus::Resolved),
                         materialization_quality,
+                        gap,
+                    )
+                    && !exact_cpp_nonvirtual_member_dispatch_discharges_gap(
+                        call_language,
+                        lookup.status == Some(DefinitionLookupStatus::Resolved),
+                        &candidates,
+                        &boundaries,
+                        materialization_quality,
+                        cpp_target_dispatch_closed,
                         gap,
                     )
                     && !concrete_overrides_proven_absent_discharges_gap(
@@ -2674,6 +2699,69 @@ fn proven_static_target_discharges_gap(
                     || ruby_constant_receiver
                     || candidate_has_free_target(candidate))
         })
+}
+
+/// Whether an exact non-virtual C++ member call discharges its own
+/// dynamic-dispatch gap (#3507).
+///
+/// The C++ adapter publishes one dynamic-dispatch gap on every member call:
+/// C++ selects another body at run time whenever the callee is virtual, and
+/// virtual-ness is stated where the member is *declared*, in a class body the
+/// call site may not contain. That answer therefore belongs to the
+/// declaration, not to the call. The analyzer resolves it per callable from
+/// the include-visible class body
+/// (`Analyzer::reconcile_member_dispatch_extensibility`), and this discharge
+/// accepts only a call whose every retained target is a proven, complete,
+/// member-owned target whose joined rows all answer `closed`.
+///
+/// Everything else keeps the gap standing. `open` is what a `virtual` member,
+/// a member of a class that writes a base clause, a template, and a recovered
+/// region publish, and a declaration that keeps no answer -- unresolved, or
+/// declared in a class body this workspace cannot see -- refuses the proof
+/// too. A candidate set that names a free function refuses it as well, so the
+/// receiverless proof stays the only route out of the gap for those calls.
+fn exact_cpp_nonvirtual_member_dispatch_discharges_gap(
+    language: SemanticLanguage,
+    lookup_resolved: bool,
+    candidates: &[DispatchCandidate],
+    boundaries: &[DispatchBoundary],
+    materialization_quality: DispatchQuality,
+    target_dispatch_closed: bool,
+    gap: &SemanticGap,
+) -> bool {
+    language == SemanticLanguage::Standard(Language::Cpp)
+        && target_dispatch_closed
+        && gap.capability == SemanticCapability::DynamicDispatch
+        && matches!(
+            gap.kind,
+            SemanticGapKind::Unknown | SemanticGapKind::Unproven
+        )
+        && lookup_resolved
+        && boundaries.is_empty()
+        && !candidates.is_empty()
+        && materialization_quality == DispatchQuality::Complete
+        && candidates.iter().all(|candidate| {
+            matches!(candidate.proof, ProofStatus::Proven)
+                && matches!(candidate.completeness, EvidenceCompleteness::Complete)
+                && candidate_is_type_owned_member(candidate)
+        })
+}
+
+/// Whether a retained candidate is a member callable, which is the only
+/// callable an object receiver can select another body for.
+///
+/// The semantic model lowers a callable reached through a receiver as
+/// [`ProcedureKind::Method`], including the out-of-line definition that
+/// repeats its owner's qualified name through a namespace; a namespace or
+/// file scope free function, where [`candidate_has_free_target`] answers
+/// `false` because a namespace is not a type, lowers as a function. A free
+/// function has no override set and the receiverless proof already covers its
+/// exact call, so keeping this arm to members is what keeps the two proofs
+/// from answering for each other. The other member kinds C++ can write --
+/// constructors, operators, accessors -- keep the gap: their call sites are
+/// not the plain member calls this proof is written for.
+fn candidate_is_type_owned_member(candidate: &DispatchCandidate) -> bool {
+    matches!(candidate.target().semantics().kind(), ProcedureKind::Method)
 }
 
 /// Whether one Ruby call is written on a receiver the language itself fixes at
@@ -4129,10 +4217,22 @@ fn synthetic_unmaterialized_external(
     let member_segment =
         DeclarationSegment::named(member_kind, member.clone(), anchor, arity).ok()?;
     let declaration = DeclarationLocator::new(vec![owner_segment, member_segment]).ok()?;
+    // The callee is declared outside the calling artifact, so it carries the
+    // dialect of its declaration. A `.c` translation unit is a `cpp-c`
+    // artifact, but everything it calls outside the workspace is declared in
+    // a header, which keeps the C++ interpretation
+    // (`LanguageDialect::for_path`) and the `cpp` label the header pack
+    // publishes under. That is also the label `modeled_procedure_key_for_unit`
+    // gives a `.c` workspace function, so a C procedure key has one label
+    // whichever side of the boundary its callee is on (#3535).
+    let declaring_language = match language {
+        SemanticLanguage::CppC => SemanticLanguage::Standard(Language::Cpp),
+        other => other,
+    };
     let locator = SemanticLocator::new(
         unmaterialized_external_mount(),
         unmaterialized_external_path(),
-        language,
+        declaring_language,
         declaration,
         SemanticRole::Procedure,
         anchor,
@@ -4143,6 +4243,9 @@ fn synthetic_unmaterialized_external(
             member,
             arity,
             has_receiver,
+            exact_external_call
+                .and_then(ExactExternalCallProof::source_jdk_artifact)
+                .cloned(),
             locator,
         )
     } else {
@@ -4410,6 +4513,7 @@ fn retain_artifact_candidates(
     let mut targets = procedures_for_definition(analyzer, definition, artifact);
     if !targets.is_empty()
         && analyzer.ranges_of(definition).len() > 1
+        && !cpp_unit_written_twice(artifact, analyzer, definition)
         && let Some(range) = crate::analyzer::usages::call_relations::selected_callable_range(
             analyzer,
             definition,
@@ -4440,6 +4544,54 @@ fn retain_artifact_candidates(
         );
     }
     (matched, truncated)
+}
+
+/// Whether the retention above keeps every written range of `definition`
+/// instead of narrowing a multi-range unit to the one declaration a call
+/// selects.
+///
+/// The written shape is [`declares_one_logical_callable`]'s question, and the
+/// unit's language decides whether this oracle asks it at all. Only a C++
+/// translation unit answers yes. The C++ adapter gives a `.c` translation unit
+/// its own dialect and its own storage identity, and a C prototype beside the
+/// body that completes it stays on the base narrowing until #3640 settles how
+/// a C prototype is keyed across translation units; no other language pairs a
+/// prototype with an out-of-line body this way.
+///
+/// The dialect is the analyzer's own structured answer for the materialized
+/// file: the artifact key records exactly the language the semantic layer
+/// decided for the unit's source when it planned the materialization, so this
+/// reads no path and no extension.
+fn cpp_unit_written_twice(
+    artifact: &Arc<SemanticArtifact>,
+    analyzer: &dyn IAnalyzer,
+    definition: &CodeUnit,
+) -> bool {
+    artifact.key().language() == SemanticLanguage::Standard(Language::Cpp)
+        && declares_one_logical_callable(analyzer, definition)
+}
+
+/// Whether a declaration's several ranges are several written occurrences of
+/// one callable -- an in-class prototype beside the out-of-line definition that
+/// completes it -- rather than an overload set (#3507, #3508).
+///
+/// [`selected_callable_range`] narrows a multi-range unit to the accepting
+/// declaration a call selects, which is what an overload set needs. It is the
+/// wrong question for one callable written twice: the definition range carries
+/// the body, and narrowing to the prototype beside it drops the only
+/// materialized target and reports a resolved call as an unmaterialized
+/// boundary. The published shape decides which case this is, exactly as it
+/// decides identity elsewhere ([`agreed_callable_identity`]).
+///
+/// [`selected_callable_range`]: crate::analyzer::usages::call_relations::selected_callable_range
+fn declares_one_logical_callable(analyzer: &dyn IAnalyzer, definition: &CodeUnit) -> bool {
+    use crate::analyzer::usages::callable_signature::{
+        agreed_callable_identity, callable_signature_reports,
+    };
+
+    let entries = analyzer.signature_metadata(definition);
+    let reports = callable_signature_reports("dispatch-retention", definition, &entries);
+    agreed_callable_identity(&reports).is_some()
 }
 
 pub(in crate::analyzer::semantic) fn retain_dispatch_candidate(
@@ -5107,7 +5259,8 @@ mod tests {
         CatalogOptions, CompilerOptions, SemanticModelActivationEvidence,
         SemanticModelActivationRequest, SemanticModelRuntimeLimits, SemanticModelRuntimeOutcome,
         SemanticPackCatalog, SessionPackSource, SessionPackSourceKind, SourceFormat,
-        acquire_active_semantic_models, compile_source,
+        acquire_active_semantic_models, acquire_active_semantic_models_with_evidence,
+        compile_source,
     };
     use crate::analyzer::{
         AnalyzerConfig, CallableArity, Language, OverlayProject, ParameterMetadata, Project,
@@ -8146,6 +8299,17 @@ pub fn prelude(text: &str) {
         source: &str,
     ) -> Vec<(String, MintedIdentity)> {
         let fixture = AnalyzerFixture::new_for_language(language, &[(rel_path, source)]);
+        external_call_identities_in(&fixture, rel_path, source)
+    }
+
+    /// The same identities, read through an already prepared fixture so a test
+    /// can activate the declaration model the resolver's identity proof needs
+    /// before asking.
+    fn external_call_identities_in(
+        fixture: &AnalyzerFixture,
+        rel_path: &str,
+        source: &str,
+    ) -> Vec<(String, MintedIdentity)> {
         let file = ProjectFile::new(fixture.project_root(), rel_path);
         let cancellation = CancellationToken::default();
         let mut budget = SemanticBudget::default();
@@ -8208,13 +8372,20 @@ pub fn prelude(text: &str) {
     /// `use`-bound single segment reaches the same shape through the file's
     /// import binders.
     ///
+    /// #3484: the identity is the activated callable's, not the spelling's, so
+    /// the fixture activates the crate's declaration surface first.
+    ///
     /// `has_receiver` is `false` for both. A Rust scoped path is not lowered as
     /// a call receiver the way a Java qualified static is, so an authored Rust
     /// summary must declare `"has_receiver": false`.
     #[test]
     fn a_qualified_rust_callee_publishes_a_dot_joined_external_identity() {
-        let identities =
-            external_call_identities(Language::Rust, "lib.rs", RUST_EXTERNAL_CALL_SOURCE);
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Rust,
+            &[("lib.rs", RUST_EXTERNAL_CALL_SOURCE)],
+        );
+        activate_rust_declaration_pack(&fixture);
+        let identities = external_call_identities_in(&fixture, "lib.rs", RUST_EXTERNAL_CALL_SOURCE);
         assert_eq!(
             identities,
             vec![
@@ -8232,6 +8403,166 @@ pub fn prelude(text: &str) {
                 ),
             ]
         );
+    }
+
+    /// #3484: a qualified spelling is not proof of a declaration. The same
+    /// three calls stay unresolved when no activated pack publishes `std`, so
+    /// a matching summary can never turn a written path into an external
+    /// callable on its own.
+    #[test]
+    fn an_unproven_rust_external_callee_publishes_no_identity() {
+        assert_eq!(
+            external_call_identities(Language::Rust, "lib.rs", RUST_EXTERNAL_CALL_SOURCE),
+            vec![
+                (String::from("Path::new(text)"), None),
+                (String::from("String::from(text)"), None),
+                (String::from("std::str::from_utf8(bytes)"), None),
+            ]
+        );
+    }
+
+    /// The reviewed `std` declaration surface the #2596 fixture's calls resolve
+    /// against: the crate root, the two owner paths, and one receiverless
+    /// callable of the written arity on each.
+    fn activate_rust_declaration_pack(fixture: &AnalyzerFixture) {
+        use crate::analyzer::semantic_model::{
+            CatalogCoordinate, SemanticModelActivationControl, SemanticModelControlAction,
+            SemanticModelControlScope, SemanticModelPackSelector,
+        };
+
+        let pack_json = serde_json::json!({
+            "schema_version": 2,
+            "pack_id": "fixture.rust-std-declarations",
+            "version": "1.0.0",
+            "producer": { "name": "rust-dispatch-fixture", "version": "1.0.0" },
+            "language": "rust",
+            "ecosystem": "cargo",
+            "compatibility": { "bifrost": "*", "toolchains": [] },
+            "provenance": { "source": "fixture" },
+            "license": "NOASSERTION",
+            "completeness": "complete",
+            "safety": { "generated_code_only": false, "review_required": false },
+            "shards": [{
+                "id": "declarations.rust-fixture",
+                "activation": [{}],
+                "payload": {
+                    "kind": "declaration_facts",
+                    "types": [
+                        rust_fixture_type("std", "module"),
+                        rust_fixture_type("std.str", "module"),
+                        rust_fixture_type("std.path", "module"),
+                        rust_fixture_type("std.path.Path", "struct")
+                    ],
+                    "members": [
+                        rust_fixture_member("std.str", "from_utf8"),
+                        rust_fixture_member("std.path.Path", "new")
+                    ],
+                    "relations": []
+                }
+            }]
+        });
+        let pack = compile_source(
+            SourceFormat::Json,
+            &serde_json::to_vec(&pack_json).expect("serialize the Rust declaration fixture"),
+            &CompilerOptions::default(),
+        )
+        .unwrap_or_else(|diagnostics| {
+            panic!("Rust declaration fixture must compile: {diagnostics:#?}")
+        });
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default())
+            .expect("ephemeral catalog");
+        catalog
+            .register_session_pack(
+                &pack,
+                &SessionPackSource {
+                    kind: SessionPackSourceKind::Embedded,
+                    source_id: "fixture.rust-std-declarations".to_owned(),
+                },
+            )
+            .expect("register the Rust declaration fixture");
+        let request = SemanticModelActivationRequest {
+            bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION"))
+                .expect("crate version"),
+            evidence: vec![SemanticModelActivationEvidence {
+                language: "rust".to_owned(),
+                ecosystem: "cargo".to_owned(),
+                package: Some(CatalogCoordinate {
+                    name: "std".to_owned(),
+                    version: None,
+                }),
+                module: None,
+                toolchain: None,
+                target: None,
+                configuration: None,
+                artifact_sha256: None,
+            }],
+            controls: vec![SemanticModelActivationControl {
+                scope: SemanticModelControlScope::Workspace,
+                action: SemanticModelControlAction::Enable,
+                selector: SemanticModelPackSelector {
+                    pack_id: "fixture.rust-std-declarations".to_owned(),
+                    version: None,
+                    manifest_digest: None,
+                },
+            }],
+            limits: SemanticModelRuntimeLimits::default(),
+        };
+        let SemanticModelRuntimeOutcome::Ready { .. } =
+            acquire_active_semantic_models_with_evidence(
+                fixture.analyzer.analyzer(),
+                &catalog,
+                None,
+                &request,
+                None,
+                &CancellationToken::new(),
+            )
+        else {
+            panic!("Rust declaration fixture must activate");
+        };
+    }
+
+    fn rust_fixture_type(name: &str, type_kind: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": format!("type.rust-fixture.{}", rust_fixture_identifier(name)),
+            "name": name,
+            "type_kind": type_kind,
+            "visibility": "public",
+            "locator": {
+                "kind": "artifact",
+                "path": "library/std/src/lib.rs",
+                "symbol": name
+            }
+        })
+    }
+
+    fn rust_fixture_member(owner: &str, member: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": format!("member.rust-fixture.{}.{member}", rust_fixture_identifier(owner)),
+            "owner": format!("type.rust-fixture.{}", rust_fixture_identifier(owner)),
+            "name": member,
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+                "parameters": [{
+                    "name": "value",
+                    "type": { "kind": "named", "name": "untyped" }
+                }]
+            },
+            "locator": {
+                "kind": "artifact",
+                "path": "library/std/src/lib.rs",
+                "symbol": format!("{owner}.{member}")
+            }
+        })
+    }
+
+    /// Stable ids in a compiled pack admit lowercase ASCII alphanumerics and
+    /// `-`, so a fixture path segment loses its Rust casing and separators the
+    /// same way the reviewed web-network pack writes `std-net-tcpstream`.
+    fn rust_fixture_identifier(name: &str) -> String {
+        name.to_lowercase().replace('.', "-")
     }
 
     /// The C++ fixture behind the #2606 acceptance. It holds one external call

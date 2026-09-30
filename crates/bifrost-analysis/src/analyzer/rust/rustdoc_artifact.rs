@@ -521,6 +521,7 @@ fn merge_source_set_productions(
         safety: request.safety.clone(),
         carried_sources: Vec::new(),
         cpp_portability: None,
+        python_correspondence: None,
         shards: vec![AuthoredShard {
             id: "declarations.rust.external".to_owned(),
             activation,
@@ -2212,6 +2213,7 @@ fn finish(
             safety: request.safety.clone(),
             carried_sources: Vec::new(),
             cpp_portability: None,
+            python_correspondence: None,
             shards: vec![AuthoredShard {
                 id: "declarations.rust.external".to_owned(),
                 activation,

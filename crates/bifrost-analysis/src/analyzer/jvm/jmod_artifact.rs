@@ -328,6 +328,7 @@ impl JdkJmodSetPackProducer {
                 safety: request.safety.clone(),
                 carried_sources: Vec::new(),
                 cpp_portability: None,
+                python_correspondence: None,
                 shards,
             }),
             completeness,

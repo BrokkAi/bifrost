@@ -447,6 +447,7 @@ impl JdkSourceArchivePackProducer {
                 // this producer parsed, so the pack carries them all.
                 carried_sources: carried_source_paths(&shards),
                 cpp_portability: None,
+                python_correspondence: None,
                 shards,
             }),
             completeness,

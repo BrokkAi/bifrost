@@ -509,7 +509,7 @@ impl CallBindingCache {
             cancellation,
         );
         // A cancelled batch answers a prefix of `ranges`, shorter than the
-        // request list it was handed (`resolve_definition_requests_traced`
+        // request list it was handed (`resolve_definition_resolutions`
         // stops at the first cancelled poll): `zip` caches exactly that
         // prefix, and every range past it stays a cache miss that
         // `resolved_call_target`'s fallback resolves (and, with the same
@@ -1646,12 +1646,26 @@ fn expand_imported_external_callee(
         return ExpandedExternalCallee::unproven(outcome);
     };
     let Some(expanded) = language_support(language_for_file(file))
-        .and_then(|support| support.expand_imported_external_callee(analyzer, file, text))
+        .and_then(|support| support.expand_imported_external_callee(analyzer, file, text, site))
     else {
         return ExpandedExternalCallee::unproven(outcome);
     };
     if let Some(reference) = outcome.outcome.reference.as_mut() {
-        reference.text = expanded;
+        reference.text = expanded.canonical_callee;
+    }
+    // A language that selected the callable itself carries its exact proof and
+    // owner/member identity into the common dispatch path, where they replace
+    // the spelling-derived identity the boundary would otherwise mint from
+    // text. The proof also states how the selected callable takes its
+    // receiver, which is the same fact the written-out route records beside
+    // its proof, so the call shape and the declaration it describes stay one
+    // answer. An expansion that only translated a spelling leaves whatever the
+    // resolver already proved exactly as it was.
+    if let Some(proof) = expanded.exact_external_call {
+        outcome.call_application = proof.call_application();
+        outcome.dispatch_extensibility = proof.dispatch_extensibility();
+        outcome.exact_external_call = Some(proof);
+        outcome.external_callee_identity = expanded.external_callee_identity;
     }
     // Kotlin can resolve the local import binding while still having no
     // workspace definition for the imported member. Once the external-member
@@ -1736,9 +1750,23 @@ fn apply_call_target_outcome(
     if let Some(identity) = &external_callee_identity {
         debug_assert_eq!(identity.language(), language);
         if let Some(proof) = &lookup.exact_external_call {
+            // The proof's text and the identity are two spellings of one
+            // callee: the text keeps the language's own separator
+            // (`std::net::TcpStream::connect`), while the identity is the
+            // structured owner/member pair authored summaries and
+            // unmaterialized external targets are indexed under. Cutting the
+            // text with the same shared splitter the summary minting side uses
+            // compares the two spellings structurally instead of assuming the
+            // owner is dot-joined in the text (#3484).
             debug_assert_eq!(
-                format!("{}.{}", identity.owner_fqn(), identity.member()),
-                proof.canonical_callee(),
+                crate::analyzer::semantic::split_canonical_qualified_callee(
+                    proof.canonical_callee(),
+                    language,
+                ),
+                Some((
+                    identity.owner_fqn().to_owned(),
+                    identity.member().to_owned()
+                )),
                 "external identity and exact proof must describe one callee"
             );
         }
@@ -1940,7 +1968,7 @@ fn apply_dispatch_outcome_with_flags(
             Some(text) => lookup.boundaries.push(CallDispatchBoundaryKind::External {
                 callee_text: Some(text),
                 normalized_static_owner,
-                external_callee_identity: None,
+                external_callee_identity,
             }),
             None => lookup.boundaries.push(unresolved_call_boundary(
                 status,
@@ -2038,8 +2066,15 @@ fn canonical_external_callee(
     // separator. PHP's reference range can likewise span an argument-unpack or
     // concatenation expression. A source spelling proves no package or
     // namespace root for either language; only resolver-owned evidence may
-    // publish an external identity (#2781, #2793).
-    if matches!(language, Language::Kotlin | Language::Php) && !resolver_proven_external_identity {
+    // publish an external identity (#2781, #2793). Rust's `::`-joined path is
+    // the same shape of claim: a multi-segment spelling such as
+    // `std::net::TcpStream::connect` names the standard-library API only when
+    // the resolver proved the leading segment names no workspace declaration,
+    // so an unresolved member under a workspace `std` must stay open rather
+    // than borrow a summary from its spelling (#3484).
+    if matches!(language, Language::Kotlin | Language::Php | Language::Rust)
+        && !resolver_proven_external_identity
+    {
         return None;
     }
     let (owner, member) =
@@ -5484,6 +5519,216 @@ fun caller(holder: Holder): String = holder.value.toString()
         assert_eq!(
             diagnostics[0].code,
             CallRelationDiagnosticCode::TargetsAmbiguous
+        );
+    }
+
+    /// The reviewed Rust declaration surface for
+    /// `std::net::TcpStream::connect`: the crate root, its two owner paths,
+    /// and one receiverless callable of the written arity. It mirrors the
+    /// shipped web-network pack, which is what an authored network summary is
+    /// keyed by.
+    fn activate_rust_connect_declaration_pack(fixture: &AnalyzerFixture) {
+        use crate::analyzer::semantic_model::{
+            CatalogCoordinate, CatalogOptions, CompilerOptions, SemanticModelActivationControl,
+            SemanticModelActivationEvidence, SemanticModelActivationRequest,
+            SemanticModelControlAction, SemanticModelControlScope, SemanticModelPackSelector,
+            SemanticModelRuntimeLimits, SemanticModelRuntimeOutcome, SemanticPackCatalog,
+            SessionPackSource, SessionPackSourceKind, SourceFormat,
+            acquire_active_semantic_models_with_evidence, compile_source,
+        };
+
+        let pack_id = "fixture.rust-std-connect-declarations";
+        let pack_json = serde_json::json!({
+            "schema_version": 2,
+            "pack_id": pack_id,
+            "version": "1.0.0",
+            "producer": { "name": "rust-dispatch-fixture", "version": "1.0.0" },
+            "language": "rust",
+            "ecosystem": "cargo",
+            "compatibility": { "bifrost": "*", "toolchains": [] },
+            "provenance": { "source": "fixture" },
+            "license": "NOASSERTION",
+            "completeness": "complete",
+            "safety": { "generated_code_only": false, "review_required": false },
+            "shards": [{
+                "id": "declarations.rust-fixture",
+                "activation": [{}],
+                "payload": {
+                    "kind": "declaration_facts",
+                    "types": [
+                        {
+                            "id": "type.rust-fixture.std",
+                            "name": "std",
+                            "type_kind": "module",
+                            "visibility": "public",
+                            "locator": {
+                                "kind": "artifact",
+                                "path": "library/std/src/lib.rs",
+                                "symbol": "std"
+                            }
+                        },
+                        {
+                            "id": "type.rust-fixture.std-net",
+                            "name": "std.net",
+                            "type_kind": "module",
+                            "visibility": "public",
+                            "locator": {
+                                "kind": "artifact",
+                                "path": "library/std/src/net/mod.rs",
+                                "symbol": "std.net"
+                            }
+                        },
+                        {
+                            "id": "type.rust-fixture.std-net-tcpstream",
+                            "name": "std.net.TcpStream",
+                            "type_kind": "struct",
+                            "visibility": "public",
+                            "locator": {
+                                "kind": "artifact",
+                                "path": "library/std/src/net/tcp.rs",
+                                "symbol": "std.net.TcpStream"
+                            }
+                        }
+                    ],
+                    "members": [{
+                        "id": "member.rust-fixture.std-net-tcpstream.connect",
+                        "owner": "type.rust-fixture.std-net-tcpstream",
+                        "name": "connect",
+                        "member_kind": "method",
+                        "visibility": "public",
+                        "is_static": true,
+                        "callable_family_complete": true,
+                        "signature": {
+                            "parameters": [{
+                                "name": "addr",
+                                "type": { "kind": "named", "name": "untyped" }
+                            }]
+                        },
+                        "locator": {
+                            "kind": "artifact",
+                            "path": "library/std/src/net/tcp.rs",
+                            "symbol": "std.net.TcpStream.connect"
+                        }
+                    }],
+                    "relations": []
+                }
+            }]
+        });
+        let pack = compile_source(
+            SourceFormat::Json,
+            &serde_json::to_vec(&pack_json).expect("serialize the Rust declaration fixture"),
+            &CompilerOptions::default(),
+        )
+        .unwrap_or_else(|diagnostics| {
+            panic!("Rust declaration fixture must compile: {diagnostics:#?}")
+        });
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default())
+            .expect("ephemeral catalog");
+        catalog
+            .register_session_pack(
+                &pack,
+                &SessionPackSource {
+                    kind: SessionPackSourceKind::Embedded,
+                    source_id: pack_id.to_owned(),
+                },
+            )
+            .expect("register the Rust declaration fixture");
+        let request = SemanticModelActivationRequest {
+            bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION"))
+                .expect("crate version"),
+            evidence: vec![SemanticModelActivationEvidence {
+                language: "rust".to_owned(),
+                ecosystem: "cargo".to_owned(),
+                package: Some(CatalogCoordinate {
+                    name: "std".to_owned(),
+                    version: None,
+                }),
+                module: None,
+                toolchain: None,
+                target: None,
+                configuration: None,
+                artifact_sha256: None,
+            }],
+            controls: vec![SemanticModelActivationControl {
+                scope: SemanticModelControlScope::Workspace,
+                action: SemanticModelControlAction::Enable,
+                selector: SemanticModelPackSelector {
+                    pack_id: pack_id.to_owned(),
+                    version: None,
+                    manifest_digest: None,
+                },
+            }],
+            limits: SemanticModelRuntimeLimits::default(),
+        };
+        let SemanticModelRuntimeOutcome::Ready { .. } =
+            acquire_active_semantic_models_with_evidence(
+                fixture.analyzer.analyzer(),
+                &catalog,
+                None,
+                &request,
+                None,
+                &CancellationToken::new(),
+            )
+        else {
+            panic!("Rust declaration fixture must activate");
+        };
+    }
+
+    /// #3484: the imported spelling (`use std::net::TcpStream;` then
+    /// `TcpStream::connect(addr)`) publishes the same evidence pair the
+    /// written-out `std::net::TcpStream::connect(addr)` route publishes. The
+    /// exact callable proof and the resolver-owned owner/member identity
+    /// travel together through `resolve_call_target_batch_with_source` and the
+    /// common dispatch path, because a matching summary is behavior attached
+    /// to a callable rather than to the spelling that named it. An expansion
+    /// that only translated a name would leave both fields empty and the
+    /// reviewed summary unbound.
+    #[test]
+    fn rust_imported_external_member_publishes_exact_proof_and_identity() {
+        let source = "use std::net::TcpStream;\n\npub fn total() {\n    let _connection = \
+                      TcpStream::connect(\"127.0.0.1:9\");\n}\n";
+        let call = "TcpStream::connect(\"127.0.0.1:9\")";
+        let fixture = AnalyzerFixture::new_for_language(Language::Rust, &[("lib.rs", source)]);
+        activate_rust_connect_declaration_pack(&fixture);
+        let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
+        let lookup = CallRelationService::dispatch_at_bounded(
+            fixture.analyzer.analyzer(),
+            scope.token(),
+            &ExactCallLocation {
+                file: ProjectFile::new(fixture.project_root(), "lib.rs"),
+                call_span: call_span(source, call),
+            },
+            Arc::from(source),
+            generous_limits(),
+            None,
+        );
+
+        assert!(
+            lookup.targets.is_empty(),
+            "an external declaration is not a workspace target: {lookup:#?}"
+        );
+        let proof = lookup
+            .exact_external_call
+            .as_ref()
+            .unwrap_or_else(|| panic!("the imported call must carry its exact proof: {lookup:#?}"));
+        assert_eq!(proof.canonical_callee(), "std::net::TcpStream::connect");
+        assert_eq!(proof.parameter_count(), 1);
+        assert!(
+            !proof.has_receiver(),
+            "an associated function of the owner takes no receiver: {proof:#?}"
+        );
+        assert_eq!(
+            lookup.boundaries,
+            vec![CallDispatchBoundaryKind::External {
+                callee_text: Some("std::net::TcpStream::connect".into()),
+                normalized_static_owner: None,
+                external_callee_identity: Some(ResolverOwnedExternalCalleeIdentity::new(
+                    Language::Rust,
+                    "std.net.TcpStream",
+                    "connect",
+                )),
+            }],
+            "the imported spelling and the written spelling publish one identity: {lookup:#?}"
         );
     }
 }

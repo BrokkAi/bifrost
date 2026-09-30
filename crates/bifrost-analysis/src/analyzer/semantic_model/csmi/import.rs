@@ -14,21 +14,24 @@ use super::validate::{CsmiVocabularySupport, validate_csmi_pack};
 use crate::analyzer::semantic_model::{
     ActivationSelector, AuthoredPayload, AuthoredProcedureSummary, AuthoredProcedureTarget,
     AuthoredSemanticModelPack, AuthoredShard, AuthoredSummaryExitKind, AuthoredSummaryInput,
-    AuthoredSummaryOutput, AuthoredSummaryTransfer, CollectionFlowFact, CollectionFlowsPayload,
-    Compatibility, CompilerOptions, Completeness, CppArtifactDigest, CppArtifactSelector,
-    CppCallableKind, CppCallableSignature, CppCanonicalType, CppDescriptorRole, CppDigestAlgorithm,
-    CppDirectHeader, CppFundamentalTypeName, CppHeaderClosure, CppIdentityStability, CppLanguage,
+    AuthoredSummaryLocation, AuthoredSummaryLocationKind, AuthoredSummaryOutput,
+    AuthoredSummaryTransfer, CollectionFlowFact, CollectionFlowsPayload, Compatibility,
+    CompilerOptions, Completeness, CppArtifactDigest, CppArtifactSelector, CppCallableKind,
+    CppCallableSignature, CppCanonicalType, CppDescriptorRole, CppDigestAlgorithm, CppDirectHeader,
+    CppFundamentalTypeName, CppHeaderClosure, CppIdentityStability, CppLanguage,
     CppPortabilityEvidence, CppPortableSymbolKey, CppPortableSymbolRecord, CppReferenceKind,
     CppResolutionContextRecord, CppResolutionContextRef, CppSpecialMemberEvidence,
     CppSpecialMemberOperation, CppSymbolDescriptor, CppTypeAliasEvidence, CppTypeQualifier,
     ImplicitOperation, KeyedReadBehavior, KeyedReadObservation, Locator, MemberFact, MemberKind,
-    NameSelector, Parameter, ParameterPassingMode, Producer, Provenance, ReceiverFact,
-    RuntimeContractsPayload, RuntimeGlobalBindingEvidence, RuntimeGlobalExposure,
-    RuntimeValueExtension, RuntimeValuesPayload, Safety, Signature, SummaryMoveInvalidation,
-    SummaryValuePreservation, SummaryValueTransfer, SummaryValueTransferKind,
-    SummaryValueTransferLimitation, SummaryValueTransferLimitationKind,
-    SummaryValueTransferOperation, TypeCopySemantics, TypeFact, TypeKind, TypeMoveSemantics,
-    TypeRef, TypeValueSemantics, Visibility, compile_pack,
+    NameSelector, NormalResultTransferPartition, Parameter, ParameterPassingMode,
+    PortableProfileEvidence, Producer, Provenance, PythonCorrespondenceEvidence,
+    PythonCorrespondenceSymbol, ReceiverFact, RuntimeContractsPayload,
+    RuntimeGlobalBindingEvidence, RuntimeGlobalExposure, RuntimeValueExtension,
+    RuntimeValuesPayload, Safety, Signature, SummaryMoveInvalidation, SummaryValuePreservation,
+    SummaryValueTransfer, SummaryValueTransferKind, SummaryValueTransferLimitation,
+    SummaryValueTransferLimitationKind, SummaryValueTransferOperation, TransferPartitionLimitation,
+    TransferPartitionSource, TransferPartitionStatus, TypeCopySemantics, TypeFact, TypeKind,
+    TypeMoveSemantics, TypeRef, TypeValueSemantics, Visibility, compile_pack,
 };
 use serde_json::Value;
 use std::collections::{BTreeSet, HashMap};
@@ -322,6 +325,13 @@ fn import_semantic_document(
     } else {
         HashMap::new()
     };
+    let python_correspondence_facts = model.extension_facts.iter().any(|fact| {
+        fact.vocabulary == CSMI_PYTHON_PROFILE_ID && fact.family == "declaration-correspondence"
+    });
+    let has_python_correspondence = python_identity && python_correspondence_facts;
+    let python_correspondence = has_python_correspondence
+        .then(|| import_python_correspondence(model, document, &python_keys))
+        .transpose()?;
     let mut symbols = HashMap::new();
     let mut types = Vec::new();
     let mut type_ids = HashMap::new();
@@ -411,6 +421,8 @@ fn import_semantic_document(
                     path: format!("csmi/{pack_digest}.json"),
                     symbol: symbol.id.clone(),
                     identity: Box::new(key.clone()),
+                    profile_evidence: None,
+                    callable_shape_evidence: None,
                 }
             } else {
                 Locator::Artifact {
@@ -420,6 +432,35 @@ fn import_semantic_document(
             },
         });
     }
+    let reference_types = if python_identity {
+        type_ids
+            .iter()
+            .map(|(local, native)| {
+                (
+                    local.clone(),
+                    TypeRef::Declared {
+                        id: native.clone(),
+                        arguments: Vec::new(),
+                        nullable: false,
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>()
+    } else {
+        symbols
+            .iter()
+            .map(|(local, name)| {
+                (
+                    local.clone(),
+                    TypeRef::Named {
+                        name: name.clone(),
+                        arguments: Vec::new(),
+                        nullable: false,
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>()
+    };
     let mut members = Vec::new();
     let mut member_ids = HashMap::new();
     for declaration in &model.declarations {
@@ -452,14 +493,22 @@ fn import_semantic_document(
                 symbol.id
             ))
         })?;
-        let signature = signature_from_shape(shape, &symbols)?;
-        let owner_id = types
-            .iter()
-            .find(|fact| fact.name == owner_name)
-            .map(|fact| fact.id.clone())
-            .unwrap_or_else(|| {
-                type_symbol_id(&owner_name).unwrap_or_else(|_| owner_symbol.clone())
-            });
+        let signature = signature_from_shape(shape, &reference_types)?;
+        let owner_id = if python_identity {
+            type_ids.get(owner_symbol).cloned().ok_or_else(|| {
+                CsmiImportError::Identity(format!(
+                    "unknown Python callable owner symbol {owner_symbol}"
+                ))
+            })?
+        } else {
+            types
+                .iter()
+                .find(|fact| fact.name == owner_name)
+                .map(|fact| fact.id.clone())
+                .unwrap_or_else(|| {
+                    type_symbol_id(&owner_name).unwrap_or_else(|_| owner_symbol.clone())
+                })
+        };
         let member_id = if let Some(key) = python_keys.get(&declaration.symbol) {
             super::python::native_id(key)
         } else if cpp_identity {
@@ -467,15 +516,17 @@ fn import_semantic_document(
         } else {
             format!("member.{}", sha256_hex(declaration.symbol.as_bytes()))
         };
-        let callable_family_complete = model.completeness_statements.iter().any(|statement| {
+        let callable_shape_statement = model.completeness_statements.iter().find(|statement| {
             statement.vocabulary.is_none()
                 && statement.version.is_none()
                 && statement.family == "declaration-aspects"
-                && statement.status == CsmiCoverageStatus::Complete
                 && statement.scope.get("symbol").and_then(Value::as_str)
                     == Some(declaration.symbol.as_str())
                 && statement.scope.get("aspect").and_then(Value::as_str) == Some("callable-shape")
         });
+        let callable_family_complete = !python_identity
+            && callable_shape_statement
+                .is_some_and(|statement| statement.status == CsmiCoverageStatus::Complete);
         member_ids.insert(declaration.symbol.clone(), member_id.clone());
         members.push(MemberFact {
             ambient_use: None,
@@ -517,6 +568,8 @@ fn import_semantic_document(
                     path: format!("csmi/{pack_digest}.json"),
                     symbol: symbol.id.clone(),
                     identity: Box::new(key.clone()),
+                    profile_evidence: None,
+                    callable_shape_evidence: None,
                 }
             } else {
                 Locator::Artifact {
@@ -525,6 +578,38 @@ fn import_semantic_document(
                 }
             },
         });
+        if python_identity && let Some(statement) = callable_shape_statement {
+            let member = members.last_mut().expect("callable was just appended");
+            let native_sha256 = super::python::native_callable_shape_digest(member);
+            let provenance_records = document
+                .provenance_records
+                .iter()
+                .filter(|record| {
+                    statement.provenance.contains(&record.id)
+                        || document.default_provenance.as_ref() == Some(&record.id)
+                })
+                .cloned()
+                .collect();
+            let Locator::Interchange {
+                callable_shape_evidence,
+                ..
+            } = &mut member.locator
+            else {
+                unreachable!("Python callable has a portable locator");
+            };
+            *callable_shape_evidence = Some(Box::new(
+                crate::analyzer::semantic_model::PortableCallableShapeEvidence {
+                    native_sha256,
+                    statement: statement.clone(),
+                    provenance_records,
+                    default_provenance: document.default_provenance.clone(),
+                    evidence_sha256: String::new(),
+                },
+            ));
+            if let Some(evidence) = callable_shape_evidence {
+                evidence.evidence_sha256 = super::python::callable_shape_evidence_digest(evidence);
+            }
+        }
     }
     import_value_transfer_facts(model, &type_ids, &member_ids, &mut types, &mut members)?;
     let conditional_type_refinements = import_conditional_type_refinements(
@@ -676,31 +761,181 @@ fn import_semantic_document(
         (Some(declaration), _) | (None, Some(declaration)) => declaration,
         (None, None) => unreachable!("unsupported declaration identity was rejected above"),
     };
-    let shard = AuthoredShard {
-        id: format!("csmi.{pack_digest}.summaries"),
-        activation: selectors,
-        payload: AuthoredPayload::DeclarationFacts {
-            types,
-            members,
-            relations: Vec::new(),
-        },
-        runtime_values,
-        runtime_contracts,
-        collection_flows,
-        deferred_yields,
-        conditional_type_refinements,
+    for member in &mut members {
+        if !matches!(
+            &member.locator,
+            Locator::Interchange {
+                callable_shape_evidence: Some(_),
+                ..
+            }
+        ) {
+            continue;
+        }
+        let native_sha256 = super::python::native_callable_shape_digest(member);
+        if let Locator::Interchange {
+            callable_shape_evidence: Some(evidence),
+            ..
+        } = &mut member.locator
+        {
+            evidence.native_sha256 = native_sha256;
+            evidence.evidence_sha256 = super::python::callable_shape_evidence_digest(evidence);
+        }
+    }
+    let shards = if has_python_correspondence {
+        let declaration_artifact = model
+            .artifact_selectors
+            .first()
+            .expect("validated Python model has one declaration artifact");
+        let declaration_key = super::canonical::canonical_json(declaration_artifact)
+            .map_err(|error| CsmiImportError::Identity(error.to_string()))?;
+        let mut artifact_facts =
+            HashMap::<Vec<u8>, (ActivationSelector, Vec<TypeFact>, Vec<MemberFact>)>::new();
+        for fact in types {
+            let artifact = python_artifact_for_locator(&fact.locator)?.clone();
+            let key = super::canonical::canonical_json(&artifact)
+                .map_err(|error| CsmiImportError::Identity(error.to_string()))?;
+            let selector =
+                selector_for_python_artifact(&artifact, declaration_artifact, &selectors)?;
+            let entry = artifact_facts
+                .entry(key)
+                .or_insert_with(|| (selector, Vec::new(), Vec::new()));
+            entry.1.push(fact);
+        }
+        for fact in members {
+            let artifact = python_artifact_for_locator(&fact.locator)?.clone();
+            let key = super::canonical::canonical_json(&artifact)
+                .map_err(|error| CsmiImportError::Identity(error.to_string()))?;
+            let selector =
+                selector_for_python_artifact(&artifact, declaration_artifact, &selectors)?;
+            let entry = artifact_facts
+                .entry(key)
+                .or_insert_with(|| (selector, Vec::new(), Vec::new()));
+            entry.2.push(fact);
+        }
+
+        let has_declaration_payload = runtime_values.is_some()
+            || runtime_contracts.is_some()
+            || collection_flows.is_some()
+            || deferred_yields.is_some()
+            || conditional_type_refinements.is_some();
+        if has_declaration_payload {
+            let selector = selector_for_python_artifact(
+                declaration_artifact,
+                declaration_artifact,
+                &selectors,
+            )?;
+            artifact_facts
+                .entry(declaration_key.clone())
+                .or_insert_with(|| (selector, Vec::new(), Vec::new()));
+        }
+
+        let mut declaration_shards = Vec::new();
+        for (key, (selector, types, members)) in artifact_facts {
+            let declaration_artifact_shard = key == declaration_key;
+            declaration_shards.push(AuthoredShard {
+                id: format!(
+                    "csmi.{pack_digest}.declarations.{}",
+                    &sha256_hex(&key)[..16]
+                ),
+                activation: vec![selector],
+                payload: AuthoredPayload::DeclarationFacts {
+                    types,
+                    members,
+                    relations: Vec::new(),
+                },
+                runtime_values: declaration_artifact_shard
+                    .then(|| runtime_values.clone())
+                    .flatten(),
+                runtime_contracts: declaration_artifact_shard
+                    .then(|| runtime_contracts.clone())
+                    .flatten(),
+                collection_flows: declaration_artifact_shard
+                    .then(|| collection_flows.clone())
+                    .flatten(),
+                deferred_yields: declaration_artifact_shard
+                    .then(|| deferred_yields.clone())
+                    .flatten(),
+                conditional_type_refinements: declaration_artifact_shard
+                    .then(|| conditional_type_refinements.clone())
+                    .flatten(),
+            });
+        }
+        let mut summary_artifacts =
+            HashMap::<Vec<u8>, (ActivationSelector, Vec<AuthoredProcedureSummary>)>::new();
+        for (source, summary) in model.procedure_summaries.iter().zip(summaries) {
+            let symbol = model
+                .symbols
+                .iter()
+                .find(|symbol| symbol.id == source.callable)
+                .expect("validated Python summary names a symbol");
+            let identity = python_keys
+                .get(&symbol.id)
+                .expect("validated Python symbol has an identity");
+            let artifact = identity
+                .artifact_selectors
+                .first()
+                .expect("Python identity has one artifact");
+            let key = super::canonical::canonical_json(artifact)
+                .map_err(|error| CsmiImportError::Identity(error.to_string()))?;
+            let selector =
+                selector_for_python_artifact(artifact, declaration_artifact, &selectors)?;
+            summary_artifacts
+                .entry(key)
+                .or_insert_with(|| (selector, Vec::new()))
+                .1
+                .push(summary);
+        }
+        for (key, (selector, summaries)) in summary_artifacts {
+            let summary_shard = AuthoredShard {
+                id: format!(
+                    "csmi.{pack_digest}.procedure-summaries.{}",
+                    &sha256_hex(&key)[..16]
+                ),
+                activation: vec![selector],
+                payload: AuthoredPayload::ProcedureSummaries { summaries },
+                runtime_values: None,
+                runtime_contracts: None,
+                collection_flows: None,
+                deferred_yields: None,
+                conditional_type_refinements: None,
+            };
+            if !summaries_empty(&summary_shard) {
+                declaration_shards.push(summary_shard);
+            }
+        }
+        declaration_shards
+    } else {
+        let shard = AuthoredShard {
+            id: format!("csmi.{pack_digest}.summaries"),
+            activation: selectors,
+            payload: AuthoredPayload::DeclarationFacts {
+                types,
+                members,
+                relations: Vec::new(),
+            },
+            runtime_values,
+            runtime_contracts,
+            collection_flows,
+            deferred_yields,
+            conditional_type_refinements,
+        };
+        let summary_shard = AuthoredShard {
+            id: format!("csmi.{pack_digest}.procedure-summaries"),
+            activation: shard.activation.clone(),
+            payload: AuthoredPayload::ProcedureSummaries { summaries },
+            runtime_values: None,
+            runtime_contracts: None,
+            collection_flows: None,
+            deferred_yields: None,
+            conditional_type_refinements: None,
+        };
+        if summaries_empty(&summary_shard) {
+            vec![shard]
+        } else {
+            vec![shard, summary_shard]
+        }
     };
-    let summary_shard = AuthoredShard {
-        id: format!("csmi.{pack_digest}.procedure-summaries"),
-        activation: shard.activation.clone(),
-        payload: AuthoredPayload::ProcedureSummaries { summaries },
-        runtime_values: None,
-        runtime_contracts: None,
-        collection_flows: None,
-        deferred_yields: None,
-        conditional_type_refinements: None,
-    };
-    Ok(AuthoredSemanticModelPack {
+    let mut pack = AuthoredSemanticModelPack {
         schema_version: crate::analyzer::semantic_model::SEMANTIC_MODEL_SCHEMA_VERSION,
         pack_id: format!("csmi.{pack_digest}"),
         version: format!("0.1.0+csmi.{pack_digest}"),
@@ -720,12 +955,164 @@ fn import_semantic_document(
         },
         carried_sources: Vec::new(),
         cpp_portability,
-        shards: if summaries_empty(&summary_shard) {
-            vec![shard]
-        } else {
-            vec![shard, summary_shard]
-        },
+        python_correspondence: None,
+        shards,
+    };
+    if let Some(evidence) = python_correspondence {
+        pack.python_correspondence = Some(evidence);
+        let native_sha256 = super::python::native_correspondence_digest(&pack);
+        pack.python_correspondence
+            .as_mut()
+            .expect("correspondence carrier was just set")
+            .native_sha256 = native_sha256;
+    } else if python_identity && model.artifact_selectors[0].purl.starts_with("pkg:pypi/") {
+        let native_sha256 = super::python::native_profile_digest(&pack);
+        let evidence = PortableProfileEvidence {
+            native_sha256,
+            vocabulary_uses: model
+                .vocabulary_uses
+                .iter()
+                .filter(|use_| use_.identifier == CSMI_PYTHON_PROFILE_ID)
+                .cloned()
+                .collect(),
+            extension_facts: model
+                .extension_facts
+                .iter()
+                .filter(|fact| fact.vocabulary == CSMI_PYTHON_PROFILE_ID)
+                .cloned()
+                .collect(),
+            completeness_statements: model
+                .completeness_statements
+                .iter()
+                .filter(|statement| statement.vocabulary.as_deref() == Some(CSMI_PYTHON_PROFILE_ID))
+                .cloned()
+                .collect(),
+            provenance_records: document.provenance_records.clone(),
+            default_provenance: document.default_provenance.clone(),
+        };
+        let Some(Locator::Interchange {
+            profile_evidence, ..
+        }) = pack
+            .shards
+            .iter_mut()
+            .find_map(|shard| match &mut shard.payload {
+                AuthoredPayload::DeclarationFacts { types, .. } => {
+                    types.first_mut().map(|fact| &mut fact.locator)
+                }
+                _ => None,
+            })
+        else {
+            return Err(CsmiImportError::Unsupported {
+                path: "symbols".to_owned(),
+                semantic: "Python distribution has no declared module to carry profile evidence"
+                    .to_owned(),
+            });
+        };
+        *profile_evidence = Some(Box::new(evidence));
+    }
+    Ok(pack)
+}
+
+fn import_python_correspondence(
+    model: &CsmiSemanticModel,
+    document: &CsmiSemanticDocument,
+    python_keys: &HashMap<String, CsmiPortableSymbolIdentity>,
+) -> Result<PythonCorrespondenceEvidence, CsmiImportError> {
+    let declaration_artifact = model
+        .artifact_selectors
+        .first()
+        .expect("validated Python model has one declaration artifact")
+        .clone();
+    let symbols = model
+        .symbols
+        .iter()
+        .map(|symbol| PythonCorrespondenceSymbol {
+            local_id: symbol.id.clone(),
+            identity: python_keys[&symbol.id].clone(),
+            provenance: symbol.provenance.clone(),
+        })
+        .collect();
+    let mut mappings = Vec::new();
+    for fact in model.extension_facts.iter().filter(|fact| {
+        fact.vocabulary == CSMI_PYTHON_PROFILE_ID && fact.family == "declaration-correspondence"
+    }) {
+        let values = fact
+            .payload
+            .get("mappings")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                CsmiImportError::Identity(
+                    "validated Python correspondence fact has no mappings array".to_owned(),
+                )
+            })?;
+        for value in values {
+            mappings.push(serde_json::from_value(value.clone()).map_err(|error| {
+                CsmiImportError::Unsupported {
+                    path: "extensionFacts.declaration-correspondence.mappings".to_owned(),
+                    semantic: error.to_string(),
+                }
+            })?);
+        }
+    }
+    Ok(PythonCorrespondenceEvidence {
+        native_sha256: String::new(),
+        declaration_artifact,
+        symbols,
+        mappings,
+        vocabulary_uses: model
+            .vocabulary_uses
+            .iter()
+            .filter(|use_| use_.identifier == CSMI_PYTHON_PROFILE_ID)
+            .cloned()
+            .collect(),
+        extension_facts: model
+            .extension_facts
+            .iter()
+            .filter(|fact| fact.vocabulary == CSMI_PYTHON_PROFILE_ID)
+            .cloned()
+            .collect(),
+        completeness_statements: model
+            .completeness_statements
+            .iter()
+            .filter(|statement| statement.vocabulary.as_deref() == Some(CSMI_PYTHON_PROFILE_ID))
+            .cloned()
+            .collect(),
+        core_completeness_statements: model
+            .completeness_statements
+            .iter()
+            .filter(|statement| statement.vocabulary.is_none())
+            .cloned()
+            .collect(),
+        provenance_records: document.provenance_records.clone(),
+        default_provenance: document.default_provenance.clone(),
     })
+}
+
+fn python_artifact_for_locator(
+    locator: &Locator,
+) -> Result<&CsmiArtifactSelector, CsmiImportError> {
+    let Locator::Interchange { identity, .. } = locator else {
+        return Err(CsmiImportError::Identity(
+            "Python declaration has no artifact-scoped interchange identity".to_owned(),
+        ));
+    };
+    identity.artifact_selectors.first().ok_or_else(|| {
+        CsmiImportError::Identity("Python identity has no exact artifact selector".to_owned())
+    })
+}
+
+fn selector_for_python_artifact(
+    artifact: &CsmiArtifactSelector,
+    declaration_artifact: &CsmiArtifactSelector,
+    declaration_selectors: &[ActivationSelector],
+) -> Result<ActivationSelector, CsmiImportError> {
+    if artifact == declaration_artifact {
+        return Ok(declaration_selectors
+            .first()
+            .expect("validated Python model has one declaration selector")
+            .clone());
+    }
+    selector_from_csmi(artifact, &[], false)
 }
 
 /// Import the four runtime-values families as one lossless native payload.
@@ -1977,7 +2364,7 @@ fn member_kind(kind: CsmiCallableKind) -> Result<MemberKind, CsmiImportError> {
 
 fn signature_from_shape(
     shape: &CsmiCallableShape,
-    symbols: &HashMap<String, String>,
+    references: &HashMap<String, TypeRef>,
 ) -> Result<Signature, CsmiImportError> {
     if shape.results.len() > 1 {
         return Err(CsmiImportError::Unsupported {
@@ -2003,7 +2390,7 @@ fn signature_from_shape(
                 name: parameter.label.clone(),
                 r#type: type_ref(
                     parameter_type,
-                    symbols,
+                    references,
                     &format!("declarations.callable.parameters[{position}].type"),
                 )?,
                 optional: !parameter.required,
@@ -2035,7 +2422,7 @@ fn signature_from_shape(
                     })?;
             type_ref(
                 result_type,
-                symbols,
+                references,
                 "declarations.callable.results[0].type",
             )
         })
@@ -2049,14 +2436,14 @@ fn signature_from_shape(
 
 fn type_ref(
     value: &CsmiTypeExpression,
-    symbols: &HashMap<String, String>,
+    references: &HashMap<String, TypeRef>,
     path: &str,
 ) -> Result<TypeRef, CsmiImportError> {
     match value {
         CsmiTypeExpression::Reference(reference) => {
-            let name = symbols.get(&reference.symbol).cloned().ok_or_else(|| {
+            let mut resolved = references.get(&reference.symbol).cloned().ok_or_else(|| {
                 CsmiImportError::Identity(format!(
-                    "unresolved JVM type symbol {} at {path}",
+                    "unresolved type symbol {} at {path}",
                     reference.symbol
                 ))
             })?;
@@ -2065,14 +2452,23 @@ fn type_ref(
                 .iter()
                 .enumerate()
                 .map(|(position, argument)| {
-                    type_ref(argument, symbols, &format!("{path}.arguments[{position}]"))
+                    type_ref(
+                        argument,
+                        references,
+                        &format!("{path}.arguments[{position}]"),
+                    )
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            Ok(TypeRef::Named {
-                name,
-                arguments,
-                nullable: false,
-            })
+            match &mut resolved {
+                TypeRef::Named {
+                    arguments: target, ..
+                }
+                | TypeRef::Declared {
+                    arguments: target, ..
+                } => *target = arguments,
+                _ => unreachable!("reference map contains only named or declared types"),
+            }
+            Ok(resolved)
         }
         CsmiTypeExpression::Parameter(parameter) => Ok(TypeRef::TypeParameter {
             name: parameter.symbol.clone(),
@@ -2140,6 +2536,72 @@ fn summary_from_csmi(
         .iter()
         .map(|transfer| transfer_from_csmi(transfer, member_ids))
         .collect::<Result<Vec<_>, _>>()?;
+    let mut transfer_partitions = Vec::new();
+    let mut locations = Vec::new();
+    for statement in model.completeness_statements.iter().filter(|statement| {
+        statement.vocabulary.as_deref() == Some(CSMI_TRANSFER_PARTITIONS_PROFILE_ID)
+    }) {
+        let scope: CsmiTransferPartitionScope = serde_json::from_value(statement.scope.clone())
+            .map_err(|error| CsmiImportError::Unsupported {
+                path: "completenessStatements.scope".to_owned(),
+                semantic: error.to_string(),
+            })?;
+        if scope.callable != summary.callable {
+            continue;
+        }
+        let source = match scope.source {
+            CsmiTransferPartitionSource::AllInputs => TransferPartitionSource::AllInputs,
+            CsmiTransferPartitionSource::InputRoot {
+                root: CsmiInputBoundaryRoot::Receiver(_),
+            } => TransferPartitionSource::InputReceiver,
+            CsmiTransferPartitionSource::InputRoot {
+                root: CsmiInputBoundaryRoot::Parameter(root),
+            } => TransferPartitionSource::InputParameter {
+                ordinal: root.position,
+            },
+            CsmiTransferPartitionSource::InputRoot {
+                root: CsmiInputBoundaryRoot::Capture(root),
+            } => {
+                if !locations
+                    .iter()
+                    .any(|location: &AuthoredSummaryLocation| location.id == root.symbol)
+                {
+                    locations.push(AuthoredSummaryLocation {
+                        id: root.symbol.clone(),
+                        location_kind: AuthoredSummaryLocationKind::Capture,
+                    });
+                }
+                TransferPartitionSource::InputCapture {
+                    symbol: root.symbol,
+                }
+            }
+        };
+        transfer_partitions.push(NormalResultTransferPartition {
+            source,
+            normal_result: scope.destination.position,
+            status: match statement.status {
+                CsmiCoverageStatus::Unknown => TransferPartitionStatus::Unknown,
+                CsmiCoverageStatus::Partial => TransferPartitionStatus::Partial,
+                CsmiCoverageStatus::Complete => TransferPartitionStatus::Complete,
+            },
+            limitations: statement
+                .limitations
+                .iter()
+                .map(|limitation| TransferPartitionLimitation {
+                    kind: limitation.kind.clone(),
+                    diagnostic_code: limitation
+                        .diagnostic
+                        .as_ref()
+                        .and_then(|diagnostic| diagnostic.code.clone()),
+                    diagnostic_message: limitation
+                        .diagnostic
+                        .as_ref()
+                        .and_then(|diagnostic| diagnostic.message.clone()),
+                })
+                .collect(),
+            provenance: statement.provenance.clone(),
+        });
+    }
     let completeness = model
         .completeness_statements
         .iter()
@@ -2160,13 +2622,15 @@ fn summary_from_csmi(
         covers_overrides: false,
         normal_continuation_absent: false,
         normal_result_count: (!shape.results.is_empty()).then_some(shape.results.len() as u32),
-        locations: Vec::new(),
+        locations,
         transfers,
+        transfer_partitions,
         effects: Vec::new(),
         concurrency_effects: Vec::new(),
         declared_effects: Vec::new(),
         preconditions: None,
         result_contracts: Vec::new(),
+        result_use_obligations: Vec::new(),
         conditional_result_refinements: Vec::new(),
         conditional_indirect_writes: Vec::new(),
         normal_return_refinements: Vec::new(),

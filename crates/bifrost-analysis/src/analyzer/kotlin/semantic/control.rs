@@ -2,12 +2,14 @@ use super::syntax::*;
 use super::values::KotlinConstructionProof;
 use super::*;
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn lower_procedure<'tree, 'targets>(
     prepared: &'tree PreparedSyntaxTree,
     spec: &ProcedureSpec<'tree>,
     procedure_targets: &'targets HashMap<usize, NestedProcedureTarget>,
     constructible_types: &'targets HashSet<Box<str>>,
     value_classes: &'targets KotlinValueClassIndex<'tree>,
+    capture_binding_expected: bool,
     budget: &SemanticBudget,
     cancellation: &'targets CancellationToken,
 ) -> Result<(ProcedureSemanticsParts, SemanticWork), KotlinLoweringError> {
@@ -60,7 +62,7 @@ pub(super) fn lower_procedure<'tree, 'targets>(
     };
     context.emit_procedure_inputs(&mut builder, spec.callable, spec.kind, spec.properties)?;
     context.bind_receiver_carrier(spec.callable);
-    context.emit_capture_inputs(&mut builder, entry, spec)?;
+    context.emit_capture_inputs(&mut builder, entry, spec, capture_binding_expected)?;
     context.emit_local_bindings(&mut builder, spec.body.scan_root())?;
 
     if spec.kind == ProcedureKind::Initializer {

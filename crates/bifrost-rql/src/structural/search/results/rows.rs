@@ -409,7 +409,7 @@ mod value_domain {
     use crate::structural::search::{
         CodeQueryFlowStatus, dispatch, member_family, receiver, render,
     };
-    use brokk_bifrost_core::analyzer::Language;
+    use brokk_bifrost_core::analyzer::model::{Language, LanguageDialect};
     use brokk_bifrost_core::analyzer::structural::callable::{
         ApplicabilityVerdict, ArgumentListKind, CallKind, CallShapeCoverage,
         CallableRejectionReason, DeclarationRole, ReceiverContract, SelectionResolution,
@@ -440,6 +440,7 @@ mod value_domain {
     use brokk_bifrost_flow::type_flow::ClassSetStatus;
 
     pub(super) const LANGUAGE: &[&str] = Language::CONFIG_LABELS;
+    pub(super) const LANGUAGE_DIALECT: &[&str] = LanguageDialect::STABLE_LABELS;
     pub(super) const STRUCTURAL_KIND: &[&str] = NormalizedKind::LABELS;
     pub(super) const CODE_UNIT_KIND: &[&str] = CodeUnitType::DISPLAY_LOWERCASE_LABELS;
 
@@ -575,6 +576,23 @@ mod value_domain {
     pub(super) const RESULT_CONTRACT_PREDICATE: &[&str] = &["null", "non_null", "true", "false"];
     pub(super) const RESULT_USE_VALIDATION: &[&str] =
         &["unused", "satisfied", "violated", "unknown"];
+    pub(super) const RESULT_OBLIGATION_KIND: &[&str] =
+        &["pure_transformation_value", "fallible_status"];
+    pub(super) const RESULT_OBLIGATION_USE: &[&str] = &["discarded", "other_context", "unknown"];
+    pub(super) const RESULT_OBLIGATION_REASON: &[&str] = &[
+        "unsupported_language",
+        "result_use_unclassified",
+        "dispatch_unresolved",
+        "dispatch_interrupted",
+        "dispatch_truncated",
+        "dispatch_open",
+        "target_unresolved",
+        "artifact_unselected",
+        "model_unavailable",
+        "model_conflict",
+        "obligation_unavailable",
+        "obligation_conflict",
+    ];
     pub(super) const RESULT_CONTRACT_USE_KIND: &[&str] = &[
         "dereference",
         "field",
@@ -626,6 +644,28 @@ mod value_domain {
         "selector_domain_open",
         "expressionless_without_default",
     ];
+    pub(super) const ASSIGNMENT_RELATION_KIND: &[&str] =
+        &["self_assignment", "failed_swap", "overwritten_unread"];
+    pub(super) const ASSIGNMENT_STORAGE_KIND: &[&str] = &[
+        "ordinary_local",
+        "nonlocal",
+        "volatile",
+        "atomic",
+        "compound",
+        "indirect",
+        "member",
+        "element",
+        "unknown",
+    ];
+    pub(super) const ASSIGNMENT_VERDICT: &[&str] = &[
+        "self_assignment",
+        "failed_swap",
+        "overwritten_unread",
+        "different",
+        "excluded",
+        "unknown",
+    ];
+    pub(super) const ASSIGNMENT_PROOF: &[&str] = &["exact", "unknown"];
     pub(super) const DETACHED_TRANSFER_ROLE: &[&str] = &["receiver", "argument", "capture"];
     pub(super) const DETACHED_TRANSFER_TIMING: &[&str] = &["different_task"];
     pub(super) const DETACHED_TRANSFER_PROOF: &[&str] = &["exact", "unknown"];
@@ -696,6 +736,80 @@ mod value_domain {
     /// value a lowerer writes.
     pub(super) const GUARD_PREDICATE: &[&str] = crate::analyzer::semantic::GuardPredicate::LABELS;
 
+    pub(super) const BRANCH_RELATION: &[&str] = &[
+        "identical_bodies",
+        "repeated_condition",
+        "contradictory_condition",
+        "subsumed_condition",
+        "redundant_boolean_return",
+    ];
+    pub(super) const BRANCH_VERDICT: &[&str] = &["proven", "distinct", "open"];
+    pub(super) const LOOP_KIND: &[&str] = &["while", "for", "do"];
+    pub(super) const LOOP_VERDICT: &[&str] = &["proven", "excluded", "open"];
+    pub(super) const STATEMENT_KIND: &[&str] = &[
+        "block",
+        "expression",
+        "local_declaration",
+        "constructor_invocation",
+        "return",
+        "throw",
+        "yield",
+        "break",
+        "continue",
+        "if",
+        "while",
+        "do",
+        "for",
+        "enhanced_for",
+        "switch",
+        "try",
+        "try_with_resources",
+        "synchronized",
+        "labeled",
+        "assert",
+        "empty",
+    ];
+    pub(super) const STATEMENT_VERDICT: &[&str] = &["reachable", "unreachable", "open"];
+    pub(super) const BRANCH_REASON: &[&str] = &[
+        "syntax_recovery",
+        "missing_branch_field",
+        "lexical_binding_unavailable",
+        "non_local_reference",
+        "distinct_binding",
+        "effectful_body",
+        "effectful_condition",
+        "unsupported_condition",
+        "comparison_budget",
+        "member_resolution_unavailable",
+        "ambiguous_member",
+        "deferred_body",
+        "snapshot_mismatch",
+        "source_limit",
+        "cancelled",
+        "syntax_unavailable",
+        "unsupported_predicate",
+        "unproven_guard",
+        "partial_guard",
+        "missing_arm",
+        "unreachable_decision",
+        "unknown_scalar",
+        "partial_procedure",
+        "partial_producer",
+        "inexact_source",
+        "stale_source",
+        "work_limit",
+        "no_enclosing_procedure",
+        "ambiguous_procedure",
+        "ambiguous_guard",
+        "incomplete_condition",
+        "unqualified_continuation",
+    ];
+    pub(super) const BRANCH_ORIENTATION: &[&str] = &[
+        "condition",
+        "negated_condition",
+        "always_false",
+        "always_true",
+    ];
     pub(super) const CONTROL_RELATION: &[&str] = ControlRelationKind::LABELS;
     pub(super) const CONTROL_EXIT_PARTITION: &[&str] = ControlExitPartition::LABELS;
     pub(super) const CONTROL_RELATION_COMPLETENESS: &[&str] =
@@ -1056,6 +1170,7 @@ detailed_row_domains! {
                     CodeQueryRowField::required("id", Scalar::StableId),
                     CodeQueryRowField::required("artifact_id", Scalar::StableId),
                     CodeQueryRowField::required_enum("language", value_domain::LANGUAGE),
+                    CodeQueryRowField::required_enum("dialect", value_domain::LANGUAGE_DIALECT),
                     CodeQueryRowField::required_enum("procedure_kind", value_domain::PROCEDURE_KIND),
         ],
     },
@@ -1628,6 +1743,27 @@ detailed_row_domains! {
                     CodeQueryRowField::required("member_contract_count", Scalar::Integer),
         ],
     },
+    CallResultObligation => "call_result_obligation" {
+        display_range: |value| Some(value.range),
+        identities: None,
+        fields: [
+            CodeQueryRowField::required("id", Scalar::StableId),
+            CodeQueryRowField::required("site_id", Scalar::StableId),
+            CodeQueryRowField::required("site_ast_id", Scalar::StableId),
+            CodeQueryRowField::optional("result_ordinal", Scalar::Integer),
+            CodeQueryRowField::optional_enum("obligation_kind", value_domain::RESULT_OBLIGATION_KIND),
+            CodeQueryRowField::optional_enum("failure_predicate", value_domain::RESULT_CONTRACT_PREDICATE),
+            CodeQueryRowField::required_enum("result_use", value_domain::RESULT_OBLIGATION_USE),
+            CodeQueryRowField::required_enum("coverage", value_domain::EFFECT_COVERAGE),
+            CodeQueryRowField::optional_enum("reason", value_domain::RESULT_OBLIGATION_REASON),
+            CodeQueryRowField::optional("pack_id", Scalar::String),
+            CodeQueryRowField::optional("model_id", Scalar::String),
+            CodeQueryRowField::optional("summary_id", Scalar::String),
+            CodeQueryRowField::required("arm_count", Scalar::Integer),
+            CodeQueryRowField::required("modeled_arm_count", Scalar::Integer),
+            CodeQueryRowField::required("terminal", Scalar::Boolean),
+        ],
+    },
     ResultContractUse => "result_contract_use" {
         display_range: |value| Some(value.range),
         identities: None,
@@ -1757,6 +1893,24 @@ detailed_row_domains! {
                     CodeQueryRowField::required_enum("verdict", value_domain::SWITCH_VERDICT),
                     CodeQueryRowField::required_enum("proof", value_domain::SWITCH_PROOF),
                     CodeQueryRowField::optional_enum("reason", value_domain::SWITCH_REASON),
+        ],
+    },
+    AssignmentRelation => "assignment_relation" {
+        display_range: |value| Some(value.range),
+        identities: None,
+        fields: [
+                    CodeQueryRowField::required("id", Scalar::StableId),
+                    CodeQueryRowField::required("procedure_id", Scalar::StableId),
+                    CodeQueryRowField::optional("assignment_point_id", Scalar::StableId),
+                    CodeQueryRowField::optional("target_value_id", Scalar::Integer),
+                    CodeQueryRowField::optional("rhs_value_id", Scalar::Integer),
+                    CodeQueryRowField::optional("ast_id", Scalar::StableId),
+                    CodeQueryRowField::required_enum("relation_kind", value_domain::ASSIGNMENT_RELATION_KIND),
+                    CodeQueryRowField::required_enum("storage_kind", value_domain::ASSIGNMENT_STORAGE_KIND),
+                    CodeQueryRowField::required_enum("verdict", value_domain::ASSIGNMENT_VERDICT),
+                    CodeQueryRowField::required_enum("proof", value_domain::ASSIGNMENT_PROOF),
+                    CodeQueryRowField::required_enum("coverage", value_domain::EFFECT_COVERAGE),
+                    CodeQueryRowField::optional("reason", Scalar::String),
         ],
     },
     DetachedTaskTransfer => "detached_task_transfer" {
@@ -2331,6 +2485,62 @@ detailed_row_domains! {
                     CodeQueryRowField::required("generation", Scalar::Integer),
         ],
     },
+    FailureHandlerState => "failure_handler_state" {
+        display_range: |value| Some(value.range),
+        identities: None,
+        fields: [
+            CodeQueryRowField::required("id", Scalar::StableId),
+            CodeQueryRowField::required("catch_ast_id", Scalar::StableId),
+            CodeQueryRowField::required_enum("language", value_domain::LANGUAGE),
+            CodeQueryRowField::required_enum("verdict", &["empty", "nonempty", "unknown"]),
+            CodeQueryRowField::required_enum("proof", &["exact", "unknown"]),
+            CodeQueryRowField::required_enum("coverage", &["exhaustive", "incomplete"]),
+            CodeQueryRowField::optional_enum("reason", &[
+                "unsupported_language", "syntax_unavailable", "source_limit",
+                "snapshot_mismatch", "cancelled", "syntax_recovery", "missing_body",
+                "missing_try_body"
+            ]),
+        ],
+    },
+    BranchRelation => "branch_relation" {
+        display_range: |value| Some(value.range),
+        identities: None,
+        fields: [
+            CodeQueryRowField::required("id", Scalar::StableId),
+            CodeQueryRowField::required("owner_id", Scalar::StableId),
+            CodeQueryRowField::required_enum("language", value_domain::LANGUAGE),
+            CodeQueryRowField::required_enum("relation", value_domain::BRANCH_RELATION),
+            CodeQueryRowField::required_enum("verdict", value_domain::BRANCH_VERDICT),
+            CodeQueryRowField::optional_enum("reason", value_domain::BRANCH_REASON),
+            CodeQueryRowField::optional_enum("orientation", value_domain::BRANCH_ORIENTATION),
+            CodeQueryRowField::required("earlier_ordinal", Scalar::Integer),
+            CodeQueryRowField::required("later_ordinal", Scalar::Integer),
+        ],
+    },
+    LoopRelation => "loop_relation" {
+        display_range: |value| Some(value.range),
+        identities: None,
+        fields: [
+            CodeQueryRowField::required("id", Scalar::StableId),
+            CodeQueryRowField::required("procedure_id", Scalar::StableId),
+            CodeQueryRowField::required_enum("language", value_domain::LANGUAGE),
+            CodeQueryRowField::required_enum("loop_kind", value_domain::LOOP_KIND),
+            CodeQueryRowField::required_enum("verdict", value_domain::LOOP_VERDICT),
+            CodeQueryRowField::optional("repeat_edge_id", Scalar::StableId),
+        ],
+    },
+    StatementReachability => "statement_reachability" {
+        display_range: |value| Some(value.range),
+        identities: None,
+        fields: [
+            CodeQueryRowField::required("id", Scalar::StableId),
+            CodeQueryRowField::required("procedure_id", Scalar::StableId),
+            CodeQueryRowField::required_enum("language", value_domain::LANGUAGE),
+            CodeQueryRowField::required_enum("statement_kind", value_domain::STATEMENT_KIND),
+            CodeQueryRowField::required_enum("verdict", value_domain::STATEMENT_VERDICT),
+            CodeQueryRowField::optional("reason", Scalar::String),
+        ],
+    },
     Guard => "guard" {
         display_range: |value| Some(value.range),
         // A guard is identified by its own content-scoped digest over the
@@ -2594,6 +2804,9 @@ fn project_code_query_row_field<'a>(
         }
         (CodeQueryResultValue::Procedure { value }, "language") => {
             Some(Scalar::ConstrainedEnum(value.language))
+        }
+        (CodeQueryResultValue::Procedure { value }, "dialect") => {
+            Some(Scalar::ConstrainedEnum(value.dialect))
         }
         (CodeQueryResultValue::Procedure { value }, "procedure_kind") => {
             Some(Scalar::ConstrainedEnum(value.procedure_kind))
@@ -3702,6 +3915,51 @@ fn project_code_query_row_field<'a>(
         (CodeQueryResultValue::CallResultContract { value }, "member_contract_count") => {
             Some(Scalar::Integer(value.member_contract_count as u64))
         }
+        (CodeQueryResultValue::CallResultObligation { value }, "id") => {
+            Some(Scalar::StableId(&value.id))
+        }
+        (CodeQueryResultValue::CallResultObligation { value }, "site_id") => {
+            Some(Scalar::StableId(&value.site_id))
+        }
+        (CodeQueryResultValue::CallResultObligation { value }, "site_ast_id") => {
+            Some(Scalar::StableId(&value.site_ast_id))
+        }
+        (CodeQueryResultValue::CallResultObligation { value }, "result_ordinal") => value
+            .result_ordinal
+            .map(|ordinal| Scalar::Integer(ordinal as u64)),
+        (CodeQueryResultValue::CallResultObligation { value }, "obligation_kind") => {
+            value.obligation_kind.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::CallResultObligation { value }, "failure_predicate") => {
+            value.failure_predicate.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::CallResultObligation { value }, "result_use") => {
+            Some(Scalar::ConstrainedEnum(value.result_use))
+        }
+        (CodeQueryResultValue::CallResultObligation { value }, "coverage") => {
+            Some(Scalar::ConstrainedEnum(value.coverage))
+        }
+        (CodeQueryResultValue::CallResultObligation { value }, "reason") => {
+            value.reason.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::CallResultObligation { value }, "pack_id") => {
+            value.pack_id.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::CallResultObligation { value }, "model_id") => {
+            value.model_id.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::CallResultObligation { value }, "summary_id") => {
+            value.summary_id.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::CallResultObligation { value }, "arm_count") => {
+            Some(Scalar::Integer(value.arm_count as u64))
+        }
+        (CodeQueryResultValue::CallResultObligation { value }, "modeled_arm_count") => {
+            Some(Scalar::Integer(value.modeled_arm_count as u64))
+        }
+        (CodeQueryResultValue::CallResultObligation { value }, "terminal") => {
+            Some(Scalar::Boolean(value.terminal))
+        }
         (CodeQueryResultValue::ResultContractUse { value }, "id") => {
             Some(Scalar::StableId(&value.id))
         }
@@ -3924,6 +4182,42 @@ fn project_code_query_row_field<'a>(
         }
         (CodeQueryResultValue::SwitchCoverage { value }, "reason") => {
             value.reason.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::AssignmentRelation { value }, "id") => {
+            Some(Scalar::StableId(&value.id))
+        }
+        (CodeQueryResultValue::AssignmentRelation { value }, "procedure_id") => {
+            Some(Scalar::StableId(&value.procedure_id))
+        }
+        (CodeQueryResultValue::AssignmentRelation { value }, "assignment_point_id") => {
+            value.assignment_point_id.as_deref().map(Scalar::StableId)
+        }
+        (CodeQueryResultValue::AssignmentRelation { value }, "target_value_id") => {
+            value.target_value_id.map(Scalar::Integer)
+        }
+        (CodeQueryResultValue::AssignmentRelation { value }, "rhs_value_id") => {
+            value.rhs_value_id.map(Scalar::Integer)
+        }
+        (CodeQueryResultValue::AssignmentRelation { value }, "ast_id") => {
+            value.ast_id.as_deref().map(Scalar::StableId)
+        }
+        (CodeQueryResultValue::AssignmentRelation { value }, "relation_kind") => {
+            Some(Scalar::ConstrainedEnum(value.relation_kind))
+        }
+        (CodeQueryResultValue::AssignmentRelation { value }, "storage_kind") => {
+            Some(Scalar::ConstrainedEnum(value.storage_kind))
+        }
+        (CodeQueryResultValue::AssignmentRelation { value }, "verdict") => {
+            Some(Scalar::ConstrainedEnum(value.verdict))
+        }
+        (CodeQueryResultValue::AssignmentRelation { value }, "proof") => {
+            Some(Scalar::ConstrainedEnum(value.proof))
+        }
+        (CodeQueryResultValue::AssignmentRelation { value }, "coverage") => {
+            Some(Scalar::ConstrainedEnum(value.coverage))
+        }
+        (CodeQueryResultValue::AssignmentRelation { value }, "reason") => {
+            value.reason.map(Scalar::String)
         }
         (CodeQueryResultValue::DetachedTaskTransfer { value }, "id") => {
             Some(Scalar::StableId(&value.id))
@@ -4676,6 +4970,86 @@ fn project_code_query_row_field<'a>(
         (CodeQueryResultValue::ControlRelation { value }, "generation") => {
             Some(Scalar::Integer(value.generation))
         }
+        (CodeQueryResultValue::FailureHandlerState { value }, "id") => {
+            Some(Scalar::StableId(&value.id))
+        }
+        (CodeQueryResultValue::FailureHandlerState { value }, "catch_ast_id") => {
+            Some(Scalar::StableId(&value.catch_ast_id))
+        }
+        (CodeQueryResultValue::FailureHandlerState { value }, "language") => {
+            Some(Scalar::ConstrainedEnum(value.language))
+        }
+        (CodeQueryResultValue::FailureHandlerState { value }, "verdict") => {
+            Some(Scalar::ConstrainedEnum(value.verdict))
+        }
+        (CodeQueryResultValue::FailureHandlerState { value }, "proof") => {
+            Some(Scalar::ConstrainedEnum(value.proof))
+        }
+        (CodeQueryResultValue::FailureHandlerState { value }, "coverage") => {
+            Some(Scalar::ConstrainedEnum(value.coverage))
+        }
+        (CodeQueryResultValue::FailureHandlerState { value }, "reason") => {
+            value.reason.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::BranchRelation { value }, "id") => Some(Scalar::StableId(&value.id)),
+        (CodeQueryResultValue::BranchRelation { value }, "owner_id") => {
+            Some(Scalar::StableId(&value.owner_id))
+        }
+        (CodeQueryResultValue::BranchRelation { value }, "language") => {
+            Some(Scalar::ConstrainedEnum(value.language))
+        }
+        (CodeQueryResultValue::BranchRelation { value }, "relation") => {
+            Some(Scalar::ConstrainedEnum(value.relation))
+        }
+        (CodeQueryResultValue::BranchRelation { value }, "verdict") => {
+            Some(Scalar::ConstrainedEnum(value.verdict))
+        }
+        (CodeQueryResultValue::BranchRelation { value }, "reason") => {
+            value.reason.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::BranchRelation { value }, "orientation") => {
+            value.orientation.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::BranchRelation { value }, "earlier_ordinal") => {
+            Some(Scalar::Integer(value.earlier_ordinal as u64))
+        }
+        (CodeQueryResultValue::BranchRelation { value }, "later_ordinal") => {
+            Some(Scalar::Integer(value.later_ordinal as u64))
+        }
+        (CodeQueryResultValue::LoopRelation { value }, "id") => Some(Scalar::StableId(&value.id)),
+        (CodeQueryResultValue::LoopRelation { value }, "procedure_id") => {
+            Some(Scalar::StableId(&value.procedure_id))
+        }
+        (CodeQueryResultValue::LoopRelation { value }, "language") => {
+            Some(Scalar::ConstrainedEnum(value.language))
+        }
+        (CodeQueryResultValue::LoopRelation { value }, "loop_kind") => {
+            Some(Scalar::ConstrainedEnum(value.loop_kind))
+        }
+        (CodeQueryResultValue::LoopRelation { value }, "verdict") => {
+            Some(Scalar::ConstrainedEnum(value.verdict))
+        }
+        (CodeQueryResultValue::LoopRelation { value }, "repeat_edge_id") => {
+            value.repeat_edge_id.as_deref().map(Scalar::StableId)
+        }
+        (CodeQueryResultValue::StatementReachability { value }, "id") => {
+            Some(Scalar::StableId(&value.id))
+        }
+        (CodeQueryResultValue::StatementReachability { value }, "procedure_id") => {
+            Some(Scalar::StableId(&value.procedure_id))
+        }
+        (CodeQueryResultValue::StatementReachability { value }, "language") => {
+            Some(Scalar::ConstrainedEnum(value.language))
+        }
+        (CodeQueryResultValue::StatementReachability { value }, "statement_kind") => {
+            Some(Scalar::ConstrainedEnum(value.statement_kind))
+        }
+        (CodeQueryResultValue::StatementReachability { value }, "verdict") => {
+            Some(Scalar::ConstrainedEnum(value.verdict))
+        }
+        (CodeQueryResultValue::StatementReachability { value }, "reason") => {
+            value.reason.as_deref().map(Scalar::String)
+        }
         (CodeQueryResultValue::Guard { value }, "id") => Some(Scalar::StableId(&value.id)),
         (CodeQueryResultValue::Guard { value }, "procedure_id") => {
             Some(Scalar::StableId(&value.procedure_id))
@@ -4982,6 +5356,10 @@ pub enum DetailedCodeQueryKey {
         id: String,
         site_id: String,
     },
+    CallResultObligation {
+        id: String,
+        site_id: String,
+    },
     ResultContractUse {
         id: String,
         acquisition_id: String,
@@ -4995,6 +5373,10 @@ pub enum DetailedCodeQueryKey {
         procedure_id: String,
     },
     SwitchCoverage {
+        id: String,
+        procedure_id: String,
+    },
+    AssignmentRelation {
         id: String,
         procedure_id: String,
     },
@@ -5095,6 +5477,25 @@ pub enum DetailedCodeQueryKey {
         procedure_id: String,
         relation: String,
         certainty: String,
+    },
+    BranchRelation {
+        id: String,
+        owner_id: String,
+        relation: String,
+        verdict: String,
+    },
+    LoopRelation {
+        id: String,
+        procedure_id: String,
+    },
+    FailureHandlerState {
+        id: String,
+        catch_ast_id: String,
+        verdict: String,
+    },
+    StatementReachability {
+        id: String,
+        procedure_id: String,
     },
     Guard {
         id: String,
@@ -5340,6 +5741,13 @@ fn detailed_semantic_identity(
                 site_id: value.site_id.clone(),
             },
         )),
+        CodeQueryResultValue::CallResultObligation { value } => Some((
+            DetailedCodeQueryDomain::CallResultObligation,
+            DetailedCodeQueryKey::CallResultObligation {
+                id: value.id.clone(),
+                site_id: value.site_id.clone(),
+            },
+        )),
         CodeQueryResultValue::ResultContractUse { value } => Some((
             DetailedCodeQueryDomain::ResultContractUse,
             DetailedCodeQueryKey::ResultContractUse {
@@ -5364,6 +5772,27 @@ fn detailed_semantic_identity(
         CodeQueryResultValue::SwitchCoverage { value } => Some((
             DetailedCodeQueryDomain::SwitchCoverage,
             DetailedCodeQueryKey::SwitchCoverage {
+                id: value.id.clone(),
+                procedure_id: value.procedure_id.clone(),
+            },
+        )),
+        CodeQueryResultValue::AssignmentRelation { value } => Some((
+            DetailedCodeQueryDomain::AssignmentRelation,
+            DetailedCodeQueryKey::AssignmentRelation {
+                id: value.id.clone(),
+                procedure_id: value.procedure_id.clone(),
+            },
+        )),
+        CodeQueryResultValue::LoopRelation { value } => Some((
+            DetailedCodeQueryDomain::LoopRelation,
+            DetailedCodeQueryKey::LoopRelation {
+                id: value.id.clone(),
+                procedure_id: value.procedure_id.clone(),
+            },
+        )),
+        CodeQueryResultValue::StatementReachability { value } => Some((
+            DetailedCodeQueryDomain::StatementReachability,
+            DetailedCodeQueryKey::StatementReachability {
                 id: value.id.clone(),
                 procedure_id: value.procedure_id.clone(),
             },
@@ -5481,6 +5910,8 @@ fn detailed_semantic_identity(
         | CodeQueryResultValue::StateEvent { .. }
         | CodeQueryResultValue::FlowRelation { .. }
         | CodeQueryResultValue::ControlRelation { .. }
+        | CodeQueryResultValue::BranchRelation { .. }
+        | CodeQueryResultValue::FailureHandlerState { .. }
         | CodeQueryResultValue::Guard { .. }
         | CodeQueryResultValue::SourceSet { .. }
         | CodeQueryResultValue::BuildTarget { .. }
@@ -5559,10 +5990,14 @@ fn semantic_wire_id(key: &DetailedCodeQueryKey) -> Option<&str> {
         | DetailedCodeQueryKey::CallBinding { .. }
         | DetailedCodeQueryKey::CallEffect { .. }
         | DetailedCodeQueryKey::CallResultContract { .. }
+        | DetailedCodeQueryKey::CallResultObligation { .. }
         | DetailedCodeQueryKey::ResultContractUse { .. }
         | DetailedCodeQueryKey::ResultContractFailureUse { .. }
         | DetailedCodeQueryKey::NilnessOperation { .. }
         | DetailedCodeQueryKey::SwitchCoverage { .. }
+        | DetailedCodeQueryKey::AssignmentRelation { .. }
+        | DetailedCodeQueryKey::LoopRelation { .. }
+        | DetailedCodeQueryKey::StatementReachability { .. }
         | DetailedCodeQueryKey::ConcurrentAccessConflict { .. }
         | DetailedCodeQueryKey::ClassSetRow { .. }
         | DetailedCodeQueryKey::AbsentMemberFinding { .. }
@@ -5586,6 +6021,8 @@ fn semantic_wire_id(key: &DetailedCodeQueryKey) -> Option<&str> {
         | DetailedCodeQueryKey::StateEvent { .. }
         | DetailedCodeQueryKey::FlowRelation { .. }
         | DetailedCodeQueryKey::ControlRelation { .. }
+        | DetailedCodeQueryKey::BranchRelation { .. }
+        | DetailedCodeQueryKey::FailureHandlerState { .. }
         | DetailedCodeQueryKey::Guard { .. }
         | DetailedCodeQueryKey::SourceSet { .. }
         | DetailedCodeQueryKey::BuildTarget { .. }

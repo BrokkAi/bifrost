@@ -155,11 +155,122 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let Some(lexical_parent) = spec.lexical_parent.filter(|_| spec.captures_receiver) else {
             return Ok(());
         };
-        let metadata = self.value_mapping(builder, spec.callable)?;
-        let (value, _) =
-            self.session
-                .add_receiver_capture_input(builder, entry, metadata, lexical_parent)?;
+        let value = self.emit_value_capture_input(
+            builder,
+            entry,
+            spec.callable,
+            lexical_parent,
+            RECEIVER_CAPTURE_DESTINATION,
+        )?;
         self.captured_receiver = Some(value);
+        Ok(())
+    }
+
+    // Java captures a value snapshot, not a mutable enclosing cell. Loading
+    // the environment establishes the lambda's own binding at its entry.
+    fn emit_value_capture_input(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        entry: ProgramPointId,
+        reference: Node<'tree>,
+        lexical_parent: ProcedureId,
+        expected_location: MemoryLocationId,
+    ) -> Result<ValueId, JavaLoweringError> {
+        let metadata = self.value_mapping(builder, reference)?;
+        let incoming = self.session.add_value_with_metadata(
+            builder,
+            metadata,
+            SemanticValueKind::Temporary,
+        )?;
+        let value =
+            self.session
+                .add_value_with_metadata(builder, metadata, SemanticValueKind::Local)?;
+        let location = self.session.add_memory_location(
+            builder,
+            entry,
+            MemoryLocationKind::Capture {
+                lexical_parent,
+                binding: None,
+            },
+        )?;
+        assert_eq!(
+            location, expected_location,
+            "capture locations precede body memory"
+        );
+        self.append_effect(
+            builder,
+            entry,
+            SemanticEffect::MemoryLoad {
+                kind: MemoryAccessKind::Capture,
+                location,
+                result: incoming,
+            },
+        )?;
+        self.append_effect(
+            builder,
+            entry,
+            SemanticEffect::Assignment {
+                target: value,
+                value: incoming,
+            },
+        )?;
+        self.append_effect(
+            builder,
+            entry,
+            SemanticEffect::ValueFlow {
+                kind: ValueFlowKind::Local,
+                source: incoming,
+                target: value,
+            },
+        )?;
+        Ok(value)
+    }
+
+    pub(super) fn emit_lexical_capture_inputs(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        entry: ProgramPointId,
+        spec: &ProcedureSpec<'tree>,
+    ) -> Result<(), JavaLoweringError> {
+        for (index, capture) in spec.captures.iter().enumerate() {
+            let value = self.emit_value_capture_input(
+                builder,
+                entry,
+                capture.reference,
+                spec.lexical_parent
+                    .expect("a captured binding has a lexical parent"),
+                java_capture_destination(spec.captures_receiver, index)?,
+            )?;
+            let name = node_text(self.prepared.source(), capture.binding.name)
+                .expect("inventoried capture has a source name");
+            self.locals
+                .entry(name.into())
+                .or_default()
+                .push(LocalBinding {
+                    declaration_start: capture.binding.name.start_byte(),
+                    visible_from: spec.body.start_byte(),
+                    scope_start: spec.body.start_byte(),
+                    scope_end: spec.body.end_byte(),
+                    value,
+                });
+            if let Some(ty) = java_binding_type(capture.binding.declaration) {
+                self.local_type_nodes.insert(value, ty);
+                if let Some(name) = node_text(self.prepared.source(), ty) {
+                    self.local_types.insert(value, name.into());
+                }
+            }
+            if java_binding_declares_array(capture.binding.declaration) {
+                self.array_values.insert(value);
+            }
+            if capture.binding.declaration.kind() == "catch_formal_parameter" {
+                self.non_null_values.insert(value);
+            }
+        }
+        if spec.captures_incomplete {
+            self.add_gap(builder, entry, SemanticGapSubject::Procedure,
+                SemanticCapability::Captures, SemanticGapKind::Unsupported,
+                "lambda capture inventory includes an unsupported binding or enclosing-class boundary")?;
+        }
         Ok(())
     }
 
@@ -177,33 +288,23 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             if is_java_nested_execution_boundary(node) {
                 return Ok(WalkControl::SkipChildren);
             }
-            let binding = match node.kind() {
-                "variable_declarator" | "catch_formal_parameter" => {
-                    node.child_by_field_name("name").zip(java_local_scope(node))
-                }
-                _ => None,
-            };
-            if let Some((name, (scope_start, scope_end))) = binding
-                && name.kind() == "identifier"
-                && let Some(text) = node_text(self.prepared.source(), name)
+            if let Some(binding) = java_local_binding(node)
+                && let Some(text) = node_text(self.prepared.source(), binding.name)
             {
+                let JavaLocalBindingSyntax {
+                    name,
+                    visible_from,
+                    scope_start,
+                    scope_end,
+                    ..
+                } = binding;
                 let metadata = self.value_mapping(builder, name)?;
                 let value = self.session.add_value_with_metadata(
                     builder,
                     metadata,
                     SemanticValueKind::Local,
                 )?;
-                let type_node = node
-                    .child_by_field_name("type")
-                    .or_else(|| {
-                        node.parent()
-                            .and_then(|declaration| declaration.child_by_field_name("type"))
-                    })
-                    .or_else(|| {
-                        named_children(node)
-                            .into_iter()
-                            .find(|child| child.kind() == "catch_type")
-                    });
+                let type_node = java_binding_type(node);
                 if let Some(type_node) = type_node {
                     if let Some(type_name) = node_text(self.prepared.source(), type_node) {
                         self.local_types.insert(value, type_name.into());
@@ -221,7 +322,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     .or_default()
                     .push(LocalBinding {
                         declaration_start: name.start_byte(),
-                        visible_from: node.end_byte(),
+                        visible_from,
                         scope_start,
                         scope_end,
                         value,
@@ -299,6 +400,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 })?;
                 if java_binding_declares_array(node) {
                     self.array_values.insert(value);
+                }
+                if let Some(type_node) = node.child_by_field_name("type") {
+                    self.local_type_nodes.insert(value, type_node);
                 }
                 value
             };
@@ -410,7 +514,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     /// that may have mutated the object it names (`emit_receiver_write_back`,
     /// #2571). Keeping one resolver means the two directions can never drift
     /// apart on which node names which slot.
-    fn lexical_reference_binding(&self, node: Node<'tree>) -> Option<(ValueId, ValueFlowKind)> {
+    pub(super) fn lexical_reference_binding(
+        &self,
+        node: Node<'tree>,
+    ) -> Option<(ValueId, ValueFlowKind)> {
         let name = node_text(self.prepared.source(), node)?;
         if node.kind() == "this" {
             if let Some(captured) = self.captured_receiver {
@@ -995,7 +1102,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             .is_some_and(|object| self.expression_is_array(object))
     }
 
-    fn expression_is_array(&self, node: Node<'tree>) -> bool {
+    pub(super) fn expression_is_array(&self, node: Node<'tree>) -> bool {
         match node.kind() {
             "array_creation_expression" => true,
             "identifier" => {

@@ -240,14 +240,6 @@ fn route_summary_targets_with_cancellation(
         if cancellation.is_some_and(crate::CancellationToken::is_cancelled) {
             break;
         }
-        if matches!(
-            split_definition_selector_with_workspace_files(&resolver, target),
-            DefinitionSelector::FileAnchored { .. }
-        ) {
-            symbol_targets.push(target.to_string());
-            continue;
-        }
-
         // A real filesystem directory at this workspace-relative path takes
         // precedence over any file whose *basename* merely collides with the
         // target (documented contract: "Real filesystem directories win name
@@ -258,7 +250,11 @@ fn route_summary_targets_with_cancellation(
         // directory is never offered. An exact file match at this literal
         // path cannot itself collide with a directory (a path cannot be both
         // on a real filesystem), so this reordering cannot regress plain file
-        // targets.
+        // targets. The check runs before the `path#symbol` split for the same
+        // whole-input reason the splitter itself now checks the complete
+        // literal file first: `#` is legal in a directory name too, and a
+        // target that names the complete existing directory is that
+        // directory, not a symbol anchored in a truncated path (#3505).
         if let Some(directory) = workspace_directory_path(target)
             && analyzer.project().has_directory(&directory)
             && let Some(listing) = directory_listing(
@@ -278,6 +274,14 @@ fn route_summary_targets_with_cancellation(
             if listed_containers.insert(key) {
                 listings.push(listing);
             }
+            continue;
+        }
+
+        if matches!(
+            split_definition_selector_with_workspace_files(&resolver, target),
+            DefinitionSelector::FileAnchored { .. }
+        ) {
+            symbol_targets.push(target.to_string());
             continue;
         }
 

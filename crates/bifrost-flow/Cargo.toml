@@ -16,11 +16,12 @@ publish = true
 name = "brokk_bifrost_flow"
 
 [dependencies]
-brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.11.5" }
-brokk-bifrost-core = { path = "../bifrost-core", version = "=0.11.5" }
+brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.12.0" }
+brokk-bifrost-core = { path = "../bifrost-core", version = "=0.12.0" }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 sha2 = "0.10.8"
+tempfile = "3.23.0"
 
 [features]
 default = []
@@ -35,9 +36,8 @@ test-support = [
 
 [dev-dependencies]
 proptest = "1.11"
-brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.11.5", features = ["test-support"] }
-brokk-bifrost-core = { path = "../bifrost-core", version = "=0.11.5", features = ["test-support"] }
-tempfile = "3.23.0"
+brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.12.0", features = ["test-support"] }
+brokk-bifrost-core = { path = "../bifrost-core", version = "=0.12.0", features = ["test-support"] }
 
 [lints]
 workspace = true

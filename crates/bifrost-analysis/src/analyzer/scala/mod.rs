@@ -63,6 +63,7 @@ use crate::analyzer::{
 use crate::hash::{HashMap, HashSet};
 use crate::{CloneSmell, CloneSmellWeights};
 use brokk_bifrost_core::CancellationToken;
+use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentKind, segment_interner};
 use brokk_bifrost_core::analyzer::structural::resolution::BoundaryStatus;
 use brokk_bifrost_core::analyzer::{
     BoundedDefinitionLookup, DefinitionLanguageScope, PackageRelationKind, PackageRelationValue,
@@ -2348,12 +2349,31 @@ impl LanguageSupport for ScalaSupport {
 
     /// The trailing `$` marks a companion object in the indexed name and is not part of
     /// how anyone writes or reads the type.
+    ///
+    /// This is the string-only reading, for callers that hold a spelling rather than a
+    /// declaration: it accepts a name a reader plausibly typed. Anything that *prints* a
+    /// name holds the declaration and must go through [`Self::undecorated_fq_name`],
+    /// whose structured answer keeps a `$` the source itself wrote (#3505).
     fn display_symbol_name(&self, symbol: &str) -> String {
         symbol
             .split('.')
             .map(|segment| segment.trim_end_matches('$'))
             .collect::<Vec<_>>()
             .join(".")
+    }
+
+    /// Scala's only `$` decoration is the suffix [`FqName::render_native`] appends to a
+    /// [`SegmentKind::Companion`] segment, so demoting that kind to `Type` removes
+    /// exactly one `$` per object segment and nothing else. `object ConstellationNode$`
+    /// renders `org.constellation.ConstellationNode$$` and undecorates to
+    /// `org.constellation.ConstellationNode$`, the spelling its source writes and the
+    /// index answers.
+    fn undecorated_fq_name(&self, fq: &FqName) -> Option<FqName> {
+        let interner = segment_interner();
+        fq.segments()
+            .iter()
+            .any(|&id| interner.resolve(id).1 == SegmentKind::Companion)
+            .then(|| brokk_bifrost_jvm::scala::scala_normalize_fq_name(fq))
     }
 
     /// The same decoration, read off a single identifier: an object is indexed

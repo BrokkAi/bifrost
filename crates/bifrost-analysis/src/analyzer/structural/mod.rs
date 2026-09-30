@@ -32,9 +32,11 @@
 //! and `.agents/plans/issue-449-query-code-reference.md` for the public rename.
 
 pub(crate) mod adapter_helpers;
+pub mod branch_relations;
 pub mod derived_cache;
 pub mod extract;
 pub mod facts;
+pub mod failure_handlers;
 pub mod identity_routes;
 pub mod index;
 pub mod index_query;

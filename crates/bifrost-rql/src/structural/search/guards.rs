@@ -154,7 +154,21 @@ pub(super) fn public_guard(value: &GuardValue) -> CodeQueryGuard {
             None,
             None,
         ),
-        GuardPredicate::OrderedIntegerComparison { relation, constant } => (
+        // A NaN test is a self-equality or self-inequality, so its polarity is
+        // the negation column: `x != x` is the negated form NaN satisfies.
+        GuardPredicate::NanComparison { nan_on_true } => (
+            None,
+            None,
+            Some(nan_on_true),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ),
+        GuardPredicate::OrderedIntegerComparison { relation, constant }
+        | GuardPredicate::OrderedFloatComparison { relation, constant } => (
             None,
             None,
             None,
@@ -309,6 +323,11 @@ mod tests {
                 relation: crate::analyzer::semantic::IntegerComparison::GreaterThan,
                 constant: crate::analyzer::semantic::ValueId::new(0),
             },
+            GuardPredicate::OrderedFloatComparison {
+                relation: crate::analyzer::semantic::IntegerComparison::GreaterThan,
+                constant: crate::analyzer::semantic::ValueId::new(0),
+            },
+            GuardPredicate::NanComparison { nan_on_true: true },
             GuardPredicate::InstanceOf {
                 value: crate::analyzer::semantic::ValueId::new(0),
                 classes: crate::analyzer::semantic::ValueId::new(1),
@@ -336,7 +355,7 @@ mod tests {
                 "{predicate:?}"
             );
         }
-        assert_eq!(GuardPredicate::LABELS.len(), 9);
+        assert_eq!(GuardPredicate::LABELS.len(), 11);
     }
 
     /// A constant condition proves one arm cannot execute, and which arm that

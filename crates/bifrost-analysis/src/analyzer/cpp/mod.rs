@@ -3,6 +3,7 @@ mod cache;
 mod clones;
 #[cfg(test)]
 mod diagnostics;
+pub mod expression_branch_facts;
 pub(crate) mod external;
 mod hierarchy;
 mod identity;
@@ -253,6 +254,18 @@ pub(crate) struct ExternalHeaderClosureWorkCounts {
 impl ForwardQueryProvider for CppAnalyzer {
     fn normalize_rendered_name(&self, fqn: &str) -> String {
         self.inner.normalize_rendered_name(fqn)
+    }
+
+    fn forward_rendered_name(
+        &self,
+        rendered: &str,
+    ) -> Option<brokk_bifrost_core::analyzer::RelationalName> {
+        let name = brokk_bifrost_cpp::declarations::cpp_rendered_name_fq(rendered);
+        (!name.is_empty()).then(|| brokk_bifrost_core::analyzer::RelationalName::stable(name))
+    }
+
+    fn forward_source_spelling_names(&self, rendered: &str) -> Vec<crate::analyzer::FqName> {
+        brokk_bifrost_cpp::declarations::cpp_colon_source_aliases(rendered)
     }
 
     fn forward_definition_fqn(&self, fqn: &str) -> Vec<CodeUnit> {
@@ -984,11 +997,7 @@ impl CppAnalyzer {
     }
 
     fn relational_definitions_for_rendered_name(&self, fq_name: &str) -> Vec<CodeUnit> {
-        let name = brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path_fq(
-            Language::Cpp,
-            fq_name,
-            crate::analyzer::fq_name::segment_interner(),
-        );
+        let name = brokk_bifrost_cpp::declarations::cpp_rendered_name_fq(fq_name);
         if name.is_empty() {
             return Vec::new();
         }
@@ -1005,6 +1014,13 @@ impl CppAnalyzer {
             crate::analyzer::RelationalDefinitionQuery::ExactName,
         );
         units.retain(|unit| unit.fq_name() == fq_name);
+        // A `::`-only spelling is source text (`Top::Only`, `ns::Outer::method`),
+        // not the canonical rendering (`Top$Only`, `ns.Outer.method`). The
+        // primary query re-renders `Unknown` segments with `.` and the retain
+        // above then drops every row whose canonical join is `$` or `::`.
+        // Ask each kind placement extraction stores; those requests carry no
+        // `Unknown` segment, so the store keeps them by structural equality.
+        self.append_colon_source_aliases(fq_name, &mut units);
         if units.is_empty() {
             units = crate::analyzer::AnalyzerDefinitionLookup::new(&self.inner, Language::Cpp)
                 .fqn(fq_name);
@@ -1027,6 +1043,23 @@ impl CppAnalyzer {
             .into_iter()
             .map(|(published, _)| published)
             .collect()
+    }
+
+    fn append_colon_source_aliases(&self, fq_name: &str, units: &mut Vec<CodeUnit>) {
+        let aliases = self.forward_source_spelling_names(fq_name);
+        if aliases.is_empty() {
+            return;
+        }
+        for alias in aliases {
+            let mut matched = self.relational_definition_values(
+                brokk_bifrost_core::analyzer::RelationalName::stable(alias.clone()),
+                crate::analyzer::RelationalDefinitionQuery::ExactName,
+            );
+            matched.retain(|unit| unit.fq() == &alias);
+            units.extend(matched);
+        }
+        crate::analyzer::sort_units(units);
+        units.dedup();
     }
 
     fn relational_definitions_for_identifier(&self, identifier: &str) -> Vec<CodeUnit> {
@@ -1223,29 +1256,26 @@ impl CppAnalyzer {
     ) -> LimitedQueryRows<SignatureMetadata> {
         let mut result = self.inner.signature_metadata_limited(code_unit, limit);
         self.reconcile_member_modifiers(code_unit, &mut result.rows);
+        self.reconcile_member_dispatch_extensibility(code_unit, &mut result.rows);
         result
     }
 
-    /// Resolve facts that an out-of-line definition cannot repeat (#3509).
-    fn reconcile_member_modifiers(&self, unit: &CodeUnit, metadata: &mut [SignatureMetadata]) {
-        use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
+    /// The declaration rows of every other written occurrence of `unit`'s
+    /// logical callable, as the defining file can see it (#3509, #3507).
+    ///
+    /// An out-of-line definition repeats neither the class body's declared
+    /// access nor its dispatch facts, and it may be written in a file that
+    /// does not hold the class body at all. Both joins that recover those
+    /// facts read the same set: the rows of the declarations whose class body
+    /// is visible from this file and whose promoted parameters make them the
+    /// same logical callable. Reading the physical metadata through the inner
+    /// index keeps this overlay out of its own input.
+    fn sibling_declaration_rows(&self, unit: &CodeUnit) -> Vec<SignatureMetadata> {
         use brokk_bifrost_cpp::graph::CppGraphSource;
         use brokk_bifrost_cpp::graph::resolver::VisibilityIndex;
 
-        if !unit.is_callable()
-            || !unit.owner_is_type_scope()
-            || unit.is_synthetic()
-            || !metadata.iter().any(|entry| {
-                !entry.is_declaration_only()
-                    && entry.callable_declared_visibility() == Some(DeclaredVisibility::Unknown)
-            })
-        {
-            return;
-        }
         let scope = AnalyzerQueryScope::new(self);
         let token = scope.token();
-        // Read physical metadata through the inner index to avoid re-entering
-        // this overlay while comparing declaration parameter shapes.
         let graph = CppGraphSource {
             index: &self.inner,
             cpp: Some(self),
@@ -1262,8 +1292,7 @@ impl CppAnalyzer {
         );
         let owner = unit.fq().parent();
         let classes = self.visible_type_units(unit.source());
-        let mut agreed = None;
-        let mut ambiguous = false;
+        let mut rows = Vec::new();
         for candidate in self
             .inner
             .lookup_candidates_by_identifier(unit.identifier())
@@ -1278,23 +1307,43 @@ impl CppAnalyzer {
             {
                 continue;
             }
-            for declaration in self.inner.signature_metadata(&candidate) {
-                let Some(access) = declaration.callable_declared_visibility() else {
-                    continue;
-                };
-                if !declaration.is_declaration_only() || access == DeclaredVisibility::Unknown {
-                    continue;
-                }
-                let facts = (
-                    declaration.callable_is_static(),
-                    declaration.callable_is_constructor(),
-                    access,
-                );
-                match agreed {
-                    Some(previous) if previous != facts => ambiguous = true,
-                    None => agreed = Some(facts),
-                    _ => {}
-                }
+            rows.extend(self.inner.signature_metadata(&candidate));
+        }
+        rows
+    }
+
+    /// Resolve facts that an out-of-line definition cannot repeat (#3509).
+    fn reconcile_member_modifiers(&self, unit: &CodeUnit, metadata: &mut [SignatureMetadata]) {
+        use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
+
+        if !unit.is_callable()
+            || !unit.owner_is_type_scope()
+            || unit.is_synthetic()
+            || !metadata.iter().any(|entry| {
+                !entry.is_declaration_only()
+                    && entry.callable_declared_visibility() == Some(DeclaredVisibility::Unknown)
+            })
+        {
+            return;
+        }
+        let mut agreed = None;
+        let mut ambiguous = false;
+        for declaration in self.sibling_declaration_rows(unit) {
+            let Some(access) = declaration.callable_declared_visibility() else {
+                continue;
+            };
+            if !declaration.is_declaration_only() || access == DeclaredVisibility::Unknown {
+                continue;
+            }
+            let facts = (
+                declaration.callable_is_static(),
+                declaration.callable_is_constructor(),
+                access,
+            );
+            match agreed {
+                Some(previous) if previous != facts => ambiguous = true,
+                None => agreed = Some(facts),
+                _ => {}
             }
         }
         for entry in metadata {
@@ -1315,6 +1364,58 @@ impl CppAnalyzer {
                         false,
                     ),
                 };
+        }
+    }
+
+    /// Resolve the dispatch fact an out-of-line definition cannot repeat (#3507).
+    ///
+    /// C++ states whether a member can select another body where the member is
+    /// declared: a `virtual` specifier, a `final` specifier that ends the
+    /// family, or the class body itself when the class has no base clause to
+    /// inherit virtual-ness from. An out-of-line definition repeats none of
+    /// those, and its own file may not hold the class body at all, so the
+    /// definition row publishes no answer and this join takes the answer from
+    /// the include-visible declarations of the same logical callable --
+    /// exactly the join [`Self::reconcile_member_modifiers`] makes for the
+    /// declared access (#3509).
+    ///
+    /// A row that keeps no answer after the join stays unknown, and no
+    /// dispatch proof may be built on it: an unproven instance call is what a
+    /// virtual member looks like, and guessing `closed` for one would let an
+    /// exact member call hide an override.
+    fn reconcile_member_dispatch_extensibility(
+        &self,
+        unit: &CodeUnit,
+        metadata: &mut [SignatureMetadata],
+    ) {
+        if !unit.is_callable()
+            || !unit.owner_is_type_scope()
+            || unit.is_synthetic()
+            || !metadata
+                .iter()
+                .any(|entry| entry.dispatch_extensibility().is_none())
+        {
+            return;
+        }
+        let mut agreed = None;
+        let mut ambiguous = false;
+        for declaration in self.sibling_declaration_rows(unit) {
+            let Some(dispatch) = declaration.dispatch_extensibility() else {
+                continue;
+            };
+            match agreed {
+                Some(previous) if previous != dispatch => ambiguous = true,
+                None => agreed = Some(dispatch),
+                _ => {}
+            }
+        }
+        for entry in metadata {
+            if entry.dispatch_extensibility().is_some() {
+                continue;
+            }
+            if let Some(dispatch) = agreed.filter(|_| !ambiguous) {
+                *entry = entry.clone().with_dispatch_extensibility(dispatch);
+            }
         }
     }
 
@@ -2083,6 +2184,7 @@ impl CodeUnitIndex for CppAnalyzer {
         let mut metadata = self.inner.signature_metadata(code_unit);
         if !metadata.is_empty() {
             self.reconcile_member_modifiers(code_unit, &mut metadata);
+            self.reconcile_member_dispatch_extensibility(code_unit, &mut metadata);
             return metadata;
         }
         // #1134: a re-keyed reconciled definition carries the same signature
@@ -2099,6 +2201,7 @@ impl CodeUnitIndex for CppAnalyzer {
         {
             let mut metadata = self.inner.signature_metadata(provisional);
             self.reconcile_member_modifiers(code_unit, &mut metadata);
+            self.reconcile_member_dispatch_extensibility(code_unit, &mut metadata);
             return metadata;
         }
         metadata

@@ -23,7 +23,8 @@ pub use brokk_bifrost_core::analyzer::configuration::{
 };
 pub use domain::*;
 pub use ir::{
-    ArityConstraint, BindingFilter, BindingOfOptions, BindingSeed, CallArgumentSelector,
+    ArityConstraint, AssignmentRelationFilter, AssignmentRelationKind, BindingFilter,
+    BindingOfOptions, BindingSeed, BranchRelationFilter, BranchRelationKind, CallArgumentSelector,
     CallIdentity, CallInputSelector, CallSiteTraversalFilter, CallTraversalFilter, CandidateFilter,
     CandidateOutcomeLabel, CodeQuery, CodeQueryPlan, CodeQueryPlanSource, CodeQueryResultDetail,
     CodeQuerySeed, ConfigurationCompletenessFilter, ConfigurationFactsFilter,

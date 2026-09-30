@@ -6,14 +6,285 @@ use crate::analyzer::semantic::{
     ValueFlowKind,
 };
 use crate::analyzer::semantic_model::{
-    ActiveSemanticModelSnapshot, CatalogOptions, CompilerOptions, SemanticModelActivationEvidence,
-    SemanticModelActivationRequest, SemanticModelRuntimeLimits, SemanticModelRuntimeOutcome,
-    SemanticPackCatalog, SessionPackSource, SessionPackSourceKind, SourceFormat,
-    acquire_active_semantic_models, compile_source,
+    ActiveSemanticModelSnapshot, CatalogOptions, CompilerOptions, DependencyPackLimits,
+    SemanticModelActivationEvidence, SemanticModelActivationRequest, SemanticModelRuntimeLimits,
+    SemanticModelRuntimeOutcome, SemanticPackCatalog, SessionPackSource, SessionPackSourceKind,
+    SourceFormat, acquire_active_semantic_models, compile_source,
 };
 use crate::analyzer::usages::effects::EffectCoverage;
 use crate::cancellation::CancellationToken;
 use semver::Version;
+
+#[test]
+fn java_result_obligation_keeps_unselected_jdk_calls_incomplete() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "App.java",
+            "class App { void run(String value) { value.trim(); String kept = value.trim(); } }",
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query =
+        CodeQuery::from_source(r#"(call-result-obligations (call-shape (call :callee "trim")))"#)
+            .expect("reviewed obligation query");
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    assert_eq!(result.results.len(), 2, "{}", result.render_text());
+    let mut discarded = 0;
+    let mut retained = 0;
+    for item in &result.results {
+        let CodeQueryResultValue::CallResultObligation { value } = &item.value else {
+            panic!("the query publishes its own typed row: {item:#?}");
+        };
+        match value.result_use {
+            "discarded" => {
+                discarded += 1;
+                assert!(value.terminal);
+                assert_ne!(value.coverage, "exhaustive");
+                assert!(value.reason.is_some());
+            }
+            "other_context" => {
+                retained += 1;
+                assert!(value.terminal);
+                assert_eq!(value.coverage, "exhaustive");
+                assert!(value.reason.is_none());
+            }
+            other => panic!("unexpected result-use classification: {other}"),
+        }
+    }
+    assert_eq!((discarded, retained), (1, 1));
+    assert!(matches!(
+        result.completion(),
+        CodeQueryCompletion::Incomplete { .. }
+    ));
+}
+
+#[test]
+fn java_result_obligation_requires_selected_jdk_source_and_discarded_use() {
+    use crate::analyzer::{
+        DependencyPackEcosystem, DependencyPackWorkspaceContext, JvmAnalyzerConfig,
+        JvmDependencyDiscoveryConfig, JvmDependencyDiscoveryMode,
+        JvmStandardLibraryDiscoveryConfig,
+    };
+    use std::io::Write;
+    use zip::write::SimpleFileOptions;
+
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "src/App.java",
+            "class App { void run(String value) { value.trim(); String kept = value.trim(); } void cleanup(String value) { try { System.out.println(value); } finally { value.trim(); } } }",
+        )
+        .file(
+            "src/DeleteApp.java",
+            "import java.nio.file.Files; import java.nio.file.Path; class DeleteApp { void run(Path path) { Files.deleteIfExists(path); boolean deleted = Files.deleteIfExists(path); } }",
+        )
+        .file(
+            "src/Virtual.java",
+            "interface Trimmer { String trim(); } class Left implements Trimmer { public String trim() { return \"left\"; } } class Right implements Trimmer { public String trim() { return \"right\"; } } class Virtual { void run(Trimmer value) { value.trim(); } }",
+        )
+        .build();
+    std::fs::create_dir_all(project.root().join(".bifrost")).expect("configuration directory");
+    std::fs::write(
+        project.root().join(".bifrost/jvm-toolchains.json"),
+        r#"{"schema_version":1,"source_toolchains":[{"source_root":"src","jdk_home":"toolchains/jdk-21"}]}"#,
+    ).expect("workspace toolchain document");
+    let home = project.root().join("toolchains/jdk-21");
+    std::fs::create_dir_all(home.join("lib")).expect("JDK lib directory");
+    std::fs::write(home.join("release"), "JAVA_VERSION=\"21.0.8\"\n").expect("JDK release file");
+    let archive = std::fs::File::create(home.join("lib/src.zip")).expect("JDK source archive");
+    let mut archive = zip::ZipWriter::new(archive);
+    for (path, source) in [
+        (
+            "java.base/module-info.java",
+            "module java.base { exports java.lang; exports java.nio.file; }",
+        ),
+        (
+            "java.base/java/lang/String.java",
+            "package java.lang; public final class String { public String trim() { return this; } }",
+        ),
+        (
+            "java.base/java/nio/file/Path.java",
+            "package java.nio.file; public interface Path {}",
+        ),
+        (
+            "java.base/java/nio/file/Files.java",
+            "package java.nio.file; public final class Files { public static boolean deleteIfExists(Path path) { return false; } }",
+        ),
+    ] {
+        archive
+            .start_file(
+                path,
+                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored),
+            )
+            .expect("JDK source entry");
+        archive
+            .write_all(source.as_bytes())
+            .expect("JDK source bytes");
+    }
+    archive.finish().expect("finished source archive");
+
+    let config = AnalyzerConfig {
+        jvm: JvmAnalyzerConfig {
+            dependency_discovery: JvmDependencyDiscoveryConfig {
+                mode: JvmDependencyDiscoveryMode::Disabled,
+                ..Default::default()
+            },
+            standard_library_discovery: JvmStandardLibraryDiscoveryConfig {
+                discover_java_home: false,
+                ..Default::default()
+            },
+            ..JvmAnalyzerConfig::default()
+        },
+        ..AnalyzerConfig::default()
+    };
+    let workspace = project.workspace_analyzer(config.clone());
+    let pack = compile_source(
+        SourceFormat::Json,
+        br#"{
+          "schema_version": 5,
+          "pack_id": "bifrost.jdk21.result-use-obligations", "version": "1.0.0",
+          "producer": {"name": "test", "version": "1.0.0"},
+          "language": "java", "ecosystem": "jdk",
+          "compatibility": {"bifrost": ">=0.12.0, <1.0.0", "toolchains": [{"name": "jdk", "requirement": ">=21.0.0, <22.0.0"}]},
+          "provenance": {"source": "test:reviewed-jdk-result-use"},
+          "license": "Apache-2.0", "completeness": "complete",
+          "safety": {"generated_code_only": false, "review_required": false},
+          "shards": [{
+            "id": "result-use", "activation": [{"toolchain": {"name": "jdk", "version": ">=21.0.0, <22.0.0"}, "targets": ["jvm"]}],
+            "payload": {"kind": "procedure_summaries", "summaries": [
+              {"id": "trim", "target": {"path": "java.base/java/lang/String.java", "symbol": "java.lang.String.trim()", "has_receiver": true, "parameter_count": 0},
+               "completeness": "complete", "ordinary_heap_unchanged": true, "covers_overrides": true,
+               "normal_result_count": 1, "transfers": [], "effects": [],
+               "result_use_obligations": [{"result_ordinal": 0, "kind": "pure_transformation_value"}]},
+              {"id": "delete", "target": {"path": "java.base/java/nio/file/Files.java", "symbol": "java.nio.file.Files.deleteIfExists(java.nio.file.Path)", "has_receiver": false, "parameter_count": 1},
+               "completeness": "partial", "normal_result_count": 1, "transfers": [],
+               "result_use_obligations": [{"result_ordinal": 0, "kind": "fallible_status", "failure_predicate": "false"}]}
+            ]}
+          }]
+        }"#,
+        &CompilerOptions::default(),
+    )
+    .unwrap_or_else(|diagnostics| panic!("reviewed JDK pack compiles: {diagnostics:#?}"));
+    let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default())
+        .expect("ephemeral semantic-pack catalog");
+    catalog
+        .register_session_pack(
+            &pack,
+            &SessionPackSource {
+                kind: SessionPackSourceKind::Embedded,
+                source_id: "test:reviewed-jdk-result-use".to_owned(),
+            },
+        )
+        .expect("register reviewed pack");
+    let activation = workspace.activate_dependency_packs(
+        workspace
+            .config()
+            .expect("immutable workspace configuration"),
+        &[DependencyPackEcosystem::Jvm],
+        DependencyPackWorkspaceContext {
+            catalog: &catalog,
+            persistence: None,
+            activation: &SemanticModelActivationRequest {
+                bifrost_version: Version::parse(env!("CARGO_PKG_VERSION")).expect("crate version"),
+                evidence: Vec::new(),
+                controls: Vec::new(),
+                limits: SemanticModelRuntimeLimits::default(),
+            },
+            limits: DependencyPackLimits::default(),
+            cancellation: &CancellationToken::default(),
+        },
+    );
+    assert!(
+        matches!(
+            activation.runtime,
+            Some(SemanticModelRuntimeOutcome::Ready { .. })
+        ),
+        "JDK source binding and pack activation: {activation:#?}"
+    );
+
+    let query =
+        CodeQuery::from_source(r#"(call-result-obligations (call-shape (call :callee "trim")))"#)
+            .expect("reviewed obligation query");
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    assert_eq!(result.results.len(), 4, "{}", result.render_text());
+    let mut positive = 0;
+    let mut retained = 0;
+    for item in &result.results {
+        let CodeQueryResultValue::CallResultObligation { value } = &item.value else {
+            panic!("the query publishes its own typed row: {item:#?}");
+        };
+        if value.path == "src/Virtual.java" {
+            assert!(value.arm_count >= 2, "{value:#?}");
+            assert_eq!(value.modeled_arm_count, 0, "{value:#?}");
+            assert!(value.terminal, "{value:#?}");
+            assert_eq!(value.coverage, "open", "{value:#?}");
+            assert_eq!(value.reason, Some("target_unresolved"), "{value:#?}");
+            continue;
+        }
+        match value.result_use {
+            "discarded" => {
+                positive += 1;
+                assert!(!value.terminal, "{value:#?}");
+                assert_eq!(value.coverage, "exhaustive");
+                assert_eq!(value.obligation_kind, Some("pure_transformation_value"));
+                assert_eq!(
+                    value.pack_id.as_deref(),
+                    Some("bifrost.jdk21.result-use-obligations")
+                );
+            }
+            "other_context" => {
+                retained += 1;
+                assert!(value.terminal, "{value:#?}");
+            }
+            other => panic!("unexpected result-use classification: {other}"),
+        }
+    }
+    assert_eq!((positive, retained), (2, 1));
+    assert!(result.results.iter().any(|item| matches!(&item.value, CodeQueryResultValue::CallResultObligation { value } if value.arm_count > 1 && value.modeled_arm_count == value.arm_count && !value.terminal)), "{result:#?}");
+
+    let status_query = CodeQuery::from_source(
+        r#"(call-result-obligations (call-shape (call :callee "deleteIfExists")))"#,
+    )
+    .expect("reviewed status query");
+    let status = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &status_query,
+    );
+    assert_eq!(status.results.len(), 2, "{}", status.render_text());
+    let discarded = status
+        .results
+        .iter()
+        .find_map(|item| match &item.value {
+            CodeQueryResultValue::CallResultObligation { value }
+                if value.result_use == "discarded" =>
+            {
+                Some(value)
+            }
+            _ => None,
+        })
+        .expect("discarded status result");
+    assert!(!discarded.terminal, "{discarded:#?}");
+    assert_eq!(discarded.coverage, "exhaustive");
+    assert_eq!(discarded.obligation_kind, Some("fallible_status"));
+    assert_eq!(discarded.failure_predicate, Some("false"));
+    let filter = CodeQuery::from_source(
+        r#"(filter :where ((failure_predicate eq (enum false)) (terminal eq false)) (call-result-obligations (call-shape (call :callee "deleteIfExists"))))"#,
+    ).expect("typed enum obligation filter");
+    let filtered = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &filter,
+    );
+    assert_eq!(filtered.results.len(), 1, "{}", filtered.render_text());
+}
 
 #[test]
 fn row_filter_and_projection_execute_over_public_occurrence_fields() {
@@ -4439,6 +4710,7 @@ func coverage(flag bool, n int, x any) {
     default: n--
     }
 }
+
 "#,
         )
         .build();
@@ -4574,6 +4846,1345 @@ func coverage(flag bool, n int, x any) {
         ],
         "{result:#?}"
     );
+}
+
+#[test]
+fn c_assignment_relations_separate_self_different_and_nonbare_rhs() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "main.c",
+            r#"void assignments(void) {
+    int x = 1;
+    int y = 2;
+    x = x;
+    x = y;
+    x = x + 1;
+}
+"#,
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = CodeQuery::from_json(&json!({
+        "languages": ["cpp"],
+        "match": { "kind": "function", "name": "assignments" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "assignment_relations" }
+        ],
+        "result_detail": "full"
+    }))
+    .expect("C assignment relation query");
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    assert_eq!(
+        result.completion(),
+        CodeQueryCompletion::Complete,
+        "{result:#?}"
+    );
+    let rows = result
+        .results
+        .iter()
+        .map(|item| {
+            let CodeQueryResultValue::AssignmentRelation { value } = &item.value else {
+                panic!("assignment_relations returns its typed row: {item:#?}");
+            };
+            (
+                value.range.start_line,
+                value.storage_kind,
+                value.verdict,
+                value.proof,
+                value.coverage,
+                value.reason,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rows,
+        [
+            (
+                4,
+                "ordinary_local",
+                "self_assignment",
+                "exact",
+                "exhaustive",
+                None,
+            ),
+            (
+                5,
+                "ordinary_local",
+                "different",
+                "exact",
+                "exhaustive",
+                Some("different_binding"),
+            ),
+            (
+                6,
+                "ordinary_local",
+                "excluded",
+                "exact",
+                "exhaustive",
+                Some("rhs_not_bare_identifier"),
+            ),
+        ],
+        "{result:#?}"
+    );
+}
+
+#[test]
+fn c_assignment_relations_support_parentheses_and_expression_exclusions() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "main.c",
+            r#"void shapes(void) {
+    int ordinary = 1;
+    ordinary = ((ordinary));
+}
+"#,
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = CodeQuery::from_json(&json!({
+        "languages": ["cpp"],
+        "match": { "kind": "function", "name": "shapes" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "assignment_relations" }
+        ],
+        "result_detail": "full"
+    }))
+    .expect("C assignment relation query");
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    assert_eq!(
+        result.completion(),
+        CodeQueryCompletion::Complete,
+        "{result:#?}"
+    );
+    let rows = result
+        .results
+        .iter()
+        .map(|item| {
+            let CodeQueryResultValue::AssignmentRelation { value } = &item.value else {
+                panic!("assignment relation row: {item:#?}");
+            };
+            (
+                value.range.start_line,
+                value.storage_kind,
+                value.verdict,
+                value.reason,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rows,
+        [(3, "ordinary_local", "self_assignment", None)],
+        "{result:#?}"
+    );
+}
+
+#[test]
+fn c_assignment_relations_resolve_nested_shadow_identity() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "main.c",
+            r#"void shadows(void) {
+    int shadow = 2;
+    {
+        int shadow = 3;
+        shadow = shadow;
+    }
+}
+"#,
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = CodeQuery::from_json(&json!({
+        "languages": ["cpp"],
+        "match": { "kind": "function", "name": "shadows" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "assignment_relations" }
+        ],
+        "result_detail": "full"
+    }))
+    .expect("shadow query");
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    assert_eq!(
+        result.completion(),
+        CodeQueryCompletion::Complete,
+        "{result:#?}"
+    );
+    let [item] = result.results.as_slice() else {
+        panic!("one shadow assignment: {result:#?}");
+    };
+    let CodeQueryResultValue::AssignmentRelation { value } = &item.value else {
+        panic!("assignment relation row: {item:#?}");
+    };
+    assert_eq!(value.storage_kind, "ordinary_local");
+    assert_eq!(value.verdict, "self_assignment");
+    assert_eq!(value.coverage, "exhaustive");
+}
+
+#[test]
+fn c_assignment_relations_keep_compound_and_comma_rhs_complete_exclusions() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "main.c",
+            r#"void excluded_shapes(void) {
+    int value = 1;
+    value += value;
+    value = (value, value);
+}
+"#,
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = CodeQuery::from_json(&json!({
+        "languages": ["cpp"],
+        "match": { "kind": "function", "name": "excluded_shapes" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "assignment_relations" }
+        ],
+        "result_detail": "full"
+    }))
+    .expect("expression exclusion query");
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    assert_eq!(
+        result.completion(),
+        CodeQueryCompletion::Complete,
+        "{result:#?}"
+    );
+    assert_eq!(result.results.len(), 2, "{result:#?}");
+    assert!(result.results.iter().all(|item| {
+        matches!(
+            &item.value,
+            CodeQueryResultValue::AssignmentRelation { value }
+                if value.verdict == "excluded" && value.coverage == "exhaustive"
+        )
+    }));
+}
+
+#[test]
+fn c_assignment_relations_keep_call_rhs_as_a_complete_exclusion() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "main.c",
+            r#"int identity(int value) { return value; }
+void call_shape(void) {
+    int value = 1;
+    value = identity(value);
+}
+"#,
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = CodeQuery::from_json(&json!({
+        "languages": ["cpp"],
+        "match": { "kind": "function", "name": "call_shape" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "assignment_relations" }
+        ],
+        "result_detail": "full"
+    }))
+    .expect("call exclusion query");
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    assert_eq!(
+        result.completion(),
+        CodeQueryCompletion::Complete,
+        "{result:#?}"
+    );
+    let [item] = result.results.as_slice() else {
+        panic!("one call exclusion: {result:#?}");
+    };
+    let CodeQueryResultValue::AssignmentRelation { value } = &item.value else {
+        panic!("assignment relation row: {item:#?}");
+    };
+    assert_eq!(value.verdict, "excluded");
+    assert_eq!(value.coverage, "exhaustive");
+    assert_eq!(value.reason, Some("rhs_not_bare_identifier"));
+}
+
+#[test]
+fn c_assignment_relations_keep_mixed_positive_and_call_coverage_incomplete() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "main.c",
+            r#"int identity(int value) { return value; }
+void mixed(void) {
+    int value = 1;
+    value = value;
+    value = identity(value);
+}
+"#,
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = CodeQuery::from_json(&json!({
+        "languages": ["cpp"],
+        "match": { "kind": "function", "name": "mixed" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "assignment_relations" }
+        ],
+        "result_detail": "full"
+    }))
+    .expect("mixed call coverage query");
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    assert!(
+        matches!(result.completion(), CodeQueryCompletion::Incomplete { .. }),
+        "{result:#?}"
+    );
+    assert!(result.results.iter().any(|item| {
+        matches!(
+            &item.value,
+            CodeQueryResultValue::AssignmentRelation { value }
+                if value.range.start_line == 4
+                    && value.verdict == "unknown"
+                    && value.coverage == "open"
+        )
+    }));
+}
+
+#[test]
+fn c_assignment_relations_scope_qualifiers_to_the_selected_declarator() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "main.c",
+            r#"void selected_declarator(void) {
+    int * volatile pointer, ordinary = 1;
+    ordinary = ordinary;
+}
+"#,
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = CodeQuery::from_json(&json!({
+        "languages": ["cpp"],
+        "match": { "kind": "function", "name": "selected_declarator" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "assignment_relations" }
+        ],
+        "result_detail": "full"
+    }))
+    .expect("selected declarator query");
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    assert!(
+        matches!(result.completion(), CodeQueryCompletion::Incomplete { .. }),
+        "{result:#?}"
+    );
+    let ordinary = result
+        .results
+        .iter()
+        .find_map(|item| {
+            let CodeQueryResultValue::AssignmentRelation { value } = &item.value else {
+                return None;
+            };
+            (value.range.start_line == 3).then_some(value)
+        })
+        .expect("ordinary sibling assignment row");
+    assert_eq!(ordinary.storage_kind, "ordinary_local", "{result:#?}");
+    assert_eq!(ordinary.verdict, "unknown", "{result:#?}");
+    assert_eq!(ordinary.coverage, "open", "{result:#?}");
+}
+
+#[test]
+fn c_assignment_relations_keep_open_rows_incomplete_after_filtering() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "main.c",
+            r#"typedef int Scalar;
+
+void unknowns(int condition) {
+    int maybe;
+    if (condition) {
+        maybe = 1;
+    }
+    maybe = maybe;
+    Scalar alias = 1;
+    alias = alias;
+    int *pointer = 0;
+    pointer = pointer;
+}
+"#,
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query_json = |filtered: bool| {
+        let mut steps = vec![
+            json!({ "op": "procedure_of" }),
+            json!({ "op": "assignment_relations" }),
+        ];
+        if filtered {
+            steps.push(json!({
+                "op": "filter",
+                "where": [{
+                    "field": "verdict",
+                    "op": "eq",
+                    "value": { "enum": "self_assignment" }
+                }]
+            }));
+        }
+        json!({
+            "languages": ["cpp"],
+            "match": { "kind": "function", "name": "unknowns" },
+            "steps": steps,
+            "result_detail": "full"
+        })
+    };
+
+    let raw_query = CodeQuery::from_json(&query_json(false)).expect("raw assignment query");
+    let raw = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &raw_query,
+    );
+    assert!(
+        matches!(raw.completion(), CodeQueryCompletion::Incomplete { .. }),
+        "{raw:#?}"
+    );
+    let open_reasons = raw
+        .results
+        .iter()
+        .filter_map(|item| {
+            let CodeQueryResultValue::AssignmentRelation { value } = &item.value else {
+                return None;
+            };
+            (value.coverage == "open").then_some(value.reason)
+        })
+        .collect::<Vec<_>>();
+    assert!(open_reasons.len() >= 3, "{raw:#?}");
+    assert!(
+        open_reasons.contains(&Some("unsupported_declarator")),
+        "{raw:#?}"
+    );
+
+    let filtered_query =
+        CodeQuery::from_json(&query_json(true)).expect("filtered assignment query");
+    let filtered = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &filtered_query,
+    );
+    assert!(filtered.results.is_empty(), "{filtered:#?}");
+    assert!(
+        matches!(
+            filtered.completion(),
+            CodeQueryCompletion::Incomplete { .. }
+        ),
+        "{filtered:#?}"
+    );
+}
+
+#[test]
+fn c_assignment_relations_keep_unproved_initialization_open_and_prove_storage_exclusions() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "main.c",
+            r#"void exclusions(void) {
+    int uninitialized;
+    uninitialized = uninitialized;
+    volatile int changing = 1;
+    changing = changing;
+    _Atomic int atomic_value = 1;
+    atomic_value = atomic_value;
+}
+"#,
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = CodeQuery::from_json(&json!({
+        "languages": ["cpp"],
+        "match": { "kind": "function", "name": "exclusions" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "assignment_relations" }
+        ],
+        "result_detail": "full"
+    }))
+    .expect("C exclusion query");
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    assert!(
+        matches!(result.completion(), CodeQueryCompletion::Incomplete { .. }),
+        "{result:#?}"
+    );
+    let rows = result
+        .results
+        .iter()
+        .map(|item| {
+            let CodeQueryResultValue::AssignmentRelation { value } = &item.value else {
+                panic!("assignment relation row: {item:#?}");
+            };
+            (
+                value.range.start_line,
+                value.storage_kind,
+                value.verdict,
+                value.reason,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rows,
+        [
+            (
+                3,
+                "ordinary_local",
+                "unknown",
+                Some("initialization_unproved")
+            ),
+            (5, "volatile", "excluded", Some("volatile_local")),
+            (7, "atomic", "excluded", Some("atomic_local")),
+        ],
+        "{result:#?}"
+    );
+}
+
+#[test]
+fn c_assignment_relations_report_configuration_and_recovery_as_incomplete() {
+    for (name, source) in [
+        (
+            "configured",
+            r#"void configured(void) {
+    int value = 1;
+#if FEATURE
+    value = value;
+#endif
+}
+"#,
+        ),
+        (
+            "recovered",
+            r#"void recovered(void) {
+    int value = 1;
+    value = (value;
+}
+"#,
+        ),
+        (
+            "macro_wrapped",
+            r#"void macro_wrapped(void) {
+    int value = 1;
+#define SELF_ASSIGN(x) x = x
+    SELF_ASSIGN(value);
+}
+"#,
+        ),
+    ] {
+        let project = InlineTestProject::with_language(Language::Cpp)
+            .file("main.c", source)
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let query = CodeQuery::from_json(&json!({
+            "languages": ["cpp"],
+            "match": { "kind": "function", "name": name },
+            "steps": [
+                { "op": "procedure_of" },
+                { "op": "assignment_relations" }
+            ],
+            "result_detail": "full"
+        }))
+        .expect("C uncertain syntax query");
+        let result = execute_workspace(
+            &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::new(),
+            &query,
+        );
+        assert!(
+            matches!(result.completion(), CodeQueryCompletion::Incomplete { .. }),
+            "{name}: {result:#?}"
+        );
+    }
+}
+
+fn c_failed_swap_query(name: &str) -> CodeQuery {
+    CodeQuery::from_json(&json!({
+        "languages": ["cpp"],
+        "match": { "kind": "function", "name": name },
+        "steps": [
+            { "op": "procedure_of" },
+            {
+                "op": "assignment_relations",
+                "assignment_relation": ["failed_swap"]
+            }
+        ],
+        "result_detail": "full"
+    }))
+    .expect("C failed-swap query")
+}
+
+#[test]
+fn c_failed_swap_proves_direct_sibling_copy_back_without_strengthening_intent() {
+    for (name, source, start_line, end_line) in [
+        (
+            "direct",
+            r#"void direct(void) {
+    int first;
+    int second = 2;
+    first = ((second));
+    // Comments do not break direct statement adjacency.
+    second = first;
+}
+"#,
+            4,
+            6,
+        ),
+        (
+            "shadowed",
+            r#"void shadowed(void) {
+    int first = 10;
+    int second = 20;
+    {
+        int first;
+        int second = 2;
+        first = second;
+        second = first;
+    }
+}
+"#,
+            7,
+            8,
+        ),
+    ] {
+        let project = InlineTestProject::with_language(Language::Cpp)
+            .file("main.c", source)
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let result = execute_workspace(
+            &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::new(),
+            &c_failed_swap_query(name),
+        );
+        assert_eq!(
+            result.completion(),
+            CodeQueryCompletion::Complete,
+            "{name}: {result:#?}"
+        );
+        let [item] = result.results.as_slice() else {
+            panic!("{name}: one C failed-swap relation: {result:#?}");
+        };
+        let CodeQueryResultValue::AssignmentRelation { value } = &item.value else {
+            panic!("{name}: assignment relation row: {item:#?}");
+        };
+        assert_eq!(value.relation_kind, "failed_swap", "{name}: {result:#?}");
+        assert_eq!(value.verdict, "failed_swap", "{name}: {result:#?}");
+        assert_eq!(value.proof, "exact", "{name}: {result:#?}");
+        assert_eq!(value.coverage, "exhaustive", "{name}: {result:#?}");
+        assert_eq!(value.range.start_line, start_line, "{name}: {result:#?}");
+        assert_eq!(value.range.end_line, end_line, "{name}: {result:#?}");
+    }
+}
+
+#[test]
+fn c_failed_swap_rejects_corrected_and_non_sibling_near_misses() {
+    for (name, source) in [
+        (
+            "temporary_swap",
+            r#"void temporary_swap(void) {
+    int first = 1;
+    int second = 2;
+    int temporary = first;
+    first = second;
+    second = temporary;
+}
+"#,
+        ),
+        (
+            "intervening_declaration",
+            r#"void intervening_declaration(void) {
+    int first = 1;
+    int second = 2;
+    first = second;
+    int marker = 0;
+    second = first;
+}
+"#,
+        ),
+        (
+            "labeled",
+            r#"void labeled(void) {
+    int first = 1;
+    int second = 2;
+first_assignment:
+    first = second;
+    second = first;
+}
+"#,
+        ),
+        (
+            "goto_boundary",
+            r#"void goto_boundary(void) {
+    int first = 1;
+    int second = 2;
+    first = second;
+    goto done;
+    second = first;
+done:
+    return;
+}
+"#,
+        ),
+        (
+            "same_target",
+            r#"void same_target(void) {
+    int first = 1;
+    int second = 2;
+    first = second;
+    first = second;
+}
+"#,
+        ),
+        (
+            "volatile_pair",
+            r#"void volatile_pair(void) {
+    volatile int first = 1;
+    volatile int second = 2;
+    first = second;
+    second = first;
+}
+"#,
+        ),
+        (
+            "indirect_pair",
+            r#"void indirect_pair(int *first, int *second) {
+    *first = *second;
+    *second = *first;
+}
+"#,
+        ),
+    ] {
+        let project = InlineTestProject::with_language(Language::Cpp)
+            .file("main.c", source)
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let result = execute_workspace(
+            &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::new(),
+            &c_failed_swap_query(name),
+        );
+        assert_eq!(
+            result.completion(),
+            CodeQueryCompletion::Complete,
+            "{name}: {result:#?}"
+        );
+        assert!(result.results.is_empty(), "{name}: {result:#?}");
+    }
+}
+
+#[test]
+fn c_failed_swap_keeps_preprocessing_and_recovery_incomplete_after_filtering() {
+    for (name, source) in [
+        (
+            "configured_swap",
+            r#"void configured_swap(void) {
+    int first = 1;
+    int second = 2;
+#if FEATURE
+    first = second;
+#endif
+    second = first;
+}
+"#,
+        ),
+        (
+            "recovered_swap",
+            r#"void recovered_swap(void) {
+    int first = 1;
+    int second = 2;
+    first = second;
+    second = (first;
+}
+"#,
+        ),
+    ] {
+        let project = InlineTestProject::with_language(Language::Cpp)
+            .file("main.c", source)
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let result = execute_workspace(
+            &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::new(),
+            &c_failed_swap_query(name),
+        );
+        assert!(result.results.is_empty(), "{name}: {result:#?}");
+        assert!(
+            matches!(result.completion(), CodeQueryCompletion::Incomplete { .. }),
+            "{name}: {result:#?}"
+        );
+    }
+}
+
+#[test]
+fn c_failed_swap_reports_pipeline_budget_exhaustion_as_incomplete() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "main.c",
+            "void bounded(void) { int first = 1; int second = 2; first = second; second = first; }\n",
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let result = execute_code_query_detailed_eager_index_workspace(
+        &workspace,
+        &c_failed_swap_query("bounded"),
+        CodeQueryExecutionLimits {
+            max_pipeline_rows: 1,
+            ..CodeQueryExecutionLimits::default()
+        },
+        None,
+    )
+    .result;
+    assert!(result.results.is_empty(), "{result:#?}");
+    assert!(result.truncated, "{result:#?}");
+    assert!(
+        matches!(result.completion(), CodeQueryCompletion::Incomplete { .. }),
+        "{result:#?}"
+    );
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == CodeQueryDiagnosticCode::PipelineBudgetExhausted),
+        "{result:#?}"
+    );
+}
+
+#[test]
+fn c_failed_swap_reports_query_pre_cancellation() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "main.c",
+            "void cancelled(void) { int first = 1; int second = 2; first = second; second = first; }\n",
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = c_failed_swap_query("cancelled");
+    let cancellation = CancellationToken::default();
+    cancellation.cancel();
+    let result = execute_code_query_detailed_eager_index_workspace(
+        &workspace,
+        &query,
+        CodeQueryExecutionLimits::default(),
+        Some(&cancellation),
+    )
+    .result;
+    assert!(result.results.is_empty(), "{result:#?}");
+    assert!(result.truncated, "{result:#?}");
+    assert_eq!(
+        result.completion(),
+        CodeQueryCompletion::Cancelled,
+        "{result:#?}"
+    );
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == CodeQueryDiagnosticCode::Cancelled),
+        "{result:#?}"
+    );
+}
+
+#[test]
+fn assignment_relations_report_unsupported_cpp_dialect_as_incomplete() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "main.cpp",
+            "void cpp_only() { int value = 1; value = value; }\n",
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = CodeQuery::from_json(&json!({
+        "languages": ["cpp"],
+        "match": { "kind": "function", "name": "cpp_only" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "assignment_relations" }
+        ],
+        "result_detail": "full"
+    }))
+    .expect("C++ dialect support query");
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    assert!(
+        matches!(result.completion(), CodeQueryCompletion::Incomplete { .. }),
+        "{result:#?}"
+    );
+    assert!(result.results.is_empty(), "{result:#?}");
+    assert!(
+        result.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("unsupported assignment relations")),
+        "{result:#?}"
+    );
+}
+
+#[test]
+fn exact_procedure_dialect_filter_selects_c_before_assignment_projection() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "main.c",
+            "void c_only(void) { int value = 1; value = value; }\n",
+        )
+        .file(
+            "main.cpp",
+            "void cpp_only() { int value = 1; value = value; }\n",
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+
+    let procedures = CodeQuery::from_source(
+        "(filter :where ((dialect eq cpp-c)) (procedure-of (language cpp (callable))))",
+    )
+    .expect("canonical procedure dialect filter");
+    let procedures = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &procedures,
+    );
+    assert_eq!(procedures.completion(), CodeQueryCompletion::Complete);
+    let [procedure] = procedures.results.as_slice() else {
+        panic!("only the C procedure is selected: {procedures:#?}");
+    };
+    let CodeQueryResultValue::Procedure { value } = &procedure.value else {
+        panic!("expected procedure row: {procedure:#?}");
+    };
+    assert_eq!(value.path, "main.c");
+    assert_eq!(value.language, "cpp");
+    assert_eq!(value.dialect, "cpp-c");
+
+    let cpp = CodeQuery::from_source(
+        "(filter :where ((dialect eq cpp)) (procedure-of (language cpp (callable))))",
+    )
+    .expect("C++ procedure dialect filter");
+    let cpp = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &cpp,
+    );
+    assert_eq!(cpp.completion(), CodeQueryCompletion::Complete);
+    let [procedure] = cpp.results.as_slice() else {
+        panic!("only the C++ procedure is selected: {cpp:#?}");
+    };
+    let CodeQueryResultValue::Procedure { value } = &procedure.value else {
+        panic!("expected procedure row: {procedure:#?}");
+    };
+    assert_eq!(value.path, "main.cpp");
+    assert_eq!(value.dialect, "cpp");
+
+    let invalid = CodeQuery::from_source(
+        "(filter :where ((dialect eq c)) (procedure-of (language cpp (callable))))",
+    )
+    .expect_err("the language alias is not an artifact dialect");
+    assert!(
+        invalid.to_string().contains("cpp-c"),
+        "the finite dialect domain explains the valid C label: {invalid}"
+    );
+
+    let assignments = CodeQuery::from_source(
+        "(assignment-relations (filter :where ((dialect eq cpp-c)) (procedure-of (language cpp (callable)))))",
+    )
+    .expect("C-only assignment projection");
+    let assignments = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &assignments,
+    );
+    assert_eq!(assignments.completion(), CodeQueryCompletion::Complete);
+    assert!(
+        assignments.results.iter().any(|item| matches!(
+            &item.value,
+            CodeQueryResultValue::AssignmentRelation { value }
+                if value.path == "main.c" && value.verdict == "self_assignment"
+        )),
+        "the C proof survives C++ exclusion: {assignments:#?}"
+    );
+    assert!(
+        assignments.results.iter().all(|item| match &item.value {
+            CodeQueryResultValue::AssignmentRelation { value } => value.path == "main.c",
+            _ => false,
+        }),
+        "no C++ assignment is projected: {assignments:#?}"
+    );
+}
+
+#[test]
+fn assignment_relations_report_unsupported_rust_obligations() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "main.rs",
+            "fn check() { let mut value = 1; value = value; }",
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = CodeQuery::from_json(&json!({
+        "languages": ["rust"],
+        "match": { "kind": "function", "name": "check" },
+        "steps": [{ "op": "procedure_of" }, { "op": "assignment_relations" }],
+        "result_detail": "full"
+    }))
+    .expect("unsupported assignment relation query");
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    assert!(
+        matches!(result.completion(), CodeQueryCompletion::Incomplete { .. }),
+        "{result:#?}"
+    );
+    assert!(result.results.is_empty(), "{result:#?}");
+    assert!(
+        result.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("unsupported assignment relations")),
+        "{result:#?}"
+    );
+}
+
+#[test]
+fn java_overwritten_unread_assignment_relations_keep_replacement_event_witnesses() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "Sample.java",
+            "class Sample { void check(boolean flag) { int value = 1; if (flag) value = 2; else value = 3; } }",
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = CodeQuery::from_json(&json!({
+        "languages": ["java"],
+        "match": { "kind": "method", "name": "check" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "assignment_relations", "assignment_relation": ["overwritten_unread"] }
+        ],
+        "result_detail": "full"
+    }))
+    .expect("Java overwrite query");
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    assert_eq!(
+        result.completion(),
+        CodeQueryCompletion::Complete,
+        "{result:#?}"
+    );
+    let findings = result
+        .results
+        .iter()
+        .filter_map(|item| match &item.value {
+            CodeQueryResultValue::AssignmentRelation { value }
+                if value.verdict == "overwritten_unread" =>
+            {
+                Some(value)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let [finding] = findings.as_slice() else {
+        panic!("one first value overwritten on both branches: {result:#?}");
+    };
+    assert_eq!(finding.relation_kind, "overwritten_unread");
+    assert_eq!(finding.replacement_events.len(), 2, "{finding:#?}");
+    assert!(finding.replacement_events.iter().all(|event| {
+        !event.id.is_empty()
+            && event.path == "Sample.java"
+            && event.event_class == "establish"
+            && event.subject == "binding"
+    }));
+    assert_ne!(
+        finding.replacement_events[0].id,
+        finding.replacement_events[1].id
+    );
+}
+
+#[test]
+fn java_overwritten_unread_preserves_lambda_capture_reads() {
+    for (body, expected) in [
+        (
+            "int captured = 1; return () -> { int observed = captured; };",
+            0,
+        ),
+        (
+            "int captured = 1; int changed = 1; Runnable task = () -> { int observed = captured; }; changed = 2; return task;",
+            1,
+        ),
+        (
+            "int captured = 1; int changed = 1; int observed = changed; Runnable task = () -> { int inside = captured; }; changed = 2; return task;",
+            0,
+        ),
+        (
+            "int changed = 1; Runnable task = () -> {}; changed = 2; return task;",
+            1,
+        ),
+    ] {
+        let project = InlineTestProject::with_language(Language::Java)
+            .file(
+                "Sample.java",
+                format!("class Sample {{ Runnable check() {{ {body} }} }}"),
+            )
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        for (kind, count) in [("method", expected), ("lambda", 0)] {
+            let query = CodeQuery::from_json(&json!({
+                "languages": ["java"],
+                "match": { "kind": kind },
+                "steps": [
+                    { "op": "procedure_of" },
+                    { "op": "assignment_relations", "assignment_relation": ["overwritten_unread"] }
+                ],
+                "result_detail": "full"
+            }))
+            .unwrap();
+            let result = execute_workspace(
+                &workspace,
+                &brokk_bifrost_flow::FlowWorkspaceState::new(),
+                &query,
+            );
+            assert_eq!(
+                result.completion(),
+                CodeQueryCompletion::Complete,
+                "{body}: {result:#?}"
+            );
+            let actual = result.results.iter().filter(|item| matches!(&item.value,
+            CodeQueryResultValue::AssignmentRelation { value } if value.verdict == "overwritten_unread"
+        )).count();
+            assert_eq!(actual, count, "{kind}: {body}: {result:#?}");
+        }
+    }
+}
+
+#[test]
+fn java_overwritten_unread_requires_every_reachable_finally_copy() {
+    for (body, expected) in [
+        (
+            "int value = 1; try { return value; } finally { value = 2; }",
+            0,
+        ),
+        (
+            "int value; try { if (flag) return 1; } finally { value = 1; value = 2; } return value;",
+            1,
+        ),
+        (
+            "int value; try { if (flag) return 1; } finally { value = 1; } return value;",
+            0,
+        ),
+    ] {
+        let project = InlineTestProject::with_language(Language::Java)
+            .file(
+                "Sample.java",
+                format!("class Sample {{ int check(boolean flag) {{ {body} }} }}"),
+            )
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let query = CodeQuery::from_json(&json!({
+            "languages": ["java"],
+            "match": { "kind": "method", "name": "check" },
+            "steps": [
+                { "op": "procedure_of" },
+                { "op": "assignment_relations", "assignment_relation": ["overwritten_unread"] }
+            ]
+        }))
+        .expect("Java overwrite query");
+        let result = execute_workspace(
+            &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::new(),
+            &query,
+        );
+        assert_eq!(
+            result.completion(),
+            CodeQueryCompletion::Complete,
+            "{body}: {result:#?}"
+        );
+        let findings = result
+            .results
+            .iter()
+            .filter(|item| {
+                matches!(
+                    &item.value, CodeQueryResultValue::AssignmentRelation { value }
+                        if value.verdict == "overwritten_unread"
+                )
+            })
+            .count();
+        assert_eq!(findings, expected, "{body}: {result:#?}");
+    }
+}
+
+#[test]
+fn js_ts_overwritten_unread_relations_require_exact_writes_and_initialized_targets() {
+    for (language, path) in [
+        (Language::JavaScript, "sample.js"),
+        (Language::TypeScript, "sample.ts"),
+    ] {
+        for (source, expected) in [
+            (
+                "function check(flag) { let value = 1; if (flag) value = 2; else value = 3; }",
+                "finding",
+            ),
+            (
+                "function check() { let value; value = 1; value = 2; }",
+                "finding",
+            ),
+            (
+                "function check() { value = 1; let value; value = 2; }",
+                "tdz",
+            ),
+        ] {
+            let project = InlineTestProject::with_language(language)
+                .file(path, source)
+                .build();
+            let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+            let query = CodeQuery::from_json(&json!({
+                "languages": [language.config_label()],
+                "match": { "kind": "function", "name": "check" },
+                "steps": [
+                    { "op": "procedure_of" },
+                    { "op": "assignment_relations", "assignment_relation": ["overwritten_unread"] }
+                ],
+                "result_detail": "full"
+            }))
+            .expect("JS/TS overwrite query");
+            let result = execute_workspace(
+                &workspace,
+                &brokk_bifrost_flow::FlowWorkspaceState::new(),
+                &query,
+            );
+            let findings = result
+                .results
+                .iter()
+                .filter_map(|item| match &item.value {
+                    CodeQueryResultValue::AssignmentRelation { value }
+                        if value.verdict == "overwritten_unread" =>
+                    {
+                        Some(value)
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            if expected == "tdz" {
+                assert!(
+                    matches!(result.completion(), CodeQueryCompletion::Incomplete { .. }),
+                    "{path}: {result:#?}"
+                );
+                assert!(findings.is_empty(), "{path}: {result:#?}");
+            } else {
+                assert_eq!(
+                    result.completion(),
+                    CodeQueryCompletion::Complete,
+                    "{path}: {result:#?}"
+                );
+                let [finding] = findings.as_slice() else {
+                    panic!("one overwritten value: {path}: {result:#?}");
+                };
+                assert!(
+                    !finding.replacement_events.is_empty(),
+                    "{path}: {finding:#?}"
+                );
+                assert!(finding.replacement_events.iter().all(|event| {
+                    !event.id.is_empty() && event.path == path && event.event_class == "establish"
+                }));
+            }
+        }
+    }
+}
+
+#[test]
+fn parenthesized_identifier_rhs_keeps_exact_self_and_swap_relations() {
+    for (language, path, source, kind) in [
+        (
+            Language::Java,
+            "Sample.java",
+            "class Sample { void check() { int a = 1; int b = 2; a = (a); a = (b); b = (a); } }",
+            "method",
+        ),
+        (
+            Language::JavaScript,
+            "sample.js",
+            "function check() { let a = 1; let b = 2; a = (a); a = (b); b = (a); }",
+            "function",
+        ),
+        (
+            Language::TypeScript,
+            "sample.ts",
+            "function check() { let a = 1; let b = 2; a = (a); a = (b); b = (a); }",
+            "function",
+        ),
+        (
+            Language::Python,
+            "sample.py",
+            "def check():\n    a = 1\n    b = 2\n    a = (a)\n    a = (b)\n    b = (a)\n",
+            "function",
+        ),
+    ] {
+        let project = InlineTestProject::with_language(language)
+            .file(path, source)
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let query = CodeQuery::from_json(&json!({
+            "languages": [language.config_label()],
+            "match": { "kind": kind, "name": "check" },
+            "steps": [
+                { "op": "procedure_of" },
+                { "op": "assignment_relations", "assignment_relation": ["self_assignment", "failed_swap"] }
+            ],
+            "result_detail": "full"
+        }))
+        .expect("parenthesized assignment relation query");
+        let result = execute_workspace(
+            &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::new(),
+            &query,
+        );
+        assert_eq!(
+            result.completion(),
+            CodeQueryCompletion::Complete,
+            "{path}: {result:#?}"
+        );
+        for verdict in ["self_assignment", "failed_swap"] {
+            assert!(
+                result.results.iter().any(|item| matches!(
+                    &item.value,
+                    CodeQueryResultValue::AssignmentRelation { value }
+                        if value.verdict == verdict && value.proof == "exact"
+                )),
+                "{path} lacks {verdict}: {result:#?}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -23383,4 +24994,1139 @@ func forwardedRoot() int {
         forwarded_projected, forwarded_direct,
         "fresh task summaries preserve the direct forwarded report"
     );
+}
+
+#[test]
+fn branch_relation_step_projects_proven_java_pairs_and_keeps_relation_filters_independent() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "Sample.java",
+            "class Sample { static int f(int x) { if (x == 1) return x; else if (x == 1) return x; else return 0; } }",
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    for (relation, expected) in [
+        ("identical-bodies", "identical_bodies"),
+        ("repeated-condition", "repeated_condition"),
+    ] {
+        let query = CodeQuery::from_source(&format!(
+            "(filter :where ((verdict eq proven)) (branch-relations :relation [{relation}] (if)))"
+        ))
+        .expect("typed branch query");
+        let result = execute_workspace(
+            &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::new(),
+            &query,
+        );
+        assert!(result.diagnostics.is_empty(), "{}", result.render_text());
+        assert!(!result.results.is_empty(), "{}", result.render_text());
+        for item in &result.results {
+            let CodeQueryResultValue::BranchRelation { value } = &item.value else {
+                panic!("expected branch relation row");
+            };
+            assert_eq!(value.relation, expected);
+            assert_eq!(value.verdict, "proven");
+            assert!(!value.owner_id.is_empty());
+            assert!(value.earlier_ordinal < value.later_ordinal);
+        }
+    }
+}
+
+#[test]
+fn java_repetition_projects_primitive_and_boxed_proofs_and_floating_gap() {
+    let query = CodeQuery::from_source(
+        "(branch-relations :relation [repeated-condition] (language java (if)))",
+    )
+    .expect("typed repeated-condition query");
+    for (source, verdict, reason) in [
+        (
+            "class Sample { int f(int x, boolean ready) { if (ready && x > 5) return 1; else if (ready && x > 5) return 2; return 0; } }",
+            "proven",
+            None,
+        ),
+        (
+            "class Sample { int f(Integer x) { if (x > 5) return 1; else if (x > 5) return 2; return 0; } }",
+            "proven",
+            None,
+        ),
+        (
+            "class Sample { int f(Double x) { if (x > 5) return 1; else if (x > 5) return 2; return 0; } }",
+            "open",
+            Some("unsupported_condition"),
+        ),
+    ] {
+        let project = InlineTestProject::with_language(Language::Java)
+            .file("Sample.java", source)
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let result = execute_workspace(
+            &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::new(),
+            &query,
+        );
+        assert_eq!(
+            result.results.len(),
+            1,
+            "{source}: {}",
+            result.render_text()
+        );
+        let CodeQueryResultValue::BranchRelation { value } = &result.results[0].value else {
+            panic!("expected branch relation row");
+        };
+        assert_eq!(value.verdict, verdict, "{source}: {}", result.render_text());
+        assert_eq!(value.reason, reason, "{source}: {}", result.render_text());
+        assert!(!value.owner_id.is_empty());
+        assert!(value.earlier_ordinal < value.later_ordinal);
+    }
+}
+
+#[test]
+fn java_loop_relation_projects_exact_range_and_open_reasons() {
+    let query = CodeQuery::from_source("(loop-relations (procedure-of (callable)))")
+        .expect("typed loop query");
+    let positive = InlineTestProject::with_language(Language::Java)
+        .file(
+            "Sample.java",
+            "class Sample { int f(boolean flag) { while (flag) { return 1; } return 0; } }",
+        )
+        .build();
+    let workspace = positive.workspace_analyzer(AnalyzerConfig::default());
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    assert!(result.diagnostics.is_empty(), "{}", result.render_text());
+    let rows = result
+        .results
+        .iter()
+        .filter_map(|item| match &item.value {
+            CodeQueryResultValue::LoopRelation { value } => Some(value),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(rows.len(), 1, "{}", result.render_text());
+    assert_eq!(rows[0].verdict, "proven");
+    assert_eq!(rows[0].loop_kind, "while");
+    assert_eq!(rows[0].range.start_line, 1);
+    assert_eq!(rows[0].range.start_column, 38);
+    assert!(rows[0].body_range.is_some());
+    assert!(result.render_text().contains("loop_relation"));
+
+    let open = InlineTestProject::with_language(Language::Java)
+        .file("Sample.java", "class Sample { int f(boolean flag, int y) { int x = 1; while (flag) { x += y; return x; } return x; } }")
+        .build();
+    let workspace = open.workspace_analyzer(AnalyzerConfig::default());
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    let rows = result
+        .results
+        .iter()
+        .filter_map(|item| match &item.value {
+            CodeQueryResultValue::LoopRelation { value } => Some(value),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(rows.len(), 1, "{}", result.render_text());
+    assert_eq!(rows[0].verdict, "open", "{}", result.render_text());
+    assert!(!rows[0].reasons.is_empty());
+    assert!(!result.diagnostics.is_empty());
+}
+
+#[test]
+fn java_loop_relation_keeps_anonymous_method_loops_with_their_owner() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "Sample.java",
+            "class Sample { void f(boolean flag) { Runnable r = new Runnable() { public void run() { while (flag) { return; } } }; while (flag) { return; } } }",
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = CodeQuery::from_source("(loop-relations (procedure-of (callable)))")
+        .expect("typed loop query");
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    let rows = result
+        .results
+        .iter()
+        .filter_map(|item| match &item.value {
+            CodeQueryResultValue::LoopRelation { value } => Some(value),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(rows.len(), 2, "{}", result.render_text());
+    assert_ne!(rows[0].procedure_id, rows[1].procedure_id);
+    assert_ne!(rows[0].range, rows[1].range);
+}
+
+#[test]
+fn java_statement_reachability_covers_assertion_control() {
+    for (body, expected) in [
+        ("assert flag; return; missed();", 1),
+        ("assert false; used();", 0),
+        ("assert flag : detail(); return; missed();", 1),
+        (
+            "try { assert flag; return; } finally { cleanup(); } missed();",
+            1,
+        ),
+        (
+            "try { assert flag; } catch (AssertionError failure) { used(); }",
+            0,
+        ),
+    ] {
+        let project = InlineTestProject::with_language(Language::Java)
+            .file(
+                "Sample.java",
+                format!("class Sample {{ void check(boolean flag) {{ {body} }} }}"),
+            )
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let query = CodeQuery::from_source("(filter :where ((verdict eq unreachable)) (statement-reachability (procedure-of (callable))))").unwrap();
+        let result = execute_workspace(
+            &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::new(),
+            &query,
+        );
+        assert_eq!(
+            result.completion(),
+            CodeQueryCompletion::Complete,
+            "{body}: {result:#?}"
+        );
+        assert_eq!(result.results.len(), expected, "{body}: {result:#?}");
+    }
+}
+
+#[test]
+fn java_statement_reachability_reports_dead_and_open_without_confusing_nested_bodies() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "Sample.java",
+            "class Sample { void dead() { return; removed(); } void clean() { okay(); } void open(boolean flag) { synchronized(this) { if(flag) return; } return; missed(); } void outer() { Runnable r = () -> { return; nested(); }; } }",
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = CodeQuery::from_source("(statement-reachability (procedure-of (callable)))")
+        .expect("typed statement query");
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    let rows = result
+        .results
+        .iter()
+        .filter_map(|item| match &item.value {
+            CodeQueryResultValue::StatementReachability { value } => Some(value),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        rows.iter()
+            .any(|row| row.verdict == "unreachable" && row.statement_kind == "expression"),
+        "{}",
+        result.render_text()
+    );
+    assert!(
+        rows.iter().any(|row| row.verdict == "reachable"),
+        "{}",
+        result.render_text()
+    );
+    assert!(
+        rows.iter().any(|row| row.verdict == "open"),
+        "{}",
+        result.render_text()
+    );
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.impact == CodeQueryDiagnosticImpact::Incomplete)
+    );
+    let dead_only = rows
+        .iter()
+        .filter(|row| row.verdict == "unreachable")
+        .collect::<Vec<_>>();
+    assert!(dead_only.iter().any(|row| row.path == "Sample.java"));
+    assert!(dead_only.iter().any(|row| row.range.start_line == 1));
+    assert!(result.render_text().contains("statement_reachability"));
+
+    let filtered = CodeQuery::from_source(
+        "(filter :where ((verdict eq unreachable)) (statement-reachability (procedure-of (callable))))",
+    )
+    .expect("filtered statement query");
+    let filtered_result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &filtered,
+    );
+    assert!(filtered_result.results.iter().all(|item| matches!(
+        &item.value,
+        CodeQueryResultValue::StatementReachability { value } if value.verdict == "unreachable"
+    )));
+    assert!(
+        filtered_result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.impact == CodeQueryDiagnosticImpact::Incomplete),
+        "filtered open rows must retain incomplete completion"
+    );
+}
+
+#[test]
+fn branch_relation_step_projects_boolean_return_orientation() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "Sample.java",
+            "class Sample { static boolean f(boolean x) { if (x) return false; else return true; } }",
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query =
+        CodeQuery::from_source("(branch-relations :relation [redundant-boolean-return] (if))")
+            .expect("typed branch query");
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    assert!(result.diagnostics.is_empty(), "{}", result.render_text());
+    assert_eq!(result.results.len(), 1, "{}", result.render_text());
+    let CodeQueryResultValue::BranchRelation { value } = &result.results[0].value else {
+        panic!("expected branch relation row");
+    };
+    assert_eq!(value.relation, "redundant_boolean_return");
+    assert_eq!(value.verdict, "proven");
+    assert_eq!(value.orientation, Some("negated_condition"));
+}
+
+#[test]
+fn branch_relation_step_joins_scalar_guard_proofs_to_nested_conditions() {
+    for (language, path, source) in [
+        (
+            Language::Java,
+            "Sample.java",
+            "class Sample { boolean f(int x) { if (x > 5) { if (x < 3) return true; } return false; } }",
+        ),
+        (
+            Language::JavaScript,
+            "sample.js",
+            "function f(x) { if (x === null) { if (x !== null) return true; } return false; }",
+        ),
+        (
+            Language::TypeScript,
+            "sample.ts",
+            "function f(x: unknown) { if (x === null) { if (x !== null) return true; } return false; }",
+        ),
+        (
+            Language::Python,
+            "sample.py",
+            "def f(x):\n    if x is None:\n        if x is not None:\n            return True\n    return False\n",
+        ),
+    ] {
+        let project = InlineTestProject::with_language(language)
+            .file(path, source)
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let query =
+            CodeQuery::from_source("(branch-relations :relation [contradictory-condition] (if))")
+                .expect("typed branch query");
+        let result = execute_workspace(
+            &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::new(),
+            &query,
+        );
+        assert!(
+            result.results.iter().any(|item| matches!(
+                &item.value,
+                CodeQueryResultValue::BranchRelation { value }
+                    if value.relation == "contradictory_condition"
+                        && value.verdict == "proven"
+                        && value.orientation == Some("always_false")
+            )),
+            "{language:?}: {}",
+            result.render_text()
+        );
+        if matches!(
+            language,
+            Language::JavaScript | Language::TypeScript | Language::Python
+        ) {
+            assert!(
+                result.results.iter().any(|item| matches!(
+                    &item.value,
+                    CodeQueryResultValue::BranchRelation { value }
+                        if value.verdict == "open" && value.reason == Some("unknown_scalar")
+                )),
+                "{language:?}: {}",
+                result.render_text()
+            );
+            assert!(
+                result.results.iter().all(|item| !matches!(
+                    &item.value,
+                    CodeQueryResultValue::BranchRelation { value }
+                        if value.reason == Some("partial_procedure")
+                )),
+                "{language:?}: {}",
+                result.render_text()
+            );
+        }
+    }
+}
+
+#[test]
+fn branch_relation_step_proves_local_null_initialization_and_python_elif() {
+    for (source, orientation) in [
+        (
+            "class Sample { int f() { Object x = null; if (x != null) return 1; return 2; } }",
+            "always_false",
+        ),
+        (
+            "class Sample { int f() { Object x = null; if (x == null) return 1; else return 2; } }",
+            "always_true",
+        ),
+    ] {
+        let project = InlineTestProject::with_language(Language::Java)
+            .file("Sample.java", source)
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let query =
+            CodeQuery::from_source("(branch-relations :relation [contradictory-condition] (if))")
+                .expect("typed branch query");
+        let result = execute_workspace(
+            &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::new(),
+            &query,
+        );
+        assert!(result.diagnostics.is_empty(), "{}", result.render_text());
+        assert_eq!(result.results.len(), 1, "{}", result.render_text());
+        let CodeQueryResultValue::BranchRelation { value } = &result.results[0].value else {
+            panic!("expected branch relation row");
+        };
+        assert_eq!(value.verdict, "proven");
+        assert_eq!(value.orientation, Some(orientation));
+    }
+
+    for (language, path, source) in [
+        (
+            Language::JavaScript,
+            "sample.js",
+            "function f() { let x = null; if (x !== null) return 1; return 2; }",
+        ),
+        (
+            Language::TypeScript,
+            "sample.ts",
+            "function f() { let x = null; if (x !== null) return 1; return 2; }",
+        ),
+        (
+            Language::Python,
+            "sample.py",
+            "def f():\n    x = None\n    if x is not None:\n        return 1\n    return 2\n",
+        ),
+    ] {
+        let project = InlineTestProject::with_language(language)
+            .file(path, source)
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let query =
+            CodeQuery::from_source("(branch-relations :relation [contradictory-condition] (if))")
+                .expect("typed branch query");
+        let result = execute_workspace(
+            &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::new(),
+            &query,
+        );
+        assert!(
+            result.diagnostics.is_empty(),
+            "{language:?}: {}",
+            result.render_text()
+        );
+        assert_eq!(
+            result.results.len(),
+            1,
+            "{language:?}: {}",
+            result.render_text()
+        );
+        let CodeQueryResultValue::BranchRelation { value } = &result.results[0].value else {
+            panic!("expected branch relation row");
+        };
+        assert_eq!(value.verdict, "proven", "{language:?}");
+        assert_eq!(value.orientation, Some("always_false"), "{language:?}");
+    }
+
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "sample.py",
+            "def f(x):\n    if x is None:\n        return 1\n    elif x is None:\n        return 2\n    return 0\n",
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query =
+        CodeQuery::from_source("(branch-relations :relation [contradictory-condition] (if))")
+            .expect("typed branch query");
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    assert_eq!(result.results.len(), 2, "{}", result.render_text());
+    let rows = result
+        .results
+        .iter()
+        .map(|item| {
+            let CodeQueryResultValue::BranchRelation { value } = &item.value else {
+                panic!("expected branch relation row");
+            };
+            value
+        })
+        .collect::<Vec<_>>();
+    let outer = rows
+        .iter()
+        .find(|row| row.later_ordinal == 0)
+        .expect("outer row");
+    let inner = rows
+        .iter()
+        .find(|row| row.later_ordinal == 1)
+        .expect("elif row");
+    assert_eq!(outer.verdict, "open");
+    assert_eq!(outer.reason, Some("unknown_scalar"));
+    assert_eq!(outer.later_ordinal, 0);
+    assert_eq!(inner.verdict, "proven");
+    assert_eq!(inner.orientation, Some("always_false"));
+    assert_eq!(inner.later_ordinal, 1);
+    assert_ne!(outer.id, inner.id);
+}
+
+#[test]
+fn branch_relation_step_distinguishes_an_always_true_inner_condition() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "Sample.java",
+            "class Sample { boolean f(Object x) { if (x != null) { if (x != null) return true; } return false; } }",
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query =
+        CodeQuery::from_source("(branch-relations :relation [contradictory-condition] (if))")
+            .expect("typed branch query");
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    assert!(
+        result.results.iter().any(|item| matches!(
+            &item.value,
+            CodeQueryResultValue::BranchRelation { value }
+                if value.relation == "contradictory_condition"
+                    && value.verdict == "proven"
+                    && value.orientation == Some("always_true")
+        )),
+        "{}",
+        result.render_text()
+    );
+}
+
+#[test]
+fn branch_relation_step_does_not_reuse_stale_integer_facts_after_updates() {
+    for (update, expected_orientation) in [
+        ("x++;", None),
+        ("x += 1;", None),
+        ("x = 1;", Some("always_true")),
+    ] {
+        let source = format!(
+            "class Sample {{ int f(int x) {{ if (x > 5) {{ {update} if (x < 3) return 1; }} return 0; }} }}"
+        );
+        let project = InlineTestProject::with_language(Language::Java)
+            .file("Sample.java", &source)
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let query =
+            CodeQuery::from_source("(branch-relations :relation [contradictory-condition] (if))")
+                .expect("typed branch query");
+        let result = execute_workspace(
+            &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::new(),
+            &query,
+        );
+        let inner = result
+            .results
+            .iter()
+            .filter_map(|item| match &item.value {
+                CodeQueryResultValue::BranchRelation { value } => Some(value),
+                _ => None,
+            })
+            .max_by_key(|value| value.owner_range.start_column)
+            .expect("inner if produces a branch relation row");
+        match expected_orientation {
+            Some(orientation) => {
+                assert_eq!(
+                    inner.verdict,
+                    "proven",
+                    "{update}: {}",
+                    result.render_text()
+                );
+                assert_eq!(
+                    inner.orientation,
+                    Some(orientation),
+                    "{update}: {}",
+                    result.render_text()
+                );
+            }
+            None => assert_ne!(
+                inner.verdict,
+                "proven",
+                "{update}: {}",
+                result.render_text()
+            ),
+        }
+    }
+}
+
+#[test]
+fn branch_relation_step_qualifies_compound_java_conditions() {
+    for (source, verdict, orientation, reason) in [
+        (
+            "class Sample { int f(int x) { if (x > 5 && x < 3) return 1; return 2; } }",
+            "proven",
+            Some("always_false"),
+            None,
+        ),
+        (
+            "class Sample { int f(int x) { if (x > 5 && x < 7) return 1; return 2; } }",
+            "distinct",
+            None,
+            None,
+        ),
+        (
+            "class Sample { int f(Object x) { if (x == null || x != null) return 1; return 2; } }",
+            "proven",
+            Some("always_true"),
+            None,
+        ),
+        (
+            "class Sample { int f(Object x, Object y) { if (x == null || y != null) return 1; return 2; } }",
+            "open",
+            None,
+            Some("unknown_scalar"),
+        ),
+        (
+            // The arithmetic operand refines nothing; both terminals stay
+            // feasible, and that operand is undecided.
+            "class Sample { int f(int x) { if (x * 2 > 5 && x < 3) return 1; return 2; } }",
+            "open",
+            None,
+            Some("unknown_scalar"),
+        ),
+    ] {
+        let project = InlineTestProject::with_language(Language::Java)
+            .file("Sample.java", source)
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let query =
+            CodeQuery::from_source("(branch-relations :relation [contradictory-condition] (if))")
+                .expect("typed branch query");
+        let result = execute_workspace(
+            &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::new(),
+            &query,
+        );
+        assert_eq!(
+            result.results.len(),
+            1,
+            "{source}: {}",
+            result.render_text()
+        );
+        let CodeQueryResultValue::BranchRelation { value } = &result.results[0].value else {
+            panic!("expected branch relation row");
+        };
+        assert_eq!(value.verdict, verdict, "{source}: {}", result.render_text());
+        assert_eq!(
+            value.orientation,
+            orientation,
+            "{source}: {}",
+            result.render_text()
+        );
+        assert_eq!(value.reason, reason, "{source}: {}", result.render_text());
+        assert_eq!(
+            result.diagnostics.is_empty(),
+            reason.is_none(),
+            "{source}: {}",
+            result.render_text()
+        );
+    }
+}
+
+/// The contradictory-condition rows of `source`, ordered by owner position.
+fn contradictory_condition_rows(
+    language: Language,
+    path: &str,
+    source: &str,
+) -> Vec<(&'static str, Option<&'static str>, Option<&'static str>)> {
+    let project = InlineTestProject::with_language(language)
+        .file(path, source)
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query =
+        CodeQuery::from_source("(branch-relations :relation [contradictory-condition] (if))")
+            .expect("typed branch query");
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    let mut rows = result
+        .results
+        .iter()
+        .filter_map(|item| match &item.value {
+            CodeQueryResultValue::BranchRelation { value } => Some((
+                (value.owner_range.start_line, value.owner_range.start_column),
+                value.later_ordinal,
+                (value.verdict, value.orientation, value.reason),
+            )),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by_key(|(position, ordinal, _)| (*position, *ordinal));
+    rows.into_iter().map(|(_, _, row)| row).collect()
+}
+
+#[test]
+fn branch_relation_step_qualifies_compound_conditions_in_every_pilot_language() {
+    let always_false = ("proven", Some("always_false"), None);
+    let always_true = ("proven", Some("always_true"), None);
+    for (language, path, source, expected) in [
+        (
+            Language::JavaScript,
+            "sample.js",
+            "function f(x) { if (x === null && x !== null) return 1; return 2; }",
+            vec![always_false],
+        ),
+        (
+            Language::JavaScript,
+            "sample.js",
+            "function f(x) { if ((x === null) || x !== null) { return 1; } else { return 2; } }",
+            vec![always_true],
+        ),
+        (
+            Language::JavaScript,
+            "sample.js",
+            "function f(x, y) { if (x === null && y !== null) return 1; return 2; }",
+            vec![("open", None, Some("unknown_scalar"))],
+        ),
+        (
+            Language::TypeScript,
+            "sample.ts",
+            "function f(x: unknown) { if (x === null && (x !== null || x !== null)) return 1; return 2; }",
+            vec![always_false],
+        ),
+        (
+            Language::Python,
+            "sample.py",
+            "def f(x):\n    if x is None and x is not None:\n        return 1\n    return 2\n",
+            vec![always_false],
+        ),
+        (
+            Language::Python,
+            "sample.py",
+            "def f(x):\n    if not (x is None or x is not None):\n        return 1\n    else:\n        return 2\n",
+            vec![always_false],
+        ),
+        (
+            Language::Python,
+            "sample.py",
+            "def f(x):\n    if x is None:\n        return 0\n    elif x is not None or x is None:\n        return 1\n    return 2\n",
+            vec![("open", None, Some("unknown_scalar")), always_true],
+        ),
+    ] {
+        assert_eq!(
+            contradictory_condition_rows(language, path, source),
+            expected,
+            "{language:?}: {source}"
+        );
+    }
+}
+
+#[test]
+fn branch_relation_step_decides_python_truth_tests_of_known_scalars() {
+    for (source, expected) in [
+        (
+            "def f():\n    x = None\n    if x:\n        return 1\n    return 2\n",
+            ("proven", Some("always_false"), None),
+        ),
+        (
+            "def f():\n    x = False\n    if not x:\n        return 1\n    return 2\n",
+            ("proven", Some("always_true"), None),
+        ),
+        (
+            "def f(x):\n    if x:\n        return 1\n    return 2\n",
+            ("open", None, Some("unknown_scalar")),
+        ),
+    ] {
+        assert_eq!(
+            contradictory_condition_rows(Language::Python, "sample.py", source),
+            vec![expected],
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn branch_relation_step_joins_java_locals_in_their_declared_domain() {
+    // Both writes to `x` take the declared int domain, so the join is the
+    // whole int range and no value exceeds its maximum.
+    let rows = contradictory_condition_rows(
+        Language::Java,
+        "Sample.java",
+        "class Sample { int f(int p, boolean c) { int x; if (c) x = p; else x = 5; if (x > 2147483647) return 1; return 0; } }",
+    );
+    assert_eq!(
+        rows.last(),
+        Some(&("proven", Some("always_false"), None)),
+        "{rows:?}"
+    );
+}
+
+#[test]
+fn branch_relation_step_qualifies_signed_java_int_constants() {
+    for (source, row_count, verdict, orientation, reason) in [
+        (
+            "class Sample { int f(int x) { if (x < -1) { if (x > 1) return 1; } return 0; } }",
+            2,
+            "proven",
+            Some("always_false"),
+            None,
+        ),
+        (
+            "class Sample { int f(int x) { if (x < -1) { if (x > -3) return 1; } return 0; } }",
+            2,
+            "distinct",
+            None,
+            None,
+        ),
+        (
+            "class Sample { int f(int x) { if (x < -1) { if (x == -1) return 1; } return 0; } }",
+            2,
+            "proven",
+            Some("always_false"),
+            None,
+        ),
+        (
+            "class Sample { int f(int x) { x = -2; if (x > -1) return 1; return 0; } }",
+            1,
+            "proven",
+            Some("always_false"),
+            None,
+        ),
+        (
+            "class Sample { int f() { int x = -2147483648; if (x > -2147483647) return 1; return 0; } }",
+            1,
+            "proven",
+            Some("always_false"),
+            None,
+        ),
+        (
+            "class Sample { int f(int x) { if (x < -2147483648) return 1; return 0; } }",
+            1,
+            "proven",
+            Some("always_false"),
+            None,
+        ),
+        (
+            "class Sample { int f(int x) { if (x < +1) return 1; return 0; } }",
+            1,
+            "distinct",
+            None,
+            None,
+        ),
+        (
+            "class Sample { int f(char x) { if (x < -1) return 1; return 0; } }",
+            1,
+            "proven",
+            Some("always_false"),
+            None,
+        ),
+        (
+            "class Sample { int f() { byte x = -128; if (x > -127) return 1; return 0; } }",
+            1,
+            "proven",
+            Some("always_false"),
+            None,
+        ),
+        (
+            "class Sample { int f(int x) { if (x < -2147483649) return 1; return 0; } }",
+            1,
+            "open",
+            None,
+            Some("unsupported_predicate"),
+        ),
+        (
+            "class Sample { int f(int x) { if (x < +2147483648) return 1; return 0; } }",
+            1,
+            "open",
+            None,
+            Some("unsupported_predicate"),
+        ),
+        (
+            "class Sample { int f(int x) { if (x < -(2147483648)) return 1; return 0; } }",
+            1,
+            "open",
+            None,
+            Some("unsupported_predicate"),
+        ),
+        (
+            // A long constant compares with an int by value after promotion.
+            "class Sample { int f(int x) { if (x < -1L) return 1; return 0; } }",
+            1,
+            "distinct",
+            None,
+            None,
+        ),
+        (
+            // A radix literal is its type's bit pattern; unary minus negates it.
+            "class Sample { int f(int x) { if (x < -0x1) return 1; return 0; } }",
+            1,
+            "distinct",
+            None,
+            None,
+        ),
+        (
+            // An ordering unboxes; a null operand throws before it decides.
+            "class Sample { int f(Integer x) { if (x < -1) return 1; return 0; } }",
+            1,
+            "distinct",
+            None,
+            None,
+        ),
+    ] {
+        let project = InlineTestProject::with_language(Language::Java)
+            .file("Sample.java", source)
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let query =
+            CodeQuery::from_source("(branch-relations :relation [contradictory-condition] (if))")
+                .expect("typed branch query");
+        let result = execute_workspace(
+            &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::new(),
+            &query,
+        );
+        assert_eq!(
+            result.results.len(),
+            row_count,
+            "{source}: {}",
+            result.render_text()
+        );
+        let row = result
+            .results
+            .iter()
+            .filter_map(|result| match &result.value {
+                CodeQueryResultValue::BranchRelation { value } => Some(value),
+                _ => None,
+            })
+            .max_by_key(|value| value.owner_range.start_column)
+            .expect("condition has a branch relation row");
+        assert_eq!(row.verdict, verdict, "{source}: {}", result.render_text());
+        assert_eq!(
+            row.orientation,
+            orientation,
+            "{source}: {}",
+            result.render_text()
+        );
+        assert_eq!(row.reason, reason, "{source}: {}", result.render_text());
+    }
+}
+
+#[test]
+fn branch_relation_step_compares_java_members_by_receiver_and_resolved_target() {
+    for (source, verdict, reason) in [
+        (
+            "class Sample { int value; int f(boolean flag) { if (flag) return this.value; else return this.value; } }",
+            "proven",
+            None,
+        ),
+        (
+            "class Sample { int value; int other; int f(boolean flag) { if (flag) return this.value; else return this.other; } }",
+            "distinct",
+            None,
+        ),
+        (
+            "class Sample { int value; int f(boolean flag, Sample other) { if (flag) return this.value; else return other.value; } }",
+            "distinct",
+            None,
+        ),
+        (
+            "class Sample { int f(boolean flag, External object) { if (flag) return object.value; else return object.value; } }",
+            "proven",
+            None,
+        ),
+        (
+            "class Sample { int value() { return 1; } int f(boolean flag) { if (flag) return this.value(); else return value(); } }",
+            "proven",
+            None,
+        ),
+        (
+            "class Sample { int value; int f(boolean flag) { if (flag) return this.value; else return value; } }",
+            "open",
+            Some("member_resolution_unavailable"),
+        ),
+    ] {
+        let project = InlineTestProject::with_language(Language::Java)
+            .file("Sample.java", source)
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let query = CodeQuery::from_source("(branch-relations :relation [identical-bodies] (if))")
+            .expect("typed branch query");
+        let result = execute_workspace(
+            &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::new(),
+            &query,
+        );
+        assert_eq!(
+            result.results.len(),
+            1,
+            "{source}: {}",
+            result.render_text()
+        );
+        let CodeQueryResultValue::BranchRelation { value } = &result.results[0].value else {
+            panic!("expected branch relation row");
+        };
+        assert_eq!(value.verdict, verdict, "{source}: {}", result.render_text());
+        assert_eq!(value.reason, reason, "{source}: {}", result.render_text());
+    }
+}
+
+#[test]
+fn branch_relation_field_budget_excludes_unrelated_java_accesses() {
+    let unrelated = (0..257)
+        .map(|index| format!("int local{index} = this.value;"))
+        .collect::<String>();
+    let source = format!(
+        "class Sample {{ int value; int f(boolean flag) {{ {unrelated} if (flag) return this.value; else return this.value; }} }}"
+    );
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("Sample.java", &source)
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = CodeQuery::from_source("(branch-relations :relation [identical-bodies] (if))")
+        .expect("typed branch query");
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    assert_eq!(result.results.len(), 1, "{}", result.render_text());
+    let CodeQueryResultValue::BranchRelation { value } = &result.results[0].value else {
+        panic!("expected branch relation row");
+    };
+    assert_eq!(value.verdict, "proven", "{}", result.render_text());
+    assert!(result.diagnostics.is_empty(), "{}", result.render_text());
+}
+
+#[test]
+fn branch_relation_step_pairs_only_java_arm_local_bindings() {
+    for (source, verdict, reason) in [
+        (
+            "class Sample { int f(boolean flag) { if (flag) { int left = 1; return left; } else { int right = 1; return right; } } }",
+            "proven",
+            None,
+        ),
+        (
+            "class Sample { int f(boolean flag) { if (flag) { int local = 1; return local; } else { int local = 1; return local; } } }",
+            "proven",
+            None,
+        ),
+        (
+            "class Sample { int f(boolean flag, int shared) { if (flag) { int left = shared; return left; } else { int right = shared; return right; } } }",
+            "proven",
+            None,
+        ),
+        (
+            "class Sample { int f(boolean flag, int shared) { if (flag) { int left = 1; return left; } else { int right = 1; return shared; } } }",
+            "distinct",
+            None,
+        ),
+        (
+            "class Sample { long f(boolean flag) { if (flag) { int left = 1; return left; } else { long right = 1; return right; } } }",
+            "distinct",
+            None,
+        ),
+        (
+            "class Sample { java.util.function.IntSupplier f(boolean flag) { if (flag) { int left = 1; return () -> left; } else { int right = 1; return () -> right; } } }",
+            "open",
+            Some("deferred_body"),
+        ),
+    ] {
+        let project = InlineTestProject::with_language(Language::Java)
+            .file("Sample.java", source)
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let query = CodeQuery::from_source("(branch-relations :relation [identical-bodies] (if))")
+            .expect("typed branch query");
+        let result = execute_workspace(
+            &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::new(),
+            &query,
+        );
+        assert_eq!(
+            result.results.len(),
+            1,
+            "{source}: {}",
+            result.render_text()
+        );
+        let CodeQueryResultValue::BranchRelation { value } = &result.results[0].value else {
+            panic!("expected branch relation row");
+        };
+        assert_eq!(value.verdict, verdict, "{source}: {}", result.render_text());
+        assert_eq!(value.reason, reason, "{source}: {}", result.render_text());
+    }
+}
+
+#[test]
+fn failure_handler_state_classifies_exact_java_catch_bodies() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "Check.java",
+            r#"class Check {
+    void work() {}
+    void run() {
+        try { work(); } catch (IllegalArgumentException | IllegalStateException ex) { /* reviewed? */ }
+        try { work(); } catch (RuntimeException ex) { throw ex; } finally { }
+    }
+}"#,
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = CodeQuery::from_source("(failure-handler-state (language java (catch)))")
+        .expect("Java failure-handler state query");
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    assert_eq!(
+        result.completion(),
+        CodeQueryCompletion::Complete,
+        "{result:#?}"
+    );
+    assert_eq!(result.results.len(), 2, "{result:#?}");
+    let verdicts = result
+        .results
+        .iter()
+        .map(|item| match &item.value {
+            CodeQueryResultValue::FailureHandlerState { value } => {
+                assert_eq!(value.proof, "exact");
+                assert_eq!(value.coverage, "exhaustive");
+                assert!(value.body_range.is_some());
+                value.verdict
+            }
+            other => panic!("expected failure handler state, got {other:#?}"),
+        })
+        .collect::<Vec<_>>();
+    assert!(verdicts.contains(&"empty"), "{verdicts:?}");
+    assert!(verdicts.contains(&"nonempty"), "{verdicts:?}");
 }

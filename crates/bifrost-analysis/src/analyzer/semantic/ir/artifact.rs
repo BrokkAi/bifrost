@@ -620,6 +620,7 @@ pub struct ProcedureSemantics {
     call_phase_points: CallPhasePointIndex,
     call_result_sites: CallResultSiteIndex,
     source_mappings: Box<[SourceMapping]>,
+    statement_entries: Box<[StatementEntrySite]>,
     evidence_rows: Box<[Evidence]>,
     gaps: Box<[SemanticGap]>,
     blocks: Box<[BasicBlock]>,
@@ -664,6 +665,7 @@ impl ProcedureSemantics {
             call_phase_points,
             call_result_sites,
             source_mappings: parts.source_mappings.into_boxed_slice(),
+            statement_entries: parts.statement_entries.into_boxed_slice(),
             evidence_rows: parts.evidence_rows.into_boxed_slice(),
             gaps: parts.gaps.into_boxed_slice(),
             blocks: parts.blocks.into_boxed_slice(),
@@ -695,6 +697,7 @@ impl ProcedureSemantics {
         self.captures.hash(&mut digest);
         self.call_sites.hash(&mut digest);
         self.source_mappings.hash(&mut digest);
+        self.statement_entries.hash(&mut digest);
         self.evidence_rows.hash(&mut digest);
         self.gaps.hash(&mut digest);
         self.blocks.hash(&mut digest);
@@ -811,6 +814,12 @@ impl ProcedureSemantics {
 
     pub fn source_mappings(&self) -> &[SourceMapping] {
         &self.source_mappings
+    }
+
+    /// All producer-attested source statement entries, including distinct
+    /// cleanup routes for one source statement.
+    pub fn statement_entries(&self) -> &[StatementEntrySite] {
+        &self.statement_entries
     }
 
     pub fn evidence_rows(&self) -> &[Evidence] {

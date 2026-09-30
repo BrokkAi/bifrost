@@ -189,6 +189,16 @@ pub const SEMANTIC_IR_SCHEMA_DOMAIN: &[u8] = b"bifrost-language-neutral-semantic
 
 /// Current language-neutral semantic IR schema revision.
 ///
+/// Revision 36 lets a point-scoped exceptional-control gap declare retained
+/// control topology for an exception dispatch whose successors are all
+/// retained.
+/// Revision 35 adds the rebind-at-call-or-suspension gap discharge for a
+/// binding a nested callable assigns.
+/// Revision 34 records exact binary64 floating constants and the ordered
+/// floating and NaN self-comparison guard predicates.
+/// Revision 33 records producer-attested source statement entry sites, which
+/// may map several CFG points to one statement or share a point with another
+/// statement. Revision 32 records signed integer constant facts.
 /// Revision 29 admits isolated heap-write effect partitions alongside heap reads.
 /// Revision 28 combines reference transport, bounded memory copies, and integer
 /// offsets with the property and backing-store alternative vocabulary. It
@@ -217,7 +227,7 @@ pub const SEMANTIC_IR_SCHEMA_DOMAIN: &[u8] = b"bifrost-language-neutral-semantic
 /// and every wire id derived from one rotates exactly once when this constant
 /// moves; that is a mechanical consequence of extending the IR, not a signal
 /// that anything else changed.
-pub const SEMANTIC_IR_SCHEMA_VERSION: u32 = 31;
+pub const SEMANTIC_IR_SCHEMA_VERSION: u32 = 36;
 
 impl SemanticIrVersion {
     /// The contract-owned fingerprint shared by every language adapter that
@@ -1350,10 +1360,10 @@ mod tests {
         let current = SemanticIrVersion::current();
         assert_eq!(
             current.to_string(),
-            "9074976fbca060e512b4483b2cc5cdd6fa090d86111c95ea03573e94e3a140c0"
+            "4771fb06c817fdaa26bc07b963e107751b4c14858af9862f67de5dcc973590f9"
         );
         assert_ne!(current.as_bytes(), &[0_u8; 32]);
-        assert_eq!(SEMANTIC_IR_SCHEMA_VERSION, 31);
+        assert_eq!(SEMANTIC_IR_SCHEMA_VERSION, 36);
     }
 
     fn digest(label: &str) -> StableDigest {

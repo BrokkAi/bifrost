@@ -7,7 +7,7 @@ use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 use super::{CatalogError, CatalogOpenMode};
 
 pub(super) const CATALOG_DB_FILE_NAME: &str = "catalog.db";
-pub(super) const CURRENT_CATALOG_VERSION: i64 = 8;
+pub(super) const CURRENT_CATALOG_VERSION: i64 = 9;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const INITIALIZATION_RETRY_BACKOFF: Duration = Duration::from_millis(5);
 const INITIALIZATION_RETRY_MAX_BACKOFF: Duration = Duration::from_millis(100);
@@ -29,6 +29,8 @@ const ACQUISITION_ABSENCE_RECEIPTS_SQL: &str = include_str!(
 const GENERATED_SOURCE_IDENTITIES_SQL: &str = include_str!(
     "../../../../migrations/semantic-pack-catalog/0008-generated-source-identities.sql"
 );
+const GENERATED_CACHE_EPOCHS_SQL: &str =
+    include_str!("../../../../migrations/semantic-pack-catalog/0009-generated-cache-epochs.sql");
 
 pub(super) fn open(root: &Path, mode: CatalogOpenMode) -> Result<Connection, CatalogError> {
     // The catalog is the other database a Bifrost process can open first, and
@@ -237,6 +239,52 @@ fn migrate(connection: &mut Connection, mode: CatalogOpenMode) -> Result<(), Cat
             .map_err(|error| {
                 CatalogError::sqlite("apply generated-source-identity migration", error)
             })?;
+    }
+    if locked_version <= 8 {
+        transaction
+            .execute_batch(GENERATED_CACHE_EPOCHS_SQL)
+            .map_err(|error| {
+                CatalogError::sqlite("apply generated-cache-epoch migration", error)
+            })?;
+        let current_keys = {
+            let mut statement = transaction.prepare(
+                "SELECT production_digest, input_digest, producer_name, producer_version, schema_version
+                 FROM catalog_generated_productions"
+            ).map_err(|error| CatalogError::sqlite("prepare legacy production epochs", error))?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, u32>(4)?,
+                    ))
+                })
+                .map_err(|error| CatalogError::sqlite("read legacy production epochs", error))?;
+            let mut current_keys = Vec::new();
+            for row in rows {
+                let (digest, input, producer, version, schema) = row.map_err(|error| {
+                    CatalogError::sqlite("decode legacy production epoch", error)
+                })?;
+                if digest == super::generated_production_digest(&input, &producer, &version, schema)
+                {
+                    current_keys.push(digest);
+                }
+            }
+            current_keys
+        };
+        for digest in current_keys {
+            transaction
+                .execute(
+                    "UPDATE catalog_generated_productions SET generated_cache_version = ?1
+                 WHERE production_digest = ?2",
+                    rusqlite::params![super::GENERATED_PRODUCTION_CACHE_VERSION, digest],
+                )
+                .map_err(|error| {
+                    CatalogError::sqlite("retain verified current production epoch", error)
+                })?;
+        }
     }
     transaction
         .pragma_update(None, "user_version", CURRENT_CATALOG_VERSION)

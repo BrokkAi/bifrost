@@ -23,6 +23,9 @@ pub(super) struct ProcedureSpec<'tree> {
     /// Enclosing bindings that are real captures but are not representable by
     /// this adapter's direct immutable value-capture subset.
     pub(super) omitted_captures: Box<[LexicalCaptureSpec<'tree>]>,
+    /// This callable or a nested lexical callable may inspect/rebind locals
+    /// through `with` or direct `eval` without a projected binding event.
+    pub(super) dynamic_local_observation: bool,
 }
 
 impl ReceiverCaptureSpec for ProcedureSpec<'_> {
@@ -198,8 +201,23 @@ pub(super) fn enumerate_procedures<'tree>(
                     && direct_free_this,
                 captures: Box::new([]),
                 omitted_captures: Box::new([]),
+                dynamic_local_observation: false,
             });
             procedure_context = Some((identity.id, identity.declaration_path));
+        }
+
+        if matches!(node.kind(), "with_statement" | "call_expression") {
+            let possible_direct_eval = node.kind() == "call_expression"
+                && node.child_by_field_name("function").is_some_and(|callee| {
+                    let callee = ts_unwrap_expression(callee).unwrap_or(callee);
+                    callee.kind() == "identifier"
+                        && node_text(prepared.source(), callee) == Some("eval")
+                });
+            if (node.kind() == "with_statement" || possible_direct_eval)
+                && let Some(owner) = lexical_parent
+            {
+                specs[owner.index()].dynamic_local_observation = true;
+            }
         }
 
         if node.kind() == "decorator" {
@@ -232,6 +250,13 @@ pub(super) fn enumerate_procedures<'tree>(
                 lexical_parent: child_parent,
                 declaration_path: child_path,
             });
+        }
+    }
+    for index in (0..specs.len()).rev() {
+        if specs[index].dynamic_local_observation
+            && let Some(parent) = specs[index].lexical_parent
+        {
+            specs[parent.index()].dynamic_local_observation = true;
         }
     }
     let lexical_bindings =
@@ -484,9 +509,10 @@ fn enclosing_variable_declarator(mut callable: Node<'_>) -> Option<Node<'_>> {
             | "satisfies_expression"
             | "non_null_expression"
             | "type_assertion" => {
-                let expression = parent
-                    .child_by_field_name("expression")
-                    .or_else(|| first_named_child(parent))?;
+                let expression = match parent.kind() {
+                    "parenthesized_expression" => first_named_child(parent),
+                    _ => ts_type_wrapper_operand(parent),
+                }?;
                 if expression.id() != callable.id() {
                     return None;
                 }

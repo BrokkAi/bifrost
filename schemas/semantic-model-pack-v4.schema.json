@@ -45,6 +45,17 @@
     "provenance": {
       "$ref": "#/$defs/Provenance"
     },
+    "python_correspondence": {
+      "description": "Exact cross-artifact declaration/runtime symbol correspondence retained\nfrom the CSMI Python profile. Omitted when the pack carries no such\nevidence, preserving the serialized form of existing packs.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/PythonCorrespondenceEvidence"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "safety": {
       "$ref": "#/$defs/Safety"
     },
@@ -1026,6 +1037,13 @@
         },
         "target": {
           "$ref": "#/$defs/AuthoredProcedureTarget"
+        },
+        "transfer_partitions": {
+          "description": "Coverage of one source universe into one whole normal-result port.\nThis never closes effects, exceptions, heap state, or the whole callable.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/NormalResultTransferPartition"
+          }
         },
         "transfers": {
           "type": "array",
@@ -3340,6 +3358,9 @@
           "description": "The path and local symbol locate the imported declaration. Only the\nstructured identity carries its portable artifact and ownership key.",
           "type": "object",
           "properties": {
+            "callable_shape_evidence": {
+              "description": "Core callable-shape coverage is independent of native callable\nfamily closure, which also claims all fixed-arity alternatives."
+            },
             "identity": {
               "$ref": "#/$defs/CsmiPortableSymbolIdentity"
             },
@@ -3349,6 +3370,9 @@
             },
             "path": {
               "type": "string"
+            },
+            "profile_evidence": {
+              "description": "Validated noncore facts for the exact imported artifact. Exactly\none declaration owns this carrier; its digest binds the complete\nnative pack that was produced from the interchange document."
             },
             "symbol": {
               "type": "string"
@@ -3531,6 +3555,40 @@
         "name"
       ]
     },
+    "NormalResultTransferPartition": {
+      "type": "object",
+      "properties": {
+        "limitations": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TransferPartitionLimitation"
+          }
+        },
+        "normal_result": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "provenance": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "source": {
+          "$ref": "#/$defs/TransferPartitionSource"
+        },
+        "status": {
+          "$ref": "#/$defs/TransferPartitionStatus"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "source",
+        "normal_result",
+        "status"
+      ]
+    },
     "Parameter": {
       "type": "object",
       "properties": {
@@ -3601,6 +3659,117 @@
       "additionalProperties": false,
       "required": [
         "source"
+      ]
+    },
+    "PythonCorrespondenceEvidence": {
+      "description": "Original CSMI Python declaration-to-runtime correspondence evidence bound\nto the native pack bytes that were compiled with it.",
+      "type": "object",
+      "properties": {
+        "completeness_statements": {
+          "type": "array",
+          "items": true
+        },
+        "core_completeness_statements": {
+          "description": "Original core completeness claims remain distinct from native pack\ncompleteness, which carries less scope and limitation detail.",
+          "type": "array",
+          "items": true
+        },
+        "declaration_artifact": {
+          "$ref": "#/$defs/CsmiArtifactSelector"
+        },
+        "default_provenance": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "extension_facts": {
+          "type": "array",
+          "items": true
+        },
+        "mappings": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PythonCorrespondenceMapping"
+          }
+        },
+        "native_sha256": {
+          "description": "SHA-256 of the normalized full authored pack, with the carrier retained\nand only this field blanked to avoid a recursive digest.",
+          "type": "string"
+        },
+        "provenance_records": {
+          "type": "array",
+          "items": true
+        },
+        "symbols": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PythonCorrespondenceSymbol"
+          }
+        },
+        "vocabulary_uses": {
+          "type": "array",
+          "items": true
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "native_sha256",
+        "declaration_artifact"
+      ]
+    },
+    "PythonCorrespondenceMapping": {
+      "description": "A typed relation between declaration and runtime CSMI symbol definitions.",
+      "type": "object",
+      "properties": {
+        "conditions": true,
+        "declaration": {
+          "type": "string"
+        },
+        "relation": {
+          "$ref": "#/$defs/PythonCorrespondenceRelationKind"
+        },
+        "runtime": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "declaration",
+        "runtime",
+        "relation"
+      ]
+    },
+    "PythonCorrespondenceRelationKind": {
+      "description": "Relation vocabulary from the CSMI Python 0.1 declaration-correspondence\nprofile.",
+      "type": "string",
+      "enum": [
+        "describes",
+        "augments",
+        "replaces-for-type-checking"
+      ]
+    },
+    "PythonCorrespondenceSymbol": {
+      "description": "A CSMI symbol definition participating in Python correspondence. The\nportable identity is independent of native declaration facts and IDs.",
+      "type": "object",
+      "properties": {
+        "identity": {
+          "$ref": "#/$defs/CsmiPortableSymbolIdentity"
+        },
+        "local_id": {
+          "type": "string"
+        },
+        "provenance": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "local_id",
+        "identity"
       ]
     },
     "ReceiverFact": {
@@ -6476,6 +6645,104 @@
             "element"
           ]
         }
+      ]
+    },
+    "TransferPartitionLimitation": {
+      "type": "object",
+      "properties": {
+        "diagnostic_code": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "diagnostic_message": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind"
+      ]
+    },
+    "TransferPartitionSource": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "all_inputs"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "input_receiver"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "input_parameter"
+            },
+            "ordinal": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "ordinal"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "input_capture"
+            },
+            "symbol": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "symbol"
+          ]
+        }
+      ]
+    },
+    "TransferPartitionStatus": {
+      "type": "string",
+      "enum": [
+        "unknown",
+        "partial",
+        "complete"
       ]
     },
     "TypeCopySemantics": {

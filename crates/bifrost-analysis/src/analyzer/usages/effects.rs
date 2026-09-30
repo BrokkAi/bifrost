@@ -49,7 +49,9 @@ use crate::analyzer::usages::call_relations::{
     CallDispatchBoundaryKind, CallRelationLimits, CallRelationService,
 };
 use crate::analyzer::usages::call_shape::CallShapeReport;
-use crate::analyzer::usages::callable_signature::callable_signature_reports;
+use crate::analyzer::usages::callable_signature::{
+    agreed_callable_identity, callable_signature_reports,
+};
 use crate::analyzer::usages::get_definition::{CallApplicationKind, DefinitionLookupStatus};
 use crate::analyzer::{AnalyzerQueryScope, CodeUnit, Language, ProjectFile, QueryScope, Range};
 use crate::cancellation::CancellationToken;
@@ -1099,6 +1101,10 @@ pub struct EffectGraphProcedure {
     pub declared: Vec<BoundDeclaredEffect>,
     /// What establishes this procedure's own effect set.
     pub basis: EffectNodeBasis,
+    /// Whether the declaration publishes no runnable signature entry, so its
+    /// source sites are declaration sites only and none of them can be read as
+    /// the procedure's body.
+    pub declaration_only: bool,
     /// Typed gaps found while enumerating this procedure's call sites.
     pub local_gaps: Vec<EffectReason>,
 }
@@ -1673,8 +1679,12 @@ pub fn modeled_procedure_key(
 /// Build the canonical procedure key for one persisted workspace declaration.
 ///
 /// This is the one declaration-side key path shared by effect evaluation and
-/// report accounting. It refuses overload sets and unrecorded receiver facts;
-/// both cases lack the exact identity required to bind a reviewed summary.
+/// report accounting. A declaration whose persisted entries are several
+/// occurrence rows of one callable -- an in-class prototype and the out-of-line
+/// definition completing it in the same translation unit (#3508) -- carries one
+/// identity and is keyed like any other single-entry declaration. It refuses
+/// overload sets and unrecorded receiver facts; both cases lack the exact
+/// identity required to bind a reviewed summary.
 pub fn modeled_procedure_key_for_unit(
     analyzer: &dyn IAnalyzer,
     unit: &CodeUnit,
@@ -1683,16 +1693,13 @@ pub fn modeled_procedure_key_for_unit(
         return None;
     }
     let entries = analyzer.signature_metadata(unit);
-    if entries.len() != 1 {
-        return None;
-    }
-    let mut reports = callable_signature_reports("modeled-procedure-key", unit, &entries);
-    let signature = reports.pop()?.signature;
-    let has_receiver = match signature.receiver_contract? {
+    let reports = callable_signature_reports("modeled-procedure-key", unit, &entries);
+    let identity = agreed_callable_identity(&reports)?;
+    let has_receiver = match identity.receiver_contract {
         ReceiverContract::Instance | ReceiverContract::Extension => true,
         ReceiverContract::None | ReceiverContract::StaticOrCompanion => false,
     };
-    let parameter_count = u32::try_from(signature.parameter_count).ok()?;
+    let parameter_count = u32::try_from(identity.parameter_count).ok()?;
     let language = crate::analyzer::common::language_for_file(unit.source()).config_label();
     modeled_procedure_key(language, unit, Some(has_receiver), Some(parameter_count))
 }
@@ -2510,6 +2517,7 @@ func caller() {
             display_name: name.to_owned(),
             declared,
             basis: EffectNodeBasis::BodyRead,
+            declaration_only: false,
             local_gaps: Vec::new(),
         }
     }

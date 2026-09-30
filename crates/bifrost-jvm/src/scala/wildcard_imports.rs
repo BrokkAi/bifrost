@@ -288,7 +288,10 @@ pub fn resolve_scala_wildcard_import_environment(
 }
 
 fn same_active_lexical_context(import: &[String], active: &[String]) -> bool {
-    import == active
+    // Entering a nested package (including a package object) extends this
+    // parser-derived context; it does not hide imports in the enclosing
+    // package. Physical lexical scopes below still exclude sibling blocks.
+    active.starts_with(import)
         || import
             .last()
             .zip(active.last())
@@ -594,4 +597,34 @@ fn inspect_named_subtree(
 
 fn inspect_node(inspect: &mut Option<&mut dyn FnMut(Node<'_>) -> bool>, node: Node<'_>) -> bool {
     inspect.as_mut().is_none_or(|inspect| inspect(node))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scala::declarations::parse_scala_file;
+    use crate::scala::imports::scala_lexical_scope_path_at;
+    use brokk_bifrost_core::analyzer::model::ProjectFile;
+
+    #[test]
+    fn enclosing_import_remains_visible_inside_package_object() {
+        let source =
+            "package app\nimport library.Item\npackage object nested { val value = Item(1) }\n";
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&crate::scala::language::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        assert!(!tree.root_node().has_error());
+        let file = ProjectFile::new(std::env::current_dir().unwrap(), "package.scala");
+        let parsed = parse_scala_file(&file, source, &tree);
+        assert_eq!(parsed.imports.len(), 1);
+        let reference = source.find("Item(1)").unwrap();
+        assert!(scala_import_visible_at(
+            &parsed.imports[0],
+            &scala_package_prefixes_at(tree.root_node(), source, reference),
+            &scala_lexical_scope_path_at(tree.root_node(), reference),
+            reference,
+        ));
+    }
 }

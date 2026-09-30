@@ -39,8 +39,9 @@ use crate::analyzer::semantic_model::{
     CompiledConditionalIndirectWrite, CompiledConditionalResultRefinement,
     CompiledIndirectWriteTarget, CompiledNormalReturnRefinement, CompiledOperationPrecondition,
     CompiledPredicateProofEffect, CompiledResultContract, CompiledResultMemberContract,
-    CompiledResultPredicate, CompiledSummaryInput, Completeness, ResolvedActiveSemanticModels,
-    SemanticModelCallableKey, SemanticModelMatchDisposition, SemanticModelOverlay,
+    CompiledResultPredicate, CompiledResultUseObligation, CompiledSummaryInput, Completeness,
+    ResolvedActiveSemanticModels, ResultUseObligationKind, SemanticModelCallableKey,
+    SemanticModelMatchDisposition, SemanticModelOverlay,
 };
 use crate::analyzer::usages::CallRelationLimits;
 use crate::analyzer::usages::call_shape::{call_shape_for_call, call_shapes_in_file};
@@ -52,9 +53,10 @@ use crate::analyzer::usages::effects::{
     ProcedureEffectReport, call_effect_report, modeled_call_targets_for_shapes,
     modeled_procedure_key_for_unit, summarize_procedure_effects,
 };
+use crate::analyzer::{JavaCallResultUse, JavaCallResultUseIndex, JavaCallResultUseOpen};
 use crate::structural::NormalizedKind;
 use crate::structural::flow_state::{FlowStateIncompleteReason, GuardDominanceAnswer};
-use brokk_bifrost_core::analyzer::model::CallableArity;
+use brokk_bifrost_core::analyzer::model::{CallableArity, SignatureMetadata};
 use brokk_bifrost_core::analyzer::structural::callable::{
     ArgumentListKind, CallKind, CallShapeCoverage,
 };
@@ -89,6 +91,7 @@ pub(super) struct CallEffectValue {
 }
 
 const CALL_RESULT_CONTRACT_ID_DOMAIN: &[u8] = b"bifrost.code_query.call_result_contract.v1";
+const CALL_RESULT_OBLIGATION_ID_DOMAIN: &[u8] = b"bifrost.code_query.call_result_obligation.v1";
 const RESULT_CONTRACT_USE_ID_DOMAIN: &[u8] = b"bifrost.code_query.result_contract_use.v1";
 const RESULT_CONTRACT_FAILURE_USE_ID_DOMAIN: &[u8] =
     b"bifrost.code_query.result_contract_failure_use.v1";
@@ -163,6 +166,31 @@ pub(super) struct SwitchCoverageValue {
 }
 
 impl SwitchCoverageValue {
+    pub(super) fn file(&self) -> &ProjectFile {
+        &self.file
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct AssignmentRelationValue {
+    pub(super) file: ProjectFile,
+    pub(super) range: Range,
+    pub(super) ast_id: Option<String>,
+    pub(super) id: String,
+    pub(super) procedure_id: String,
+    pub(super) assignment_point_id: Option<String>,
+    pub(super) target_value_id: Option<u64>,
+    pub(super) rhs_value_id: Option<u64>,
+    pub(super) relation_kind: &'static str,
+    pub(super) storage_kind: &'static str,
+    pub(super) verdict: &'static str,
+    pub(super) proof: &'static str,
+    pub(super) coverage: EffectCoverage,
+    pub(super) reason: Option<&'static str>,
+    pub(super) replacement_events: Vec<brokk_bifrost_flow::flow_state::StateEventRow>,
+}
+
+impl AssignmentRelationValue {
     pub(super) fn file(&self) -> &ProjectFile {
         &self.file
     }
@@ -331,6 +359,36 @@ pub(super) struct CallResultContractValue {
 }
 
 impl CallResultContractValue {
+    pub(super) fn file(&self) -> &ProjectFile {
+        &self.file
+    }
+}
+
+/// Exact result-use classification joined to one reviewed obligation common
+/// to every feasible JDK dispatch arm, or a terminal row explaining why that
+/// join remains incomplete.
+#[derive(Debug, Clone)]
+pub(super) struct CallResultObligationValue {
+    pub(super) file: ProjectFile,
+    pub(super) range: Range,
+    pub(super) id: String,
+    pub(super) site_id: String,
+    pub(super) site_ast_id: String,
+    pub(super) result_ordinal: Option<u32>,
+    pub(super) obligation_kind: Option<&'static str>,
+    pub(super) failure_predicate: Option<&'static str>,
+    pub(super) result_use: &'static str,
+    pub(super) coverage: EffectCoverage,
+    pub(super) reason: Option<&'static str>,
+    pub(super) pack_id: Option<String>,
+    pub(super) model_id: Option<String>,
+    pub(super) summary_id: Option<String>,
+    pub(super) arm_count: usize,
+    pub(super) modeled_arm_count: usize,
+    pub(super) terminal: bool,
+}
+
+impl CallResultObligationValue {
     pub(super) fn file(&self) -> &ProjectFile {
         &self.file
     }
@@ -532,6 +590,7 @@ pub(super) struct EffectTraversalCache {
     facts: HashMap<ProjectFile, Option<Arc<FileFacts>>>,
     result_member_call_shapes: Option<ResultMemberCallShapeWindow>,
     result_use_indexes: Option<ResultUseIndexWindow>,
+    java_result_use_indexes: HashMap<(ProjectFile, ContentIdentity), JavaCallResultUseIndex>,
     result_assignment_conversion_proofs:
         std::cell::RefCell<HashMap<ResultAssignmentConversionProofKey, bool>>,
     exact_sources: HashMap<ProjectFile, Option<Arc<str>>>,
@@ -1556,12 +1615,50 @@ impl EffectTraversalCache {
         answer
     }
 
+    /// Classify the exact call span against the same source snapshot that
+    /// supplied its structural call-shape row. One index is built per source
+    /// identity, so several candidate calls do not repeatedly parse a file.
+    fn java_result_use_for_shape(
+        &mut self,
+        shape: &CallShapeValue,
+    ) -> Result<JavaCallResultUse, JavaCallResultUseOpen> {
+        let source = shape
+            .source
+            .as_deref()
+            .ok_or(JavaCallResultUseOpen::UnclassifiedSyntax)?;
+        let outcome = &shape.report.outcome;
+        let key = (
+            outcome.file.clone(),
+            ContentIdentity::hash_bytes(source.as_bytes()),
+        );
+        if !self.java_result_use_indexes.contains_key(&key) {
+            let mut parser = tree_sitter::Parser::new();
+            let language = crate::analyzer::parser_language_for(crate::analyzer::Language::Java)
+                .expect("the Java grammar is installed");
+            parser
+                .set_language(&language)
+                .expect("the installed Java grammar matches tree-sitter");
+            let tree = parser
+                .parse(source, None)
+                .ok_or(JavaCallResultUseOpen::UnclassifiedSyntax)?;
+            self.java_result_use_indexes
+                .insert(key.clone(), JavaCallResultUseIndex::new(tree.root_node()));
+        }
+        self.java_result_use_indexes
+            .get(&key)
+            .expect("the source index was just installed")
+            .at_span(outcome.range.start_byte, outcome.range.end_byte)
+    }
+
     /// The canonical identity of one workspace callable, cached per unit.
     ///
     /// `None` means no key could be built, which is a coverage gap and never a
     /// looser match: the owner must be a qualified prefix of the declaration's
-    /// own fully-qualified name, the persisted signature contract must publish
-    /// exactly one entry, and that entry must decide the receiver shape.
+    /// own fully-qualified name, and the persisted signature contract must
+    /// describe one callable identity -- though that identity may be published
+    /// as several occurrence entries, such as an in-class prototype beside the
+    /// definition that completes it (#3508) -- and must decide the receiver
+    /// shape.
     fn key_for(
         &mut self,
         analyzer: &dyn IAnalyzer,
@@ -2497,6 +2594,195 @@ pub(super) fn call_result_contract_expansions(
             )))
         })
         .collect()
+}
+
+/// A result-use obligation is a positive only when the exact Java call is an
+/// expression statement and every feasible dispatch arm binds the same
+/// reviewed obligation from that arm's selected JDK artifact.
+pub(super) fn call_result_obligation_expansions(
+    analyzer: &dyn IAnalyzer,
+    semantic: &mut SemanticQueryContext<'_>,
+    cache: &mut EffectTraversalCache,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+    shape: &CallShapeValue,
+) -> Vec<PipelineExpansion> {
+    let outcome = &shape.report.outcome;
+    let mut row = CallResultObligationValue {
+        file: outcome.file.clone(),
+        range: outcome.range,
+        id: result_obligation_row_id(&outcome.site_id, None),
+        site_id: outcome.site_id.clone(),
+        site_ast_id: outcome.site_ast_id.clone(),
+        result_ordinal: None,
+        obligation_kind: None,
+        failure_predicate: None,
+        result_use: "unknown",
+        coverage: EffectCoverage::Open,
+        reason: None,
+        pack_id: None,
+        model_id: None,
+        summary_id: None,
+        arm_count: 0,
+        modeled_arm_count: 0,
+        terminal: true,
+    };
+    if crate::analyzer::common::language_for_file(&outcome.file) != crate::analyzer::Language::Java
+    {
+        row.coverage = EffectCoverage::Unsupported;
+        row.reason = Some("unsupported_language");
+    } else {
+        match cache.java_result_use_for_shape(shape) {
+            Ok(JavaCallResultUse::OtherContext) => {
+                row.result_use = "other_context";
+                row.coverage = EffectCoverage::Exhaustive;
+            }
+            Err(_) => row.reason = Some("result_use_unclassified"),
+            Ok(JavaCallResultUse::Discarded) => {
+                row.result_use = "discarded";
+                let answer = cache.dispatch_at_source(semantic, &outcome.file, outcome.range);
+                row.arm_count = answer.arms.len();
+                row.coverage = coverage_for(answer.coverage);
+                let models = cache.models(analyzer);
+                let mut common: Option<CompiledResultUseObligation> = None;
+                let mut closes_residual = !answer.arms.is_empty();
+                if answer.arms.is_empty() {
+                    row.reason = Some("dispatch_unresolved");
+                } else if matches!(answer.outcome, "cancelled" | "exceeded_budget") {
+                    row.reason = Some("dispatch_interrupted");
+                } else if let Some(models) = models {
+                    for arm in &answer.arms {
+                        let Some(target) = arm.unmaterialized_target.as_ref() else {
+                            row.reason = Some("target_unresolved");
+                            break;
+                        };
+                        if !target.has_resolver_owned_call_shape()
+                            || target.selected_jdk_artifact().is_none()
+                        {
+                            row.reason = Some("artifact_unselected");
+                            break;
+                        }
+                        let matched = models.procedure_summaries_for_selected_jdk_artifact(target);
+                        let summary = match (matched.disposition, matched.records.as_slice()) {
+                            (SemanticModelMatchDisposition::Unique, [summary]) => summary,
+                            (SemanticModelMatchDisposition::Conflict, _) => {
+                                row.reason = Some("model_conflict");
+                                break;
+                            }
+                            _ => {
+                                row.reason = Some("model_unavailable");
+                                break;
+                            }
+                        };
+                        let Some([obligation]) =
+                            summary.bind_reviewed_jdk_result_use_obligations(target)
+                        else {
+                            row.reason = Some("obligation_unavailable");
+                            break;
+                        };
+                        if let Some(existing) = &common {
+                            if existing != obligation {
+                                row.reason = Some("obligation_conflict");
+                                break;
+                            }
+                        } else {
+                            common = Some(obligation.clone());
+                            row.pack_id = Some(summary.shard.manifest.pack_id.clone());
+                            row.model_id = Some(summary.record.model_id.clone());
+                            row.summary_id = Some(summary.record.id.clone());
+                        }
+                        if row.pack_id.as_deref() != Some(summary.shard.manifest.pack_id.as_str())
+                            || row.model_id.as_deref() != Some(summary.record.model_id.as_str())
+                            || row.summary_id.as_deref() != Some(summary.record.id.as_str())
+                        {
+                            row.pack_id = None;
+                            row.model_id = None;
+                            row.summary_id = None;
+                        }
+                        closes_residual &=
+                            !target.has_receiver() || summary.record.covers_overrides;
+                        row.modeled_arm_count += 1;
+                    }
+                } else {
+                    row.reason = Some("model_unavailable");
+                }
+                // Cleanup lowering can publish several call observations for
+                // one source call. Discharge each observation separately: an
+                // armless observation or any additional residual stays open.
+                let contexts_with_arms = answer
+                    .arms
+                    .iter()
+                    .map(|arm| arm.call_context)
+                    .collect::<HashSet<_>>();
+                let residuals_are_closable = !answer.unnamed_boundaries.is_empty()
+                    && !answer.call_contexts.is_empty()
+                    && answer
+                        .call_contexts
+                        .iter()
+                        .enumerate()
+                        .all(|(index, context)| {
+                            contexts_with_arms.contains(&index)
+                                && matches!(
+                                    context.unnamed_boundaries.as_slice(),
+                                    [] | ["unresolved"]
+                                )
+                        });
+                if row.reason.is_none()
+                    && row.coverage == EffectCoverage::Open
+                    && residuals_are_closable
+                    && closes_residual
+                {
+                    row.coverage = EffectCoverage::Exhaustive;
+                }
+                if row.reason.is_none() && row.coverage != EffectCoverage::Exhaustive {
+                    row.reason = Some(if row.coverage == EffectCoverage::Truncated {
+                        "dispatch_truncated"
+                    } else {
+                        "dispatch_open"
+                    });
+                }
+                if row.reason.is_none()
+                    && let Some(obligation) = common
+                {
+                    row.id = result_obligation_row_id(&outcome.site_id, Some(&obligation));
+                    row.result_ordinal = Some(obligation.result_ordinal);
+                    row.obligation_kind = Some(match obligation.kind {
+                        ResultUseObligationKind::PureTransformationValue => {
+                            "pure_transformation_value"
+                        }
+                        ResultUseObligationKind::FallibleStatus => "fallible_status",
+                    });
+                    row.failure_predicate =
+                        obligation.failure_predicate.map(result_predicate_label);
+                    row.terminal = false;
+                } else {
+                    row.coverage = row.coverage.meet(EffectCoverage::Open);
+                }
+            }
+        }
+    }
+    record_result_obligation_coverage(cache, diagnostics, &outcome.file, row.coverage);
+    vec![pipeline_expansion(PipelineValue::CallResultObligation(
+        Box::new(row),
+    ))]
+}
+
+fn result_obligation_row_id(
+    site_id: &str,
+    obligation: Option<&CompiledResultUseObligation>,
+) -> String {
+    let mut digest = LengthDelimitedDigest::new(CALL_RESULT_OBLIGATION_ID_DOMAIN);
+    digest.push(site_id.as_bytes());
+    if let Some(obligation) = obligation {
+        digest.push(&obligation.result_ordinal.to_le_bytes());
+        digest.push(match obligation.kind {
+            ResultUseObligationKind::PureTransformationValue => b"pure_transformation_value",
+            ResultUseObligationKind::FallibleStatus => b"fallible_status",
+        });
+        if let Some(predicate) = obligation.failure_predicate {
+            digest.push(result_predicate_label(predicate).as_bytes());
+        }
+    }
+    digest.finish().to_string()
 }
 
 /// Add resource-use validation to one already projected result contract. The
@@ -5938,6 +6224,8 @@ fn normalized_success_guard_edges(
                     GuardPredicate::ConstantBoolean { .. }
                     | GuardPredicate::ConstantEquality { .. }
                     | GuardPredicate::OrderedIntegerComparison { .. }
+                    | GuardPredicate::OrderedFloatComparison { .. }
+                    | GuardPredicate::NanComparison { .. }
                     | GuardPredicate::InstanceOf { .. }
                     | GuardPredicate::ExactClass { .. }
                     | GuardPredicate::HasMember { .. }
@@ -8741,6 +9029,34 @@ fn record_result_contract_dispatch_coverage(
     );
 }
 
+fn record_result_obligation_coverage(
+    cache: &mut EffectTraversalCache,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+    file: &ProjectFile,
+    coverage: EffectCoverage,
+) {
+    if coverage == EffectCoverage::Exhaustive {
+        return;
+    }
+    cache.incomplete = true;
+    cache.truncated |= coverage == EffectCoverage::Truncated;
+    let message = "reviewed result-use obligation or exact discard proof is incomplete";
+    if !cache
+        .result_contract_incomplete_diagnostics
+        .insert((file.clone(), message))
+    {
+        return;
+    }
+    diagnostics.push(CodeQueryDiagnostic {
+        code: CodeQueryDiagnosticCode::ResultObligationDerivationIncomplete,
+        impact: CodeQueryDiagnosticImpact::Incomplete,
+        branch: Vec::new(),
+        language: crate::analyzer::common::language_for_file(file).config_label(),
+        message: format!("{message} in `{}`", rel_path_string(file)),
+        exhausted_roots: Vec::new(),
+    });
+}
+
 fn record_result_contract_guard_coverage(
     cache: &mut EffectTraversalCache,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
@@ -9220,19 +9536,45 @@ fn discover_effect_graph(
             return None;
         }
         let identity = declaration_identity(unit);
-        let declared = match cache.key_for(analyzer, unit) {
+        let declaration_only =
+            SignatureMetadata::unit_is_declaration_only(&analyzer.signature_metadata(unit));
+        let (declared, basis) = match cache.key_for(analyzer, unit) {
             Some(key) => match cache.answer_for(analyzer, &key) {
-                ModelAnswer::Modeled { effects, .. } => effects,
-                ModelAnswer::Conflict | ModelAnswer::Empty => Vec::new(),
+                ModelAnswer::Modeled {
+                    complete,
+                    covers_overrides,
+                    effects,
+                    ..
+                } => {
+                    // A declaration with no runnable entry has no body to read,
+                    // so only a reviewed summary that speaks for every
+                    // implementation can state its effects in full -- the same
+                    // closing rule an external member's leaf follows (#3508).
+                    // Everything else leaves the declaration's own effect set
+                    // unestablished, because the body it would have to read is
+                    // not here.
+                    let established =
+                        declaration_only && complete && (covers_overrides || !key.has_receiver);
+                    let basis = if established {
+                        EffectNodeBasis::CompleteSummary
+                    } else {
+                        EffectNodeBasis::Unestablished
+                    };
+                    (effects, basis)
+                }
+                ModelAnswer::Conflict | ModelAnswer::Empty => {
+                    (Vec::new(), EffectNodeBasis::Unestablished)
+                }
             },
-            None => Vec::new(),
+            None => (Vec::new(), EffectNodeBasis::Unestablished),
         };
         let index = graph.procedures.len();
         graph.procedures.push(EffectGraphProcedure {
             declaration_id: identity,
             display_name: unit.fq_name(),
             declared,
-            basis: EffectNodeBasis::Unestablished,
+            basis,
+            declaration_only,
             local_gaps: Vec::new(),
         });
         index_by_unit.insert(unit.clone(), index);
@@ -9258,6 +9600,7 @@ fn discover_effect_graph(
             display_name: external.key.display(),
             declared: external.declared.clone(),
             basis: external.basis,
+            declaration_only: false,
             local_gaps: Vec::new(),
         });
         index_by_external.insert(external.key.clone(), index);
@@ -9310,10 +9653,18 @@ fn discover_effect_graph(
             continue;
         };
         let ranges = analyzer.ranges_of(&unit);
-        let Some(span) = ranges.into_iter().min_by_key(primary_range_key) else {
+        // A declaration with no runnable entry has no body to enumerate: its
+        // sites are declaration sites, and reading one as a body would claim an
+        // empty effect set it never proved (#3508). The node keeps the basis
+        // `push_node` decided from the summary answer.
+        if ranges.is_empty() || graph.procedures[node].declaration_only {
             continue;
-        };
+        }
         graph.procedures[node].basis = EffectNodeBasis::BodyRead;
+        // One declaration can own several source sites -- a prototype and its
+        // out-of-line definition inside one translation unit (#1650) -- and the
+        // body is the union of the calls they contain.
+        let body_spans = ranges.as_slice();
 
         let mut call_nodes = facts
             .nodes()
@@ -9321,7 +9672,9 @@ fn discover_effect_graph(
             .enumerate()
             .filter(|(_, fact)| fact.kind == NormalizedKind::Call)
             .filter(|(_, fact)| {
-                fact.range.start_byte >= span.start_byte && fact.range.end_byte <= span.end_byte
+                body_spans.iter().any(|span| {
+                    fact.range.start_byte >= span.start_byte && fact.range.end_byte <= span.end_byte
+                })
             })
             .map(|(id, fact)| (fact.range.start_byte, fact.range.end_byte, id))
             .collect::<Vec<_>>();

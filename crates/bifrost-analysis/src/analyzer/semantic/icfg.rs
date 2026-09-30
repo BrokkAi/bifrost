@@ -1007,6 +1007,16 @@ pub enum IcfgLimitKind {
     Edges,
 }
 
+impl IcfgLimitKind {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::CallDepth => "call_depth_limit",
+            Self::Nodes => "node_limit",
+            Self::Edges => "edge_limit",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum IcfgBoundaryKind {
     Dispatch(DispatchBoundaryKind),

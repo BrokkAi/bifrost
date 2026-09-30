@@ -20,7 +20,7 @@ use crate::analyzer::{CSharpAnalyzer, Language, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 use brokk_bifrost_core::analyzer::tree_walk::ParentIndex;
 
-const ADAPTER_VERSION: &[u8] = b"csharp-value-semantics-v10";
+const ADAPTER_VERSION: &[u8] = b"csharp-value-semantics-v13";
 
 /// How many declared slots one value-type copy duplicates.
 ///
@@ -3623,7 +3623,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 SemanticGapKind::Unknown,
                 "assignment target accessors and overloaded assignment conversions require type refinement",
             )?;
-            self.implicit_exception_gap(builder, terminal, node)?;
+            self.implicit_abort_route(builder, node, terminal, scope, stack)?;
             runtime_expression_children(node)
         };
         self.edge(builder, continuation, next)?;
@@ -3727,8 +3727,14 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 )?;
             }
         }
-        if node.kind() == "cast_expression" {
-            self.implicit_exception_gap(builder, terminal, node)?;
+        if node.kind() == "cast_expression" && continuation == terminal {
+            // A predefined or unresolved cast throws on its own -- an invalid
+            // reference cast, a checked overflow -- so it routes an implicit
+            // abort. A user-defined conversion is a call, and the call's own
+            // exceptional continuation already carries that route; adding a
+            // second exceptional edge from the same invoke point would break
+            // the one-continuation control-flow contract.
+            self.implicit_abort_route(builder, node, terminal, scope, stack)?;
         }
         self.edge(builder, continuation, next)?;
         stack.push(Work::Expression {
@@ -4562,7 +4568,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             | "reftype_expression"
             | "refvalue_expression" => {
                 if node.kind() == "checked_expression" {
-                    self.implicit_exception_gap(builder, entry, node)?;
+                    self.implicit_abort_route(builder, node, entry, scope, stack)?;
                 }
                 if let Some(value) = first_runtime_named_child(node) {
                     self.transparent_expression(builder, node, value, entry, next, scope, stack)
@@ -4602,7 +4608,22 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 // a terminal preserves conservative downstream control flow
                 // without making the already-evaluated receiver incomplete.
                 let terminal = self.point(builder, node, Vec::new())?;
-                self.implicit_exception_gap(builder, terminal, node)?;
+                self.implicit_abort_route(builder, node, terminal, scope, stack)?;
+                // The lowered route answers where an abort goes, not what a
+                // property getter, an indexer, or a type initializer the
+                // access can enter does. That is an invocation question, so it
+                // is a `Calls` claim like the user-defined operator one, not an
+                // `ExceptionalControlFlow` claim: the solver reads a point
+                // claim of that capability as an unlowered abort route and
+                // reopens every caller's exceptional return (#3679).
+                self.add_gap(
+                    builder,
+                    terminal,
+                    SemanticGapSubject::Point,
+                    SemanticCapability::Calls,
+                    SemanticGapKind::Unknown,
+                    "property or element access can invoke accessor, indexer, or type-initializer user code whose value and effect semantics are not modeled",
+                )?;
                 // A read of a member or an element loads from a location
                 // (#2661). A write target and a method group are not reads at
                 // all: the target's own store already represents the write,
@@ -4668,7 +4689,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 if operation_can_throw_implicitly(node) {
                     // Integral division by zero and checked-context overflow
                     // still throw. Neither embeds an operand value.
-                    self.implicit_exception_gap(builder, terminal, node)?;
+                    self.implicit_abort_route(builder, node, terminal, scope, stack)?;
                 }
                 self.edge(builder, terminal, next)?;
                 self.schedule_expressions(
@@ -4714,7 +4735,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     )?;
                 }
                 if operation_can_throw_implicitly(node) {
-                    self.implicit_exception_gap(builder, entry, node)?;
+                    self.implicit_abort_route(builder, node, entry, scope, stack)?;
                 }
                 if may_invoke_user_code(node) {
                     self.add_gap(
@@ -5947,29 +5968,47 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         self.edge(builder, entry, next)
     }
 
-    fn implicit_exception_gap(
+    /// Lower the route an operation's implicit exception takes, to the
+    /// enclosing handler or cleanup, or to the exceptional exit when this
+    /// procedure has none.
+    ///
+    /// The modeled edge is why no "route not lowered" claim is published
+    /// here: the route, not a discharge, answers whether the abort can carry a
+    /// store. A `Point`-scoped claim instead left every caller's matched
+    /// exceptional return unproven and partial, so no procedure containing a
+    /// comparison, a cast, or an arithmetic operator could ever be a complete
+    /// callee (#3528).
+    ///
+    /// The edge leaves `operation`, the point that carries the operation's own
+    /// effect, so every value its operands established is already live on the
+    /// abort path. The failing operation's exception object is a fresh value
+    /// this adapter does not type, and a catch declaration's binding stays the
+    /// separate unlowered question it already was.
+    fn implicit_abort_route(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
-        point: ProgramPointId,
         node: Node<'tree>,
+        operation: ProgramPointId,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), CSharpLoweringError> {
-        let detail = match node.kind() {
-            "member_access_expression" | "member_binding_expression" => {
-                "implicit null, type-initialization, or property-access exceptions are not yet lowered"
-            }
-            "element_access_expression" | "element_binding_expression" => {
-                "implicit null, bounds, or indexer-access exceptions are not yet lowered"
-            }
-            _ => "implicit exceptions from runtime operators are not yet lowered",
+        let Some(route) =
+            builder.resolve_completion(scope, &CompletionRequest::new(CompletionKind::Throw, None))
+        else {
+            return Err(CSharpLoweringError::Invalid(
+                "implicit abort has no matching structured continuation".into(),
+            ));
         };
-        self.add_gap(
+        let abort = self.point(builder, node, Vec::new())?;
+        self.edge(
             builder,
-            point,
-            SemanticGapSubject::Point,
-            SemanticCapability::ExceptionalControlFlow,
-            SemanticGapKind::Unsupported,
-            detail,
-        )
+            operation,
+            EdgeTarget {
+                point: abort,
+                kind: ControlEdgeKind::Exceptional,
+            },
+        )?;
+        self.route(builder, abort, &route, stack)
     }
 
     fn unhandled_control_syntax(

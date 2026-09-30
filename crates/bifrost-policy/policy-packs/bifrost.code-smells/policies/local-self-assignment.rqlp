@@ -1,0 +1,26 @@
+; An initialized ordinary local is assigned its own value.
+(policy
+  :schema-version 1
+  :id "bifrost.correctness.local-self-assignment"
+  :name "Local self-assignment"
+  :message "this assignment writes an initialized local back to itself"
+  :severity warning
+  :description "A direct assignment reads and writes the same ordinary local binding. Prepared syntax and procedure-local reaching evidence prove the right-hand read was initialized and the assignment has no indirect target or effectful right-hand expression."
+  :help-uri "https://bifrost.brokk.ai/static-analysis-policies/#built-in-code-smell-pack"
+  :tags ["correctness" "assignment"]
+  :analysis (analysis
+    :type assertion
+    (bind :name self-assignment
+      :query (rql :schema-version 1
+        (filter :where ((relation_kind eq self_assignment)
+                        (storage_kind eq ordinary_local)
+                        (verdict eq self_assignment)
+                        (proof eq exact)
+                        (coverage eq exhaustive))
+          (language java javascript typescript python
+            (assignment-relations
+              (procedure-of
+                (callable)))))))
+    (group :name by-assignment :by (self-assignment.id)
+      (aggregate :name self-assignments :op count))
+    (assert :group by-assignment :value self-assignments :cardinality (exactly 0))))

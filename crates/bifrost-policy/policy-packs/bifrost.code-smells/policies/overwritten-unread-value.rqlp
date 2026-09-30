@@ -1,0 +1,28 @@
+; An ordinary Java, JavaScript, or TypeScript local value replaced before
+; any read. The RHS has already run at the selected establishment; no fix is
+; offered because removing it could remove side effects.
+(policy
+  :schema-version 1
+  :id "bifrost.correctness.overwritten-unread-value"
+  :name "Overwritten unread local value"
+  :message "the local value is overwritten before it is read"
+  :severity warning
+  :description "An exact ordinary local establishment is replaced on every modeled continuation before any read of that value. The row retains every first replacement event as evidence. Review the original assignment and its right-hand-side effects; no automatic removal is offered."
+  :help-uri "https://bifrost.brokk.ai/static-analysis-policies/#built-in-code-smell-pack"
+  :tags ["correctness" "assignment"]
+  :analysis (analysis
+    :type assertion
+    (bind :name overwritten-unread
+      :query (rql :schema-version 1
+        (filter :where ((relation_kind eq overwritten_unread)
+                        (storage_kind eq ordinary_local)
+                        (verdict eq overwritten_unread)
+                        (proof eq exact)
+                        (coverage eq exhaustive))
+          (language java javascript typescript
+            (assignment-relations :relation [overwritten-unread]
+              (procedure-of
+                (callable)))))))
+    (group :name by-assignment :by (overwritten-unread.id)
+      (aggregate :name overwritten-values :op count))
+    (assert :group by-assignment :value overwritten-values :cardinality (exactly 0))))

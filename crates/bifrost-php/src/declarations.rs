@@ -365,6 +365,11 @@ impl<'a> PhpVisitor<'a> {
         scope: &PhpScope,
         stack: &mut Vec<PhpWork<'tree>>,
     ) {
+        if php_declaration_kind(node.kind())
+            && php_declaration_overlaps_parse_error(node, self.source)
+        {
+            return;
+        }
         match node.kind() {
             // `push_php_child_work` is the only producer of node work, and it
             // resolves every `namespace_definition` into the package its
@@ -1090,6 +1095,105 @@ fn php_declaration_range(node: Node<'_>, source: &str) -> Range {
         start_point,
         node.end_byte(),
         node.end_position(),
+    )
+}
+
+/// Whether publishing this declaration would make parser recovery look like
+/// authoritative structure.
+///
+/// Tree-sitter keeps useful siblings around a damaged declaration, so a parse
+/// error elsewhere in the file does not invalidate every fact in that file.
+/// An error inside the declaration itself is different: its recorded range
+/// overlaps recovery, and its member ownership can be a consequence of that
+/// recovery. Attached attributes are part of the declaration range as well,
+/// so they participate in the same gate.
+fn php_declaration_overlaps_parse_error(node: Node<'_>, source: &str) -> bool {
+    if node.is_error() || node.is_missing() {
+        return true;
+    }
+
+    if php_type_declaration_kind(node.kind()) {
+        let Some(body) = node.child_by_field_name("body") else {
+            return true;
+        };
+        if body.is_error() || body.is_missing() {
+            return true;
+        }
+        for index in 0..body.child_count() {
+            if body.child(index).is_some_and(|child| child.is_missing()) {
+                return true;
+            }
+        }
+
+        // A type declaration owns nested declaration bodies. Recovery in one
+        // method must not erase the type and every clean sibling before those
+        // nested declarations can be judged independently (#3167). Inspect
+        // the type header and attributes, but stop at the required body node.
+        let mut stack = vec![node];
+        while let Some(current) = stack.pop() {
+            for index in (0..current.child_count()).rev() {
+                let Some(child) = current.child(index) else {
+                    continue;
+                };
+                if child.id() == body.id() {
+                    continue;
+                }
+                if child.is_error() || child.is_missing() {
+                    return true;
+                }
+                if child.has_error() {
+                    stack.push(child);
+                }
+            }
+        }
+    } else if node.has_error() {
+        return true;
+    }
+
+    let mut ancestor = node.parent();
+    while let Some(parent) = ancestor {
+        if parent.is_error() || parent.is_missing() {
+            return true;
+        }
+        ancestor = parent.parent();
+    }
+
+    let mut current = node;
+    while let Some(previous) = current.prev_named_sibling() {
+        if previous.kind() != "attribute_list" {
+            break;
+        }
+        let gap = &source[previous.end_byte()..current.start_byte()];
+        if !gap.trim().is_empty() {
+            break;
+        }
+        if previous.has_error() || previous.is_error() || previous.is_missing() {
+            return true;
+        }
+        current = previous;
+    }
+    false
+}
+
+fn php_type_declaration_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "class_declaration" | "interface_declaration" | "trait_declaration" | "enum_declaration"
+    )
+}
+
+fn php_declaration_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "class_declaration"
+            | "interface_declaration"
+            | "trait_declaration"
+            | "enum_declaration"
+            | "function_definition"
+            | "method_declaration"
+            | "property_declaration"
+            | "const_declaration"
+            | "enum_case"
     )
 }
 

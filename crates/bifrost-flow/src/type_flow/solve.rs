@@ -836,15 +836,15 @@ pub fn solve_type_flow_for_root_with_refinements(
                 interpreted.published_summaries =
                     summaries.publish_complete(&fixed.result, &mut fixed_request);
                 solver_attempts[fixed.attempt_index].work = fixed_request.budget.used();
-            } else if summaries.has_reusable_rows() {
-                // Reusable rows currently retain reachability and path quality,
-                // not witness fragments. Run the cheap symbolic trial without a
-                // witness sidecar. If it produces a finding, run the exact
-                // witness-producing path and discard the trial's staged solver
-                // budget unless it retained shared summary state. Keep its
-                // semantic charge because that path observes the provider cache
-                // it warmed. Otherwise no consumer can observe the missing
-                // sidecar, so commit the trial.
+            } else {
+                // Establish findings before allocating witness paths, including
+                // on a cold root with no reusable summaries. A finding-free
+                // relation owes no witness; retaining paths eagerly can exhaust
+                // the witness budget without producing anything to explain.
+                // Findings still require the exact strict witness solve below.
+                // Retain semantic charges for provider caches warmed by this
+                // trial, even when its staged solver result is discarded.
+                let has_reusable_rows = summaries.has_reusable_rows();
                 let mut trial_solver_budget = SolverBudget::new(root_solver_limits);
                 let mut trial_request =
                     DataflowRequest::new(&mut trial_solver_budget, request.cancellation)
@@ -852,15 +852,25 @@ pub fn solve_type_flow_for_root_with_refinements(
                 let mut trial_semantic_budget = iteration_budget.clone();
                 let trial_result = {
                     let _scope = profiling::scope("type_flow.solve");
-                    solve_value_flow_with_reusable_summaries(
-                        root,
-                        &provider,
-                        &mut summaries,
-                        plan.value_flow(),
-                        WitnessRetentionLimits::disabled(),
-                        &mut trial_semantic_budget,
-                        &mut trial_request,
-                    )
+                    if has_reusable_rows {
+                        solve_value_flow_with_reusable_summaries(
+                            root,
+                            &provider,
+                            &mut summaries,
+                            plan.value_flow(),
+                            WitnessRetentionLimits::disabled(),
+                            &mut trial_semantic_budget,
+                            &mut trial_request,
+                        )
+                    } else {
+                        solve_value_flow_with_summaries(
+                            root,
+                            &provider,
+                            plan.value_flow(),
+                            &mut trial_semantic_budget,
+                            &mut trial_request,
+                        )
+                    }
                 };
                 let trial_publication_writes = summaries.take_retained_publication_writes();
                 let trial_result = match trial_result {
@@ -989,52 +999,6 @@ pub fn solve_type_flow_for_root_with_refinements(
                         summaries.publish_complete(&result, &mut witness_request);
                     solver_attempts[witness_attempt_index].work = witness_request.budget.used();
                 }
-            } else {
-                if plan.has_summary_cuts() {
-                    // Planning an unusable cut can still publish complete
-                    // semantic/value-flow cache entries consumed by retry.
-                    *semantic_budget = iteration_budget;
-                    require_full_plan = true;
-                    summary_profile = summary_profile.saturating_add(summaries.profile());
-                    root_summary_observation_rejections = root_summary_observation_rejections
-                        .saturating_add(summaries.root_observation_rejections());
-                    continue 'plan_attempt;
-                }
-                let mut witness_solver_budget = SolverBudget::new(root_solver_limits);
-                let mut witness_request =
-                    DataflowRequest::new(&mut witness_solver_budget, request.cancellation)
-                        .with_query_plan_config(query_plan_config);
-                let result = {
-                    let _scope = profiling::scope("type_flow.solve");
-                    let result = solve_value_flow_with_witnesses(
-                        root,
-                        &provider,
-                        plan.value_flow(),
-                        WitnessRetentionLimits::new(1)
-                            .expect("one alternative is a valid witness retention limit"),
-                        &mut iteration_budget,
-                        &mut witness_request,
-                    );
-                    result?
-                };
-                let witness_attempt_index = record_solver_attempt(
-                    &mut solver_attempts,
-                    TypeFlowSolvePhase::Witness,
-                    &result,
-                    witness_request.budget.used(),
-                );
-                interpreted = interpret(
-                    workspace,
-                    adapter,
-                    field_slots,
-                    root,
-                    &plan,
-                    &result,
-                    &solver_attempts,
-                );
-                interpreted.published_summaries =
-                    summaries.publish_complete(&result, &mut witness_request);
-                solver_attempts[witness_attempt_index].work = witness_request.budget.used();
             }
             let maintenance = summaries.maintenance_metrics();
             summary_profile = summary_profile.saturating_add(summaries.profile());

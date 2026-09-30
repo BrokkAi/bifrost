@@ -509,7 +509,7 @@ impl PhysicalQueryPlan {
                 };
                 let semantic_request = match node.operator() {
                     LogicalQueryOperator::Step { step, .. } => {
-                        CodeQuerySemanticRequest::from_facets(step.op().semantic_facets())
+                        CodeQuerySemanticRequest::from_facets(step.semantic_facets())
                     }
                     _ => None,
                 };

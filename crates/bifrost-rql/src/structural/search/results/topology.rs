@@ -1,4 +1,5 @@
 use super::*;
+use schemars::JsonSchema;
 
 /// One compilation input set the build declares, as a query row (#2448).
 ///
@@ -6,7 +7,8 @@ use super::*;
 /// itself the statement "the build says this file compiles here". A file no
 /// build file claims produces no row and an explicit diagnostic; it never
 /// produces a row derived from the file's path.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct CodeQuerySourceSet {
     /// The source set's stable identity: a digest over the coordinates the
     /// build declares for it, never over the build files that justify it.
@@ -29,7 +31,8 @@ pub struct CodeQuerySourceSet {
 }
 
 /// One artifact the build declares, as a query row (#2448).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct CodeQueryBuildTarget {
     pub id: String,
     /// The name the build declares for the target, which is the name an
@@ -52,7 +55,8 @@ pub struct CodeQueryBuildTarget {
 /// relates two targets by id equality rather than by comparing names it read
 /// out of two different places. The names travel too, because the rule an
 /// author writes names the target the build names.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct CodeQueryTopologyEdge {
     /// The edge's stable identity, which includes the build file that declares
     /// it: two build files declaring the same dependency are two pieces of

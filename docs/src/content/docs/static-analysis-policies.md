@@ -422,6 +422,11 @@ segment `TcpStream::connect(addr)` that a `use std::net::TcpStream;`
 declaration expands. The owner path is the identity, so a workspace type also
 spelled `TcpStream` with an associated function also spelled `connect`, called
 at the same arity, binds the workspace declaration and carries no effect.
+Neither spelling is proof by itself: the resolver publishes that identity only
+when the activated declaration surface publishes one applicable receiverless
+callable for the written member at the written arity, a workspace root of the
+same name wins over the pack, and a member nothing declares leaves the absence
+claim open rather than borrowing a same-spelled summary.
 The Ruby specialization
 (`bifrost.effects.ruby.selected-boundary-no-network-io`) consumes
 `semantic-packs/web-network/ruby/bifrost.web-network-ruby.json`, which
@@ -432,6 +437,18 @@ activated model publishes and `Net::HTTP.get(address)` binds the reviewed API
 at its written arity instead of the member spelling. A workspace class also
 spelled `Net::HTTP` with its own `get` resolves inside the workspace and
 carries no effect, and an unresolved Ruby helper keeps the absence claim open.
+
+The same model declares the result of `Net::HTTP.new`, so a local such as
+`http = Net::HTTP.new(host, port)` or a chained constructor expression can
+bind `http.request(req)` to the reviewed instance member. One- and two-argument
+requests carry the network effect. Ordinary construction at one or two arguments
+has a reviewed complete effect-free summary; it creates the client without
+opening a connection. Other constructor call shapes retain their unmodeled
+behavior obligations. This return typing also applies to separately named
+factories when an activated declaration supplies a unique applicable return
+type. Reassigning the local to an unknown value keeps a later request unresolved;
+factory-to-caller, parameter, conditional-join and instance-field propagation
+remain separate capabilities.
 
 <!-- policy-doc-test:rqlp:tests/fixtures/network-effect-boundary/policies/javascript.rqlp -->
 ```lisp

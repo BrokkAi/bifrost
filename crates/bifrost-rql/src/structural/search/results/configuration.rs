@@ -11,7 +11,8 @@ use super::*;
 /// `#<occurrence>` only on duplicates, zero-based indexes as integers) as a
 /// JSON array; it is a rendering, and `occurrence`/`index` carry the exact
 /// numbers.
-#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CodeQueryConfigurationFact {
     pub id: String,
     pub fact_id: String,
@@ -26,6 +27,10 @@ pub struct CodeQueryConfigurationFact {
     pub role: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scalar_kind: Option<&'static str>,
+    /// Authorship provenance for this configuration fact. The wire name is
+    /// distinct from `CodeQueryResultItem::provenance`, which is flattened
+    /// into the same object as query-derivation provenance.
+    #[serde(rename = "fact_provenance")]
     pub provenance: &'static str,
     pub completeness: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]

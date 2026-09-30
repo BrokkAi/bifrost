@@ -62,9 +62,24 @@ const NO_ACTIVE_MODELS: &str = "bifrost-policy-unit:no-active-models:v1";
 /// Bump this whenever a change makes either something this engine would no
 /// longer mint.
 ///
-/// The current value adds #3205's row-level coverage envelope to persisted
+/// The current value carries #3513: a declaration row is identified by its
+/// code unit and covered range, and the optional structural leaf kind is
+/// presentation evidence the executor merges into the surviving row instead of
+/// part of the key. A cached row from the preceding engine spells one
+/// declaration's key once per kind its projections proved, so a union of the
+/// member and the enclosing-declaration projections replayed from such a
+/// product still publishes that one declaration once per spelling, and their
+/// intersection still publishes no row for the declaration both name. Those
+/// products must be recomputed rather than replayed.
+///
+/// The preceding value invalidated work receipts from before #3531's shared
+/// runtime-syntax census and finding-first cold-root solve. Replaying old
+/// per-procedure file or eager witness charges could retain an obsolete
+/// budget boundary instead of running the corrected scan.
+///
+/// The one before that added #3205's row-level coverage envelope to persisted
 /// query unit products: an analysis row now carries what its solver proved
-/// about the partition it came from. A cached row from the preceding engine
+/// about the partition it came from. A cached row from the engine before it
 /// carries no coverage, which a reader would take as adding no restriction, so
 /// a negative assertion over a reused flow, taint, typestate or type-flow
 /// relation must be recomputed rather than replayed.
@@ -93,7 +108,7 @@ const NO_ACTIVE_MODELS: &str = "bifrost-policy-unit:no-active-models:v1";
 /// this change exists to fix. The previous value was #3022, which took the byte
 /// anchors out of the locator's declaration segments; the one before that was
 /// #2968, which took the binding-plan hash out of the finding identity itself.
-const POLICY_SUBSTRATE_EPOCH: &str = "bifrost-policy-unit:substrate:3205-row-coverage";
+const POLICY_SUBSTRATE_EPOCH: &str = "bifrost-policy-unit:substrate:3513-declaration-row-identity";
 
 /// The epoch every unit key and the evaluation row key carry.
 fn policy_substrate_epoch() -> StableDigest {

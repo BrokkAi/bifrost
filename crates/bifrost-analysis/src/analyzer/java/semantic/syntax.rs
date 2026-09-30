@@ -220,18 +220,8 @@ fn enclosing_type_is_final(node: Node<'_>) -> bool {
 }
 
 pub(super) fn has_modifier(node: Node<'_>, modifier: &str) -> bool {
-    node.child_by_field_name("modifiers")
-        .or_else(|| {
-            named_children(node)
-                .into_iter()
-                .find(|child| child.kind() == "modifiers")
-        })
-        .is_some_and(|modifiers| {
-            let mut cursor = modifiers.walk();
-            modifiers
-                .children(&mut cursor)
-                .any(|child| child.kind() == modifier)
-        })
+    brokk_bifrost_jvm::java::declarations::java_modifier_keywords(node)
+        .any(|keyword| keyword == modifier)
 }
 
 fn field_matches(parent: Node<'_>, field: &str, child: Node<'_>) -> bool {
@@ -483,6 +473,51 @@ pub(super) fn body_contains_free_this(
     Ok(found)
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct JavaLocalBindingSyntax<'tree> {
+    pub(super) declaration: Node<'tree>,
+    pub(super) name: Node<'tree>,
+    pub(super) visible_from: usize,
+    pub(super) scope_start: usize,
+    pub(super) scope_end: usize,
+}
+
+pub(super) fn java_local_binding(node: Node<'_>) -> Option<JavaLocalBindingSyntax<'_>> {
+    let (name, visible_from, scope_start, scope_end) = match node.kind() {
+        "variable_declarator" | "catch_formal_parameter" => {
+            let name = node.child_by_field_name("name")?;
+            let (start, end) = java_local_scope(node)?;
+            (name, node.end_byte(), start, end)
+        }
+        "enhanced_for_statement" => {
+            let body = node.child_by_field_name("body")?;
+            let name = node.child_by_field_name("name")?;
+            (name, body.start_byte(), body.start_byte(), body.end_byte())
+        }
+        _ => return None,
+    };
+    (name.kind() == "identifier").then_some(JavaLocalBindingSyntax {
+        declaration: node,
+        name,
+        visible_from,
+        scope_start,
+        scope_end,
+    })
+}
+
+pub(super) fn java_binding_type(node: Node<'_>) -> Option<Node<'_>> {
+    node.child_by_field_name("type")
+        .or_else(|| {
+            node.parent()
+                .and_then(|parent| parent.child_by_field_name("type"))
+        })
+        .or_else(|| {
+            named_children(node)
+                .into_iter()
+                .find(|child| child.kind() == "catch_type")
+        })
+}
+
 pub(super) fn java_local_scope(node: Node<'_>) -> Option<(usize, usize)> {
     let mut current = node.parent();
     while let Some(parent) = current {
@@ -509,6 +544,7 @@ pub(super) fn java_local_scope(node: Node<'_>) -> Option<(usize, usize)> {
 pub(super) fn expression_value_kind(node: Node<'_>) -> SemanticValueKind {
     match node.kind() {
         "lambda_expression" | "method_reference" => SemanticValueKind::Callable,
+        "null_literal" => SemanticValueKind::Null,
         "decimal_integer_literal"
         | "hex_integer_literal"
         | "octal_integer_literal"
@@ -518,8 +554,7 @@ pub(super) fn expression_value_kind(node: Node<'_>) -> SemanticValueKind {
         | "true"
         | "false"
         | "character_literal"
-        | "string_literal"
-        | "null_literal" => SemanticValueKind::Constant,
+        | "string_literal" => SemanticValueKind::Constant,
         _ => SemanticValueKind::Temporary,
     }
 }

@@ -32,7 +32,7 @@
 //! [`TraceSession`] for the extent of one batch, drained per request, and
 //! removed on drop, so its lifetime is exactly the batch that asked for it.
 
-use super::{DefinitionLookupOutcome, DefinitionLookupStatus, resolve_definition_requests_traced};
+use super::{DefinitionLookupOutcome, DefinitionLookupStatus, resolve_definition_resolutions};
 use crate::analyzer::QueryScope;
 use crate::analyzer::lexical_definitions::LexicalDefinition;
 use crate::analyzer::structural::resolution::{
@@ -661,7 +661,7 @@ pub fn resolve_definition_batch_with_trace(
         super::DefinitionBatchContext::new(analyzer, scope.token(), requests.len() > 1);
     context.sources.insert(file.clone(), Ok(source));
     let mut per_request = Vec::with_capacity(requests.len());
-    let outcomes = resolve_definition_requests_traced(
+    let resolutions = resolve_definition_resolutions(
         analyzer,
         token,
         &mut context,
@@ -674,8 +674,9 @@ pub fn resolve_definition_batch_with_trace(
     );
     drop(session);
 
-    outcomes
+    resolutions
         .into_iter()
+        .map(|resolution| resolution.outcome)
         .zip(
             per_request
                 .into_iter()

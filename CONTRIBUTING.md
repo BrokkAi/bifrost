@@ -69,6 +69,23 @@ separate public API commitments.
 
 For repo-local development without installing the package, `SearchToolsClient(..., library_path=...)` can load a built debug library such as `target/debug/libbrokk_bifrost.so`.
 
+The Python `query_code` result dataclasses, enums, and decoders are generated
+from the Rust serialization contract. After changing a serializable result
+type, regenerate the checked-in module from the repository root:
+
+```bash
+set -o pipefail
+cargo run --quiet --locked -p brokk-bifrost-rql --bin query_result_schema |
+  python3 scripts/public/generate-python-query-models.py \
+    --output bifrost_searchtools/_generated_query_models.py \
+    --root-name CodeQueryResult
+```
+
+Use the same command with `--check` to verify that the artifact is current.
+The generator consumes JSON Schema only; it does not parse Rust source.
+Unsupported schema constructs fail explicitly. Client lifecycle and result
+rendering remain handwritten in `models.py`.
+
 ## Citation Authorship Policy
 
 `CITATION.cff` uses **Bifrost contributors** as the collective software author
@@ -109,19 +126,60 @@ The protected `release-ready` branch records the newest `master` commit that
 has passed all promotion evidence at that exact SHA. The periodic and manually
 dispatchable `promote-release-ready.yml` reconciler reviews each candidate by
 its immutable SHA, not the moving branch tip. It advances the ref only when
-CI, Hourly CI, and Release analyzer validation all report terminal success;
+CI, Hourly CI, Release analyzer validation, and complete full-performance
+qualification all report terminal success;
 Release analyzer validation includes policy analysis and performance evidence
 whose artifact digest is verified. Promotion is a fast-forward only, records
 the evidence used, and never resets the performance baseline. If evidence is
-missing, pending, failed, or skipped, the branch stays where it is. Nightly and
-other full benchmark suites remain valuable but are not part of that promotion
-guarantee.
+missing, pending, failed, or skipped, the branch stays where it is. Full benchmark evidence must belong to the exact
+candidate, including all
+standard benchmark jobs. A green ancestor or manual diagnostic subset cannot
+qualify a newer commit. Nightly evidence, when present, must also pass.
+
+The daily Benchmark schedule supplies full evidence automatically. For an
+on-demand master or RC candidate, dispatch `full-performance.yml` at that exact
+branch head. This dedicated workflow has no subset or non-strict options and
+runs the same full benchmark jobs without tracing or notifications. Full
+reports carry source, manifest, baseline, binary and comparison digests; the
+qualifier verifies the GitHub artifact digest and those bindings. Older runs
+without this provenance cannot qualify. Arbitrary manual
+Benchmark diagnostics cannot qualify. If either trusted full-performance
+workflow has a run for the candidate, its latest attempt must pass; a second
+workflow cannot hide an existing failure. Rerun the failed workflow to replace
+its evidence after an infrastructure failure, or repair source at a new SHA.
+
+The 30-minute reconciler does not promise 30-minute qualification throughput:
+all evidence must meet on one source SHA. Projection checks full performance
+and digest-verified quick performance before building and immediately before
+publishing, using tooling from the workflow revision. A later failure revokes
+publication permission even for an already-promoted commit. Keep the protected
+ref in place and repair master; never roll it back. RC handoffs retain their
+manual quick-performance qualification path and require the dedicated full
+workflow too. Manual projection and workflow recovery cannot skip these gates.
 
 `release-ready` is operated by the reconciler, not edited by people. GitHub
 branch rules must reject deletion and non-fast-forward updates with no bypass
 actors. A new `release-ready` branch may be created only at a commit the same
 reconciler has qualified. Development fixes still land on `master`, which lets
 ordinary review and repair continue independently of promotion.
+
+A registered stabilization campaign can freeze a selected master ancestor
+while master development continues. Its registry is read from trusted master,
+not candidate code. The registered branch and immutable candidate SHA must
+agree. Each forward-only repair revision needs its own complete CI, executed
+Hourly matrix, policy, quick and full performance, classification and applicable
+auxiliary evidence. Newer failed or pending attempts remain blockers across
+both master and RC origins. Registration never erases a measured failure.
+
+The existing promotion workflow serializes campaign registration, candidate
+updates and promotion. While a campaign is active it cannot silently select
+another master source. The gate contract pins workflow/action/tooling inputs,
+coverage configuration, corpus pins, historical baseline and thresholds.
+An unexpected branch, registry or protected-ref change holds promotion.
+Promotion additionally requires the tested RC head to be integrated into master
+with its identity intact. Closing or explicitly withdrawing a campaign restores
+normal master discovery; every later source still requires exact qualification.
+RC creation and promotion do not authorize public projection, tagging or publication.
 
 Rust third-party license HTML is generated rather than committed. Release
 workflows generate it automatically. To inspect or package it locally, install
@@ -297,14 +355,15 @@ To cut a release:
    tag the RC commit only because its ordinary branch CI is green. Confirm that
    each release-only promotion gate has an equivalent pre-tag check, and run it
    on the frozen RC commit.
-7. Sync the release version projection and every stabilization fix from the RC
-   branch back to `master`. A release repair normally lands on `master` first;
-   it then follows the same checks and promotion rules before it can reach
-   `release-ready`. An RC-only fix is not complete until its equivalent has
-   landed on `master`; use a cherry-pick or an equivalent focused commit and
-   resolve any conflicts against current `master` deliberately. Changes that
-   land on `master` after the branch point remain outside the release unless
-   they are explicitly selected for the RC branch.
+7. Integrate the release version and stabilization history from the RC branch
+   into `master`, preserving the original RC commits. A registered stabilization
+   campaign requires the exact tested RC head to be an ancestor of master;
+   a squash or cherry-pick alone does not satisfy that check. Resolve integration
+   conflicts deliberately on master without importing unrelated changes into
+   the RC. A necessary candidate repair advances the RC and requires new exact
+   qualification. The designated reconciler then fast-forwards `release-ready`
+   directly to that fully qualified RC SHA, without creating an untested merge
+   commit on `release-ready`.
 8. After the RC branch is frozen and validated, project it to public `master`,
    qualify that public commit, and tag **the qualified public commit in
    `BrokkAi/bifrost`**. The tag does not go on the private RC commit and does

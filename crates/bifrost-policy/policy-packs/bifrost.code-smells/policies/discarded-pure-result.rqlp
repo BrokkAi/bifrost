@@ -1,0 +1,26 @@
+; A Java statement expression discards the reviewed return value of an
+; exact JDK 21 String.trim() call. The call-result-obligations relation checks
+; the selected JDK artifact and every feasible dispatch arm before a finding.
+(policy
+  :schema-version 1
+  :id "bifrost.correctness.discarded-pure-result"
+  :name "Discarded pure transformation result"
+  :message "the result of this reviewed pure String transformation is discarded"
+  :severity warning
+  :description "The exact JDK 21 String.trim() return value is unused by an expression statement or for-loop initializer/update. Expression lambdas remain incomplete until their functional return contract is proven. This diagnostic requires a reviewed pure-transformation obligation, exact result-use syntax, a selected JDK source artifact, and complete dispatch coverage. Calls with missing model or artifact evidence remain incomplete."
+  :help-uri "https://bifrost.brokk.ai/static-analysis-policies/#built-in-code-smell-pack"
+  :tags ["correctness" "java" "result-use"]
+  :analysis (analysis
+    :type assertion
+    (bind :name discarded
+      :query (rql :schema-version 1
+        (filter :where ((obligation_kind eq pure_transformation_value)
+                        (result_use eq discarded)
+                        (coverage eq exhaustive)
+                        (terminal eq false))
+          (language java
+            (call-result-obligations
+              (call-shape (call :callee "trim")))))))
+    (group :name by-call :by (discarded.id)
+      (aggregate :name discarded-results :op count))
+    (assert :group by-call :value discarded-results :cardinality (exactly 0))))

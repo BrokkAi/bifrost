@@ -237,6 +237,75 @@ fn indexed_postings_match_scan_results_in_every_structural_language() {
 }
 
 #[test]
+fn rust_inside_decl_owner_resolution_matches_between_scan_and_postings() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().canonicalize().expect("canonical root");
+    ProjectFile::new(root.clone(), "Cargo.toml")
+        .write("[package]\nname = \"owner-index\"\nversion = \"0.1.0\"\nedition = \"2024\"\n")
+        .expect("write manifest");
+    ProjectFile::new(root.clone(), "src/lib.rs")
+        .write("mod model;\nmod pricing;\n")
+        .expect("write crate root");
+    ProjectFile::new(root.clone(), "src/model.rs")
+        .write(
+            "pub struct PriceCalculator { pub subtotal: u64 }\n\
+             pub struct TaxCalculator { pub rate: u64 }\n",
+        )
+        .expect("write model source");
+    ProjectFile::new(root.clone(), "src/pricing.rs")
+        .write(
+            "use crate::model::{PriceCalculator, TaxCalculator};\n\n\
+             impl PriceCalculator { pub fn total() -> u64 { 10 } }\n\
+             impl TaxCalculator { pub fn total() -> u64 { 2 } }\n",
+        )
+        .expect("write impl source");
+    let project: Arc<dyn crate::analyzer::Project> =
+        Arc::new(TestProject::new(root, Language::Rust));
+    let workspace = WorkspaceAnalyzer::build_ephemeral_footgun(project, AnalyzerConfig::default())
+        .expect("build workspace");
+    let analyzer = workspace.analyzer();
+    let query = CodeQuery::from_source(
+        r#"(inside-decl
+              (class :name "PriceCalculator" :capture "owner"
+                     :has (declaration :name "subtotal"))
+              (method :name "total"))"#,
+    )
+    .expect("query");
+
+    let scan = execute_code_query_with_access_mode(
+        analyzer,
+        &query,
+        CodeQueryExecutionLimits::default(),
+        StructuralAccessMode::ScanOnly,
+        true,
+    )
+    .expect("scan query");
+    let indexed = execute_code_query_with_access_mode(
+        analyzer,
+        &query,
+        CodeQueryExecutionLimits::default(),
+        StructuralAccessMode::IndexedRequired,
+        true,
+    )
+    .expect("indexed query");
+
+    assert_eq!(
+        serde_json::to_value(&indexed.result).expect("indexed result JSON"),
+        serde_json::to_value(&scan.result).expect("scan result JSON")
+    );
+    assert_eq!(indexed.result.results.len(), 1, "{:#?}", indexed.result);
+    assert!(
+        indexed
+            .profile
+            .expect("indexed profile")
+            .access_path
+            .selected
+            .starts_with("posting:"),
+        "inside-decl root method must retain posting access"
+    );
+}
+
+#[test]
 fn scan_only_kotlin_seed_hydrates_from_durable_facts_after_workspace_reopen() {
     let temp = tempfile::tempdir().expect("temp dir");
     let root = temp.path().canonicalize().expect("canonical root");

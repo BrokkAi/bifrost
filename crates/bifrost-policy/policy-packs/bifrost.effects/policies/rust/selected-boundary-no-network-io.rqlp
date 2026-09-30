@@ -28,6 +28,12 @@
 ;    `function`; an associated function inside an `impl` block is a `method`:
 ;      (language rust (enclosing-decl (function :name "total")))
 ;      (language rust (enclosing-decl (method :name "total")))
+;    Qualify an associated function by the exact type that owns its impl when
+;    another type has a method with the same name:
+;      (language rust
+;        (enclosing-decl
+;          (inside-decl (class :name "PriceCalculator")
+;            (method :name "total"))))
 ; 3. Enable the policy: `bifrost --policy-id
 ;    bifrost.effects.rust.selected-boundary-no-network-io --fail-on error`.
 ;

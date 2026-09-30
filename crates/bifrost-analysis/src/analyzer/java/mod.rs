@@ -1,6 +1,10 @@
 mod adapter;
 mod cache;
 mod call_conversion;
+mod checked_exceptions;
+pub(crate) use call_conversion::{
+    JavaFormalShape, formal_shapes, parse_declaring_file, primitive_actual_type, primitive_converts,
+};
 mod clones;
 pub(crate) mod diagnostics;
 mod hierarchy;
@@ -11,6 +15,9 @@ use crate::analyzer::QueryToken;
 use crate::analyzer::Range;
 use crate::analyzer::store::LimitedQueryRows;
 use crate::analyzer::{AnalyzerQueryScope, QueryScope};
+pub use brokk_bifrost_jvm::java::structural::{
+    JavaCallResultUse, JavaCallResultUseIndex, JavaCallResultUseOpen,
+};
 
 use crate::analyzer::clone_detection::{
     CloneCandidateProfile, detect_structural_clone_smells, refine_clone_similarity_with_ast,
@@ -19,8 +26,8 @@ use crate::analyzer::common::{is_unparseable_source, language_for_file as file_l
 use crate::analyzer::languages::{
     DeadCodeBulkEdges, DeadCodeBulkPreflight, DeadCodeBulkProof, DeadCodeRouting, DeadCodeSupport,
     EdgePassId, EdgeSiteScanCtx, EdgeWeightScanCtx, LanguageEdgePass, LanguageEdgeSites,
-    LanguageEdgeWeights, LanguageSupport, analyzable_file_count, fqn_bulk_nodes,
-    overloaded_function_fqns, package_fq_name,
+    LanguageEdgeWeights, LanguageSupport, PatternBindingNameProvider, analyzable_file_count,
+    fqn_bulk_nodes, overloaded_function_fqns, package_fq_name,
 };
 use crate::analyzer::tree_sitter_analyzer::FileState;
 use crate::analyzer::usages::java_graph::{
@@ -55,6 +62,9 @@ use brokk_bifrost_jvm::java::graph_support::{
     JavaSource, java_constructor_context, java_extract_type_identifiers, java_package_name_of,
     resolve_java_forward_type_name, resolve_java_forward_type_name_candidates,
 };
+use brokk_bifrost_jvm::java::structural::{
+    java_parent_statement_body, java_switch_rule_value_expression_statement,
+};
 use brokk_bifrost_jvm::java::test_detection::detect_test_assertion_smells_java;
 use brokk_bifrost_jvm::proof::JvmRetainedExternalIndex;
 use cache::JavaMemoCaches;
@@ -71,6 +81,15 @@ pub struct JavaAnalyzer {
 crate::analyzer::impl_forward_query_provider!(JavaAnalyzer);
 
 impl JavaAnalyzer {
+    pub(crate) fn selected_jdk_home_for_file(
+        &self,
+        file: &ProjectFile,
+    ) -> Result<&std::path::Path, crate::analyzer::JvmSourceToolchainSelectionOpen> {
+        self.java_config
+            .standard_library_discovery
+            .selected_jdk_home_for_file(file)
+    }
+
     #[cfg(test)]
     pub(crate) fn relational_batch_reader_checkouts_for_test(&self) -> usize {
         self.inner
@@ -327,6 +346,15 @@ impl JavaAnalyzer {
         packs: Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>,
     ) -> JvmExternalDeclarations<'_> {
         JvmExternalDeclarations::new(self.external_declaration_index(), packs)
+    }
+
+    pub(crate) fn external_declarations_for_source_jdk(
+        &self,
+        packs: Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>,
+        artifact_sha256: &str,
+    ) -> JvmExternalDeclarations<'_> {
+        self.external_declarations(packs)
+            .select_jdk_artifact(artifact_sha256)
     }
 
     pub(crate) fn bulk_file_states(
@@ -1163,11 +1191,68 @@ impl crate::analyzer::AnalyzerTestHooks for JavaAnalyzer {
 
 static JAVA_USAGE_STRATEGY: JavaUsageGraphStrategy = JavaUsageGraphStrategy::new();
 
+fn executable_statement_kind(node: tree_sitter::Node<'_>) -> Option<&'static str> {
+    match node.kind() {
+        "block" | "constructor_body" => Some("block"),
+        "expression_statement" if java_switch_rule_value_expression_statement(node) => None,
+        "expression_statement" => Some(
+            if node
+                .named_child(0)
+                .is_some_and(|child| child.kind() == "switch_expression")
+            {
+                "switch"
+            } else {
+                "expression"
+            },
+        ),
+        "local_variable_declaration"
+            if !node
+                .parent()
+                .is_some_and(|parent| parent.kind() == "for_statement") =>
+        {
+            Some("local_declaration")
+        }
+        "explicit_constructor_invocation" => Some("constructor_invocation"),
+        "return_statement" => Some("return"),
+        "throw_statement" => Some("throw"),
+        "yield_statement" => Some("yield"),
+        "break_statement" => Some("break"),
+        "continue_statement" => Some("continue"),
+        "if_statement" => Some("if"),
+        "while_statement" => Some("while"),
+        "do_statement" => Some("do"),
+        "for_statement" => Some("for"),
+        "enhanced_for_statement" => Some("enhanced_for"),
+        "switch_expression"
+            if node
+                .parent()
+                .is_some_and(|parent| java_parent_statement_body(parent, node)) =>
+        {
+            Some("switch")
+        }
+        "try_statement" => Some("try"),
+        "try_with_resources_statement" => Some("try_with_resources"),
+        "synchronized_statement" => Some("synchronized"),
+        "labeled_statement" => Some("labeled"),
+        "assert_statement" => Some("assert"),
+        "empty_statement" => Some("empty"),
+        _ => None,
+    }
+}
+
 pub(crate) struct JavaSupport;
 
 impl LanguageSupport for JavaSupport {
     fn language(&self) -> Language {
         Language::Java
+    }
+
+    fn executable_statement_kind(&self, node: tree_sitter::Node<'_>) -> Option<&'static str> {
+        executable_statement_kind(node)
+    }
+
+    fn pattern_binding_name_provider(&self) -> Option<PatternBindingNameProvider> {
+        Some(brokk_bifrost_jvm::java::structural::java_pattern_binding_name)
     }
 
     fn call_argument_conversion_prover(
@@ -1198,6 +1283,25 @@ impl LanguageSupport for JavaSupport {
             spelling,
         )
         .is_some_and(|member| member.is_static() && member.is_compile_time_constant())
+    }
+
+    /// Answers from Java's checked-exception rules; see
+    /// [`checked_exceptions::call_cannot_reach_catch_parameter`].
+    fn call_cannot_reach_catch_parameter(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
+        source: &Arc<str>,
+        call: std::ops::Range<usize>,
+        catch_parameter: std::ops::Range<usize>,
+    ) -> bool {
+        checked_exceptions::call_cannot_reach_catch_parameter(
+            analyzer,
+            file,
+            source,
+            call,
+            catch_parameter,
+        )
     }
 
     /// Java keeps method names and variable names in separate namespaces (JLS

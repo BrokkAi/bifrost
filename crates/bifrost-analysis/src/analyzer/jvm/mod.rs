@@ -14,6 +14,7 @@ pub(crate) mod jmod_artifact;
 pub(crate) mod kotlin_artifact;
 pub(crate) mod realm_builder;
 pub(crate) mod scala_artifact;
+pub(crate) mod toolchains_document;
 pub(crate) mod topology;
 
 use brokk_bifrost_jvm::proof::{

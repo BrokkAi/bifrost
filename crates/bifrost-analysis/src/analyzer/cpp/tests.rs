@@ -707,6 +707,92 @@ int DecoyOuter::DecoyInner::method() const { return 3; }
     }
 }
 
+/// #3520: a nested terminal type's canonical `$` identity is a first-class
+/// `definitions` question. Extraction always indexed these declarations
+/// (`Top$Only`, `ns.Outer$Inner`); the exact-name *request* was the defect,
+/// because the shared client-path splitter takes `$` as segment text, so the
+/// owner/terminal boundary it asked the store for was `""` + `Top$Only`
+/// instead of the persisted `Top` + `Only`. The owner, member and literal-`$`
+/// control lookups around it already worked and must keep working.
+#[test]
+fn definitions_reach_nested_terminal_types_by_exact_name() {
+    let fixture = crate::inline_project::InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "nested.cpp",
+            "struct Top { struct Only { int b; }; };\n\
+             namespace ns { struct Outer { struct Inner { int a; }; }; }\n\
+             struct Dollar { int foo$bar; };\n\
+             struct Buck$Stop { int c; };\n",
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(fixture.project().clone());
+
+    let defined = |name: &str| {
+        let mut names: Vec<String> = analyzer
+            .definitions(name)
+            .map(|unit| unit.fq_name())
+            .collect();
+        names.sort();
+        names
+    };
+
+    // The defect: the nested terminal type's own canonical identity.
+    assert_eq!(defined("Top$Only"), ["Top$Only"]);
+    assert_eq!(defined("ns.Outer$Inner"), ["ns.Outer$Inner"]);
+    // Controls: owners and members, already working before the fix.
+    assert_eq!(defined("Top"), ["Top"]);
+    assert_eq!(defined("ns.Outer"), ["ns.Outer"]);
+    assert_eq!(defined("Top$Only.b"), ["Top$Only.b"]);
+    assert_eq!(defined("ns.Outer$Inner.a"), ["ns.Outer$Inner.a"]);
+    // A `$` inside a source identifier is not a nesting join (#2140). The
+    // identifier fallback has to keep answering both the member and the type.
+    assert_eq!(defined("Dollar.foo$bar"), ["Dollar.foo$bar"]);
+    assert_eq!(defined("Buck$Stop"), ["Buck$Stop"]);
+
+    // The multi-language lookup route asks through the language provider's
+    // rendered-name construction rather than its own splitter.
+    let lookup = crate::analyzer::AnalyzerDefinitionLookup::new(&analyzer, Language::Cpp);
+    let lookup_defined = |name: &str| {
+        let mut names: Vec<String> = lookup
+            .fqn(name)
+            .into_iter()
+            .map(|unit| unit.fq_name())
+            .collect();
+        names.sort();
+        names
+    };
+    assert_eq!(lookup_defined("Top$Only"), ["Top$Only"]);
+    assert_eq!(lookup_defined("ns.Outer$Inner"), ["ns.Outer$Inner"]);
+    assert_eq!(lookup_defined("Dollar.foo$bar"), ["Dollar.foo$bar"]);
+    assert_eq!(lookup_defined("Buck$Stop"), ["Buck$Stop"]);
+
+    // #3631: the source spelling uses `::`. The canonical `$` query above
+    // already answered; this one used to come back empty.
+    assert_eq!(defined("Top::Only"), ["Top$Only"]);
+    assert_eq!(defined("ns::Outer::Inner"), ["ns.Outer$Inner"]);
+    assert_eq!(defined("Top::Only::b"), ["Top$Only.b"]);
+    assert_eq!(defined("ns::Outer::Inner::a"), ["ns.Outer$Inner.a"]);
+
+    // The lookup route and both batched prefetches answer the `::` spelling
+    // with the same persisted rows. Each prefetch runs on a fresh lookup, so
+    // the point ask afterwards reads what that prefetch memoized.
+    assert_eq!(lookup_defined("Top::Only"), ["Top$Only"]);
+    let names = |units: Vec<CodeUnit>| {
+        let mut names: Vec<String> = units.into_iter().map(|unit| unit.fq_name()).collect();
+        names.sort();
+        names
+    };
+    let prefetched = crate::analyzer::AnalyzerDefinitionLookup::new(&analyzer, Language::Cpp);
+    prefetched.prefetch_fqns(&["Top::Only".to_string()]);
+    assert_eq!(names(prefetched.fqn("Top::Only")), ["Top$Only"]);
+    let prefetched = crate::analyzer::AnalyzerDefinitionLookup::new(&analyzer, Language::Cpp);
+    prefetched.prefetch_fqn_in_language(Language::Cpp, &["ns::Outer::Inner".to_string()]);
+    assert_eq!(
+        names(prefetched.fqn("ns::Outer::Inner")),
+        ["ns.Outer$Inner"]
+    );
+}
+
 #[test]
 fn retained_analyzer_reads_callable_facts_from_its_content_snapshot() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -1475,6 +1561,55 @@ mod header_c_projection_storage_tests {
             CodeUnitIndex::declarations(&analyzer, &header),
             analyzer.declarations_in_reading(&header, true),
             "the C view of an identical header is the file's own row-set"
+        );
+    }
+
+    #[test]
+    fn recovered_export_class_reparse_keeps_its_c_reading() {
+        let fixture = crate::inline_project::InlineTestProject::with_language(Language::Cpp)
+            .file(
+                "recovered.h",
+                r#"
+namespace api {
+
+/**
+* Doc comment
+*/
+class PROJECT_PUBLIC_API(2, 0) RecoveryOwner : public virtual BaseKey {
+   public:
+      /** Construct from a point. */
+      RecoveryOwner(const Group& group, const Point& point) : BaseKey(group, point) {}
+
+#if defined(PROJECT_HAS_LEGACY_POINT)
+      /** Construct from a legacy point. */
+      RecoveryOwner(const Group& group, const LegacyPoint& point) : BaseKey(group, point) {}
+#endif
+
+      struct RecoveredTag { int value; };
+      std::string algo_name() const override;
+      AlgorithmIdentifier algorithm_identifier() const override;
+};
+}
+"#,
+            )
+            .file("use.c", "#include \"recovered.h\"\n")
+            .build();
+        let header = fixture.file("recovered.h");
+        let analyzer = CppAnalyzer::from_project(fixture.project().clone());
+
+        let reading = analyzer
+            .c_reading(&header)
+            .expect("the recovered C tag must keep the alternate reading published");
+        assert!(
+            reading
+                .c_only
+                .iter()
+                .any(|unit| { unit.is_class() && unit.fq_name() == "api.RecoveredTag" })
+        );
+        assert!(
+            reading.cpp_only.iter().any(|unit| {
+                unit.is_class() && unit.fq_name() == "api.RecoveryOwner$RecoveredTag"
+            })
         );
     }
 

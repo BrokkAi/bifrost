@@ -663,6 +663,8 @@ pub(super) fn tested_boolean_bindings_from_copy_graph(
             }
             GuardPredicate::ConstantBoolean { .. }
             | GuardPredicate::OrderedIntegerComparison { .. }
+            | GuardPredicate::OrderedFloatComparison { .. }
+            | GuardPredicate::NanComparison { .. }
             | GuardPredicate::NullComparison { .. }
             | GuardPredicate::InstanceOf { .. }
             | GuardPredicate::ExactClass { .. }
@@ -742,6 +744,8 @@ fn guard_binding_and_true_fact(
         }
         GuardPredicate::ConstantBoolean { .. }
         | GuardPredicate::OrderedIntegerComparison { .. }
+        | GuardPredicate::OrderedFloatComparison { .. }
+        | GuardPredicate::NanComparison { .. }
         | GuardPredicate::NullComparison { .. }
         | GuardPredicate::InstanceOf { .. }
         | GuardPredicate::ExactClass { .. }

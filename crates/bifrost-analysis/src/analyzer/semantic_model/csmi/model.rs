@@ -14,6 +14,10 @@ pub const CSMI_PYTHON_PROFILE_ID: &str = "csmi.python";
 pub const CSMI_PYTHON_PROFILE_VERSION: &str = "0.1.0";
 pub const CSMI_PYTHON_PROFILE_SCHEMA: &str =
     "https://csmi.brokk.ai/schema/profiles/python/0.1/schema.json";
+pub const CSMI_TRANSFER_PARTITIONS_PROFILE_ID: &str = "csmi.transfer-partitions";
+pub const CSMI_TRANSFER_PARTITIONS_PROFILE_VERSION: &str = "0.1.0";
+pub const CSMI_TRANSFER_PARTITIONS_PROFILE_SCHEMA: &str =
+    "https://csmi.brokk.ai/schema/profiles/transfer-partitions/0.1/schema.json";
 
 pub const CSMI_SCHEMA_URI: &str = "https://csmi.brokk.ai/schema/0.1/schema.json";
 pub const CSMI_SEMANTIC_MODEL_VERSION: &str = "0.1";
@@ -1734,6 +1738,28 @@ pub struct CsmiCompletenessStatement {
     pub provenance: Vec<LocalId>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extensions: Vec<CsmiExtensionAttachment>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CsmiTransferPartitionScope {
+    pub callable: LocalId,
+    pub exit: CsmiTransferPartitionExit,
+    pub destination: CsmiOutputResultRoot,
+    pub source: CsmiTransferPartitionSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CsmiTransferPartitionExit {
+    #[serde(rename = "normal")]
+    Normal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum CsmiTransferPartitionSource {
+    AllInputs,
+    InputRoot { root: CsmiInputBoundaryRoot },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

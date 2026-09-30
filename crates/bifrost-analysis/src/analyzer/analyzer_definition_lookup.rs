@@ -22,6 +22,31 @@ type StructuredMemberLookupKey = (Language, FqName, String);
 
 pub(crate) trait ForwardQueryProvider {
     fn normalize_rendered_name(&self, fqn: &str) -> String;
+    /// The structured name a rendered spelling addresses, when the language's
+    /// own rendering rules disagree with the shared client-path splitter.
+    ///
+    /// `parse_symbol_path_fq` splits a client path on `::`, `.`, `\`, `/` and
+    /// `+`. A language that renders a *join* outside that set -- C++ spells a
+    /// nested class `Outer$Inner`, which persists as a `Type` + `Nested` pair
+    /// -- supplies the construction here so the exact-name query's
+    /// owner/terminal boundary is the persisted one. `None` (the default)
+    /// keeps the shared all-`Unknown` parse.
+    fn forward_rendered_name(&self, _rendered: &str) -> Option<RelationalName> {
+        None
+    }
+    /// Further persisted identities a source spelling names, beyond the one
+    /// [`Self::forward_rendered_name`] builds.
+    ///
+    /// The exact-name route keeps a row when its rendering equals the request,
+    /// which cannot hold when the source spelling and the canonical rendering
+    /// use different joins: C++ source writes `Top::Only` for the nested class
+    /// persisted and rendered as `Top$Only`. Each returned name is fully kinded,
+    /// so the route asks the store for it with the persisted owner/terminal
+    /// boundary and keeps a row whose structured identity equals it. Empty (the
+    /// default) adds no question.
+    fn forward_source_spelling_names(&self, _rendered: &str) -> Vec<FqName> {
+        Vec::new()
+    }
     /// Navigation candidates for a rendered name. Language adapters may admit
     /// source-spelling aliases beyond exact persisted identity.
     fn forward_definition_fqn(&self, fqn: &str) -> Vec<CodeUnit>;
@@ -332,9 +357,39 @@ impl<'a> AnalyzerDefinitionLookup<'a> {
         Some(RelationalName::stable(name))
     }
 
-    fn rendered_name(language: Language, rendered: &str) -> Option<RelationalName> {
+    fn rendered_name(&self, language: Language, rendered: &str) -> Option<RelationalName> {
+        if let Some(provider) = self.language_analyzer(language)
+            && let Some(name) = provider.forward_rendered_name(rendered)
+        {
+            return Some(name);
+        }
         let name = parse_symbol_path_fq(language, rendered, segment_interner());
         (!name.is_empty()).then(|| RelationalName::stable(name))
+    }
+
+    /// See [`ForwardQueryProvider::forward_source_spelling_names`].
+    fn source_spelling_names(&self, language: Language, rendered: &str) -> Vec<FqName> {
+        self.language_analyzer(language)
+            .map(|provider| provider.forward_source_spelling_names(rendered))
+            .unwrap_or_default()
+    }
+
+    /// The exact-name questions one rendered spelling asks: its rendered name,
+    /// then each of its source-spelling names.
+    fn exact_questions(
+        name: RelationalName,
+        spellings: &[FqName],
+    ) -> impl Iterator<Item = (RelationalName, RelationalDefinitionQuery)> + '_ {
+        std::iter::once(name)
+            .chain(spellings.iter().cloned().map(RelationalName::stable))
+            .map(|name| (name, RelationalDefinitionQuery::ExactName))
+    }
+
+    /// Whether `unit` answers an exact ask for `rendered`: its structured
+    /// identity is one of the spelling's source-spelling names, or its
+    /// rendering is the request itself.
+    fn answers_exact_request(unit: &CodeUnit, rendered: &str, spellings: &[FqName]) -> bool {
+        spellings.contains(unit.fq()) || unit.fq_name() == rendered
     }
 
     fn rendered_terminal(language: Language, rendered: &str) -> Option<String> {
@@ -467,17 +522,18 @@ impl<'a> AnalyzerDefinitionLookup<'a> {
     }
 
     fn exact_for_language(&self, rendered: &str, language: Language) -> Vec<CodeUnit> {
-        let Some(name) = Self::rendered_name(language, rendered) else {
+        let Some(name) = self.rendered_name(language, rendered) else {
             return Vec::new();
         };
-        let mut units = match self
-            .query_values(language, vec![(name, RelationalDefinitionQuery::ExactName)])
-            .pop()
-        {
-            Some(RelationalDefinitionValue::Definitions(units)) => units,
-            Some(_) => panic!("an exact-name query returned the wrong result shape"),
-            None => Vec::new(),
-        };
+        let spellings = self.source_spelling_names(language, rendered);
+        let mut units = self
+            .query_values(language, Self::exact_questions(name, &spellings).collect())
+            .into_iter()
+            .flat_map(|value| match value {
+                RelationalDefinitionValue::Definitions(units) => units,
+                _ => panic!("an exact-name query returned the wrong result shape"),
+            })
+            .collect::<Vec<_>>();
         // A rendered path-derived identity may address a content-stable tail
         // that hydrates under a different live mount. Only an authoritative
         // hydrated-name match makes the exact result complete. Otherwise
@@ -486,19 +542,19 @@ impl<'a> AnalyzerDefinitionLookup<'a> {
         // `.`). No normalized seek joins this round: this entry point promises
         // the exact rendered identity, and the encoding-agnostic question is
         // `by_normalized_fqn`, whose own seek already runs first there (#3299).
-        units.retain(|unit| unit.fq_name() == rendered);
+        units.retain(|unit| Self::answers_exact_request(unit, rendered, &spellings));
         if units.is_empty() {
             let identifiers = self.rendered_identifier_candidates(language, rendered);
             units.extend(self.identifier_candidates_for_spellings(language, &identifiers, None));
+            units.retain(|unit| Self::answers_exact_request(unit, rendered, &spellings));
         }
-        units.retain(|unit| unit.fq_name() == rendered);
         sort_units(&mut units);
         units.dedup();
         units
     }
 
     fn normalized_for_language(&self, normalized: &str, language: Language) -> Vec<CodeUnit> {
-        let Some(name) = Self::rendered_name(language, normalized) else {
+        let Some(name) = self.rendered_name(language, normalized) else {
             return Vec::new();
         };
         let mut units = match self
@@ -591,7 +647,8 @@ impl<'a> AnalyzerDefinitionLookup<'a> {
     /// relational reads per language instead of one point batch per name.
     ///
     /// The rounds are the same two questions [`Self::exact_for_language`]
-    /// asks per name -- an exact persisted-identity seek, then the identifier
+    /// asks per name -- an exact persisted-identity seek for the rendered name
+    /// and each of its source-spelling names, then the identifier
     /// compatibility view for the names the exact round missed -- with
     /// identical per-name filtering, so a memoized answer cannot differ from
     /// what the point path would compute. A cancelled or failed batch
@@ -618,11 +675,18 @@ impl<'a> AnalyzerDefinitionLookup<'a> {
 
             let mut exact_owners = Vec::new();
             let mut exact_questions = Vec::new();
+            let mut spellings_by_name = Vec::with_capacity(missing.len());
             for (index, fqn) in missing.iter().enumerate() {
-                if let Some(name) = Self::rendered_name(language, fqn) {
+                let Some(name) = self.rendered_name(language, fqn) else {
+                    spellings_by_name.push(Vec::new());
+                    continue;
+                };
+                let spellings = self.source_spelling_names(language, fqn);
+                for question in Self::exact_questions(name, &spellings) {
                     exact_owners.push(index);
-                    exact_questions.push((name, RelationalDefinitionQuery::ExactName));
+                    exact_questions.push(question);
                 }
+                spellings_by_name.push(spellings);
             }
             // A name the language cannot even render as a path resolves to
             // nothing without a fallback, exactly as the point path answers.
@@ -638,7 +702,7 @@ impl<'a> AnalyzerDefinitionLookup<'a> {
                     parseable[owner] = true;
                     match value {
                         RelationalDefinitionValue::Definitions(units) => {
-                            units_by_name[owner] = units;
+                            units_by_name[owner].extend(units);
                         }
                         _ => panic!("an exact-name query returned the wrong result shape"),
                     }
@@ -648,7 +712,9 @@ impl<'a> AnalyzerDefinitionLookup<'a> {
             let mut fallback: Vec<(usize, std::ops::Range<usize>, Vec<String>)> = Vec::new();
             let mut fallback_questions = Vec::new();
             for (index, fqn) in missing.iter().enumerate() {
-                units_by_name[index].retain(|unit| unit.fq_name() == *fqn);
+                units_by_name[index].retain(|unit| {
+                    Self::answers_exact_request(unit, fqn, &spellings_by_name[index])
+                });
                 if !parseable[index] || !units_by_name[index].is_empty() {
                     continue;
                 }
@@ -671,7 +737,13 @@ impl<'a> AnalyzerDefinitionLookup<'a> {
                         .collect::<Vec<_>>();
                     units_by_name[index] =
                         Self::identifier_units_from_values(&identifiers, name_values);
-                    units_by_name[index].retain(|unit| unit.fq_name() == missing[index]);
+                    units_by_name[index].retain(|unit| {
+                        Self::answers_exact_request(
+                            unit,
+                            &missing[index],
+                            &spellings_by_name[index],
+                        )
+                    });
                 }
             }
 
@@ -714,27 +786,41 @@ impl<'a> AnalyzerDefinitionLookup<'a> {
             return;
         }
         let mut queries = Vec::with_capacity(pending_fqns.len());
+        let mut query_owners = Vec::with_capacity(pending_fqns.len());
         let mut named_fqns = Vec::with_capacity(pending_fqns.len());
         for fqn in pending_fqns {
-            let Some(name) = Self::rendered_name(language, &fqn) else {
+            let Some(name) = self.rendered_name(language, &fqn) else {
                 continue;
             };
-            queries.push((name, RelationalDefinitionQuery::ExactName));
-            named_fqns.push(fqn);
+            let spellings = self.source_spelling_names(language, &fqn);
+            for question in Self::exact_questions(name, &spellings) {
+                queries.push(question);
+                query_owners.push(named_fqns.len());
+            }
+            named_fqns.push((fqn, spellings));
         }
         if queries.is_empty() {
             return;
         }
+        let expected = queries.len();
         let results = self.query_values(language, queries);
-        let mut misses = Vec::new();
-        for (fqn, value) in named_fqns.into_iter().zip(results) {
-            let mut units = match value {
-                RelationalDefinitionValue::Definitions(units) => units,
+        if results.len() != expected {
+            return;
+        }
+        let mut units_by_name: Vec<Vec<CodeUnit>> = vec![Vec::new(); named_fqns.len()];
+        for (owner, value) in query_owners.into_iter().zip(results) {
+            match value {
+                RelationalDefinitionValue::Definitions(units) => {
+                    units_by_name[owner].extend(units);
+                }
                 _ => panic!("an exact-name query returned the wrong result shape"),
-            };
-            units.retain(|unit| unit.fq_name() == fqn);
+            }
+        }
+        let mut misses = Vec::new();
+        for ((fqn, spellings), mut units) in named_fqns.into_iter().zip(units_by_name) {
+            units.retain(|unit| Self::answers_exact_request(unit, &fqn, &spellings));
             if units.is_empty() {
-                misses.push(fqn);
+                misses.push((fqn, spellings));
             } else {
                 sort_units(&mut units);
                 units.dedup();
@@ -758,7 +844,7 @@ impl<'a> AnalyzerDefinitionLookup<'a> {
         let mut fallback_queries = Vec::new();
         let mut fallback_owner = Vec::new();
         let mut identifiers_by_fqn = Vec::with_capacity(misses.len());
-        for fqn in &misses {
+        for (fqn, _) in &misses {
             let identifiers = self.rendered_identifier_candidates(language, fqn);
             for identifier in &identifiers {
                 if let Some(name) = Self::identifier_name(identifier) {
@@ -803,14 +889,14 @@ impl<'a> AnalyzerDefinitionLookup<'a> {
                 }
             }
         }
-        for (fqn, (identifiers, mut units)) in misses
+        for ((fqn, spellings), (identifiers, mut units)) in misses
             .into_iter()
             .zip(identifiers_by_fqn.into_iter().zip(units_by_fqn))
         {
             units.retain(|unit| {
                 identifiers.iter().any(|identifier| {
                     crate::analyzer::common::identifier_addresses_target(unit, identifier)
-                }) && unit.fq_name() == fqn
+                }) && Self::answers_exact_request(unit, &fqn, &spellings)
             });
             sort_units(&mut units);
             units.dedup();

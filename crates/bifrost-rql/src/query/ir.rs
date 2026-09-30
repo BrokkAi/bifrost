@@ -1,6 +1,7 @@
 use super::domain::ConfigurationFormat;
 use super::schema::{
-    CallTraversalCompleteness, CodeQueryExecutionMode, QueryStepOp, RuntimeKeyKind,
+    CallTraversalCompleteness, CodeQueryExecutionMode, QuerySemanticFacet, QueryStepOp,
+    RuntimeKeyKind,
 };
 use crate::refs::{ProtocolRef, TaintResultRef, ValueFlowPlanRef};
 use crate::structural::{CodeQueryRowField, CodeQueryRowScalarType, DetailedCodeQueryDomain};
@@ -277,10 +278,12 @@ pub enum QueryValueKind {
     CallBinding,
     CallEffect,
     CallResultContract,
+    CallResultObligation,
     ResultContractUse,
     ResultContractFailureUse,
     NilnessOperation,
     SwitchCoverage,
+    AssignmentRelation,
     DetachedTaskTransfer,
     ProcedureEffect,
     CallableSignature,
@@ -302,6 +305,10 @@ pub enum QueryValueKind {
     StateEvent,
     FlowRelation,
     ControlRelation,
+    BranchRelation,
+    LoopRelation,
+    FailureHandlerState,
+    StatementReachability,
     Guard,
     SourceSet,
     BuildTarget,
@@ -350,10 +357,12 @@ impl QueryValueKind {
             Self::CallBinding => "call_binding",
             Self::CallEffect => "call_effect",
             Self::CallResultContract => "call_result_contract",
+            Self::CallResultObligation => "call_result_obligation",
             Self::ResultContractUse => "result_contract_use",
             Self::ResultContractFailureUse => "result_contract_failure_use",
             Self::NilnessOperation => "nilness_operation",
             Self::SwitchCoverage => "switch_coverage",
+            Self::AssignmentRelation => "assignment_relation",
             Self::DetachedTaskTransfer => "detached_task_transfer",
             Self::ProcedureEffect => "procedure_effect",
             Self::CallableSignature => "callable_signature",
@@ -375,6 +384,10 @@ impl QueryValueKind {
             Self::StateEvent => "state_event",
             Self::FlowRelation => "flow_relation",
             Self::ControlRelation => "control_relation",
+            Self::BranchRelation => "branch_relation",
+            Self::LoopRelation => "loop_relation",
+            Self::FailureHandlerState => "failure_handler_state",
+            Self::StatementReachability => "statement_reachability",
             Self::Guard => "guard",
             Self::SourceSet => "source_set",
             Self::BuildTarget => "build_target",
@@ -683,9 +696,95 @@ pub struct ControlRelationFilter {
     pub exit_partitions: Vec<ControlExitPartition>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssignmentRelationKind {
+    SelfAssignment,
+    FailedSwap,
+    OverwrittenUnread,
+}
+
+impl AssignmentRelationKind {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::SelfAssignment => "self_assignment",
+            Self::FailedSwap => "failed_swap",
+            Self::OverwrittenUnread => "overwritten_unread",
+        }
+    }
+
+    pub fn from_label(label: &str) -> Option<Self> {
+        match label {
+            "self_assignment" => Some(Self::SelfAssignment),
+            "failed_swap" => Some(Self::FailedSwap),
+            "overwritten_unread" => Some(Self::OverwrittenUnread),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AssignmentRelationFilter {
+    pub relations: Vec<AssignmentRelationKind>,
+}
+
+impl AssignmentRelationFilter {
+    pub fn includes(&self, relation: AssignmentRelationKind) -> bool {
+        if self.relations.is_empty() {
+            relation == AssignmentRelationKind::SelfAssignment
+        } else {
+            self.relations.contains(&relation)
+        }
+    }
+}
+
 impl ControlRelationFilter {
     pub fn is_empty(&self) -> bool {
         self.relations.is_empty() && self.exit_partitions.is_empty()
+    }
+}
+
+/// Relation families accepted by the branch-relations step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BranchRelationKind {
+    IdenticalBodies,
+    RepeatedCondition,
+    ContradictoryCondition,
+    SubsumedCondition,
+    RedundantBooleanReturn,
+}
+
+impl BranchRelationKind {
+    pub const ALL: &[Self] = &[
+        Self::IdenticalBodies,
+        Self::RepeatedCondition,
+        Self::ContradictoryCondition,
+        Self::SubsumedCondition,
+        Self::RedundantBooleanReturn,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::IdenticalBodies => "identical_bodies",
+            Self::RepeatedCondition => "repeated_condition",
+            Self::ContradictoryCondition => "contradictory_condition",
+            Self::SubsumedCondition => "subsumed_condition",
+            Self::RedundantBooleanReturn => "redundant_boolean_return",
+        }
+    }
+
+    pub fn from_label(label: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|kind| kind.label() == label)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BranchRelationFilter {
+    pub relations: Vec<BranchRelationKind>,
+}
+
+impl BranchRelationFilter {
+    pub fn accepts(&self, label: &str) -> bool {
+        self.relations.is_empty() || self.relations.iter().any(|kind| kind.label() == label)
     }
 }
 
@@ -1119,11 +1218,13 @@ pub enum QueryStep {
     CallEffects,
     ResultContractCalls,
     CallResultContracts,
+    CallResultObligations,
     ResultContractUses,
     ResultContractOperationUses,
     ResultContractFailureUses(ResultContractFailureUseFilter),
     NilnessOperations,
     SwitchCoverage,
+    AssignmentRelations(AssignmentRelationFilter),
     DetachedTaskTransfers,
     ProcedureEffects,
     CallableSignature,
@@ -1155,6 +1256,10 @@ pub enum QueryStep {
     FlowSource,
     FlowTarget,
     ControlRelations(ControlRelationFilter),
+    BranchRelations(BranchRelationFilter),
+    LoopRelations,
+    FailureHandlerState,
+    StatementReachability,
     GuardsOf,
     TargetOf,
     SourceSetOf,
@@ -1608,6 +1713,26 @@ impl QueryStep {
         self.op().label()
     }
 
+    /// Semantic work is needed only when this selection asks for a scalar
+    /// condition proof; the structural branch families do not materialize IR.
+    pub fn semantic_facets(&self) -> &'static [QuerySemanticFacet] {
+        match self {
+            Self::BranchRelations(filter)
+                if filter.relations.is_empty()
+                    || filter
+                        .relations
+                        .contains(&BranchRelationKind::ContradictoryCondition) =>
+            {
+                &[
+                    QuerySemanticFacet::Procedures,
+                    QuerySemanticFacet::ProgramPoints,
+                    QuerySemanticFacet::ControlEdges,
+                ]
+            }
+            _ => self.op().semantic_facets(),
+        }
+    }
+
     pub fn op(&self) -> QueryStepOp {
         match self {
             Self::Filter(_) => QueryStepOp::Filter,
@@ -1660,11 +1785,13 @@ impl QueryStep {
             Self::CallEffects => QueryStepOp::CallEffects,
             Self::ResultContractCalls => QueryStepOp::ResultContractCalls,
             Self::CallResultContracts => QueryStepOp::CallResultContracts,
+            Self::CallResultObligations => QueryStepOp::CallResultObligations,
             Self::ResultContractUses => QueryStepOp::ResultContractUses,
             Self::ResultContractOperationUses => QueryStepOp::ResultContractOperationUses,
             Self::ResultContractFailureUses(_) => QueryStepOp::ResultContractFailureUses,
             Self::NilnessOperations => QueryStepOp::NilnessOperations,
             Self::SwitchCoverage => QueryStepOp::SwitchCoverage,
+            Self::AssignmentRelations(_) => QueryStepOp::AssignmentRelations,
             Self::DetachedTaskTransfers => QueryStepOp::DetachedTaskTransfers,
             Self::ProcedureEffects => QueryStepOp::ProcedureEffects,
             Self::CallableSignature => QueryStepOp::CallableSignature,
@@ -1702,6 +1829,10 @@ impl QueryStep {
             Self::FlowSource => QueryStepOp::FlowSource,
             Self::FlowTarget => QueryStepOp::FlowTarget,
             Self::ControlRelations(_) => QueryStepOp::ControlRelations,
+            Self::BranchRelations(_) => QueryStepOp::BranchRelations,
+            Self::LoopRelations => QueryStepOp::LoopRelations,
+            Self::FailureHandlerState => QueryStepOp::FailureHandlerState,
+            Self::StatementReachability => QueryStepOp::StatementReachability,
             Self::GuardsOf => QueryStepOp::GuardsOf,
             Self::TargetOf => QueryStepOp::TargetOf,
             Self::SourceSetOf => QueryStepOp::SourceSetOf,
@@ -1776,6 +1907,7 @@ impl QueryStep {
             QueryStepOp::CallEffects => Some(Self::CallEffects),
             QueryStepOp::ResultContractCalls => Some(Self::ResultContractCalls),
             QueryStepOp::CallResultContracts => Some(Self::CallResultContracts),
+            QueryStepOp::CallResultObligations => Some(Self::CallResultObligations),
             QueryStepOp::ResultContractUses => Some(Self::ResultContractUses),
             QueryStepOp::ResultContractOperationUses => Some(Self::ResultContractOperationUses),
             QueryStepOp::ResultContractFailureUses => Some(Self::ResultContractFailureUses(
@@ -1783,6 +1915,9 @@ impl QueryStep {
             )),
             QueryStepOp::NilnessOperations => Some(Self::NilnessOperations),
             QueryStepOp::SwitchCoverage => Some(Self::SwitchCoverage),
+            QueryStepOp::AssignmentRelations => Some(Self::AssignmentRelations(
+                AssignmentRelationFilter::default(),
+            )),
             QueryStepOp::DetachedTaskTransfers => Some(Self::DetachedTaskTransfers),
             QueryStepOp::ProcedureEffects => Some(Self::ProcedureEffects),
             QueryStepOp::CallableSignature => Some(Self::CallableSignature),
@@ -1821,9 +1956,15 @@ impl QueryStep {
             QueryStepOp::SourceSetOf => Some(Self::SourceSetOf),
             QueryStepOp::TopologyEdgesOf => Some(Self::TopologyEdgesOf),
             QueryStepOp::GuardsOf => Some(Self::GuardsOf),
+            QueryStepOp::FailureHandlerState => Some(Self::FailureHandlerState),
             QueryStepOp::ControlRelations => {
                 Some(Self::ControlRelations(ControlRelationFilter::default()))
             }
+            QueryStepOp::BranchRelations => {
+                Some(Self::BranchRelations(BranchRelationFilter::default()))
+            }
+            QueryStepOp::LoopRelations => Some(Self::LoopRelations),
+            QueryStepOp::StatementReachability => Some(Self::StatementReachability),
             QueryStepOp::RewritePathsOf => Some(Self::RewritePathsOf(RewritePathFilter::default())),
             QueryStepOp::SegmentsOf => Some(Self::SegmentsOf(SegmentsOfOptions::default())),
             QueryStepOp::SegmentTarget => Some(Self::SegmentTarget),
@@ -1908,6 +2049,7 @@ impl QueryStep {
                 | QueryValueKind::CallBinding
                 | QueryValueKind::CallEffect
                 | QueryValueKind::CallResultContract
+                | QueryValueKind::CallResultObligation
                 | QueryValueKind::ResultContractUse
                 | QueryValueKind::ResultContractFailureUse
                 | QueryValueKind::ProcedureEffect
@@ -1926,7 +2068,11 @@ impl QueryStep {
                 | QueryValueKind::Binding
                 | QueryValueKind::QualifiedPath
                 | QueryValueKind::PathSegment
-                | QueryValueKind::StateEvent,
+                | QueryValueKind::StateEvent
+                | QueryValueKind::BranchRelation
+                | QueryValueKind::LoopRelation
+                | QueryValueKind::FailureHandlerState
+                | QueryValueKind::StatementReachability,
             ) => Some(QueryValueKind::File),
             (Self::ImportsOf | Self::ImportersOf, QueryValueKind::File) => {
                 Some(QueryValueKind::File)
@@ -2021,6 +2167,9 @@ impl QueryStep {
             (Self::CallResultContracts, QueryValueKind::CallShape) => {
                 Some(QueryValueKind::CallResultContract)
             }
+            (Self::CallResultObligations, QueryValueKind::CallShape) => {
+                Some(QueryValueKind::CallResultObligation)
+            }
             (Self::ResultContractUses, QueryValueKind::CallResultContract) => {
                 Some(QueryValueKind::CallResultContract)
             }
@@ -2035,6 +2184,9 @@ impl QueryStep {
             }
             (Self::SwitchCoverage, QueryValueKind::Procedure) => {
                 Some(QueryValueKind::SwitchCoverage)
+            }
+            (Self::AssignmentRelations(_), QueryValueKind::Procedure) => {
+                Some(QueryValueKind::AssignmentRelation)
             }
             (Self::DetachedTaskTransfers, QueryValueKind::Procedure) => {
                 Some(QueryValueKind::DetachedTaskTransfer)
@@ -2145,6 +2297,16 @@ impl QueryStep {
             (Self::ControlRelations(_), QueryValueKind::Procedure) => {
                 Some(QueryValueKind::ControlRelation)
             }
+            (Self::FailureHandlerState, QueryValueKind::StructuralMatch) => {
+                Some(QueryValueKind::FailureHandlerState)
+            }
+            (Self::BranchRelations(_), QueryValueKind::StructuralMatch) => {
+                Some(QueryValueKind::BranchRelation)
+            }
+            (Self::LoopRelations, QueryValueKind::Procedure) => Some(QueryValueKind::LoopRelation),
+            (Self::StatementReachability, QueryValueKind::Procedure) => {
+                Some(QueryValueKind::StatementReachability)
+            }
             (Self::GuardsOf, QueryValueKind::Procedure) => Some(QueryValueKind::Guard),
             // Project topology (#2448). A file's owner is what the build
             // declares about it, so both ownership steps are seeded from a
@@ -2233,7 +2395,7 @@ fn validate_query_steps(
             QueryStep::Taint(_) => "procedure",
             QueryStep::Witness(_) => "typestate_finding, flow_endpoint, or absent_member_finding",
             QueryStep::FileOf => {
-                "structural_match, declaration, procedure, program_point, control_edge, typestate_finding, typestate_witness, flow_endpoint, flow_witness, class_set_row, absent_member_finding, absent_member_witness, taint_finding, reference_site, call_site, expression_site, jsx_attribute_value, receiver_analysis, receiver_outcome, receiver_evidence, result_contract_failure_use, occurrence, lexical_scope, or binding"
+                "structural_match, declaration, procedure, program_point, control_edge, branch_relation, typestate_finding, typestate_witness, flow_endpoint, flow_witness, class_set_row, absent_member_finding, absent_member_witness, taint_finding, reference_site, call_site, expression_site, jsx_attribute_value, receiver_analysis, receiver_outcome, receiver_evidence, result_contract_failure_use, occurrence, lexical_scope, or binding"
             }
             QueryStep::ImportsOf | QueryStep::ImportersOf => "file",
             QueryStep::Supertypes(_)
@@ -2271,11 +2433,13 @@ fn validate_query_steps(
             QueryStep::CallEffects => "call_shape",
             QueryStep::ResultContractCalls => "call_shape",
             QueryStep::CallResultContracts => "call_shape",
+            QueryStep::CallResultObligations => "call_shape",
             QueryStep::ResultContractUses
             | QueryStep::ResultContractOperationUses
             | QueryStep::ResultContractFailureUses(_) => "call_result_contract",
             QueryStep::NilnessOperations => "procedure",
             QueryStep::SwitchCoverage => "procedure",
+            QueryStep::AssignmentRelations(_) => "procedure",
             QueryStep::DetachedTaskTransfers => "procedure",
             QueryStep::ProcedureEffects => "declaration",
             QueryStep::CallableSignature => "declaration",
@@ -2305,6 +2469,8 @@ fn validate_query_steps(
             QueryStep::FlowRelationsOf(_) => "state_event or procedure",
             QueryStep::FlowSource | QueryStep::FlowTarget => "flow_relation",
             QueryStep::ControlRelations(_) => "procedure",
+            QueryStep::BranchRelations(_) | QueryStep::FailureHandlerState => "structural_match",
+            QueryStep::LoopRelations | QueryStep::StatementReachability => "procedure",
             QueryStep::GuardsOf => "procedure",
             QueryStep::TargetOf | QueryStep::SourceSetOf => "file",
             QueryStep::TopologyEdgesOf => "build_target",
@@ -2668,7 +2834,8 @@ pub struct CodeQuerySeed {
     /// The root match must be lexically contained in a node matching this.
     pub inside: Option<Pattern>,
     /// The root match must be inside a matching ancestor without crossing an
-    /// intervening callable declaration.
+    /// intervening callable declaration. Rust impl members can also match the
+    /// resolved type declaration that owns the impl.
     pub inside_decl: Option<Pattern>,
     /// Verifier-only negative containment: never used for candidate pruning.
     pub not_inside: Option<Pattern>,

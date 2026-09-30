@@ -3456,6 +3456,10 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
         .map(|node| (node.primary.clone(), node.primary_range))
         .collect();
     let mut files_by_id: HashMap<DeclarationId, HashSet<ProjectFile>> = HashMap::default();
+    // `declarations` holds one primary per node, so each layer catalog groups
+    // only primaries. The other members of a merged C++ or C# node are joined
+    // back to it through this map (#3671).
+    let mut merged_members: HashMap<DeclarationId, DeclarationId> = HashMap::default();
     let mut frontier: BTreeSet<DeclarationId> = BTreeSet::new();
     for node in &root_catalog.nodes {
         frontier.insert(node.key.id.clone());
@@ -3463,6 +3467,12 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
             .entry(node.key.id.clone())
             .or_default()
             .extend(node.declaration_files.iter().cloned());
+        merged_members.extend(
+            node.declaration_ids
+                .iter()
+                .filter(|id| **id != node.key.id)
+                .map(|id| (id.clone(), node.key.id.clone())),
+        );
     }
     let mut visited = frontier.clone();
 
@@ -3515,7 +3525,7 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
             .is_none_or(|(built_len, _)| *built_len != declarations.len())
         {
             let _scope = profiling::scope("usage_graph::layer_catalog_build");
-            let catalog = WorkspaceUsageCatalog::from_declarations(
+            let mut catalog = WorkspaceUsageCatalog::from_declarations(
                 declarations
                     .iter()
                     .map(|(unit, _)| (unit.clone(), None))
@@ -3523,6 +3533,7 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
                 &CancellationToken::default(),
             )
             .expect("uncancelled exact layer catalog construction");
+            catalog.join_members(&merged_members);
             layer_catalog_once = Some((declarations.len(), catalog));
         }
         let layer_catalog = &layer_catalog_once.as_ref().unwrap().1;
@@ -4197,13 +4208,21 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
                                 .filter(|unit| unit.fq_name() == from_name)
                         })
                         .or_else(|| {
+                            // A merged node declares in every member's file,
+                            // not only in its primary's.
                             let callers = declarations
                                 .iter()
                                 .map(|(unit, _)| unit)
                                 .filter(|unit| {
                                     UsageEcosystem::of(language_for_target(unit)) == ecosystem
                                         && unit.fq_name() == from_name
-                                        && rel_path_string(unit.source()) == site.path
+                                        && files_by_id.get(&unit.declaration_id()).is_some_and(
+                                            |files| {
+                                                files
+                                                    .iter()
+                                                    .any(|file| rel_path_string(file) == site.path)
+                                            },
+                                        )
                                 })
                                 .cloned()
                                 .collect::<Vec<_>>();
@@ -4261,10 +4280,10 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
                     else {
                         continue;
                     };
-                    let Some(target) = canonical_graph_unit_for_id(&endpoints, &resolved_to_id)
-                    else {
+                    let Some(target_node) = graph_node_for_id(&endpoints, &resolved_to_id) else {
                         continue;
                     };
+                    let target = target_node.primary;
                     let from_id = source.declaration_id();
                     let to_id = target.declaration_id();
                     if !frontier.contains(&from_id) || from_id == to_id {
@@ -4275,7 +4294,14 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
                         files_by_id
                             .entry(to_id.clone())
                             .or_default()
-                            .insert(target.source().clone());
+                            .extend(target_node.declaration_files);
+                        merged_members.extend(
+                            target_node
+                                .declaration_ids
+                                .into_iter()
+                                .filter(|id| *id != to_id)
+                                .map(|id| (id, to_id.clone())),
+                        );
                         let range = analyzer
                             .ranges(&target)
                             .into_iter()
@@ -4475,13 +4501,17 @@ fn unique_graph_unit(units: &[CodeUnit]) -> Option<CodeUnit> {
 }
 
 fn canonical_graph_unit_for_id(units: &[CodeUnit], id: &DeclarationId) -> Option<CodeUnit> {
-    let catalog = WorkspaceUsageCatalog::from_declarations(
+    graph_node_for_id(units, id).map(|node| node.primary)
+}
+
+/// The graph node among `units` that the declaration `id` belongs to.
+fn graph_node_for_id(units: &[CodeUnit], id: &DeclarationId) -> Option<WorkspaceUsageNode> {
+    let mut catalog = WorkspaceUsageCatalog::from_declarations(
         units.iter().cloned().map(|unit| (unit, None)).collect(),
         &CancellationToken::default(),
     )?;
-    catalog
-        .index_for_id(id)
-        .map(|index| catalog.nodes[index].primary.clone())
+    let index = catalog.index_for_id(id)?;
+    Some(catalog.nodes.swap_remove(index))
 }
 
 fn inverse_target_has_unique_callable_shape(

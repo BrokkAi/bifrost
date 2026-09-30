@@ -462,8 +462,9 @@ fn scoped_dynamic_write(
     procedure: &ProcedureHandle,
     node: Node<'_>,
     name: DynamicMemberName,
-    source: &str,
+    prepared: &PreparedSyntaxTree,
 ) -> DynamicFieldWrite {
+    let source = prepared.source();
     if let DynamicMemberName::Member(member) = name {
         return DynamicFieldWrite::Member(member);
     }
@@ -517,9 +518,10 @@ fn scoped_dynamic_write(
                                 .map(|argument| argument.value),
                             _ if matches!(
                                 builtin_class_reference(
+                                    python_analyzer(workspace),
                                     overlay_of(workspace).as_deref(),
                                     object,
-                                    source,
+                                    prepared,
                                     &mut ExternalClassCache::default()
                                 ),
                                 Some(ClassSeed::Class(_))
@@ -995,7 +997,7 @@ fn exact_external_base(
             Some(identity) => identity,
             None => {
                 let ClassSeed::Class(identity) =
-                    builtin_class_reference(overlay, base, prepared.source(), cache)?
+                    builtin_class_reference(python, overlay, base, &prepared, cache)?
                 else {
                     return None;
                 };
@@ -1052,6 +1054,7 @@ fn collect_guard_class_nodes<'tree>(node: Node<'tree>, nodes: &mut Vec<Node<'tre
 /// no lexical or module binding competes with it, which is the same proof a
 /// builtin base spelling needs.
 fn exact_builtin_class(
+    python: &PythonAnalyzer,
     reference: Node<'_>,
     prepared: &PreparedSyntaxTree,
     overlay: Option<&SemanticModelOverlay>,
@@ -1068,17 +1071,81 @@ fn exact_builtin_class(
     if identity.qualified_name() != format!("builtins.{name}") {
         return None;
     }
-    builtin_base_is_unshadowed(reference, prepared.source())?.then_some(identity)
+    indexed_builtin_is_unshadowed(python, reference, prepared)?.then_some(identity)
+}
+
+/// Completed lexical facts are independent of models and workspace bindings.
+/// Exact source bytes and the reference position determine the answer. Keep
+/// them for one query only; an interrupted bounded walk never supplies a fact.
+#[derive(Default)]
+struct PythonBuiltinShadowRequestMemo {
+    answers: Mutex<HashMap<([u8; 32], SourceSpan), bool>>,
+    #[cfg(test)]
+    walks: std::sync::atomic::AtomicUsize,
+}
+
+impl PythonBuiltinShadowRequestMemo {
+    fn unshadowed(
+        &self,
+        reference: Node<'_>,
+        prepared: &PreparedSyntaxTree,
+        session: &ResolutionSession,
+    ) -> Option<bool> {
+        if !session.scope_step() {
+            return None;
+        }
+        let key = (prepared.source_sha256(), span_for_node(reference));
+        if let Some(answer) = self
+            .answers
+            .lock()
+            .expect("builtin shadow memo lock poisoned")
+            .get(&key)
+            .copied()
+        {
+            return Some(answer);
+        }
+        #[cfg(test)]
+        self.walks
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let answer = builtin_base_is_unshadowed_bounded(reference, prepared.source(), session)?;
+        self.answers
+            .lock()
+            .expect("builtin shadow memo lock poisoned")
+            .insert(key, answer);
+        Some(answer)
+    }
+}
+
+fn indexed_builtin_is_unshadowed(
+    python: &PythonAnalyzer,
+    reference: Node<'_>,
+    prepared: &PreparedSyntaxTree,
+) -> Option<bool> {
+    let cancellation = python.inner.active_query_cancellation();
+    let session = ResolutionSession::bounded(INTERACTIVE_TYPE_LOOKUP_BUDGET, cancellation.as_ref());
+    if let Some(memo) = python.active_query_request_memo::<PythonBuiltinShadowRequestMemo>() {
+        memo.unshadowed(reference, prepared, &session)
+    } else {
+        builtin_base_is_unshadowed_bounded(reference, prepared.source(), &session)
+    }
 }
 
 pub(super) fn builtin_base_is_unshadowed(reference: Node<'_>, source: &str) -> Option<bool> {
+    let session = ResolutionSession::bounded(INTERACTIVE_TYPE_LOOKUP_BUDGET, None);
+    builtin_base_is_unshadowed_bounded(reference, source, &session)
+}
+
+fn builtin_base_is_unshadowed_bounded(
+    reference: Node<'_>,
+    source: &str,
+    session: &ResolutionSession,
+) -> Option<bool> {
     let name = reference.utf8_text(source.as_bytes()).ok()?;
     if python_comprehension_binds_name_at(name, reference, source)
         || python_type_parameter_binds_name_at(name, reference, source)
     {
         return Some(false);
     }
-    let session = ResolutionSession::bounded(INTERACTIVE_TYPE_LOOKUP_BUDGET, None);
     let mut current = reference;
     let mut crossed_callable_body = false;
     while let Some(scope) = current.parent() {
@@ -1534,11 +1601,13 @@ fn python_string_literal_class(node: Node<'_>, prepared: &PreparedSyntaxTree) ->
 /// Python's implicit builtin namespace is a lexical binding source, even
 /// when no workspace declaration exists for the referenced class.
 fn builtin_class_reference(
+    python: &PythonAnalyzer,
     overlay: Option<&SemanticModelOverlay>,
     reference: Node<'_>,
-    source: &str,
+    prepared: &PreparedSyntaxTree,
     cache: &mut ExternalClassCache,
 ) -> Option<ClassSeed> {
+    let source = prepared.source();
     if reference.kind() != "identifier" {
         return None;
     }
@@ -1546,7 +1615,7 @@ fn builtin_class_reference(
     if !is_python_builtin_or_constant(name) {
         return None;
     }
-    match builtin_base_is_unshadowed(reference, source) {
+    match indexed_builtin_is_unshadowed(python, reference, prepared) {
         Some(false) => None,
         None => Some(ClassSeed::Unknown(UnknownReason::SemanticBudget)),
         Some(true) => {
@@ -1656,9 +1725,10 @@ fn resolve_indexed_class_at_span(
     let indexed_source = prepared.source();
     if let Some(reference) = node_at_span(prepared, span)
         && let Some(seed) = builtin_class_reference(
+            python_analyzer(workspace),
             overlay_of(workspace).as_deref(),
             reference,
-            indexed_source,
+            prepared,
             &mut ExternalClassCache::default(),
         )
     {
@@ -1779,10 +1849,14 @@ impl PythonTypeFlowAdapter {
                     // A builtin name has no workspace declaration for the type
                     // lookup to return, so `isinstance(value, dict)` resolves
                     // to nothing through that route and is modeled here.
-                    ClassSeed::NotApplicable => {
-                        exact_builtin_class(class, &prepared, overlay.as_deref(), &mut cache)
-                            .ok_or_else(|| unmodeled(class))
-                    }
+                    ClassSeed::NotApplicable => exact_builtin_class(
+                        python_analyzer(workspace),
+                        class,
+                        &prepared,
+                        overlay.as_deref(),
+                        &mut cache,
+                    )
+                    .ok_or_else(|| unmodeled(class)),
                     ClassSeed::Classes(_)
                     | ClassSeed::ClassWithOpenBound(_)
                     | ClassSeed::ClassesWithOpenBound(_)
@@ -2057,11 +2131,26 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
         // remainder, the arm-proven classes that now reach the guard's
         // reconvergence instead of ending there, and the class-body binding
         // a member name resolves to, the dependency class a bare
-        // import-bound base denotes, and the source root a by-name import
-        // resolves its module in.
+        // import-bound base denotes, the source root a by-name import
+        // resolves its module in, and the module an absolute import written
+        // against a source root below the project root names -- now only when
+        // the workspace's own packaging declaration or package chain
+        // establishes that root, so the class sets that used to come from a
+        // bare tail match are no longer reported -- and now with a packaging
+        // declaration of the project root counting as a declaration like any
+        // other, so the shorter spellings it rules out no longer carry class
+        // sets either -- and with a spelling below a declared root admitted
+        // only when the package it starts from states that the repeated
+        // directory is on its `__path__`, so a nested name a marker never
+        // extends no longer carries the classes of the file it merely
+        // resembles. The statement has to be one the interpreter runs and
+        // keeps, so an append behind `if False:` or one a later `__path__`
+        // assignment replaces no longer carries them either, and the
+        // membership guard it hangs under has to be module-level, so a guard
+        // inside an enclosing dead branch no longer carries them.
         AdapterSemanticsVersion::hash_bytes(
             "python-type-flow",
-            b"python-type-flow-unmodeled-guards-scoped-dynamic-writes-subscripted-annotation-outer-class-class-object-reference-imports-unmodeled-predicate-type-is-guard-exact-binding-replacement-stable-receiver-entry-implicit-tuples-closed-native-members-sequence-initializers-module-binding-reuse-comprehension-scope-closed-sequence-loads-implicit-none-returns-returned-sequence-loads-arm-proven-classes-reach-joins-class-body-member-binding-import-bound-bases-importing-source-root-v51",
+            b"python-type-flow-unmodeled-guards-scoped-dynamic-writes-subscripted-annotation-outer-class-class-object-reference-imports-unmodeled-predicate-type-is-guard-exact-binding-replacement-stable-receiver-entry-implicit-tuples-closed-native-members-sequence-initializers-module-binding-reuse-comprehension-scope-closed-sequence-loads-implicit-none-returns-returned-sequence-loads-arm-proven-classes-reach-joins-class-body-member-binding-import-bound-bases-importing-source-root-established-source-root-modules-declared-project-root-authority-package-path-extension-executed-typed-numeric-literals-v57",
         )
         .expect("adapter name is non-empty")
     }
@@ -2097,7 +2186,11 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
                 let is_builtin_str = function.kind() == "identifier"
                     && function.utf8_text(prepared.source().as_bytes()).ok() == Some("str")
                     && is_python_builtin_or_constant("str")
-                    && builtin_base_is_unshadowed(function, prepared.source()) == Some(true);
+                    && indexed_builtin_is_unshadowed(
+                        python_analyzer(workspace),
+                        function,
+                        &prepared,
+                    ) == Some(true);
                 if is_builtin_str {
                     "builtins.str"
                 } else {
@@ -2125,7 +2218,10 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
         // not name a literal: fallthrough None names the completed body.
         let implicit_class = match value.kind {
             SemanticValueKind::Null => Some("types.NoneType"),
-            SemanticValueKind::UnsignedInteger(_) => Some("builtins.int"),
+            SemanticValueKind::UnsignedInteger(_) | SemanticValueKind::SignedInteger(_) => {
+                Some("builtins.int")
+            }
+            SemanticValueKind::FloatingPoint { .. } => Some("builtins.float"),
             _ => None,
         };
         if let Some(name) = implicit_class {
@@ -2979,11 +3075,7 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
             }
             if let Some(write) = dynamic_call_write(node, prepared.source()) {
                 writes.push(scoped_dynamic_write(
-                    workspace,
-                    procedure,
-                    node,
-                    write,
-                    prepared.source(),
+                    workspace, procedure, node, write, &prepared,
                 ));
             }
             if matches!(node.kind(), "assignment" | "augmented_assignment")
@@ -2991,11 +3083,7 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
             {
                 writes.push(DynamicFieldWrite::Member("__dict__".into()));
                 writes.push(scoped_dynamic_write(
-                    workspace,
-                    procedure,
-                    node,
-                    write,
-                    prepared.source(),
+                    workspace, procedure, node, write, &prepared,
                 ));
             }
             let mut cursor = node.walk();
@@ -3147,6 +3235,8 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
             GuardPredicate::ConstantBoolean { .. }
             | GuardPredicate::ConstantEquality { .. }
             | GuardPredicate::OrderedIntegerComparison { .. }
+            | GuardPredicate::OrderedFloatComparison { .. }
+            | GuardPredicate::NanComparison { .. }
             | GuardPredicate::Opaque { .. } => unknown(),
         }
     }
@@ -3178,6 +3268,8 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
             | GuardPredicate::HasMember { .. }
             | GuardPredicate::Truthy { .. }
             | GuardPredicate::OrderedIntegerComparison { .. }
+            | GuardPredicate::OrderedFloatComparison { .. }
+            | GuardPredicate::NanComparison { .. }
             | GuardPredicate::Opaque { .. } => return ClassSeed::NotApplicable,
         };
         let Ok(classes) = self.guard_classes(workspace, procedure, classes) else {
@@ -3625,6 +3717,171 @@ mod tests {
     };
     use crate::analyzer::{AnalyzerConfig, CodeUnitIndex, Language, resolve_analyzer};
     use crate::inline_project::InlineTestProject;
+
+    #[test]
+    fn builtin_shadow_memo_keeps_source_and_reference_identity() {
+        let project = InlineTestProject::with_language(Language::Python)
+            .file("open.py", "pass         \nclass C(list):\n    pass\n")
+            .file("shadowed.py", "list = object\nclass C(list):\n    pass\n")
+            .file("scopes.py", "class Open(list):\n    pass\ndef f(list):\n    class Closed(list):\n        pass\n")
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let python = super::python_analyzer(&workspace);
+        let memo = super::PythonBuiltinShadowRequestMemo::default();
+        for _ in 0..3 {
+            for (file, expected) in [("open.py", true), ("shadowed.py", false)] {
+                let prepared =
+                    super::current_indexed_prepared(python, &project.file(file)).unwrap();
+                let class = prepared.tree().root_node().named_child(1).unwrap();
+                let base = class
+                    .child_by_field_name("superclasses")
+                    .unwrap()
+                    .named_child(0)
+                    .unwrap();
+                let session =
+                    super::ResolutionSession::bounded(super::INTERACTIVE_TYPE_LOOKUP_BUDGET, None);
+                assert_eq!(memo.unshadowed(base, &prepared, &session), Some(expected));
+                assert_eq!(
+                    super::builtin_base_is_unshadowed(base, prepared.source()),
+                    Some(expected)
+                );
+            }
+            let prepared =
+                super::current_indexed_prepared(python, &project.file("scopes.py")).unwrap();
+            let module = prepared.tree().root_node();
+            let open = module.named_child(0).unwrap();
+            let closed = module
+                .named_child(1)
+                .unwrap()
+                .child_by_field_name("body")
+                .unwrap()
+                .named_child(0)
+                .unwrap();
+            for (class, expected) in [(open, true), (closed, false)] {
+                let base = class
+                    .child_by_field_name("superclasses")
+                    .unwrap()
+                    .named_child(0)
+                    .unwrap();
+                let session =
+                    super::ResolutionSession::bounded(super::INTERACTIVE_TYPE_LOOKUP_BUDGET, None);
+                assert_eq!(memo.unshadowed(base, &prepared, &session), Some(expected));
+                assert_eq!(
+                    super::builtin_base_is_unshadowed(base, prepared.source()),
+                    Some(expected)
+                );
+            }
+        }
+        assert_eq!(memo.walks.load(std::sync::atomic::Ordering::Relaxed), 4);
+    }
+
+    #[test]
+    fn builtin_shadow_memo_retries_exhaustion_and_respects_cancellation() {
+        let project = InlineTestProject::with_language(Language::Python)
+            .file("app.py", "class C(list):\n    pass\n")
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let prepared = super::current_indexed_prepared(
+            super::python_analyzer(&workspace),
+            &project.file("app.py"),
+        )
+        .unwrap();
+        let base = prepared
+            .tree()
+            .root_node()
+            .named_child(0)
+            .unwrap()
+            .child_by_field_name("superclasses")
+            .unwrap()
+            .named_child(0)
+            .unwrap();
+        let memo = super::PythonBuiltinShadowRequestMemo::default();
+        let mut tiny = super::INTERACTIVE_TYPE_LOOKUP_BUDGET;
+        tiny.max_scope_nodes = 1;
+        assert_eq!(
+            memo.unshadowed(
+                base,
+                &prepared,
+                &super::ResolutionSession::bounded(tiny, None)
+            ),
+            None
+        );
+        let funded =
+            || super::ResolutionSession::bounded(super::INTERACTIVE_TYPE_LOOKUP_BUDGET, None);
+        assert_eq!(memo.unshadowed(base, &prepared, &funded()), Some(true));
+        assert_eq!(memo.unshadowed(base, &prepared, &funded()), Some(true));
+        assert_eq!(memo.walks.load(std::sync::atomic::Ordering::Relaxed), 2);
+        let cancellation = CancellationToken::default();
+        cancellation.cancel();
+        let stopped = super::ResolutionSession::bounded(
+            super::INTERACTIVE_TYPE_LOOKUP_BUDGET,
+            Some(&cancellation),
+        );
+        assert_eq!(memo.unshadowed(base, &prepared, &stopped), None);
+        let fresh = super::PythonBuiltinShadowRequestMemo::default();
+        assert_eq!(
+            fresh.unshadowed(
+                base,
+                &prepared,
+                &super::ResolutionSession::bounded(tiny, None)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn builtin_shadow_answers_are_reused_only_inside_the_active_query() {
+        let project = InlineTestProject::with_language(Language::Python)
+            .file("app.py", "class C(list):\n    pass\n")
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let python = super::python_analyzer(&workspace);
+        let prepared = super::current_indexed_prepared(python, &project.file("app.py")).unwrap();
+        let base = prepared
+            .tree()
+            .root_node()
+            .named_child(0)
+            .unwrap()
+            .child_by_field_name("superclasses")
+            .unwrap()
+            .named_child(0)
+            .unwrap();
+        let cancellation = CancellationToken::default();
+        let scope = crate::analyzer::AnalyzerQueryScope::with_cancellation(
+            workspace.analyzer(),
+            &cancellation,
+        );
+        let memo = python
+            .active_query_request_memo::<super::PythonBuiltinShadowRequestMemo>()
+            .unwrap();
+        for _ in 0..8 {
+            assert_eq!(
+                super::indexed_builtin_is_unshadowed(python, base, &prepared),
+                Some(true)
+            );
+        }
+        assert_eq!(memo.walks.load(std::sync::atomic::Ordering::Relaxed), 1);
+        cancellation.cancel();
+        assert_eq!(
+            super::indexed_builtin_is_unshadowed(python, base, &prepared),
+            None
+        );
+        drop(scope);
+        let fresh_cancellation = CancellationToken::default();
+        let _fresh_scope = crate::analyzer::AnalyzerQueryScope::with_cancellation(
+            workspace.analyzer(),
+            &fresh_cancellation,
+        );
+        let fresh = python
+            .active_query_request_memo::<super::PythonBuiltinShadowRequestMemo>()
+            .unwrap();
+        assert!(!std::sync::Arc::ptr_eq(&memo, &fresh));
+        assert_eq!(
+            super::indexed_builtin_is_unshadowed(python, base, &prepared),
+            Some(true)
+        );
+        assert_eq!(fresh.walks.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
 
     #[test]
     fn class_lookup_reuses_answer_and_dependency_reads_within_request() {

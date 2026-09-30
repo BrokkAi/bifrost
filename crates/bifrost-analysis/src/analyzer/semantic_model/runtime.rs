@@ -1,6 +1,7 @@
 use crate::analyzer::semantic_model::DeferredYieldsPayload;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -14,10 +15,10 @@ use super::{
     CompiledConditionalIndirectWrite, CompiledConditionalResultRefinement, CompiledDeclaredEffect,
     CompiledNormalReturnRefinement, CompiledNormalReturnTypeRefinement,
     CompiledOperationPrecondition, CompiledPackManifest, CompiledProcedureSummary,
-    CompiledProcedureTarget, CompiledResultContract, CompiledShard, DeclarationGuard,
-    GeneratorRule, MemberFact, PayloadKind, RelationFact, RuleTrigger, RuntimeValuesPayload,
-    SemanticModelOverlay, SemanticModelOverlayBuildError, SemanticPackCatalog,
-    SemanticPackSelectorQuery, TypeFact,
+    CompiledProcedureTarget, CompiledResultContract, CompiledResultUseObligation, CompiledShard,
+    DeclarationGuard, GeneratorRule, MemberFact, PayloadKind, RelationFact, RuleTrigger,
+    RuntimeValuesPayload, SemanticModelOverlay, SemanticModelOverlayBuildError,
+    SemanticPackCatalog, SemanticPackSelectorQuery, TypeFact,
 };
 use crate::CancellationToken;
 use crate::analyzer::canonical_hash::{is_lower_sha256, parse_lower_sha256};
@@ -38,12 +39,13 @@ use crate::hash::{HashMap, map_with_capacity};
 /// one durable index key ([`semantic_pack_realm`]), so the same active pack set
 /// resolves a Kotlin or Scala call differently than the label-exact keying did.
 /// A recorded identity from before this change must not satisfy the new
-/// contract, so the version moves even though no pack changed.
-pub const SEMANTIC_MODEL_RUNTIME_REPRESENTATION_VERSION: u32 = 6;
+/// contract, so the version moves even though no pack changed. Version 7
+/// retains all highest-rank activation evidence for exact artifact matching.
+pub const SEMANTIC_MODEL_RUNTIME_REPRESENTATION_VERSION: u32 = 7;
 
 type DependencyEvidencePublication = (Box<[Language]>, super::DependencyDiscoveryEvidence);
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SemanticModelActivationEvidence {
     pub language: String,
     pub ecosystem: String,
@@ -181,6 +183,10 @@ pub struct ActiveSemanticModelShard {
     pub source_kind: CatalogPackSourceKind,
     pub source_id: String,
     pub matched_evidence: SemanticModelActivationEvidence,
+    /// Every evidence row that satisfies a highest-rank selector. The legacy
+    /// representative above remains the ordinary matcher input; an exact
+    /// call-artifact proof must select its own row from this complete set.
+    pub matching_evidence: Vec<SemanticModelActivationEvidence>,
     evidence_rank: EvidenceRank,
     source_rank: u8,
 }
@@ -240,6 +246,7 @@ pub struct ActiveSemanticModelSnapshot {
     active_models: Arc<ResolvedActiveSemanticModels>,
     semantic_model_overlay: Option<Arc<SemanticModelOverlay>>,
     overlay_measurement: Option<SemanticModelOverlayMeasurement>,
+    jdk_artifacts_by_configured_home: Arc<HashMap<PathBuf, SemanticModelActivationEvidence>>,
 }
 
 impl ActiveSemanticModelSnapshot {
@@ -247,6 +254,7 @@ impl ActiveSemanticModelSnapshot {
         active_models: Arc<ResolvedActiveSemanticModels>,
         semantic_model_overlay: Option<Arc<SemanticModelOverlay>>,
         overlay_measurement: Option<SemanticModelOverlayMeasurement>,
+        jdk_artifacts_by_configured_home: Arc<HashMap<PathBuf, SemanticModelActivationEvidence>>,
     ) -> Self {
         debug_assert_eq!(
             semantic_model_overlay.is_some(),
@@ -257,6 +265,7 @@ impl ActiveSemanticModelSnapshot {
             active_models,
             semantic_model_overlay,
             overlay_measurement,
+            jdk_artifacts_by_configured_home,
         }
     }
 
@@ -270,6 +279,16 @@ impl ActiveSemanticModelSnapshot {
 
     pub fn overlay_measurement(&self) -> Option<SemanticModelOverlayMeasurement> {
         self.overlay_measurement
+    }
+
+    /// Exact prepared JDK artifact selected by a configured source binding in
+    /// this same model publication. A missing home supplies no applicability
+    /// proof, even if a model for its release version is globally active.
+    pub(crate) fn jdk_artifact_for_home(
+        &self,
+        configured_home: &Path,
+    ) -> Option<&SemanticModelActivationEvidence> {
+        self.jdk_artifacts_by_configured_home.get(configured_home)
     }
 }
 
@@ -463,6 +482,45 @@ impl ResolvedActiveSemanticModels {
             shapes,
             target.has_receiver,
             target.parameter_count,
+        )
+    }
+
+    /// Select reviewed-JDK candidates only after pinning the exact artifact
+    /// that the Java resolver proved for this call. Filtering before rank and
+    /// claim deduplication keeps equal summaries from two JDK installations
+    /// from collapsing into the wrong artifact's representative.
+    pub fn procedure_summaries_for_selected_jdk_artifact(
+        &self,
+        target: &UnmaterializedExternalTarget,
+    ) -> ProcedureSummaryMatch<'_> {
+        if !target.has_resolver_owned_call_shape()
+            || target.language()
+                != crate::analyzer::semantic::SemanticLanguage::Standard(
+                    crate::analyzer::Language::Java,
+                )
+        {
+            return empty_procedure_match();
+        }
+        let Some(selected) = target.selected_jdk_artifact() else {
+            return empty_procedure_match();
+        };
+        let shapes = self
+            .indexes
+            .procedure_summaries_by_member
+            .get(semantic_pack_realm("java"))
+            .and_then(|owners| owners.get(target.owner_fqn()))
+            .and_then(|members| members.get(target.member()));
+        resolve_applicable_procedure_postings_where(
+            &self.shards,
+            shapes,
+            target.has_receiver(),
+            target.arity(),
+            |shard, record| {
+                shard.manifest.language == "java"
+                    && shard.manifest.ecosystem == "jdk"
+                    && shard.matching_evidence.binary_search(selected).is_ok()
+                    && !record.result_use_obligations.is_empty()
+            },
         )
     }
 
@@ -879,6 +937,38 @@ impl<'a> ActivatedProcedureSummary<'a> {
     /// in deterministic ordinal order.
     pub fn result_contracts(&self) -> &'a [CompiledResultContract] {
         &self.record.result_contracts
+    }
+
+    pub fn result_use_obligations(&self) -> &'a [CompiledResultUseObligation] {
+        &self.record.result_use_obligations
+    }
+
+    /// Reviewed JDK result-use claims for an exact resolver-owned call whose
+    /// selected declaration artifact is one of this shard's activating rows.
+    /// A model name, release version, or source toolchain alone is insufficient.
+    /// Dispatch coverage remains a separate consumer obligation.
+    pub fn bind_reviewed_jdk_result_use_obligations(
+        &self,
+        target: &UnmaterializedExternalTarget,
+    ) -> Option<&'a [CompiledResultUseObligation]> {
+        if self.record.result_use_obligations.is_empty()
+            || self.shard.manifest.language != "java"
+            || self.shard.manifest.ecosystem != "jdk"
+            || !target.has_resolver_owned_call_shape()
+        {
+            return None;
+        }
+        let selected = target.selected_jdk_artifact()?;
+        if self
+            .shard
+            .matching_evidence
+            .binary_search(selected)
+            .is_err()
+        {
+            return None;
+        }
+        self.bind_unmaterialized_call_shape(target)?;
+        Some(&self.record.result_use_obligations)
     }
 
     /// Outcome-sensitive predicate effects this reviewed summary attributes to
@@ -1741,7 +1831,13 @@ where
             .expect("semantic-model index address must resolve to its record kind");
         if !records
             .iter()
-            .any(|candidate: &ActivatedSemanticModelRecord<'_, T>| candidate.record == record)
+            .any(|candidate: &ActivatedSemanticModelRecord<'_, T>| {
+                candidate.record == record
+                    && !(candidate.shard.matched_evidence.ecosystem == "jdk"
+                        && shard.matched_evidence.ecosystem == "jdk"
+                        && candidate.shard.matched_evidence.artifact_sha256
+                            != shard.matched_evidence.artifact_sha256)
+            })
         {
             records.push(ActivatedSemanticModelRecord { record, shard });
         }
@@ -1787,6 +1883,7 @@ fn procedure_claims_agree(
         && left.declared_effects == right.declared_effects
         && left.preconditions == right.preconditions
         && left.result_contracts == right.result_contracts
+        && left.result_use_obligations == right.result_use_obligations
         && left.conditional_result_refinements == right.conditional_result_refinements
         && left.conditional_indirect_writes == right.conditional_indirect_writes
         && left.normal_return_refinements == right.normal_return_refinements
@@ -1819,6 +1916,22 @@ fn resolve_applicable_procedure_postings<'a>(
     has_receiver: bool,
     actual_parameter_count: u32,
 ) -> ProcedureSummaryMatch<'a> {
+    resolve_applicable_procedure_postings_where(
+        shards,
+        shapes,
+        has_receiver,
+        actual_parameter_count,
+        |_, _| true,
+    )
+}
+
+fn resolve_applicable_procedure_postings_where<'a>(
+    shards: &'a [ActiveSemanticModelShard],
+    shapes: Option<&ProcedureSummaryShapePostings>,
+    has_receiver: bool,
+    actual_parameter_count: u32,
+    accepts_record: impl Fn(&ActiveSemanticModelShard, &CompiledProcedureSummary) -> bool,
+) -> ProcedureSummaryMatch<'a> {
     let Some(shapes) = shapes else {
         return empty_procedure_match();
     };
@@ -1830,7 +1943,7 @@ fn resolve_applicable_procedure_postings<'a>(
         .variadic
         .range((has_receiver, 1)..=(has_receiver, maximum_variadic_formals))
         .map(|(_key, posting)| posting);
-    resolve_procedure_postings(
+    resolve_procedure_postings_where(
         shards,
         shapes
             .fixed
@@ -1838,6 +1951,7 @@ fn resolve_applicable_procedure_postings<'a>(
             .into_iter()
             .chain(variadic),
         procedure_claims_agree,
+        accepts_record,
     )
 }
 
@@ -1863,6 +1977,15 @@ fn resolve_procedure_postings<'a, 'posting>(
     postings: impl IntoIterator<Item = &'posting Vec<RecordAddress>>,
     claims_agree: fn(&CompiledProcedureSummary, &CompiledProcedureSummary) -> bool,
 ) -> ProcedureSummaryMatch<'a> {
+    resolve_procedure_postings_where(shards, postings, claims_agree, |_, _| true)
+}
+
+fn resolve_procedure_postings_where<'a, 'posting>(
+    shards: &'a [ActiveSemanticModelShard],
+    postings: impl IntoIterator<Item = &'posting Vec<RecordAddress>>,
+    claims_agree: fn(&CompiledProcedureSummary, &CompiledProcedureSummary) -> bool,
+    accepts_record: impl Fn(&ActiveSemanticModelShard, &CompiledProcedureSummary) -> bool,
+) -> ProcedureSummaryMatch<'a> {
     let mut candidates_examined = 0usize;
     let mut best_rank = None;
     let mut records = Vec::<ActivatedProcedureSummary<'a>>::new();
@@ -1870,14 +1993,6 @@ fn resolve_procedure_postings<'a, 'posting>(
         candidates_examined = candidates_examined.saturating_add(posting.len());
         for address in posting {
             let shard = &shards[address.shard as usize];
-            let rank = (shard.evidence_rank, shard.source_rank);
-            if best_rank.is_some_and(|best| rank < best) {
-                continue;
-            }
-            if best_rank.is_none_or(|best| rank > best) {
-                best_rank = Some(rank);
-                records.clear();
-            }
             let payload = shard
                 .shard
                 .payload()
@@ -1886,6 +2001,17 @@ fn resolve_procedure_postings<'a, 'posting>(
             let record = payload
                 .get(address.record as usize)
                 .expect("procedure-summary index address must resolve to its record");
+            if !accepts_record(shard, record) {
+                continue;
+            }
+            let rank = (shard.evidence_rank, shard.source_rank);
+            if best_rank.is_some_and(|best| rank < best) {
+                continue;
+            }
+            if best_rank.is_none_or(|best| rank > best) {
+                best_rank = Some(rank);
+                records.clear();
+            }
             if records
                 .iter()
                 .any(|candidate| claims_agree(candidate.record, record))
@@ -2102,6 +2228,9 @@ impl SemanticModelRuntimeCache {
         analyzer: &dyn IAnalyzer,
         active: &Arc<ResolvedActiveSemanticModels>,
         dependency_evidence: Option<&[DependencyEvidencePublication]>,
+        jdk_artifacts_by_configured_home: Option<
+            &HashMap<PathBuf, SemanticModelActivationEvidence>,
+        >,
         cancellation: &CancellationToken,
         max_combined_retained_bytes: u64,
     ) -> Result<Arc<ActiveSemanticModelSnapshot>, SemanticModelOverlayBuildError> {
@@ -2112,6 +2241,7 @@ impl SemanticModelRuntimeCache {
                 .lock()
                 .expect("semantic-model publication mutex poisoned");
             if dependency_evidence.is_none()
+                && jdk_artifacts_by_configured_home.is_none()
                 && let Some(snapshot) = published.snapshot.as_ref()
                 && Arc::ptr_eq(snapshot.active_models(), active)
             {
@@ -2131,6 +2261,7 @@ impl SemanticModelRuntimeCache {
             .lock()
             .expect("semantic-model publication mutex poisoned");
         if dependency_evidence.is_none()
+            && jdk_artifacts_by_configured_home.is_none()
             && let Some(current) = published.snapshot.as_ref()
             && Arc::ptr_eq(current.active_models(), active)
         {
@@ -2154,10 +2285,20 @@ impl SemanticModelRuntimeCache {
                 .unwrap_or(u64::MAX),
             retained_bytes,
         };
+        let jdk_artifacts_by_configured_home = jdk_artifacts_by_configured_home
+            .map(|artifacts| Arc::new(artifacts.clone()))
+            .or_else(|| {
+                published
+                    .snapshot
+                    .as_ref()
+                    .map(|snapshot| Arc::clone(&snapshot.jdk_artifacts_by_configured_home))
+            })
+            .unwrap_or_default();
         let snapshot = Arc::new(ActiveSemanticModelSnapshot::new(
             Arc::clone(active),
             Some(overlay),
             Some(overlay_measurement),
+            jdk_artifacts_by_configured_home,
         ));
         published.snapshot = Some(Arc::clone(&snapshot));
         Ok(snapshot)
@@ -2347,6 +2488,7 @@ pub fn resolve_active_semantic_models(
         let Some(StrictActivationMatch {
             evidence_rank,
             matched_evidence,
+            matching_evidence,
             matched_requirements,
         }) = strict_activation_match(
             &loaded.manifest,
@@ -2430,6 +2572,7 @@ pub fn resolve_active_semantic_models(
                 source_kind: loaded.source_kind,
                 source_id: loaded.source_id,
                 matched_evidence,
+                matching_evidence,
                 evidence_rank,
                 source_rank: source_rank(loaded.source_kind),
             },
@@ -2655,6 +2798,29 @@ pub fn acquire_active_semantic_models_with_evidence(
     dependency_evidence: Option<&[DependencyEvidencePublication]>,
     cancellation: &CancellationToken,
 ) -> SemanticModelRuntimeOutcome {
+    acquire_active_semantic_models_with_jdk_artifacts(
+        analyzer,
+        catalog,
+        persistence,
+        request,
+        dependency_evidence,
+        None,
+        cancellation,
+    )
+}
+
+/// Publish the exact source-binding artifact map with the activated models.
+/// Only the host activation stage supplies this map; ordinary model acquisition
+/// preserves an existing map when it publishes another ecosystem.
+pub(crate) fn acquire_active_semantic_models_with_jdk_artifacts(
+    analyzer: &dyn IAnalyzer,
+    catalog: &SemanticPackCatalog,
+    persistence: Option<SemanticModelActivationPersistence<'_>>,
+    request: &SemanticModelActivationRequest,
+    dependency_evidence: Option<&[DependencyEvidencePublication]>,
+    jdk_artifacts_by_configured_home: Option<&HashMap<PathBuf, SemanticModelActivationEvidence>>,
+    cancellation: &CancellationToken,
+) -> SemanticModelRuntimeOutcome {
     let request_key = match runtime_request_key(request) {
         Ok(key) => key,
         Err(reason) => {
@@ -2695,7 +2861,11 @@ pub fn acquire_active_semantic_models_with_evidence(
         {
             return catalog_lifecycle_error(request.limits, "publish", error);
         }
-        return runtime_outcome(outcome, SemanticModelRuntimeLifecycle::Uncached);
+        return runtime_outcome(
+            outcome,
+            SemanticModelRuntimeLifecycle::Uncached,
+            jdk_artifacts_by_configured_home,
+        );
     };
     let (acquisition, _) = caches.semantic_models().values.acquire(&key, cancellation);
     match acquisition {
@@ -2710,6 +2880,7 @@ pub fn acquire_active_semantic_models_with_evidence(
                 analyzer,
                 &value,
                 dependency_evidence,
+                jdk_artifacts_by_configured_home,
                 cancellation,
                 request.limits.max_retained_bytes,
             ) {
@@ -2725,7 +2896,11 @@ pub fn acquire_active_semantic_models_with_evidence(
         CompleteValueAcquisition::Leader { permit } => {
             let outcome = resolve_active_semantic_models(catalog, request, cancellation);
             let SemanticModelResolutionOutcome::Ready(active) = outcome else {
-                return runtime_outcome(outcome, SemanticModelRuntimeLifecycle::Built);
+                return runtime_outcome(
+                    outcome,
+                    SemanticModelRuntimeLifecycle::Built,
+                    jdk_artifacts_by_configured_home,
+                );
             };
             if !content_is_current() {
                 return stale_generation_outcome(request.limits);
@@ -2738,6 +2913,7 @@ pub fn acquire_active_semantic_models_with_evidence(
                 analyzer,
                 &active,
                 dependency_evidence,
+                jdk_artifacts_by_configured_home,
                 cancellation,
                 request.limits.max_retained_bytes,
             ) {
@@ -2846,6 +3022,7 @@ fn catalog_lifecycle_error(
 fn runtime_outcome(
     outcome: SemanticModelResolutionOutcome,
     lifecycle: SemanticModelRuntimeLifecycle,
+    jdk_artifacts_by_configured_home: Option<&HashMap<PathBuf, SemanticModelActivationEvidence>>,
 ) -> SemanticModelRuntimeOutcome {
     match outcome {
         SemanticModelResolutionOutcome::Ready(active) => {
@@ -2854,6 +3031,11 @@ fn runtime_outcome(
                 Arc::clone(&active),
                 None,
                 None,
+                Arc::new(
+                    jdk_artifacts_by_configured_home
+                        .cloned()
+                        .unwrap_or_default(),
+                ),
             ));
             SemanticModelRuntimeOutcome::Ready {
                 active,
@@ -3095,6 +3277,7 @@ impl MatchedVersionRequirement {
 struct StrictActivationMatch {
     evidence_rank: EvidenceRank,
     matched_evidence: SemanticModelActivationEvidence,
+    matching_evidence: Vec<SemanticModelActivationEvidence>,
     matched_requirements: Vec<MatchedVersionRequirement>,
 }
 
@@ -3108,31 +3291,30 @@ fn strict_activation_match(
     if !bifrost.matches(bifrost_version) {
         return None;
     }
+    let toolchains = manifest
+        .compatibility
+        .toolchains
+        .iter()
+        .map(|constraint| {
+            VersionReq::parse(&constraint.requirement)
+                .ok()
+                .map(|requirement| (constraint, requirement))
+        })
+        .collect::<Option<Vec<_>>>()?;
     let scoped = |row: &&SemanticModelActivationEvidence| {
         semantic_pack_language(&row.language) == manifest.language
             && row.ecosystem == manifest.ecosystem
+            && toolchains.iter().all(|(constraint, requirement)| {
+                row.toolchain.as_ref().is_some_and(|toolchain| {
+                    toolchain.name == constraint.name
+                        && toolchain
+                            .version
+                            .as_ref()
+                            .is_some_and(|version| requirement.matches(version))
+                })
+            })
     };
     let mut matched_requirements = Vec::new();
-    for constraint in &manifest.compatibility.toolchains {
-        let requirement = VersionReq::parse(&constraint.requirement).ok()?;
-        let version = evidence.iter().filter(scoped).find_map(|row| {
-            let toolchain = row.toolchain.as_ref()?;
-            if toolchain.name != constraint.name {
-                return None;
-            }
-            toolchain
-                .version
-                .as_ref()
-                .filter(|version| requirement.matches(version))
-        })?;
-        push_matched_requirement(
-            &mut matched_requirements,
-            "toolchain",
-            &constraint.name,
-            &constraint.requirement,
-            version,
-        );
-    }
     let (evidence_rank, matched_evidence, selector) = shard
         .activation()
         .iter()
@@ -3143,6 +3325,34 @@ fn strict_activation_match(
                 .map(move |row| (selector_rank(selector), row.clone(), selector))
         })
         .max_by(|left, right| (left.0, &left.1).cmp(&(right.0, &right.1)))?;
+    let mut matching_evidence = shard
+        .activation()
+        .iter()
+        .filter(|selector| selector_rank(selector) == evidence_rank)
+        .flat_map(|selector| {
+            evidence
+                .iter()
+                .filter(move |row| scoped(row) && strict_selector_matches(selector, row))
+                .cloned()
+        })
+        .collect::<Vec<_>>();
+    matching_evidence.sort();
+    matching_evidence.dedup();
+    debug_assert!(matching_evidence.contains(&matched_evidence));
+    for (constraint, _) in &toolchains {
+        let version = matched_evidence
+            .toolchain
+            .as_ref()
+            .and_then(|toolchain| toolchain.version.as_ref())
+            .expect("a matched toolchain requirement has a version");
+        push_matched_requirement(
+            &mut matched_requirements,
+            "toolchain",
+            &constraint.name,
+            &constraint.requirement,
+            version,
+        );
+    }
     for (axis, coordinate_selector, coordinate_evidence) in [
         (
             "package",
@@ -3181,6 +3391,7 @@ fn strict_activation_match(
     Some(StrictActivationMatch {
         evidence_rank,
         matched_evidence,
+        matching_evidence,
         matched_requirements,
     })
 }
@@ -3538,6 +3749,11 @@ fn active_model_set_hash(
                     .matched_evidence
                     .cmp(&right.active.matched_evidence)
             })
+            .then_with(|| {
+                left.active
+                    .matching_evidence
+                    .cmp(&right.active.matching_evidence)
+            })
     });
     let mut gaps = extraction_gaps.iter().collect::<Vec<_>>();
     gaps.sort_unstable_by(|left, right| {
@@ -3547,7 +3763,7 @@ fn active_model_set_hash(
             .then_with(|| left.reason.cmp(&right.reason))
     });
     let mut hasher = Sha256::new();
-    hasher.update(b"bifrost.semantic-model.active-set.v2\0");
+    hasher.update(b"bifrost.semantic-model.active-set.v3\0");
     hasher.update(SEMANTIC_MODEL_RUNTIME_REPRESENTATION_VERSION.to_be_bytes());
     hasher.update((rows.len() as u64).to_be_bytes());
     for selection in rows {
@@ -3565,6 +3781,10 @@ fn active_model_set_hash(
         }]);
         hasher.update([selection.source_rank]);
         hash_activation_evidence(&mut hasher, &selection.active.matched_evidence);
+        hasher.update((selection.active.matching_evidence.len() as u64).to_be_bytes());
+        for evidence in &selection.active.matching_evidence {
+            hash_activation_evidence(&mut hasher, evidence);
+        }
     }
     hasher.update((gaps.len() as u64).to_be_bytes());
     for gap in gaps {
@@ -3759,6 +3979,268 @@ mod unmaterialized_call_shape_binding_tests {
     }
 
     #[test]
+    fn equal_version_jdk_artifacts_remain_distinct_after_activation() {
+        let source = std::str::from_utf8(PACK)
+            .expect("fixture is UTF-8")
+            .replace("\"ecosystem\": \"maven\"", "\"ecosystem\": \"jdk\"");
+        let compiled = compile_source(
+            SourceFormat::Json,
+            source.as_bytes(),
+            &CompilerOptions::default(),
+        )
+        .expect("JDK fixture compiles");
+        let shard = decode_shard(
+            &compiled.shards[0].descriptor,
+            &compiled.shards[0].bytes,
+            &DecodeLimits::default(),
+        )
+        .expect("JDK fixture decodes");
+        let evidence = |digest: &str| SemanticModelActivationEvidence {
+            language: "java".to_owned(),
+            ecosystem: "jdk".to_owned(),
+            package: None,
+            module: None,
+            toolchain: Some(CatalogCoordinate {
+                name: "jdk".to_owned(),
+                version: Some(Version::parse("21.0.8").expect("valid JDK version")),
+            }),
+            target: Some("jvm".to_owned()),
+            configuration: None,
+            artifact_sha256: Some(digest.repeat(64)),
+        };
+        let first = evidence("1");
+        let second = evidence("2");
+        let matched = strict_activation_match(
+            &compiled.manifest,
+            &shard,
+            &[first.clone(), second.clone()],
+            &Version::parse("0.9.0").expect("valid runtime version"),
+        )
+        .expect("both JDK artifacts activate this shard");
+        assert_eq!(matched.matching_evidence, vec![first, second]);
+        assert_eq!(matched.matched_evidence, matched.matching_evidence[1]);
+    }
+
+    #[test]
+    fn jdk_compatibility_is_checked_against_each_matching_artifact() {
+        let source = std::str::from_utf8(PACK)
+            .expect("fixture is UTF-8")
+            .replace("\"ecosystem\": \"maven\"", "\"ecosystem\": \"jdk\"")
+            .replace(
+                "\"compatibility\": {\"bifrost\": \">=0.8.0, <1.0.0\"}",
+                "\"compatibility\": {\"bifrost\": \">=0.8.0, <1.0.0\", \"toolchains\": [{\"name\": \"jdk\", \"requirement\": \">=21.0.0, <22.0.0\"}]}",
+            );
+        let compiled = compile_source(
+            SourceFormat::Json,
+            source.as_bytes(),
+            &CompilerOptions::default(),
+        )
+        .expect("version-constrained JDK fixture compiles");
+        let shard = decode_shard(
+            &compiled.shards[0].descriptor,
+            &compiled.shards[0].bytes,
+            &DecodeLimits::default(),
+        )
+        .expect("JDK fixture decodes");
+        let row = |version: &str, digest: &str| SemanticModelActivationEvidence {
+            language: "java".to_owned(),
+            ecosystem: "jdk".to_owned(),
+            package: None,
+            module: None,
+            toolchain: Some(CatalogCoordinate {
+                name: "jdk".to_owned(),
+                version: Some(Version::parse(version).expect("valid JDK version")),
+            }),
+            target: Some("jvm".to_owned()),
+            configuration: None,
+            artifact_sha256: Some(digest.repeat(64)),
+        };
+        let java21 = row("21.0.8", "1");
+        let java22 = row("22.0.1", "2");
+        let matched = strict_activation_match(
+            &compiled.manifest,
+            &shard,
+            &[java21.clone(), java22],
+            &Version::parse("0.9.0").expect("valid runtime version"),
+        )
+        .expect("the JDK 21 artifact activates the shard");
+        assert_eq!(matched.matching_evidence, vec![java21]);
+    }
+
+    #[test]
+    fn reviewed_jdk_result_obligation_requires_the_exact_selected_artifact_and_call_shape() {
+        let mut source: serde_json::Value = serde_json::from_slice(PACK).unwrap();
+        source["schema_version"] = 5.into();
+        source["ecosystem"] = "jdk".into();
+        let fixed = &mut source["shards"][0]["payload"]["summaries"][0];
+        fixed["ordinary_heap_unchanged"] = true.into();
+        fixed["normal_result_count"] = 1.into();
+        fixed["result_use_obligations"] = serde_json::json!([{
+            "result_ordinal": 0,
+            "kind": "pure_transformation_value"
+        }]);
+        let compiled = compile_source(
+            SourceFormat::Json,
+            &serde_json::to_vec(&source).unwrap(),
+            &CompilerOptions::default(),
+        )
+        .expect("reviewed JDK obligation compiles");
+        let shard = decode_shard(
+            &compiled.shards[0].descriptor,
+            &compiled.shards[0].bytes,
+            &DecodeLimits::default(),
+        )
+        .expect("reviewed JDK obligation decodes");
+        let evidence = |version: &str, digest: &str| SemanticModelActivationEvidence {
+            language: "java".to_owned(),
+            ecosystem: "jdk".to_owned(),
+            package: None,
+            module: None,
+            toolchain: Some(CatalogCoordinate {
+                name: "jdk".to_owned(),
+                version: Some(Version::parse(version).unwrap()),
+            }),
+            target: Some("jvm".to_owned()),
+            configuration: None,
+            artifact_sha256: Some(digest.repeat(64)),
+        };
+        let first = evidence("21.0.8", "1");
+        let second = evidence("21.0.8", "2");
+        let active = ActiveSemanticModelShard {
+            manifest: Arc::new(compiled.manifest),
+            shard,
+            source_kind: CatalogPackSourceKind::Embedded,
+            source_id: "test:reviewed-jdk-obligation".to_owned(),
+            matched_evidence: second.clone(),
+            matching_evidence: vec![first.clone(), second.clone()],
+            evidence_rank: EvidenceRank::Language,
+            source_rank: 0,
+        };
+        let payload = active.shard.payload().procedure_summaries().unwrap();
+        let reviewed = ActivatedProcedureSummary {
+            record: &payload[0],
+            shard: &active,
+            payload,
+        };
+        assert_eq!(
+            reviewed
+                .bind_reviewed_jdk_result_use_obligations(
+                    &target("fixed", 3).with_selected_jdk_for_test(first.clone())
+                )
+                .map(|obligations| obligations.len()),
+            Some(1),
+            "the non-representative matching artifact is still applicable"
+        );
+        assert!(
+            reviewed
+                .bind_reviewed_jdk_result_use_obligations(
+                    &target("fixed", 3).with_selected_jdk_for_test(second.clone())
+                )
+                .is_some()
+        );
+        for mismatched in [evidence("21.0.8", "3"), evidence("22.0.1", "1")] {
+            assert!(
+                reviewed
+                    .bind_reviewed_jdk_result_use_obligations(
+                        &target("fixed", 3).with_selected_jdk_for_test(mismatched)
+                    )
+                    .is_none(),
+                "an unselected digest or a different version has no obligation"
+            );
+        }
+        assert!(
+            reviewed
+                .bind_reviewed_jdk_result_use_obligations(&target("fixed", 3))
+                .is_none(),
+            "a name-only target has no resolver-owned JDK artifact"
+        );
+        assert!(
+            reviewed
+                .bind_reviewed_jdk_result_use_obligations(
+                    &target("fixed", 4).with_selected_jdk_for_test(first.clone())
+                )
+                .is_none(),
+            "artifact equality cannot rescue an inapplicable arity"
+        );
+
+        let mut separate = [first.clone(), second.clone()]
+            .into_iter()
+            .map(|evidence| ActiveSemanticModelShard {
+                manifest: Arc::clone(&active.manifest),
+                shard: active.shard.clone(),
+                source_kind: CatalogPackSourceKind::Embedded,
+                source_id: format!(
+                    "test:artifact-{}",
+                    evidence.artifact_sha256.as_deref().unwrap()
+                ),
+                matched_evidence: evidence.clone(),
+                matching_evidence: vec![evidence],
+                evidence_rank: EvidenceRank::Language,
+                source_rank: 0,
+            })
+            .collect::<Vec<_>>();
+        let mut bare_source = source.clone();
+        bare_source["shards"][0]["payload"]["summaries"][0]["result_use_obligations"] =
+            serde_json::json!([]);
+        let bare_compiled = compile_source(
+            SourceFormat::Json,
+            &serde_json::to_vec(&bare_source).unwrap(),
+            &CompilerOptions::default(),
+        )
+        .expect("ordinary model without an obligation compiles");
+        separate.push(ActiveSemanticModelShard {
+            manifest: Arc::new(bare_compiled.manifest),
+            shard: decode_shard(
+                &bare_compiled.shards[0].descriptor,
+                &bare_compiled.shards[0].bytes,
+                &DecodeLimits::default(),
+            )
+            .unwrap(),
+            source_kind: CatalogPackSourceKind::Embedded,
+            source_id: "test:higher-rank-unannotated-jdk-summary".to_owned(),
+            matched_evidence: second.clone(),
+            matching_evidence: vec![second.clone()],
+            evidence_rank: EvidenceRank::Language,
+            source_rank: 1,
+        });
+        let mut report = SemanticModelActivationReport::default();
+        let indexes = MatcherIndexes::build(
+            &separate,
+            SemanticModelRuntimeLimits::default(),
+            &CancellationToken::default(),
+            &mut report,
+        )
+        .expect("two equal-summary JDK shards index");
+        let active_set = ResolvedActiveSemanticModels {
+            active_model_set_hash: "test:two-jdk-artifacts".to_owned(),
+            shards: separate,
+            indexes,
+            extraction_gaps: Vec::new(),
+            extraction_gaps_by_declaration: HashMap::default(),
+            report,
+        };
+        let selected = target("fixed", 3).with_selected_jdk_for_test(second.clone());
+        let matched = active_set.procedure_summaries_for_selected_jdk_artifact(&selected);
+        assert_eq!(matched.disposition, SemanticModelMatchDisposition::Unique);
+        assert_eq!(matched.records.len(), 1);
+        assert_eq!(matched.records[0].shard.matched_evidence, second);
+        assert_eq!(matched.records[0].shard.source_rank, 0);
+        assert!(
+            matched.records[0]
+                .bind_reviewed_jdk_result_use_obligations(&selected)
+                .is_some()
+        );
+        assert_eq!(
+            active_set
+                .procedure_summaries_for_selected_jdk_artifact(
+                    &target("fixed", 3).with_selected_jdk_for_test(evidence("21.0.8", "3"))
+                )
+                .disposition,
+            SemanticModelMatchDisposition::Empty
+        );
+    }
+
+    #[test]
     fn call_shape_binding_proves_fixed_and_variadic_applicability() {
         let compiled = compile_source(SourceFormat::Json, PACK, &CompilerOptions::default())
             .expect("the call-shape fixture compiles");
@@ -3769,21 +4251,23 @@ mod unmaterialized_call_shape_binding_tests {
             &DecodeLimits::default(),
         )
         .expect("the compiled call-shape shard decodes");
+        let matched_evidence = SemanticModelActivationEvidence {
+            language: "java".to_owned(),
+            ecosystem: "maven".to_owned(),
+            package: None,
+            module: None,
+            toolchain: None,
+            target: None,
+            configuration: None,
+            artifact_sha256: None,
+        };
         let active = ActiveSemanticModelShard {
             manifest: std::sync::Arc::new(compiled.manifest),
             shard,
             source_kind: CatalogPackSourceKind::Embedded,
             source_id: "test:call-shape".to_owned(),
-            matched_evidence: SemanticModelActivationEvidence {
-                language: "java".to_owned(),
-                ecosystem: "maven".to_owned(),
-                package: None,
-                module: None,
-                toolchain: None,
-                target: None,
-                configuration: None,
-                artifact_sha256: None,
-            },
+            matching_evidence: vec![matched_evidence.clone()],
+            matched_evidence,
             evidence_rank: EvidenceRank::Language,
             source_rank: 0,
         };
@@ -3921,6 +4405,7 @@ mod active_model_set_identity_tests {
                 shard,
                 source_kind: CatalogPackSourceKind::Embedded,
                 source_id: format!("test:{pack_id}"),
+                matching_evidence: vec![matched_evidence.clone()],
                 matched_evidence,
                 evidence_rank,
                 source_rank: 0,
@@ -3981,7 +4466,7 @@ mod active_model_set_identity_tests {
 
     #[test]
     fn value_semantics_schema_rotates_active_set_identity() {
-        assert_eq!(SEMANTIC_MODEL_RUNTIME_REPRESENTATION_VERSION, 6);
+        assert_eq!(SEMANTIC_MODEL_RUNTIME_REPRESENTATION_VERSION, 7);
         let mut previous = Sha256::new();
         previous.update(b"bifrost.semantic-model.active-set.v2\0");
         previous.update(2u32.to_be_bytes());
@@ -4080,11 +4565,13 @@ mod procedure_claim_agreement_tests {
             normal_result_count: None,
             locations: Vec::new(),
             transfers: vec![transfer(CompiledSummaryInput::Parameter { ordinal: 0 })],
+            transfer_partitions: Vec::new(),
             effects: Vec::new(),
             concurrency_effects: Vec::new(),
             declared_effects: Vec::new(),
             preconditions: None,
             result_contracts: Vec::new(),
+            result_use_obligations: Vec::new(),
             conditional_result_refinements: Vec::new(),
             conditional_indirect_writes: Vec::new(),
             normal_return_refinements: Vec::new(),

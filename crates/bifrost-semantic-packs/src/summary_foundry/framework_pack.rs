@@ -536,6 +536,7 @@ impl PackIdentity {
             },
             carried_sources: Vec::new(),
             cpp_portability: None,
+            python_correspondence: None,
             shards: vec![AuthoredShard {
                 id: format!("declarations.{}", self.ecosystem),
                 activation: vec![self.activation.clone()],

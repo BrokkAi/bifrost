@@ -32,3 +32,9 @@ Current history:
   generated production was learned under (a JDK's release digest and JMOD
   listing), so a later process can find the production without reading its
   artifacts. The row cascades with the production it names.
+- `0009-generated-cache-epochs.sql`: removes the incomplete generated-production
+  uniqueness index. The primary production digest includes the cache epoch,
+  allowing revised producer output to coexist with earlier cached generations.
+  Records the epoch for candidate selection. Historical rows remain stored;
+  migration marks them current only if their canonical digest verifies against
+  this binary's epoch. Unverified historical output is not activated.

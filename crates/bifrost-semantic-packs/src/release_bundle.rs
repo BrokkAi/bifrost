@@ -43,17 +43,18 @@ use brokk_bifrost_analysis::analyzer::semantic_model::{
     AcquisitionReceiptRelease, AcquisitionReceiptSource, ActivationSelector, ArtifactEncoding,
     ArtifactProducerLimits, ArtifactProduction, ArtifactProductionRequest,
     AuthoredSemanticModelPack, CatalogCoordinate, CatalogOptions, Compatibility,
-    CompiledSemanticModelPack, CompilerOptions, Completeness, DecodeLimits, DependencyArtifactRole,
-    DependencyPackLimits, DurablePackSource, DurablePackSourceKind, ExactArtifact,
-    ExactDependencyArtifact, ExternalArtifactKind, GENERATED_PRODUCTION_CACHE_VERSION,
-    GeneratedProductionKey, PackExtractionAccounting, PackExtractionGap, PackExtractionSourceEntry,
-    ProcedureSummaryMemberKey, ProducerDiagnostic, ProducerDiagnosticSeverity, Provenance,
-    ResolvedActiveSemanticModels, SEMANTIC_MODEL_SCHEMA_VERSION,
-    SEMANTIC_MODEL_SUPPORTED_SCHEMA_VERSIONS, Safety, SemanticModelActivationControl,
-    SemanticModelActivationEvidence, SemanticModelActivationRequest, SemanticModelControlAction,
-    SemanticModelControlScope, SemanticModelPackSelector, SemanticModelResolutionOutcome,
-    SemanticModelRuntimeOutcome, SemanticPackCatalog, acquire_active_semantic_models,
-    compile_exact_dependency_production, compile_pack, decode_manifest, decode_shard_for_manifest,
+    CompiledPackManifest, CompiledSemanticModelPack, CompilerOptions, Completeness, DecodeLimits,
+    DependencyArtifactRole, DependencyPackLimits, DurablePackSource, DurablePackSourceKind,
+    ExactArtifact, ExactDependencyArtifact, ExternalArtifactKind,
+    GENERATED_PRODUCTION_CACHE_VERSION, GeneratedProductionKey, PackExtractionAccounting,
+    PackExtractionGap, PackExtractionSourceEntry, ProcedureSummaryMemberKey, ProducerDiagnostic,
+    ProducerDiagnosticSeverity, Provenance, ResolvedActiveSemanticModels,
+    SEMANTIC_MODEL_SCHEMA_VERSION, SEMANTIC_MODEL_SUPPORTED_SCHEMA_VERSIONS, Safety,
+    SemanticModelActivationControl, SemanticModelActivationEvidence,
+    SemanticModelActivationRequest, SemanticModelControlAction, SemanticModelControlScope,
+    SemanticModelPackSelector, SemanticModelResolutionOutcome, SemanticModelRuntimeOutcome,
+    SemanticPackCatalog, acquire_active_semantic_models, compile_exact_dependency_production,
+    compile_pack, decode_manifest, decode_validated_shard_for_manifest,
     pack_rejects_are_warning_only, read_exact_artifact, read_exact_source_set,
     resolve_active_semantic_models, verify_recorded_generated_production_digest,
 };
@@ -70,6 +71,9 @@ use semver::{Op, Version, VersionReq};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tempfile::{NamedTempFile, tempdir};
+
+#[cfg(feature = "download")]
+use brokk_bifrost_analysis::analyzer::semantic_model::AcquisitionReceiptRequest;
 
 pub const PACK_SPEC_SCHEMA_VERSION: u32 = 1;
 pub const RELEASE_BUNDLE_SCHEMA_VERSION: u32 = 3;
@@ -496,6 +500,46 @@ pub(crate) struct VerifiedReleaseBundle {
     /// matching `generated_reuse` entry is `Eligible`: a production this build
     /// will not install is verified from the index and never decoded.
     generated_packs: Vec<Option<CompiledSemanticModelPack>>,
+}
+
+/// Acquisition verified the whole release envelope, but decoded only packs
+/// that can satisfy this exact request. It cannot be passed to the exhaustive
+/// release installer or used as a proof for another request.
+#[cfg(feature = "download")]
+#[derive(Debug)]
+pub(crate) struct VerifiedAcquisitionBundle {
+    bundle: ReleaseBundle,
+    request: AcquisitionReceiptRequest,
+    curated_packs: Vec<(usize, CompiledSemanticModelPack)>,
+    generated_packs: Vec<(usize, CompiledSemanticModelPack)>,
+}
+
+#[cfg(feature = "download")]
+#[derive(Debug)]
+pub(crate) enum AcquisitionInstallationProof {
+    Complete {
+        request: AcquisitionReceiptRequest,
+        sources: Vec<AcquisitionReceiptSource>,
+    },
+    EmptySlice {
+        request: AcquisitionReceiptRequest,
+    },
+}
+
+#[cfg(feature = "download")]
+impl AcquisitionInstallationProof {
+    pub(crate) fn request(&self) -> &AcquisitionReceiptRequest {
+        match self {
+            Self::Complete { request, .. } | Self::EmptySlice { request } => request,
+        }
+    }
+
+    pub(crate) fn sources(&self) -> Option<&[AcquisitionReceiptSource]> {
+        match self {
+            Self::Complete { sources, .. } => Some(sources),
+            Self::EmptySlice { .. } => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2037,7 +2081,7 @@ pub fn verify_release_bundle(output_root: &Path) -> Result<ReleaseBundle, Bundle
     verify_current_release_bundle(output_root)
 }
 
-#[cfg(any(test, feature = "download"))]
+#[cfg(test)]
 pub(crate) fn verify_release_bundle_for_install(
     output_root: &Path,
 ) -> Result<VerifiedReleaseBundle, BundleError> {
@@ -2067,34 +2111,7 @@ fn verify_release_bundle_for_cache_version(
     for pack in &index.packs {
         let compiled =
             read_compiled_pack(output_root, &pack.pack_id, &pack.manifest, &pack.shards)?;
-        let manifest = &compiled.manifest;
-        if manifest.pack_id != pack.pack_id
-            || manifest.version != pack.pack_version
-            || manifest.semantic_sha256 != pack.manifest_semantic_sha256
-            || manifest.content_sha256 != pack.manifest_content_sha256
-            || manifest.shards.len() != pack.shards.len()
-            || manifest.language != pack.language
-            || manifest.ecosystem != pack.ecosystem
-            || manifest.completeness != pack.completeness
-            || manifest.compatibility != pack.compatibility
-            || manifest.provenance != pack.provenance
-            || manifest.license != pack.license
-        {
-            return Err(BundleError::new(format!(
-                "release index metadata does not match manifest for {}@{}",
-                pack.pack_id, pack.pack_version
-            )));
-        }
-        if pack.notices.is_empty() {
-            return Err(BundleError::new(format!(
-                "release pack {}@{} must include at least one license or notice asset",
-                pack.pack_id, pack.pack_version
-            )));
-        }
-        validate_release_notices(&pack.notices)?;
-        for notice in &pack.notices {
-            verify_asset(output_root, &notice.asset)?;
-        }
+        verify_release_pack_metadata(output_root, pack, &compiled.manifest)?;
         curated_packs.push(compiled);
     }
     let mut generated_packs = Vec::with_capacity(index.generated_productions.len());
@@ -2115,6 +2132,119 @@ fn verify_release_bundle_for_cache_version(
         curated_packs,
         generated_packs,
     })
+}
+
+#[cfg(feature = "download")]
+pub(crate) fn verify_release_bundle_for_acquisition(
+    output_root: &Path,
+    request: &AcquisitionReceiptRequest,
+) -> Result<VerifiedAcquisitionBundle, BundleError> {
+    let index = read_release_bundle_index(output_root)?;
+    let generated_reuse = generated_production_reuse(
+        &index.generated_productions,
+        GENERATED_PRODUCTION_CACHE_VERSION,
+    )?;
+    verify_checksums(output_root, &index)?;
+    let rejects = verify_rejects(output_root, &index)?;
+    let measurements_path = safe_asset_path(output_root, Path::new("measurements.json"))?;
+    verify_measurements(&measurements_path, &index)?;
+
+    let mut curated_packs = Vec::new();
+    for (position, pack) in index.packs.iter().enumerate() {
+        let (manifest, manifest_bytes) =
+            read_compiled_manifest(output_root, &pack.pack_id, &pack.manifest)?;
+        verify_release_pack_metadata(output_root, pack, &manifest)?;
+        verify_indexed_shards(&pack.pack_id, &manifest, &pack.shards)?;
+        if let AcquisitionReceiptRequest::DeclaredPack(query) = request
+            && manifest.language == query.language
+            && manifest.ecosystem == query.ecosystem
+        {
+            let compiled = read_compiled_pack_from_manifest(
+                output_root,
+                &pack.pack_id,
+                manifest,
+                manifest_bytes,
+                &pack.shards,
+            )?;
+            curated_packs.push((position, compiled));
+        }
+    }
+
+    let mut generated_packs = Vec::new();
+    for (position, (generated, reuse)) in index
+        .generated_productions
+        .iter()
+        .zip(generated_reuse)
+        .enumerate()
+    {
+        verify_generated_production_identity(&index, generated)?;
+        if reuse != GeneratedProductionReuse::Eligible {
+            continue;
+        }
+        let (manifest, manifest_bytes) =
+            read_compiled_manifest(output_root, &generated.pack_id, &generated.manifest)?;
+        verify_generated_manifest_metadata(generated, &manifest)?;
+        verify_indexed_shards(&generated.pack_id, &manifest, &generated.shards)?;
+        let selected = match request {
+            AcquisitionReceiptRequest::GeneratedProduction(key) => {
+                generated.production_digest == key.production_digest()
+            }
+            AcquisitionReceiptRequest::DeclaredPack(query) => {
+                manifest.language == query.language && manifest.ecosystem == query.ecosystem
+            }
+        };
+        if selected {
+            let compiled = read_compiled_pack_from_manifest(
+                output_root,
+                &generated.pack_id,
+                manifest,
+                manifest_bytes,
+                &generated.shards,
+            )?;
+            generated_packs.push((position, compiled));
+        }
+    }
+    Ok(VerifiedAcquisitionBundle {
+        bundle: ReleaseBundle { index, rejects },
+        request: request.clone(),
+        curated_packs,
+        generated_packs,
+    })
+}
+
+fn verify_release_pack_metadata(
+    output_root: &Path,
+    pack: &ReleasePack,
+    manifest: &CompiledPackManifest,
+) -> Result<(), BundleError> {
+    if manifest.pack_id != pack.pack_id
+        || manifest.version != pack.pack_version
+        || manifest.semantic_sha256 != pack.manifest_semantic_sha256
+        || manifest.content_sha256 != pack.manifest_content_sha256
+        || manifest.shards.len() != pack.shards.len()
+        || manifest.language != pack.language
+        || manifest.ecosystem != pack.ecosystem
+        || manifest.completeness != pack.completeness
+        || manifest.compatibility != pack.compatibility
+        || manifest.provenance != pack.provenance
+        || manifest.license != pack.license
+    {
+        return Err(BundleError::new(format!(
+            "release index metadata does not match manifest for {}@{}",
+            pack.pack_id, pack.pack_version
+        )));
+    }
+    if pack.notices.is_empty() {
+        return Err(BundleError::new(format!(
+            "release pack {}@{} must include at least one license or notice asset",
+            pack.pack_id, pack.pack_version
+        )));
+    }
+    validate_release_notices(&pack.notices)?;
+    for notice in &pack.notices {
+        verify_asset(output_root, &notice.asset)?;
+    }
+    Ok(())
 }
 
 /// Read `index.json` and run the index-level gates: bundle schema, generator
@@ -2587,22 +2717,30 @@ fn verify_generated_production_pack(
         &generated.manifest,
         &generated.shards,
     )?;
-    if compiled.manifest.pack_id != generated.pack_id
-        || compiled.manifest.version != generated.pack_version
-        || compiled.manifest.language != generated.language
-        || compiled.manifest.ecosystem != generated.ecosystem
-        || compiled.manifest.semantic_sha256 != generated.manifest_semantic_sha256
-        || compiled.manifest.content_sha256 != generated.manifest_content_sha256
-        || compiled.manifest.completeness != generated.completeness
-        || compiled.manifest.producer.name != generated.producer_name
-        || compiled.manifest.producer.version != generated.producer_version
-        || compiled.manifest.schema_version != generated.schema_version
+    verify_generated_manifest_metadata(generated, &compiled.manifest)?;
+    Ok(compiled)
+}
+
+fn verify_generated_manifest_metadata(
+    generated: &ReleaseGeneratedProduction,
+    manifest: &CompiledPackManifest,
+) -> Result<(), BundleError> {
+    if manifest.pack_id != generated.pack_id
+        || manifest.version != generated.pack_version
+        || manifest.language != generated.language
+        || manifest.ecosystem != generated.ecosystem
+        || manifest.semantic_sha256 != generated.manifest_semantic_sha256
+        || manifest.content_sha256 != generated.manifest_content_sha256
+        || manifest.completeness != generated.completeness
+        || manifest.producer.name != generated.producer_name
+        || manifest.producer.version != generated.producer_version
+        || manifest.schema_version != generated.schema_version
     {
         return Err(BundleError::new(
             "generated production index metadata does not match its manifest",
         ));
     }
-    Ok(compiled)
+    Ok(())
 }
 
 /// Read and cross-check the structured extraction burn-down report.
@@ -2770,7 +2908,7 @@ pub fn install_release_bundle(
     .map(|proof| proof.installations)
 }
 
-#[cfg(feature = "download")]
+#[cfg(all(test, feature = "download"))]
 pub(crate) fn install_release_bundle_with_proof(
     bundle_root: &Path,
     catalog: &SemanticPackCatalog,
@@ -2800,12 +2938,104 @@ fn install_release_bundle_for_cache_version(
 }
 
 #[cfg(feature = "download")]
-pub(crate) fn install_verified_release_bundle_with_proof(
-    verified: VerifiedReleaseBundle,
+pub(crate) fn install_acquisition_bundle(
+    bundle_root: &Path,
     catalog: &SemanticPackCatalog,
     release: &AcquisitionReceiptRelease,
-) -> Result<BundleInstallationProof, BundleError> {
-    install_verified_release_bundle(verified, catalog, Some(release))
+    request: &AcquisitionReceiptRequest,
+) -> Result<AcquisitionInstallationProof, BundleError> {
+    let verified = {
+        let _scope = brokk_bifrost_analysis::profiling::scope(
+            "semantic_pack.release_bundle.verify_for_acquisition",
+        );
+        verify_release_bundle_for_acquisition(bundle_root, request)?
+    };
+    install_verified_acquisition_bundle(verified, catalog, release)
+}
+
+#[cfg(feature = "download")]
+pub(crate) fn install_verified_acquisition_bundle(
+    verified: VerifiedAcquisitionBundle,
+    catalog: &SemanticPackCatalog,
+    release: &AcquisitionReceiptRelease,
+) -> Result<AcquisitionInstallationProof, BundleError> {
+    let VerifiedAcquisitionBundle {
+        bundle,
+        request,
+        curated_packs,
+        generated_packs,
+    } = verified;
+    if curated_packs.is_empty() && generated_packs.is_empty() {
+        return Ok(AcquisitionInstallationProof::EmptySlice { request });
+    }
+    let _scope = brokk_bifrost_analysis::profiling::scope(
+        "semantic_pack.release_bundle.install_acquisition",
+    );
+    let mut sources = Vec::new();
+    for (position, compiled) in curated_packs {
+        let pack = &bundle.index.packs[position];
+        let rejects = &bundle.rejects.packs[position];
+        let source = DurablePackSource {
+            kind: DurablePackSourceKind::PreShipped,
+            source_id: format!(
+                "release:{}@{}:{}",
+                pack.pack_id, pack.pack_version, pack.manifest.sha256
+            ),
+        };
+        let (_, proof) = catalog
+            .install_release_for_receipt(
+                release,
+                &compiled,
+                &source,
+                &release_extraction_accounting(rejects),
+            )
+            .map_err(|error| {
+                BundleError::new(format!(
+                    "install {}@{}: {error}",
+                    pack.pack_id, pack.pack_version
+                ))
+            })?;
+        sources.push(proof);
+    }
+    for (position, compiled) in generated_packs {
+        let generated = &bundle.index.generated_productions[position];
+        let key = GeneratedProductionKey::new(
+            generated.input_digest.clone(),
+            generated.producer_name.clone(),
+            generated.producer_version.clone(),
+            generated.schema_version,
+        )
+        .map_err(|error| BundleError::new(format!("invalid generated production key: {error}")))?;
+        let source = DurablePackSource {
+            kind: DurablePackSourceKind::PreShipped,
+            source_id: format!(
+                "release-generated:{}@{}:{}",
+                generated.source_pack_id,
+                generated.source_pack_version,
+                generated.production_digest
+            ),
+        };
+        let (_, proof) = catalog
+            .install_release_generated_for_receipt(
+                release,
+                &key,
+                &compiled,
+                &source,
+                &generated_extraction_accounting(generated),
+            )
+            .map_err(|error| {
+                BundleError::new(format!(
+                    "install generated {}@{}: {error}",
+                    generated.pack_id, generated.pack_version
+                ))
+            })?;
+        sources.extend(proof);
+    }
+    assert!(
+        !sources.is_empty(),
+        "selected acquisition has receipt sources"
+    );
+    Ok(AcquisitionInstallationProof::Complete { request, sources })
 }
 
 fn install_verified_release_bundle(
@@ -2946,16 +3176,37 @@ fn read_compiled_pack(
     manifest_asset: &ReleaseAsset,
     indexed_shards: &[ReleaseShard],
 ) -> Result<CompiledSemanticModelPack, BundleError> {
+    let (manifest, manifest_bytes) = read_compiled_manifest(bundle_root, pack_id, manifest_asset)?;
+    read_compiled_pack_from_manifest(
+        bundle_root,
+        pack_id,
+        manifest,
+        manifest_bytes,
+        indexed_shards,
+    )
+}
+
+fn read_compiled_manifest(
+    bundle_root: &Path,
+    pack_id: &str,
+    manifest_asset: &ReleaseAsset,
+) -> Result<(CompiledPackManifest, Vec<u8>), BundleError> {
     let manifest_bytes = verify_asset(bundle_root, manifest_asset)?;
     let limits = DecodeLimits::default();
     let manifest = decode_manifest(&manifest_bytes, &limits)
         .map_err(|error| BundleError::new(format!("decode manifest for {pack_id}: {error}")))?;
-    if indexed_shards.len() != manifest.shards.len() {
-        return Err(BundleError::new(format!(
-            "indexed shard count does not match manifest for {pack_id}"
-        )));
-    }
-    let mut indexed_ids = BTreeSet::new();
+    Ok((manifest, manifest_bytes))
+}
+
+fn read_compiled_pack_from_manifest(
+    bundle_root: &Path,
+    pack_id: &str,
+    manifest: CompiledPackManifest,
+    manifest_bytes: Vec<u8>,
+    indexed_shards: &[ReleaseShard],
+) -> Result<CompiledSemanticModelPack, BundleError> {
+    let limits = DecodeLimits::default();
+    verify_indexed_shards(pack_id, &manifest, indexed_shards)?;
     let shards = manifest
         .shards
         .iter()
@@ -2963,32 +3214,13 @@ fn read_compiled_pack(
             let indexed = indexed_shards
                 .iter()
                 .find(|shard| shard.shard_id == descriptor.shard_id)
-                .ok_or_else(|| {
-                    BundleError::new(format!("missing indexed shard {}", descriptor.shard_id))
-                })?;
-            if !indexed_ids.insert(indexed.shard_id.as_str()) {
-                return Err(BundleError::new(format!(
-                    "duplicate indexed shard {} for {pack_id}",
-                    indexed.shard_id
-                )));
-            }
-            if indexed.encoding != descriptor.encoding
-                || indexed.raw_bytes != descriptor.raw_size
-                || indexed.records != descriptor.record_count
-                || indexed.semantic_sha256 != descriptor.semantic_sha256
-                || indexed.content_sha256 != descriptor.content_sha256
-                || indexed.asset.sha256 != descriptor.stored_sha256
-                || indexed.asset.bytes != descriptor.stored_size
-            {
-                return Err(BundleError::new(format!(
-                    "indexed shard metadata does not match {} for {pack_id}",
-                    descriptor.shard_id
-                )));
-            }
+                .expect("validated shard index contains every manifest shard");
             let bytes = verify_asset(bundle_root, &indexed.asset)?;
-            decode_shard_for_manifest(&manifest, descriptor, &bytes, &limits).map_err(|error| {
-                BundleError::new(format!("decode shard {}: {error}", descriptor.shard_id))
-            })?;
+            // decode_manifest already validated the whole inventory. Keep the
+            // per-shard checks without walking every manifest ID again.
+            decode_validated_shard_for_manifest(&manifest, descriptor, &bytes, &limits).map_err(
+                |error| BundleError::new(format!("decode shard {}: {error}", descriptor.shard_id)),
+            )?;
             Ok(
                 brokk_bifrost_analysis::analyzer::semantic_model::CompiledShardArtifact {
                     descriptor: descriptor.clone(),
@@ -3002,6 +3234,47 @@ fn read_compiled_pack(
         manifest_bytes,
         shards,
     })
+}
+
+fn verify_indexed_shards(
+    pack_id: &str,
+    manifest: &CompiledPackManifest,
+    indexed_shards: &[ReleaseShard],
+) -> Result<(), BundleError> {
+    if indexed_shards.len() != manifest.shards.len() {
+        return Err(BundleError::new(format!(
+            "indexed shard count does not match manifest for {pack_id}"
+        )));
+    }
+    let mut indexed_ids = BTreeSet::new();
+    for descriptor in &manifest.shards {
+        let indexed = indexed_shards
+            .iter()
+            .find(|shard| shard.shard_id == descriptor.shard_id)
+            .ok_or_else(|| {
+                BundleError::new(format!("missing indexed shard {}", descriptor.shard_id))
+            })?;
+        if !indexed_ids.insert(indexed.shard_id.as_str()) {
+            return Err(BundleError::new(format!(
+                "duplicate indexed shard {} for {pack_id}",
+                indexed.shard_id
+            )));
+        }
+        if indexed.encoding != descriptor.encoding
+            || indexed.raw_bytes != descriptor.raw_size
+            || indexed.records != descriptor.record_count
+            || indexed.semantic_sha256 != descriptor.semantic_sha256
+            || indexed.content_sha256 != descriptor.content_sha256
+            || indexed.asset.sha256 != descriptor.stored_sha256
+            || indexed.asset.bytes != descriptor.stored_size
+        {
+            return Err(BundleError::new(format!(
+                "indexed shard metadata does not match {} for {pack_id}",
+                descriptor.shard_id
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn verify_checksums(output_root: &Path, index: &ReleaseBundleIndex) -> Result<(), BundleError> {
@@ -3843,6 +4116,56 @@ mod tests {
             artifact_sha256: Some(artifact_sha256.clone()),
             bifrost_version: env!("CARGO_PKG_VERSION").parse().unwrap(),
         };
+        #[cfg(feature = "download")]
+        {
+            use brokk_bifrost_analysis::analyzer::semantic_model::AcquisitionReceiptLookup;
+
+            let mut absent_query = query.clone();
+            absent_query.toolchain.as_mut().unwrap().version =
+                Some(Version::parse("17.0.10").unwrap());
+            let request = AcquisitionReceiptRequest::declared(&absent_query);
+            let mut verified = verify_release_bundle_for_acquisition(&first, &request).unwrap();
+            assert_eq!(verified.curated_packs.len(), 1);
+            assert_eq!(verified.generated_packs.len(), 1);
+            verified.generated_packs[0].1.shards[0].bytes[0] ^= 1;
+            let release = AcquisitionReceiptRelease {
+                repository: "fixture".to_owned(),
+                tag: "v0".to_owned(),
+                archive_name: "fixture.tar.gz".to_owned(),
+                archive_digest: "0".repeat(64),
+                bundle_schema_version: RELEASE_BUNDLE_SCHEMA_VERSION,
+                bundle_generator_name: current_release_generator().name,
+                bundle_generator_version: env!("CARGO_PKG_VERSION").to_owned(),
+                semantic_schema_version: SEMANTIC_MODEL_SCHEMA_VERSION,
+                generated_cache_version: GENERATED_PRODUCTION_CACHE_VERSION,
+                client_epoch: 3,
+            };
+            let partial_catalog =
+                SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+            let error = install_verified_acquisition_bundle(verified, &partial_catalog, &release)
+                .unwrap_err();
+            assert!(error.to_string().contains("install generated"), "{error}");
+            assert!(
+                partial_catalog
+                    .candidates(&absent_query)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                !partial_catalog
+                    .inventory_bounded(usize::MAX)
+                    .unwrap()
+                    .packs
+                    .is_empty()
+            );
+            assert_eq!(
+                partial_catalog
+                    .acquisition_receipt_lookup(&request, &release)
+                    .unwrap(),
+                AcquisitionReceiptLookup::ReceiptMiss,
+                "a partial installation cannot certify absence"
+            );
+        }
         assert!(
             stale_catalog
                 .candidates(&query)

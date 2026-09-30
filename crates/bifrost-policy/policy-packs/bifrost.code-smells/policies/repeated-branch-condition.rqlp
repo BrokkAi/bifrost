@@ -1,0 +1,26 @@
+; A later test can repeat an earlier test only when every condition evaluated
+; on the path between them is proven stable and effect free. Calls, getters,
+; Python truthiness hooks, and unresolved bindings stay open.
+(policy
+  :schema-version 1
+  :id "bifrost.correctness.repeated-branch-condition"
+  :name "Repeated stable branch condition"
+  :message "this later branch repeats an earlier condition whose tested values cannot have changed"
+  :severity warning
+  :description "A later condition in one ordered if/else-if chain repeats an earlier condition over the same ordinary bindings. Each intervening condition is proven effect free, so the later branch cannot be selected. Calls, getters, Python truthiness hooks, and unresolved bindings are not proof of stability. Review the intended alternative test; no automatic fix is implied."
+  :help-uri "https://bifrost.brokk.ai/static-analysis-policies/#built-in-code-smell-pack"
+  :tags ["correctness" "conditional" "code-smell"]
+  :analysis (analysis
+    :type assertion
+    (bind :name branch
+      :query (rql :schema-version 1
+        (filter :where ((verdict eq proven))
+          (branch-relations :relation [repeated-condition]
+            (union
+              (language java (if))
+              (language javascript (if))
+              (language typescript (if))
+              (language python (if)))))))
+    (group :name by-branch :by (branch.id)
+      (aggregate :name violations :op count))
+    (assert :group by-branch :value violations :cardinality (exactly 0))))

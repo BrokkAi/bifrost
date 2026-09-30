@@ -23,7 +23,10 @@ use crate::imports::{
 };
 use crate::providers::JsTsSource;
 use crate::syntax::compute_import_binder as compute_jsts_import_binder;
-use crate::syntax::{JsTsImportBinder, nested_type_identifier_parts, parse_js_ts_tree, slice};
+use crate::syntax::{
+    JsTsImportBinder, nested_type_identifier_parts, parse_js_ts_tree, slice,
+    ts_type_wrapper_operand, ts_type_wrapper_type,
+};
 use crate::tsconfig::AliasResolver;
 use crate::type_text::{
     jsts_type_space_candidates, jsts_unit_is_type_only, jsts_value_space_candidates,
@@ -111,22 +114,21 @@ pub fn ts_direct_object_literal_value(node: Node<'_>) -> Option<Node<'_>> {
     (node.kind() == "object").then_some(node)
 }
 
-pub fn ts_unwrap_expression(node: Node<'_>) -> Option<Node<'_>> {
-    match node.kind() {
-        "as_expression"
-        | "satisfies_expression"
-        | "type_assertion"
-        | "parenthesized_expression" => {
-            let mut cursor = node.walk();
-            node.named_children(&mut cursor)
-                .find(|child| {
-                    child.kind() != "type_annotation"
-                        && child.kind() != "type_identifier"
-                        && child.kind() != "predefined_type"
-                })
-                .and_then(ts_unwrap_expression)
-        }
-        _ => Some(node),
+/// The expression inside parentheses and `as`, `satisfies` and `<T>` type
+/// assertions. `None` when a recovered wrapper has no operand.
+pub fn ts_unwrap_expression(mut node: Node<'_>) -> Option<Node<'_>> {
+    loop {
+        node = match node.kind() {
+            "as_expression" | "satisfies_expression" | "type_assertion" => {
+                ts_type_wrapper_operand(node)?
+            }
+            "parenthesized_expression" => {
+                let mut cursor = node.walk();
+                node.named_children(&mut cursor)
+                    .find(|child| !child.is_extra())?
+            }
+            _ => return Some(node),
+        };
     }
 }
 
@@ -827,42 +829,50 @@ fn ts_expression_property_owners(
                 )
             })
             .unwrap_or_default(),
-        "as_expression" | "satisfies_expression" | "type_assertion" => expression
-            .child_by_field_name("type")
-            .or_else(|| ts_assertion_type_child(expression))
-            .map(|type_node| {
-                ts_resolve_type_text_to_property_owners(
-                    host,
-                    support,
-                    file,
-                    source,
-                    imports,
-                    aliases,
-                    ts_type_annotation_text(type_node, source).as_str(),
-                    depth + 1,
-                )
-            })
-            .unwrap_or_else(|| {
-                let mut cursor = expression.walk();
-                expression
-                    .named_children(&mut cursor)
-                    .find(|child| child.kind() != "type_annotation")
-                    .map(|child| {
-                        ts_expression_property_owners(
-                            host,
-                            support,
-                            file,
-                            source,
-                            root,
-                            imports,
-                            aliases,
-                            child,
-                            depth + 1,
-                            resolution,
-                        )
-                    })
-                    .unwrap_or_default()
-            }),
+        "as_expression" | "satisfies_expression" | "type_assertion" => {
+            ts_type_wrapper_type(expression)
+                .filter(|type_node| {
+                    matches!(
+                        type_node.kind(),
+                        "type_identifier"
+                            | "generic_type"
+                            | "object_type"
+                            | "predefined_type"
+                            | "union_type"
+                            | "intersection_type"
+                    )
+                })
+                .map(|type_node| {
+                    ts_resolve_type_text_to_property_owners(
+                        host,
+                        support,
+                        file,
+                        source,
+                        imports,
+                        aliases,
+                        ts_type_annotation_text(type_node, source).as_str(),
+                        depth + 1,
+                    )
+                })
+                .unwrap_or_else(|| {
+                    ts_type_wrapper_operand(expression)
+                        .map(|child| {
+                            ts_expression_property_owners(
+                                host,
+                                support,
+                                file,
+                                source,
+                                root,
+                                imports,
+                                aliases,
+                                child,
+                                depth + 1,
+                                resolution,
+                            )
+                        })
+                        .unwrap_or_default()
+                })
+        }
         _ => Vec::new(),
     }
 }
@@ -1808,22 +1818,6 @@ fn ts_call_reference_name(node: Node<'_>, source: &str) -> Option<String> {
             .and_then(|property| ts_call_reference_name(property, source)),
         _ => None,
     }
-}
-
-fn ts_assertion_type_child(node: Node<'_>) -> Option<Node<'_>> {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor).find(|child| {
-        matches!(
-            child.kind(),
-            "type_identifier"
-                | "generic_type"
-                | "type_arguments"
-                | "object_type"
-                | "predefined_type"
-                | "union_type"
-                | "intersection_type"
-        )
-    })
 }
 
 #[cfg(test)]

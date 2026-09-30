@@ -8,11 +8,14 @@
 use super::*;
 use crate::analyzer::usages::receiver_query::ReceiverQueryOperation;
 use brokk_bifrost_rql::QueryValueKind;
+use schemars::JsonSchema;
 
 mod configuration;
 mod coverage;
 mod diagnostics;
 mod environment;
+#[cfg(feature = "query-result-fixtures")]
+mod fixtures;
 mod provenance;
 mod render;
 mod rows;
@@ -24,6 +27,8 @@ pub use configuration::*;
 pub use coverage::*;
 pub use diagnostics::*;
 pub use environment::*;
+#[cfg(feature = "query-result-fixtures")]
+pub use fixtures::code_query_result_fixtures_json;
 pub use provenance::*;
 pub use rows::*;
 pub use semantic::*;
@@ -49,7 +54,7 @@ pub(crate) enum UnionExecutionStrategy {
     Parallel,
 }
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default, Serialize, JsonSchema)]
 pub struct CodeQueryResult {
     pub results: Vec<CodeQueryResultItem>,
     pub truncated: bool,
@@ -60,6 +65,7 @@ pub struct CodeQueryResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_subset: Option<SubsetCoverage>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[schemars(default)]
     pub diagnostics: Vec<CodeQueryDiagnostic>,
 }
 
@@ -308,13 +314,25 @@ pub fn code_query_completion(
     CodeQueryCompletion::Complete
 }
 
-#[derive(Debug, Clone, Serialize)]
+/// Return the JSON Schema for the serializing `CodeQueryResult` contract.
+#[must_use]
+pub fn code_query_result_json_schema() -> serde_json::Value {
+    let schema = schemars::generate::SchemaSettings::draft2020_12()
+        .for_serialize()
+        .into_generator()
+        .into_root_schema_for::<CodeQueryResult>();
+    serde_json::to_value(schema).expect("a generated JSON Schema is serializable")
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CodeQueryResultItem {
     #[serde(flatten)]
     pub value: CodeQueryResultValue,
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[schemars(default)]
     pub provenance: Vec<CodeQueryProvenance>,
     #[serde(skip_serializing_if = "is_false")]
+    #[schemars(default)]
     pub provenance_truncated: bool,
     /// Query-local projected field names used by typed row consumers. The
     /// ordinary result value retains its stable domain-specific wire shape.
@@ -356,7 +374,7 @@ impl CodeQueryResultItem {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(tag = "result_type", rename_all = "snake_case")]
 pub enum CodeQueryResultValue {
     StructuralMatch {
@@ -492,6 +510,10 @@ pub enum CodeQueryResultValue {
         #[serde(flatten)]
         value: Box<CodeQueryCallResultContract>,
     },
+    CallResultObligation {
+        #[serde(flatten)]
+        value: Box<CodeQueryCallResultObligation>,
+    },
     ResultContractUse {
         #[serde(flatten)]
         value: Box<CodeQueryResultContractUse>,
@@ -507,6 +529,10 @@ pub enum CodeQueryResultValue {
     SwitchCoverage {
         #[serde(flatten)]
         value: Box<CodeQuerySwitchCoverage>,
+    },
+    AssignmentRelation {
+        #[serde(flatten)]
+        value: Box<CodeQueryAssignmentRelation>,
     },
     DetachedTaskTransfer {
         #[serde(flatten)]
@@ -604,6 +630,22 @@ pub enum CodeQueryResultValue {
         #[serde(flatten)]
         value: Box<CodeQueryControlRelation>,
     },
+    BranchRelation {
+        #[serde(flatten)]
+        value: Box<CodeQueryBranchRelation>,
+    },
+    LoopRelation {
+        #[serde(flatten)]
+        value: Box<CodeQueryLoopRelation>,
+    },
+    FailureHandlerState {
+        #[serde(flatten)]
+        value: Box<CodeQueryFailureHandlerState>,
+    },
+    StatementReachability {
+        #[serde(flatten)]
+        value: Box<CodeQueryStatementReachability>,
+    },
     Guard {
         #[serde(flatten)]
         value: Box<CodeQueryGuard>,
@@ -634,7 +676,8 @@ pub enum CodeQueryResultValue {
     },
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CodeQueryMatch {
     pub path: String,
     pub language: &'static str,
@@ -656,14 +699,17 @@ pub struct CodeQueryMatch {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub decorated_range: Option<CodeQueryRange>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[schemars(default)]
     pub decorator_ranges: Vec<CodeQueryRange>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[schemars(default)]
     pub captures: Vec<CodeQueryCapture>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enclosing_symbol: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CodeQueryDeclaration {
     pub path: String,
     pub language: &'static str,

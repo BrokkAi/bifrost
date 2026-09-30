@@ -4,6 +4,7 @@
 //! closed [`ResolvedTaintPolicySpec`] boundary and lowers only structured,
 //! source-backed selector results into the diagnostic-neutral taint engine.
 
+use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -20,11 +21,11 @@ use crate::definition::{
 use crate::evaluator::{PolicyEvaluationContext, TaintPolicyEvaluator};
 use crate::finding::{
     AuthoredArmClosureEvidence, BoundedWitness, CertaintyReason, FindingCertainty,
-    FindingCompleteness, FindingIncompleteReason, PolicyDiagnostic, PolicyDiagnosticCode,
-    PolicyDiagnosticImpact, PolicyDiagnosticSeverity, PolicyFailureReason, PolicyIncompleteReason,
-    PolicyLocationRelationship, PolicyRunCompletion, ProofMetadata, ProofReason, ProofState,
-    RelatedPolicyLocation, ReportValueError, StoreDimensionEvidence, WitnessStep, WitnessStepKind,
-    WitnessStepProvenance,
+    FindingCompleteness, FindingIncompleteReason, MAX_REPORT_PROSE_BYTES, PolicyDiagnostic,
+    PolicyDiagnosticCode, PolicyDiagnosticImpact, PolicyDiagnosticSeverity, PolicyFailureReason,
+    PolicyIncompleteReason, PolicyLocationRelationship, PolicyRunCompletion, PolicySourceLocation,
+    ProofMetadata, ProofReason, ProofState, RelatedPolicyLocation, ReportValueError,
+    StoreDimensionEvidence, WitnessStep, WitnessStepKind, WitnessStepProvenance,
 };
 use crate::finding::{PolicyWorkMetric, PolicyWorkReport, PolicyWorkUnit};
 use crate::finding_identity::{
@@ -55,14 +56,16 @@ use brokk_bifrost_analysis::analyzer::semantic::workspace_oracle::{
 };
 use brokk_bifrost_analysis::analyzer::semantic::{
     CallArgumentMapping, CallArgumentMember, CallBinding, CallBindings, CallSiteHandle,
-    CandidateCoverage, DispatchCandidate, DispatchHints, DispatchReadAttribution, DispatchResult,
-    DurablePortIdentity, EvidenceCompleteness, ExactExternalProcedureTarget, LengthDelimitedDigest,
-    ObservationPhase, OracleCallContext, ProcedureHandle, ProcedurePortHandle, ProcedurePortKind,
-    ProgramPointHandle, ProofStatus, ReturnedCallableProvenance, RuntimeReadSourceOrigin,
-    SemanticArtifactKey, SemanticBudget, SemanticExecutionBudget, SemanticOutcome, SemanticRequest,
-    SemanticValueKind, SemanticWork, SourceMappingKind, UnmaterializedExternalTarget,
-    ValueFlowSnapshot, ValueHandle, WorkspaceIcfgProvider, WorkspaceRelativePath,
-    WorkspaceSemanticOracle, authored_procedure_target_identity, dispatch_read_attribution,
+    CandidateCoverage, DispatchBoundaryKind, DispatchCandidate, DispatchHints,
+    DispatchReadAttribution, DispatchResult, DurablePortIdentity, EvidenceCompleteness,
+    ExactExternalProcedureTarget, IcfgEdgeKind, LengthDelimitedDigest, ObservationPhase,
+    OracleCallContext, OracleRelationHandle, ProcedureHandle, ProcedurePortHandle,
+    ProcedurePortKind, ProgramPointHandle, ProofStatus, ReturnedCallableProvenance,
+    RuntimeReadSourceOrigin, SemanticArtifactKey, SemanticBudget, SemanticExecutionBudget,
+    SemanticLocator, SemanticOutcome, SemanticRequest, SemanticValueKind, SemanticWork,
+    SourceMappingKind, UnmaterializedExternalTarget, ValueFlowSnapshot, ValueHandle,
+    WorkspaceIcfgProvider, WorkspaceRelativePath, WorkspaceSemanticOracle,
+    authored_procedure_target_identity, dispatch_read_attribution,
 };
 use brokk_bifrost_analysis::analyzer::semantic::{DispatchOracle, ValueFlowOracle};
 use brokk_bifrost_analysis::analyzer::semantic_model::{
@@ -78,10 +81,10 @@ use brokk_bifrost_analysis::analyzer::{ProjectFile, WorkspaceAnalyzer};
 use brokk_bifrost_flow::dataflow::{
     CuratedCallModel, DataflowRequest, ExternalSemanticSummarySet, ExternalSummaryCompatibilityKey,
     ExternalSummaryContentHash, ExternalSummaryModelId, ExternalSummaryTarget, SemanticInputStatus,
-    SolverBudget, SolverTermination, SummaryBehaviorKey, SummaryContextKey, SummaryEffect,
-    SummaryEffectKey, SummaryEvidence, SummaryExit, SummaryExitKind, SummaryPort,
-    SummarySchemaVersion, SummarySemanticsVersion, SummaryTransfer, SummaryWitness,
-    SummaryWitnessStepKind, WitnessReconstructionLimits, WitnessRetentionLimits,
+    SolverBudget, SolverTermination, SummaryBehaviorKey, SummaryBoundary, SummaryBoundaryKind,
+    SummaryContextKey, SummaryEdge, SummaryEffect, SummaryEffectKey, SummaryEvidence, SummaryExit,
+    SummaryExitKind, SummaryPort, SummarySchemaVersion, SummarySemanticsVersion, SummaryTransfer,
+    SummaryWitness, SummaryWitnessStepKind, WitnessReconstructionLimits, WitnessRetentionLimits,
 };
 use brokk_bifrost_flow::taint::{
     SourceClassId, SourceEventKey, TaintAnalysisPlan, TaintBatch, TaintBatchCompatibilityKey,
@@ -5331,7 +5334,7 @@ fn solve_and_project_batch(
                         payload.diagnostics.push(diagnostic);
                     }
                 }
-                ensure_taint_incomplete_diagnostic(payload, retained.report());
+                ensure_taint_incomplete_diagnostic(payload, retained.report(), workspace);
             }
         }
     }
@@ -5367,9 +5370,15 @@ fn solve_and_project_batch(
 /// example: the plan can be structurally complete while the fixed-point result
 /// retains an open coverage boundary. Before #2838 those runs carried only
 /// `completion.reasons = [partial_discovery]`, with no diagnostic family at all.
+///
+/// A fixed point keeps the three coverage totals and names the first rows of
+/// each coverage category with their locations and proof or completeness
+/// reasons (#3644). Rows are projected lazily, so a cancelled or
+/// budget-exhausted solve resolves no locations.
 fn ensure_taint_incomplete_diagnostic(
     payload: &mut TaintProjectionPayload,
     report: &TaintFindingReport,
+    workspace: &WorkspaceAnalyzer,
 ) {
     if payload
         .diagnostics
@@ -5385,34 +5394,191 @@ fn ensure_taint_incomplete_diagnostic(
         .first()
         .copied()
         .expect("validated inconclusive completion has a reason");
+    let coverage = report.result().coverage();
     let diagnostic = taint_incomplete_diagnostic(
         report.result().termination(),
         reason,
-        report.result().coverage().unproven_edges().len(),
-        report.result().coverage().partial_edges().len(),
-        report.result().coverage().boundaries().len(),
+        coverage
+            .unproven_edges()
+            .iter()
+            .map(|edge| CoverageRow::edge(workspace, edge)),
+        coverage
+            .partial_edges()
+            .iter()
+            .map(|edge| CoverageRow::edge(workspace, edge)),
+        coverage
+            .boundaries()
+            .iter()
+            .map(|boundary| CoverageRow::boundary(workspace, boundary)),
     );
     payload.diagnostics.push(diagnostic);
 }
 
-fn taint_incomplete_diagnostic(
+/// Coverage rows a fixed-point warning names from each category, taken in
+/// the order `SummaryCoverage` already holds them.
+const FIXED_POINT_ROWS_PER_CATEGORY: usize = 3;
+/// Bytes one rendered coverage row keeps, truncation marker included.
+const FIXED_POINT_ROW_BYTES: usize = 400;
+/// Bytes one retained proof or completeness reason keeps inside a row,
+/// truncation marker included, so a long proof reason cannot push the
+/// completeness reason out of its row.
+const FIXED_POINT_REASON_BYTES: usize = 120;
+/// Upper bounds, with every count at `usize::MAX` digits, of the totals
+/// sentence and of one category's omitted-count clause.
+const FIXED_POINT_TOTALS_BYTES: usize = 200;
+const FIXED_POINT_OMITTED_BYTES: usize = 64;
+const MAX_FIXED_POINT_PROVENANCE: usize = 3;
+const COVERAGE_ROW_TRUNCATION: &str = " [truncated]";
+
+const _: () = assert!(FIXED_POINT_ROW_BYTES > COVERAGE_ROW_TRUNCATION.len());
+const _: () = assert!(FIXED_POINT_REASON_BYTES > COVERAGE_ROW_TRUNCATION.len());
+// Three categories of at most three rows, each behind a "; " separator, and
+// one omitted-count clause per category fit the report prose bound for any
+// coverage, so the diagnostic below cannot be rejected for its length.
+const _: () = assert!(
+    FIXED_POINT_TOTALS_BYTES
+        + 3 * (FIXED_POINT_ROWS_PER_CATEGORY * (2 + FIXED_POINT_ROW_BYTES)
+            + FIXED_POINT_OMITTED_BYTES)
+        <= MAX_REPORT_PROSE_BYTES
+);
+
+/// One retained coverage row, projected for the fixed-point warning.
+///
+/// The program point, origin call site, and dispatch target are resolved to
+/// report locations; the kind, reasons, and provenance are borrowed from the
+/// coverage. Rendering reads only these fields and needs no workspace.
+struct CoverageRow<'a> {
+    location: PolicySourceLocation,
+    kind: CoverageRowKind<'a>,
+    origin: Option<PolicySourceLocation>,
+    proof: Option<&'a ProofStatus>,
+    completeness: Option<&'a EvidenceCompleteness>,
+    provenance: &'a [OracleRelationHandle],
+}
+
+enum CoverageRowKind<'a> {
+    Edge(IcfgEdgeKind),
+    Boundary {
+        kind: &'a SummaryBoundaryKind,
+        /// The exact target a dispatch boundary names, when it names one.
+        target: Option<PolicySourceLocation>,
+    },
+}
+
+impl<'a> CoverageRow<'a> {
+    /// An unproven or partial edge, located at its source point.
+    fn edge(workspace: &WorkspaceAnalyzer, edge: &'a SummaryEdge) -> Self {
+        Self {
+            location: coverage_location(
+                workspace,
+                super::semantic_identity::program_point_locator(edge.source()),
+            ),
+            kind: CoverageRowKind::Edge(edge.kind()),
+            origin: edge.origin().map(|call| {
+                coverage_location(workspace, super::semantic_identity::call_site_locator(call))
+            }),
+            proof: Some(edge.proof()),
+            completeness: Some(edge.completeness()),
+            provenance: &[],
+        }
+    }
+
+    /// An open boundary, located at its program point.
+    fn boundary(workspace: &WorkspaceAnalyzer, boundary: &'a SummaryBoundary) -> Self {
+        let target = match boundary.kind() {
+            SummaryBoundaryKind::Dispatch(dispatch) => dispatch
+                .target_locator()
+                .map(|target| coverage_location(workspace, target)),
+            SummaryBoundaryKind::Semantic(_)
+            | SummaryBoundaryKind::Limit(_)
+            | SummaryBoundaryKind::Continuation { .. } => None,
+        };
+        Self {
+            location: coverage_location(
+                workspace,
+                super::semantic_identity::program_point_locator(boundary.at()),
+            ),
+            kind: CoverageRowKind::Boundary {
+                kind: boundary.kind(),
+                target,
+            },
+            origin: boundary.origin().map(|call| {
+                coverage_location(workspace, super::semantic_identity::call_site_locator(call))
+            }),
+            proof: boundary.proof(),
+            completeness: boundary.completeness(),
+            provenance: boundary.provenance(),
+        }
+    }
+}
+
+/// The report location of one coverage locator. A location that cannot be
+/// built keeps its row, named by the locator's path alone, rather than
+/// dropping the row or the warning.
+fn coverage_location(
+    workspace: &WorkspaceAnalyzer,
+    locator: &SemanticLocator,
+) -> PolicySourceLocation {
+    super::semantic_identity::policy_location(workspace, locator)
+        .unwrap_or_else(|_| PolicySourceLocation::artifact(locator.path().clone()))
+}
+
+fn taint_incomplete_diagnostic<'a>(
     termination: SolverTermination,
     reason: PolicyIncompleteReason,
-    unproven_edges: usize,
-    partial_edges: usize,
-    boundaries: usize,
+    unproven_edges: impl ExactSizeIterator<Item = CoverageRow<'a>>,
+    partial_edges: impl ExactSizeIterator<Item = CoverageRow<'a>>,
+    boundaries: impl ExactSizeIterator<Item = CoverageRow<'a>>,
 ) -> PolicyDiagnostic {
-    let (family, message) = match termination {
-        SolverTermination::FixedPoint => (
-            format!("taint_analysis/{}", reason.label()),
-            format!(
+    let (family, message, primary, related) = match termination {
+        SolverTermination::FixedPoint => {
+            let mut message = format!(
                 "taint analysis is incomplete after reaching a fixed point: {} unproven edge(s), {} partial edge(s), and {} open boundary row(s)",
-                unproven_edges, partial_edges, boundaries,
-            ),
-        ),
+                unproven_edges.len(),
+                partial_edges.len(),
+                boundaries.len(),
+            );
+            debug_assert!(message.len() <= FIXED_POINT_TOTALS_BYTES);
+            let mut locations = Vec::new();
+            push_coverage_category(
+                &mut message,
+                &mut locations,
+                "unproven edge",
+                unproven_edges,
+            );
+            push_coverage_category(&mut message, &mut locations, "partial edge", partial_edges);
+            push_coverage_category(
+                &mut message,
+                &mut locations,
+                "open boundary row",
+                boundaries,
+            );
+            let primary = locations.first().cloned();
+            let related = locations
+                .into_iter()
+                .filter_map(|location| {
+                    // A location too large to keep as evidence stays named in
+                    // the message.
+                    RelatedPolicyLocation::try_new(
+                        PolicyLocationRelationship::Evidence,
+                        location,
+                        Vec::new(),
+                    )
+                    .ok()
+                })
+                .collect();
+            (
+                format!("taint_analysis/{}", reason.label()),
+                message,
+                primary,
+                related,
+            )
+        }
         SolverTermination::Cancelled => (
             "taint_analysis/cancelled".to_owned(),
             "taint analysis was cancelled before reaching a fixed point".to_owned(),
+            None,
+            Vec::new(),
         ),
         SolverTermination::ExceededBudget(exceeded) => (
             format!(
@@ -5420,6 +5586,8 @@ fn taint_incomplete_diagnostic(
                 exceeded.dimension().label()
             ),
             exceeded.to_string(),
+            None,
+            Vec::new(),
         ),
     };
     PolicyDiagnostic::try_new_in_family(
@@ -5428,10 +5596,165 @@ fn taint_incomplete_diagnostic(
         PolicyDiagnosticImpact::RunIncomplete,
         family,
         message,
-        None,
-        Vec::new(),
+        primary,
+        related,
     )
-    .expect("static taint incompleteness diagnostic is valid")
+    .expect("taint incompleteness diagnostic is bounded by construction")
+}
+
+/// Append the first rows of one coverage category and, when rows remain,
+/// the exact count of the ones left out.
+///
+/// The summary solve already ordered and deduplicated each category, so a
+/// long unproven list never hides the partial edges or the open boundaries.
+/// Rows past the first `FIXED_POINT_ROWS_PER_CATEGORY` are never projected.
+fn push_coverage_category<'a>(
+    message: &mut String,
+    locations: &mut Vec<PolicySourceLocation>,
+    category: &str,
+    rows: impl ExactSizeIterator<Item = CoverageRow<'a>>,
+) {
+    let total = rows.len();
+    for row in rows.take(FIXED_POINT_ROWS_PER_CATEGORY) {
+        message.push_str("; ");
+        message.push_str(&render_coverage_row(category, &row));
+        locations.push(row.location);
+    }
+    let omitted = total.saturating_sub(FIXED_POINT_ROWS_PER_CATEGORY);
+    if omitted > 0 {
+        let clause = format!("; omitted {omitted} {category}(s)");
+        debug_assert!(clause.len() <= FIXED_POINT_OMITTED_BYTES);
+        message.push_str(&clause);
+    }
+}
+
+fn render_coverage_row(category: &str, row: &CoverageRow<'_>) -> String {
+    let kind = match &row.kind {
+        CoverageRowKind::Edge(kind) => Cow::Borrowed(kind.label()),
+        CoverageRowKind::Boundary { kind, .. } => Cow::Owned(boundary_kind_detail(kind)),
+    };
+    let mut text = format!("{category} {kind} at {}", location_text(&row.location));
+    if let Some(origin) = &row.origin {
+        text.push_str(" origin=");
+        text.push_str(&location_text(origin));
+    }
+    if let CoverageRowKind::Boundary {
+        target: Some(target),
+        ..
+    } = &row.kind
+    {
+        text.push_str(" target=");
+        text.push_str(&location_text(target));
+    }
+    if let Some(proof) = row.proof {
+        text.push_str(" proof=");
+        text.push_str(proof.label());
+        if let ProofStatus::Unproven(reason) = proof {
+            push_coverage_reason(&mut text, reason);
+        }
+    }
+    if let Some(completeness) = row.completeness {
+        text.push_str(" completeness=");
+        text.push_str(completeness.label());
+        if let EvidenceCompleteness::Partial(reason) = completeness {
+            push_coverage_reason(&mut text, reason);
+        }
+    }
+    push_provenance(&mut text, row.provenance);
+    bound_coverage_row(text)
+}
+
+/// `path:line:column` from the location's display region, as the human
+/// report writes locations; a path-only location is its path.
+fn location_text(location: &PolicySourceLocation) -> String {
+    match location.region() {
+        Some(region) => format!(
+            "{}:{}:{}",
+            location.path(),
+            region.start_line(),
+            region.start_column()
+        ),
+        None => location.path().to_owned(),
+    }
+}
+
+fn boundary_kind_detail(kind: &SummaryBoundaryKind) -> String {
+    match kind {
+        SummaryBoundaryKind::Semantic(status) => {
+            let mut text = format!("semantic:{}", status.label());
+            if let Some(capability) = status.unsupported_capability() {
+                text.push_str(" (");
+                text.push_str(capability.label());
+                text.push(')');
+            }
+            if let Some(exceeded) = status.budget_exceeded() {
+                text.push_str(" (");
+                text.push_str(&exceeded.to_string());
+                text.push(')');
+            }
+            text
+        }
+        SummaryBoundaryKind::Dispatch(dispatch) => match dispatch {
+            DispatchBoundaryKind::Deferred { kind, .. } => {
+                format!("dispatch:{} {}", dispatch.label(), kind.label())
+            }
+            DispatchBoundaryKind::External(_)
+            | DispatchBoundaryKind::Unmaterialized(_)
+            | DispatchBoundaryKind::Unresolved
+            | DispatchBoundaryKind::Truncated => format!("dispatch:{}", dispatch.label()),
+        },
+        SummaryBoundaryKind::Limit(limit) => format!("limit:{}", limit.label()),
+        SummaryBoundaryKind::Continuation { kind, state } => {
+            format!("continuation:{}:{}", kind.label(), state.label())
+        }
+    }
+}
+
+fn push_provenance(text: &mut String, provenance: &[OracleRelationHandle]) {
+    if provenance.is_empty() {
+        return;
+    }
+    text.push_str(" provenance=");
+    let shown = provenance.len().min(MAX_FIXED_POINT_PROVENANCE);
+    for (index, relation) in provenance[..shown].iter().enumerate() {
+        if index > 0 {
+            text.push(',');
+        }
+        text.push_str(relation.record().kind().label());
+        text.push('#');
+        text.push_str(&relation.id().get().to_string());
+    }
+    let omitted = provenance.len() - shown;
+    if omitted > 0 {
+        text.push_str(",+");
+        text.push_str(&omitted.to_string());
+    }
+}
+
+/// Append one retained proof or completeness reason in parentheses, cut at
+/// `FIXED_POINT_REASON_BYTES` on a char boundary with a marker.
+fn push_coverage_reason(text: &mut String, reason: &str) {
+    text.push_str(" (");
+    if reason.len() <= FIXED_POINT_REASON_BYTES {
+        text.push_str(reason);
+    } else {
+        let boundary =
+            reason.floor_char_boundary(FIXED_POINT_REASON_BYTES - COVERAGE_ROW_TRUNCATION.len());
+        text.push_str(&reason[..boundary]);
+        text.push_str(COVERAGE_ROW_TRUNCATION);
+    }
+    text.push(')');
+}
+
+fn bound_coverage_row(mut text: String) -> String {
+    if text.len() <= FIXED_POINT_ROW_BYTES {
+        return text;
+    }
+    let boundary = text.floor_char_boundary(FIXED_POINT_ROW_BYTES - COVERAGE_ROW_TRUNCATION.len());
+    text.truncate(boundary);
+    text.push_str(COVERAGE_ROW_TRUNCATION);
+    debug_assert!(text.len() <= FIXED_POINT_ROW_BYTES);
+    text
 }
 
 /// Publish every metric name a compiled taint run reports: the compile's bound
@@ -7764,7 +8087,8 @@ mod tests {
     use crate::definition::PolicyId;
     use crate::evaluator::{DefaultPolicyEvaluator, PolicyEvaluationContext, PolicyEvaluator};
     use crate::finding::{
-        PolicyIncompleteReason, PolicyRunCompletion, PolicyWorkMetric, PolicyWorkReport,
+        PolicyDiagnostic, PolicyIncompleteReason, PolicyRunCompletion, PolicyWorkMetric,
+        PolicyWorkReport,
     };
     use crate::inline_project::InlineTestProject;
     use crate::registry::{PolicyRegistry, PolicyRegistryLimits};
@@ -7773,22 +8097,48 @@ mod tests {
     use brokk_bifrost_analysis::CancellationToken;
     use brokk_bifrost_analysis::analyzer::read_ledger::{LookupKind, ReadKey, ReadLedger};
     use brokk_bifrost_analysis::analyzer::semantic::{
-        ProcedureHandle, SemanticArtifact, SemanticBudget, SemanticRequest, SemanticWork,
+        DispatchBoundaryKind, EvidenceCompleteness, IcfgEdgeKind, IcfgLimitKind, ProcedureHandle,
+        ProofStatus, SemanticArtifact, SemanticBudget, SemanticRequest, SemanticWork,
     };
     use brokk_bifrost_analysis::analyzer::{
         AnalyzerConfig, AnalyzerQueryScope, FilesystemProject, Language, Project, WorkspaceAnalyzer,
     };
-    use brokk_bifrost_flow::dataflow::SolverWork;
+    use brokk_bifrost_flow::dataflow::{SolverWork, SummaryBoundaryKind};
     use brokk_bifrost_rql::structural::{CodeQueryExecutionLimits, CodeQuerySemanticLimits};
 
     #[test]
     fn solver_incompleteness_diagnostics_have_stable_typed_families() {
+        let proof = ProofStatus::Unproven("unproven".into());
+        let gap = EvidenceCompleteness::Partial("partial".into());
+        let limit = SummaryBoundaryKind::Limit(IcfgLimitKind::CallDepth);
+        let edges = |count: u64| {
+            (1..=count)
+                .map(|line| {
+                    coverage_rows::edge(
+                        IcfgEdgeKind::NormalReturn,
+                        coverage_rows::at("handler.js", line),
+                        &proof,
+                        &gap,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let boundaries = (1..=3)
+            .map(|line| {
+                coverage_rows::boundary(
+                    &limit,
+                    coverage_rows::at("handler.js", line),
+                    Some(&proof),
+                    None,
+                )
+            })
+            .collect::<Vec<_>>();
         let fixed_point = super::taint_incomplete_diagnostic(
             super::SolverTermination::FixedPoint,
             PolicyIncompleteReason::PartialDiscovery,
-            1,
-            2,
-            3,
+            edges(1).into_iter(),
+            edges(2).into_iter(),
+            boundaries.into_iter(),
         );
         assert_eq!(fixed_point.family(), "taint_analysis/partial_discovery");
         assert_eq!(
@@ -7802,14 +8152,18 @@ mod tests {
         let cancelled = super::taint_incomplete_diagnostic(
             super::SolverTermination::Cancelled,
             PolicyIncompleteReason::Cancelled,
-            0,
-            0,
-            0,
+            std::iter::empty(),
+            std::iter::empty(),
+            std::iter::empty(),
         );
         assert_eq!(cancelled.family(), "taint_analysis/cancelled");
         assert_eq!(
             cancelled.impact(),
             super::PolicyDiagnosticImpact::RunIncomplete
+        );
+        assert_eq!(
+            cancelled.message(),
+            "taint analysis was cancelled before reaching a fixed point"
         );
 
         let cancellation = CancellationToken::default();
@@ -7823,9 +8177,9 @@ mod tests {
         let budgeted = super::taint_incomplete_diagnostic(
             exceeded,
             PolicyIncompleteReason::PartialDiscovery,
-            0,
-            0,
-            0,
+            std::iter::empty(),
+            std::iter::empty(),
+            std::iter::empty(),
         );
         assert_eq!(
             budgeted.family(),
@@ -7835,6 +8189,276 @@ mod tests {
             budgeted.impact(),
             super::PolicyDiagnosticImpact::RunIncomplete
         );
+    }
+
+    /// #3644: two fixed points with equal coverage totals used to produce one
+    /// warning. The retained reasons and kinds now tell them apart, at the
+    /// same locations, and `primary` and `related` name the selected rows.
+    #[test]
+    fn fixed_point_incompleteness_names_distinct_reasons_at_equal_counts() {
+        fn fixed_point(proof: &ProofStatus, boundary: &SummaryBoundaryKind) -> PolicyDiagnostic {
+            let gap = EvidenceCompleteness::Partial(
+                "the callee exit has exact return-affecting semantic gaps".into(),
+            );
+            let proven = ProofStatus::Proven;
+            let unproven = super::CoverageRow {
+                origin: Some(coverage_rows::at("handler.js", 12)),
+                ..coverage_rows::edge(
+                    IcfgEdgeKind::ExceptionalReturn,
+                    coverage_rows::at("handler.js", 7),
+                    proof,
+                    &gap,
+                )
+            };
+            let partial = coverage_rows::edge(
+                IcfgEdgeKind::NormalReturn,
+                coverage_rows::at("handler.js", 9),
+                &proven,
+                &gap,
+            );
+            let open = coverage_rows::boundary(
+                boundary,
+                coverage_rows::at("handler.js", 7),
+                Some(proof),
+                None,
+            );
+            super::taint_incomplete_diagnostic(
+                super::SolverTermination::FixedPoint,
+                PolicyIncompleteReason::PartialDiscovery,
+                [unproven].into_iter(),
+                [partial].into_iter(),
+                [open].into_iter(),
+            )
+        }
+        let operator = fixed_point(
+            &ProofStatus::Unproven(
+                "implicit exceptions from runtime coercion or operator dispatch are not yet lowered"
+                    .into(),
+            ),
+            &SummaryBoundaryKind::Limit(IcfgLimitKind::CallDepth),
+        );
+        let property = fixed_point(
+            &ProofStatus::Unproven(
+                "implicit exceptions from property access, accessors, or proxies are not yet lowered"
+                    .into(),
+            ),
+            &SummaryBoundaryKind::Dispatch(DispatchBoundaryKind::Unresolved),
+        );
+
+        let totals = "taint analysis is incomplete after reaching a fixed point: 1 unproven edge(s), 1 partial edge(s), and 1 open boundary row(s); ";
+        assert_eq!(operator.family(), "taint_analysis/partial_discovery");
+        assert_eq!(operator.family(), property.family());
+        assert!(
+            operator.message().starts_with(totals),
+            "{}",
+            operator.message()
+        );
+        assert!(
+            property.message().starts_with(totals),
+            "{}",
+            property.message()
+        );
+        assert_ne!(operator.message(), property.message());
+        assert_eq!(
+            operator.message(),
+            format!(
+                "{totals}unproven edge exceptional_return at handler.js:7:3 origin=handler.js:12:3 proof=unproven (implicit exceptions from runtime coercion or operator dispatch are not yet lowered) completeness=partial (the callee exit has exact return-affecting semantic gaps); partial edge normal_return at handler.js:9:3 proof=proven completeness=partial (the callee exit has exact return-affecting semantic gaps); open boundary row limit:call_depth_limit at handler.js:7:3 proof=unproven (implicit exceptions from runtime coercion or operator dispatch are not yet lowered)"
+            )
+        );
+        assert!(
+            property
+                .message()
+                .contains("; open boundary row dispatch:unresolved at handler.js:7:3 proof=unproven (implicit exceptions from property access, accessors, or proxies are not yet lowered)"),
+            "{}",
+            property.message()
+        );
+        assert!(!property.message().contains("operator dispatch"));
+        assert!(!property.message().contains("limit:"));
+
+        for diagnostic in [&operator, &property] {
+            assert_eq!(
+                diagnostic.primary(),
+                Some(&coverage_rows::at("handler.js", 7))
+            );
+            // The boundary shares the unproven edge's location, and
+            // try_new_in_family keeps one entry per identical location.
+            let related = diagnostic
+                .related()
+                .iter()
+                .map(|related| {
+                    assert_eq!(
+                        related.relationship(),
+                        crate::finding::PolicyLocationRelationship::Evidence
+                    );
+                    related.location().clone()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                related,
+                vec![
+                    coverage_rows::at("handler.js", 7),
+                    coverage_rows::at("handler.js", 9)
+                ]
+            );
+        }
+    }
+
+    /// #3644: far more rows than the warning names, with 2 KiB reasons and one
+    /// oversized path, construct under the report prose bound with three rows
+    /// per category in coverage order and each category's exact omitted count.
+    #[test]
+    fn fixed_point_incompleteness_is_bounded_per_category() {
+        const ROWS: usize = 40;
+        // Two-byte characters after a five-byte label, so the 108-byte reason
+        // cut falls inside a character and must step back to 107.
+        let reason = |label: String| format!("({label}){}", "\u{e9}".repeat(1_024));
+        let proofs = (0..ROWS)
+            .map(|index| ProofStatus::Unproven(reason(format!("r{index:02}")).into()))
+            .collect::<Vec<_>>();
+        let gaps = (0..ROWS)
+            .map(|index| EvidenceCompleteness::Partial(reason(format!("g{index:02}")).into()))
+            .collect::<Vec<_>>();
+        let limit = SummaryBoundaryKind::Limit(IcfgLimitKind::Nodes);
+        let edges = |kind: IcfgEdgeKind| {
+            (0..ROWS)
+                .map(|index| {
+                    coverage_rows::edge(
+                        kind,
+                        coverage_rows::at("handler.js", index as u64 + 1),
+                        &proofs[index],
+                        &gaps[index],
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut boundaries = (0..ROWS)
+            .map(|index| {
+                coverage_rows::boundary(
+                    &limit,
+                    coverage_rows::at("handler.js", index as u64 + 1),
+                    Some(&proofs[index]),
+                    Some(&gaps[index]),
+                )
+            })
+            .collect::<Vec<_>>();
+        let long_path = format!("{}handler.js", "nested/".repeat(70));
+        boundaries[0].location = coverage_rows::at(&long_path, 1);
+
+        let diagnostic = super::taint_incomplete_diagnostic(
+            super::SolverTermination::FixedPoint,
+            PolicyIncompleteReason::PartialDiscovery,
+            edges(IcfgEdgeKind::ExceptionalReturn).into_iter(),
+            edges(IcfgEdgeKind::NormalReturn).into_iter(),
+            boundaries.into_iter(),
+        );
+        let message = diagnostic.message();
+        assert!(
+            message.len() <= super::MAX_REPORT_PROSE_BYTES,
+            "{}",
+            message.len()
+        );
+        let totals = "taint analysis is incomplete after reaching a fixed point: 40 unproven edge(s), 40 partial edge(s), and 40 open boundary row(s); ";
+        assert!(message.starts_with(totals), "{message}");
+        let parts = message[totals.len()..].split("; ").collect::<Vec<_>>();
+        assert_eq!(parts.len(), 12, "{parts:#?}");
+        let kept = "\u{e9}".repeat(51);
+        for (offset, category) in [
+            (0, "unproven edge"),
+            (4, "partial edge"),
+            (8, "open boundary row"),
+        ] {
+            for (index, row) in parts[offset..offset + 3].iter().enumerate() {
+                assert!(row.starts_with(&format!("{category} ")), "{row}");
+                assert!(row.len() <= super::FIXED_POINT_ROW_BYTES, "{row}");
+                if category == "open boundary row" && index == 0 {
+                    assert!(row.contains(&long_path[..100]), "{row}");
+                    assert!(row.ends_with(" [truncated]"), "{row}");
+                    continue;
+                }
+                // Both reasons survive, each cut on a char boundary.
+                assert!(
+                    row.contains(&format!(
+                        "proof=unproven ((r{index:02}){kept} [truncated]) completeness=partial ((g{index:02}){kept} [truncated])"
+                    )),
+                    "{row}"
+                );
+            }
+            assert_eq!(parts[offset + 3], format!("omitted 37 {category}(s)"));
+        }
+        assert!(!message.contains("(r03)"), "{message}");
+        assert_eq!(
+            diagnostic.primary(),
+            Some(&coverage_rows::at("handler.js", 1))
+        );
+        // try_new_in_family sorts related locations and keeps one entry per
+        // identical location, so nine selected rows here give four entries.
+        assert_eq!(
+            diagnostic
+                .related()
+                .iter()
+                .map(|related| related.location().clone())
+                .collect::<Vec<_>>(),
+            vec![
+                coverage_rows::at("handler.js", 1),
+                coverage_rows::at("handler.js", 2),
+                coverage_rows::at("handler.js", 3),
+                coverage_rows::at(&long_path, 1),
+            ]
+        );
+    }
+
+    /// Projected coverage rows for the rendering tests (#3644). Projection
+    /// needs a workspace and solver-built coverage; rendering reads only
+    /// these fields.
+    mod coverage_rows {
+        use crate::finding::{PolicyByteSpan, PolicyDisplayRegion, PolicySourceLocation};
+        use brokk_bifrost_analysis::analyzer::semantic::{
+            EvidenceCompleteness, IcfgEdgeKind, ProofStatus, WorkspaceRelativePath,
+        };
+        use brokk_bifrost_flow::dataflow::SummaryBoundaryKind;
+
+        use super::super::{CoverageRow, CoverageRowKind};
+
+        /// Line `line`, columns 3 to 9, of `path`.
+        pub(super) fn at(path: &str, line: u64) -> PolicySourceLocation {
+            PolicySourceLocation::span(
+                WorkspaceRelativePath::new(path).expect("workspace-relative path"),
+                PolicyByteSpan::new(line * 100 + 2, line * 100 + 8).expect("byte span"),
+                PolicyDisplayRegion::new(line, 3, line, 9).expect("display region"),
+            )
+        }
+
+        pub(super) fn edge<'a>(
+            kind: IcfgEdgeKind,
+            location: PolicySourceLocation,
+            proof: &'a ProofStatus,
+            completeness: &'a EvidenceCompleteness,
+        ) -> CoverageRow<'a> {
+            CoverageRow {
+                location,
+                kind: CoverageRowKind::Edge(kind),
+                origin: None,
+                proof: Some(proof),
+                completeness: Some(completeness),
+                provenance: &[],
+            }
+        }
+
+        pub(super) fn boundary<'a>(
+            kind: &'a SummaryBoundaryKind,
+            location: PolicySourceLocation,
+            proof: Option<&'a ProofStatus>,
+            completeness: Option<&'a EvidenceCompleteness>,
+        ) -> CoverageRow<'a> {
+            CoverageRow {
+                location,
+                kind: CoverageRowKind::Boundary { kind, target: None },
+                origin: None,
+                proof,
+                completeness,
+                provenance: &[],
+            }
+        }
     }
 
     #[test]

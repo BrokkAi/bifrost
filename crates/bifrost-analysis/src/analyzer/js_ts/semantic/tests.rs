@@ -68,6 +68,65 @@ fn lower_javascript_parts(source: &str) -> Vec<ProcedureSemanticsParts> {
 }
 
 #[test]
+fn dynamic_scope_observation_marks_lexical_owners_open() {
+    let source = r#"
+function outer() {
+    let value = 1;
+    function inner() { eval("value"); }
+    value = 2;
+}
+function scoped(object) {
+    let value = 1;
+    with (object) { value = 2; }
+    value = 3;
+}
+function wrapped() {
+    let value = 1;
+    (eval)("value");
+    value = 2;
+}
+"#;
+    let parts = lower_javascript_parts(source);
+    for name in ["outer", "inner", "scoped", "wrapped"] {
+        let procedure = parts
+            .iter()
+            .find(|procedure| {
+                procedure
+                    .locator
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|segment| segment.name())
+                    == Some(name)
+            })
+            .expect("named procedure exists");
+        assert!(
+            procedure.gaps.iter().any(|gap| {
+                gap.capability == SemanticCapability::LocalFlow
+                    && gap.kind == SemanticGapKind::Unsupported
+            }),
+            "{name}: {:?}",
+            procedure.gaps
+        );
+    }
+}
+
+#[test]
+fn for_initializer_let_is_established_before_body_and_increment_writes() {
+    let procedure = lower_javascript_source(
+        "function f() { for (let iteration = 0; iteration < 3; iteration = iteration + 1) { iteration = 1; } }",
+    );
+    assert!(
+        !procedure
+            .gaps
+            .iter()
+            .any(|gap| gap.capability == SemanticCapability::LocalFlow),
+        "{:?}",
+        procedure.gaps
+    );
+}
+
+#[test]
 fn local_const_callback_publishes_target_and_capture_ports() {
     let source = r#"
         function capture(source) {
@@ -392,6 +451,275 @@ fn lower_typescript_source(source: &str) -> Vec<ProcedureSemanticsParts> {
         panic!("TypeScript semantic lowering must complete");
     };
     value
+}
+
+#[test]
+fn uninitialized_js_ts_declarations_establish_undefined_at_the_right_time() {
+    for lower in [
+        lower_javascript_parts as fn(&str) -> Vec<ProcedureSemanticsParts>,
+        lower_typescript_source,
+    ] {
+        let parts = lower(
+            "function hoisted() { return x; var x; }\n\
+             function lexical() { let x; return x; }\n\
+             function redeclared() { var x = 1; var x; return x; }\n\
+             function shadowed() { var x; { let x; } return x; }\n\
+             function outer() { var own; function inner() { var hidden; } }",
+        );
+        let named = |name: &str| {
+            parts
+                .iter()
+                .find(|part| {
+                    part.locator
+                        .declaration()
+                        .segments()
+                        .last()
+                        .and_then(|segment| segment.name())
+                        == Some(name)
+                })
+                .unwrap_or_else(|| panic!("missing {name} procedure"))
+        };
+        let assignments = |part: &ProcedureSemanticsParts| {
+            part.points
+                .iter()
+                .flat_map(|point| {
+                    point.events.iter().filter_map(move |event| {
+                        if let SemanticEffect::Assignment { target, value } = &event.effect {
+                            Some((point.id, *target, *value))
+                        } else {
+                            None
+                        }
+                    })
+                })
+                .filter(|(_, target, _)| {
+                    matches!(&part.values[target.index()].kind, SemanticValueKind::Local)
+                })
+                .collect::<Vec<_>>()
+        };
+        let entry = |part: &ProcedureSemanticsParts| {
+            part.points
+                .iter()
+                .find(|point| {
+                    point
+                        .events
+                        .iter()
+                        .any(|event| matches!(&event.effect, SemanticEffect::Entry))
+                })
+                .expect("procedure entry")
+                .id
+        };
+        let reaches = |part: &ProcedureSemanticsParts, target: ProgramPointId| {
+            let mut pending = vec![entry(part)];
+            let mut visited = HashSet::default();
+            while let Some(point) = pending.pop() {
+                if point == target {
+                    return true;
+                }
+                if visited.insert(point) {
+                    pending.extend(
+                        part.control_edges
+                            .iter()
+                            .filter(|edge| edge.source_point == point)
+                            .map(|edge| edge.target_point),
+                    );
+                }
+            }
+            false
+        };
+
+        let hoisted = named("hoisted");
+        assert_eq!(assignments(hoisted).len(), 1);
+        assert_eq!(assignments(hoisted)[0].0, entry(hoisted));
+        assert!(matches!(
+            &hoisted.values[assignments(hoisted)[0].2.index()].kind,
+            SemanticValueKind::LanguageDefined(name) if name.as_ref() == "js.undefined"
+        ));
+
+        let lexical = named("lexical");
+        assert_eq!(assignments(lexical).len(), 1);
+        assert_ne!(assignments(lexical)[0].0, entry(lexical));
+        assert!(reaches(lexical, assignments(lexical)[0].0));
+        assert!(matches!(
+            &lexical.values[assignments(lexical)[0].2.index()].kind,
+            SemanticValueKind::LanguageDefined(name) if name.as_ref() == "js.undefined"
+        ));
+
+        let redeclared = named("redeclared");
+        assert_eq!(assignments(redeclared).len(), 2);
+        assert_eq!(
+            assignments(redeclared)
+                .iter()
+                .filter(|(point, _, _)| *point == entry(redeclared))
+                .count(),
+            1,
+        );
+
+        let shadowed = named("shadowed");
+        assert_eq!(assignments(shadowed).len(), 2);
+        assert_ne!(assignments(shadowed)[0].1, assignments(shadowed)[1].1);
+        assert_eq!(
+            assignments(shadowed)
+                .iter()
+                .filter(|(point, _, _)| *point == entry(shadowed))
+                .count(),
+            1,
+        );
+
+        for name in ["outer", "inner"] {
+            let procedure = named(name);
+            assert_eq!(assignments(procedure).len(), 1, "{name}");
+            assert_eq!(assignments(procedure)[0].0, entry(procedure), "{name}");
+        }
+    }
+}
+
+#[test]
+fn js_ts_updates_write_computed_values_or_report_open_targets() {
+    for lower in [
+        lower_javascript_parts as fn(&str) -> Vec<ProcedureSemanticsParts>,
+        lower_typescript_source,
+    ] {
+        let parts = lower(
+            "function local() { let x = make(); x++; ++x; x += 1; return x; }\n\
+             function parameter(x) { x++; }\n\
+             function property(obj) { obj.x++; }\n\
+             function unresolved() { external++; }",
+        );
+        let named = |name: &str| {
+            parts
+                .iter()
+                .find(|part| {
+                    part.locator
+                        .declaration()
+                        .segments()
+                        .last()
+                        .and_then(|segment| segment.name())
+                        == Some(name)
+                })
+                .unwrap_or_else(|| panic!("missing {name} procedure"))
+        };
+        let writes = |part: &ProcedureSemanticsParts,
+                      target_kind: fn(&SemanticValueKind) -> bool| {
+            part.points
+                .iter()
+                .flat_map(|point| point.events.iter())
+                .filter_map(|event| match &event.effect {
+                    SemanticEffect::Assignment { target, value }
+                        if target_kind(&part.values[target.index()].kind) =>
+                    {
+                        Some(*value)
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let local = named("local");
+        let local_writes = writes(local, |kind| matches!(kind, SemanticValueKind::Local));
+        assert_eq!(local_writes.len(), 4, "local writes: {local_writes:?}");
+        assert_eq!(
+            local_writes
+                .iter()
+                .filter(|value| matches!(
+                    &local.values[value.index()].kind,
+                    SemanticValueKind::LanguageDefined(name) if name.as_ref() == "js.update.write"
+                ))
+                .count(),
+            2,
+            "both prefix and postfix updates must invalidate the old binding",
+        );
+        assert!(
+            local
+                .gaps
+                .iter()
+                .filter(|gap| {
+                    gap.capability == SemanticCapability::Calls
+                        && gap.impacts.contains(SemanticGapImpact::CallEvaluation)
+                })
+                .count()
+                >= 3,
+            "each update and compound operator may run user conversion code",
+        );
+        let parameter = named("parameter");
+        assert_eq!(
+            writes(parameter, |kind| matches!(
+                kind,
+                SemanticValueKind::Parameter { .. }
+            ))
+            .len(),
+            1,
+        );
+        for name in ["property", "unresolved"] {
+            assert!(
+                named(name).gaps.iter().any(|gap| {
+                    gap.capability == SemanticCapability::Assignments
+                        && gap.kind == SemanticGapKind::Unknown
+                }),
+                "{name} update must report its unmodeled target store",
+            );
+        }
+    }
+}
+
+#[test]
+fn js_ts_strict_comparison_keeps_operand_gaps_without_operator_throw_gap() {
+    for lower in [
+        lower_javascript_parts as fn(&str) -> Vec<ProcedureSemanticsParts>,
+        lower_typescript_source,
+    ] {
+        let parts = lower(
+            "function strict_equal(x) { return x === null; }\n\
+             function strict_unequal(x) { return x !== null; }\n\
+             function loose_equal(x) { return x == null; }\n\
+             function member(obj) { return obj.value === null; }",
+        );
+        let procedure = |name: &str| {
+            parts
+                .iter()
+                .find(|part| {
+                    part.locator
+                        .declaration()
+                        .segments()
+                        .last()
+                        .and_then(|segment| segment.name())
+                        == Some(name)
+                })
+                .unwrap_or_else(|| panic!("missing {name} procedure"))
+        };
+        let has_exception_gap = |name: &str| {
+            procedure(name)
+                .gaps
+                .iter()
+                .any(|gap| gap.capability == SemanticCapability::ExceptionalControlFlow)
+        };
+        let lowers_abort_route = |name: &str| {
+            procedure(name)
+                .control_edges
+                .iter()
+                .any(|edge| edge.kind == ControlEdgeKind::Exceptional)
+        };
+        // The intrinsic strict comparison neither coerces nor dispatches user
+        // code, so it both publishes no claim and lowers no abort route.
+        for name in ["strict_equal", "strict_unequal"] {
+            assert!(!has_exception_gap(name), "{name} keeps no operator claim");
+            assert!(!lowers_abort_route(name), "{name} cannot throw");
+        }
+        // A loose comparison can coerce and dispatch user code. Its implicit
+        // abort is lowered as a real route to the enclosing handler, cleanup,
+        // or exceptional exit instead of an unmodeled point claim: the route,
+        // not a discharge, answers whether the abort can carry a store.
+        assert!(
+            !has_exception_gap("loose_equal"),
+            "the lowered route replaces the coercing operator's unmodeled claim",
+        );
+        assert!(
+            lowers_abort_route("loose_equal"),
+            "the coercing comparison lowers its implicit abort route",
+        );
+        // Operand evaluation stays open under a strict operator: the property
+        // read keeps its own runtime-read claim.
+        assert!(has_exception_gap("member"));
+    }
 }
 
 fn value_for_node(parts: &ProcedureSemanticsParts, node: tree_sitter::Node<'_>) -> ValueId {
@@ -1933,5 +2261,460 @@ fn computed_runtime_container_loads_resolve_to_the_binding_their_chain_starts_fr
             }
         }
         assert!(found, "the computed runtime container load must be lowered");
+    }
+}
+
+/// One lowering route per dialect the adapters accept. `.jsx` and `.tsx`
+/// both parse with the TSX grammar under their own language's semantics.
+#[derive(Debug, Clone, Copy)]
+enum NumericFlavor {
+    JavaScript,
+    Jsx,
+    TypeScript,
+    Tsx,
+}
+
+impl NumericFlavor {
+    const ALL: [Self; 4] = [Self::JavaScript, Self::Jsx, Self::TypeScript, Self::Tsx];
+
+    fn lower(self, source: &str) -> ProcedureSemanticsParts {
+        let (dialect, lowerer, file) = match self {
+            Self::JavaScript => (
+                LanguageDialect::Standard(Language::JavaScript),
+                JsTsSemanticLowerer::javascript(),
+                "numeric.js",
+            ),
+            Self::Jsx => (
+                LanguageDialect::JavaScriptJsx,
+                JsTsSemanticLowerer::javascript(),
+                "numeric.jsx",
+            ),
+            Self::TypeScript => (
+                LanguageDialect::Standard(Language::TypeScript),
+                JsTsSemanticLowerer::typescript(),
+                "numeric.ts",
+            ),
+            Self::Tsx => (
+                LanguageDialect::TypeScriptTsx,
+                JsTsSemanticLowerer::typescript(),
+                "numeric.tsx",
+            ),
+        };
+        let grammar =
+            crate::analyzer::parser_language_for_dialect(dialect).expect("dialect has a grammar");
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&grammar).expect("grammar must load");
+        let tree = parser.parse(source, None).expect("source must parse");
+        assert!(!tree.root_node().has_error(), "{self:?}: {source}");
+        let prepared = PreparedSyntaxTree::new(
+            PreparedSyntaxSource::Exact(Arc::from(source)),
+            tree,
+            crate::text_utils::compute_line_starts(source),
+            dialect,
+            PreparedSourceOrigin::Disk,
+            None,
+        );
+        let file = ProjectFile::new(std::env::temp_dir(), file);
+        let outcome = lowerer
+            .lower(
+                &file,
+                &prepared,
+                &SemanticBudget::default(),
+                &CancellationToken::default(),
+            )
+            .expect("semantic lowering must succeed");
+        let SemanticOutcome::Complete { value, .. } = outcome else {
+            panic!("{self:?}: semantic lowering must complete");
+        };
+        value
+            .into_iter()
+            .find(|procedure| procedure.kind == ProcedureKind::Function)
+            .expect("function procedure must be lowered")
+    }
+}
+
+fn mapped_text<'source>(
+    parts: &ProcedureSemanticsParts,
+    source: &'source str,
+    mapping: SourceMappingId,
+) -> &'source str {
+    let span = parts.source_mappings[mapping.index()]
+        .locator
+        .anchor()
+        .span();
+    &source[span.start_byte() as usize..span.end_byte() as usize]
+}
+
+/// The kind of the one value minted for an exactly spelled expression.
+fn value_kind_for_text(
+    parts: &ProcedureSemanticsParts,
+    source: &str,
+    text: &str,
+) -> SemanticValueKind {
+    let kinds = parts
+        .values
+        .iter()
+        .filter(|value| mapped_text(parts, source, value.source) == text)
+        .map(|value| value.kind.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(kinds.len(), 1, "`{text}` must mint one value: {kinds:?}");
+    kinds.into_iter().next().expect("one value")
+}
+
+fn floating(value: f64) -> SemanticValueKind {
+    SemanticValueKind::FloatingPoint {
+        bits: value.to_bits(),
+    }
+}
+
+#[test]
+fn js_ts_numeric_and_boolean_literals_publish_typed_constants() {
+    let body = "let a = 1_000; let b = 0x1_F; let c = 0o17; let d = 0B101; let e = 1.5; \
+         let f = 2.5e3; let g = -7; let h = 9007199254740992; let i = 017; let j = 10n; \
+         let k = true; let l = false; let m = 1e400; let n = -0.0; let o = 0.1; \
+         let p = 9007199254740991; let q = -9007199254740990; let r = 0.5e1; let s = -1.25; \
+         let t = 08; let u = 0; let v = .5; let w = -20n;";
+    let cases = [
+        ("1_000", SemanticValueKind::UnsignedInteger(1000)),
+        ("0x1_F", SemanticValueKind::UnsignedInteger(31)),
+        ("0o17", SemanticValueKind::UnsignedInteger(15)),
+        ("0B101", SemanticValueKind::UnsignedInteger(5)),
+        ("1.5", floating(1.5)),
+        ("2.5e3", SemanticValueKind::UnsignedInteger(2500)),
+        ("-7", SemanticValueKind::SignedInteger(-7)),
+        ("9007199254740992", floating(9_007_199_254_740_992.0)),
+        ("017", SemanticValueKind::Constant),
+        ("10n", SemanticValueKind::Constant),
+        ("true", SemanticValueKind::Boolean(true)),
+        ("false", SemanticValueKind::Boolean(false)),
+        ("1e400", SemanticValueKind::Constant),
+        ("-0.0", SemanticValueKind::UnsignedInteger(0)),
+        ("0.1", floating(0.1)),
+        (
+            "9007199254740991",
+            SemanticValueKind::UnsignedInteger(9_007_199_254_740_991),
+        ),
+        (
+            "-9007199254740990",
+            SemanticValueKind::SignedInteger(-9_007_199_254_740_990),
+        ),
+        ("0.5e1", SemanticValueKind::UnsignedInteger(5)),
+        ("-1.25", floating(-1.25)),
+        ("08", SemanticValueKind::Constant),
+        ("0", SemanticValueKind::UnsignedInteger(0)),
+        (".5", floating(0.5)),
+        ("-20n", SemanticValueKind::Temporary),
+    ];
+    for flavor in NumericFlavor::ALL {
+        let source = format!("function f() {{ {body} }}");
+        let parts = flavor.lower(&source);
+        for (text, expected) in &cases {
+            assert_eq!(
+                &value_kind_for_text(&parts, &source, text),
+                expected,
+                "{flavor:?}: `{text}`"
+            );
+        }
+    }
+}
+
+fn describe_guards(parts: &ProcedureSemanticsParts, source: &str) -> Vec<String> {
+    let kind = |value: ValueId| &parts.values[value.index()].kind;
+    parts
+        .guard_facts
+        .iter()
+        .map(|guard| {
+            let predicate = match guard.predicate {
+                GuardPredicate::OrderedIntegerComparison { relation, constant } => {
+                    format!("int {} {:?}", relation.label(), kind(constant))
+                }
+                GuardPredicate::OrderedFloatComparison { relation, constant } => {
+                    let SemanticValueKind::FloatingPoint { bits } = kind(constant) else {
+                        panic!("a floating guard compares with a floating constant");
+                    };
+                    format!("float {} {}", relation.label(), f64::from_bits(*bits))
+                }
+                GuardPredicate::ConstantEquality { negated, constant } => {
+                    format!("equality negated={negated} {:?}", kind(constant))
+                }
+                GuardPredicate::NanComparison { nan_on_true } => {
+                    format!("nan nan_on_true={nan_on_true}")
+                }
+                GuardPredicate::Truthy { value } => {
+                    assert_eq!(Some(value), guard.subject, "truthiness tests its subject");
+                    "truthy".to_string()
+                }
+                GuardPredicate::Opaque { .. } => "opaque".to_string(),
+                other => format!("{other:?}"),
+            };
+            let subject = guard.subject.map_or("<none>", |subject| {
+                mapped_text(parts, source, parts.values[subject.index()].source)
+            });
+            format!(
+                "{}: {predicate} on {subject}",
+                mapped_text(parts, source, guard.source)
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn js_ts_numeric_comparisons_publish_scalar_guards() {
+    let conditions = [
+        ("x < 5", "int less_than UnsignedInteger(5) on x"),
+        ("5 < x", "int greater_than UnsignedInteger(5) on x"),
+        (
+            "x >= -2",
+            "int greater_than_or_equal SignedInteger(-2) on x",
+        ),
+        ("-2 >= x", "int less_than_or_equal SignedInteger(-2) on x"),
+        ("x <= 1.5", "float less_than_or_equal 1.5 on x"),
+        ("0.5 > x", "float less_than 0.5 on x"),
+        ("x === 3", "equality negated=false UnsignedInteger(3) on x"),
+        ("3 == x", "equality negated=false UnsignedInteger(3) on x"),
+        (
+            "x != 0x10",
+            "equality negated=true UnsignedInteger(16) on x",
+        ),
+        ("x !== x", "nan nan_on_true=true on x"),
+        ("x != x", "nan nan_on_true=true on x"),
+        ("x === x", "nan nan_on_true=false on x"),
+        ("x <= x", "nan nan_on_true=false on x"),
+        ("x", "truthy on x"),
+        // Strict equality tests exactly `null`; loose equality also holds for
+        // `undefined`, so it compares with the null constant and refines no
+        // arm to null or not-null.
+        ("x === null", "NullComparison { null_on_true: true } on x"),
+        ("null !== x", "NullComparison { null_on_true: false } on x"),
+        ("x == null", "equality negated=false Null on x"),
+        ("null != x", "equality negated=true Null on x"),
+        // Loose equality converts a Boolean operand with ToNumber.
+        (
+            "x == true",
+            "equality negated=false UnsignedInteger(1) on x",
+        ),
+        (
+            "false != x",
+            "equality negated=true UnsignedInteger(0) on x",
+        ),
+        ("x === true", "equality negated=false Boolean(true) on x"),
+        ("x < true", "opaque on x < true"),
+        // Negative shapes keep the generic guard.
+        ("x < x", "opaque on x < x"),
+        ("o.x < 5", "opaque on o.x < 5"),
+        ("x < 10n", "opaque on x < 10n"),
+        ("x < 017", "opaque on x < 017"),
+        ("x < 1e400", "opaque on x < 1e400"),
+        ("x === \"5\"", "opaque on x === \"5\""),
+        ("\"a\" < x", "opaque on \"a\" < x"),
+        ("x < y", "opaque on x < y"),
+        ("x < -(5)", "opaque on x < -(5)"),
+        ("x + 1 < 5", "opaque on x + 1 < 5"),
+        ("!x", "opaque on !x"),
+    ];
+    for flavor in NumericFlavor::ALL {
+        for (condition, expected) in conditions {
+            let source =
+                format!("function f(x, y, o) {{ if ({condition}) {{ return 1; }} return 0; }}");
+            let parts = flavor.lower(&source);
+            assert_eq!(
+                describe_guards(&parts, &source),
+                [format!("{condition}: {expected}")],
+                "{flavor:?}"
+            );
+        }
+        let source = "function f(x) { if (x !== -2.5) { return 1; } return 0; }";
+        let parts = flavor.lower(source);
+        let [guard] = parts.guard_facts.as_slice() else {
+            panic!("{flavor:?}: one guard: {:?}", parts.guard_facts);
+        };
+        let GuardPredicate::ConstantEquality {
+            negated: true,
+            constant,
+        } = guard.predicate
+        else {
+            panic!("{flavor:?}: {:?}", guard.predicate);
+        };
+        assert_eq!(parts.values[constant.index()].kind, floating(-2.5));
+    }
+}
+
+#[test]
+fn tsx_and_jsx_numeric_guard_beside_markup_keeps_its_shape() {
+    for flavor in [
+        NumericFlavor::JavaScript,
+        NumericFlavor::Jsx,
+        NumericFlavor::Tsx,
+    ] {
+        let source = "function f(x) { if (x < 5) { return <div>{x}</div>; } return null; }";
+        let parts = flavor.lower(source);
+        assert_eq!(
+            describe_guards(&parts, source),
+            ["x < 5: int less_than UnsignedInteger(5) on x"],
+            "{flavor:?}"
+        );
+    }
+}
+
+fn integer_offsets<'source>(
+    parts: &ProcedureSemanticsParts,
+    source: &'source str,
+) -> Vec<(&'source str, &'source str, bool, u128)> {
+    parts
+        .points
+        .iter()
+        .flat_map(|point| point.events.iter())
+        .filter_map(|event| match event.effect {
+            SemanticEffect::ValueFlow {
+                kind: ValueFlowKind::IntegerOffset { offset },
+                source: from,
+                target,
+            } => Some((
+                mapped_text(parts, source, parts.values[from.index()].source),
+                mapped_text(parts, source, parts.values[target.index()].source),
+                offset.negative(),
+                offset.magnitude(),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn js_ts_identifier_plus_integer_literal_publishes_integer_offset() {
+    let body = "let a = x + 1; let b = 2 + x; let c = x - 3; let d = x - -4; let e = 5 - x; \
+         let f = x + 1.5; let g = x + 10n; let h = o.x + 1; let i = x * 2; let j = x + y;";
+    for flavor in NumericFlavor::ALL {
+        let source = format!("function f(x, y, o) {{ {body} }}");
+        let parts = flavor.lower(&source);
+        let mut offsets = integer_offsets(&parts, &source);
+        offsets.sort_unstable();
+        assert_eq!(
+            offsets,
+            [
+                ("x", "2 + x", false, 2),
+                ("x", "x + 1", false, 1),
+                ("x", "x - -4", false, 4),
+                ("x", "x - 3", true, 3),
+            ],
+            "{flavor:?}"
+        );
+        let language_defined_targets = parts
+            .points
+            .iter()
+            .flat_map(|point| point.events.iter())
+            .filter_map(|event| match event.effect {
+                SemanticEffect::ValueFlow {
+                    kind: ValueFlowKind::LanguageDefined,
+                    target,
+                    ..
+                } => Some(mapped_text(
+                    &parts,
+                    &source,
+                    parts.values[target.index()].source,
+                )),
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+        for offset in ["x + 1", "2 + x", "x - 3", "x - -4"] {
+            assert!(
+                !language_defined_targets.contains(offset),
+                "{flavor:?}: `{offset}` keeps only its offset flow"
+            );
+        }
+        for generic in ["5 - x", "x + 1.5", "x + 10n", "o.x + 1", "x * 2", "x + y"] {
+            assert!(
+                language_defined_targets.contains(generic),
+                "{flavor:?}: `{generic}` keeps its operand flows"
+            );
+        }
+    }
+}
+
+#[test]
+fn js_ts_numeric_guards_and_offsets_add_no_scalar_gaps() {
+    for source in [
+        "function f(x) { let y = x + 1; if (y < 5) { return 1; } \
+         if (x === 2.5) { return 2; } if (x !== x) { return 3; } if (y) { return 4; } \
+         return y - 1; }",
+        // A counted loop with a per-iteration binding and its update.
+        "function f() { let found = -1; for (let i = 0; i < 3; i++) { if (i === 2) found = i; } \
+         if (found === -1) return null; return found; }",
+    ] {
+        for flavor in NumericFlavor::ALL {
+            let parts = flavor.lower(source);
+            assert!(parts.gaps.is_empty(), "{flavor:?}: {:?}", parts.gaps);
+        }
+    }
+}
+
+#[test]
+fn js_ts_updates_and_compound_literals_publish_integer_offsets() {
+    let source = "function f() { let i = 0; i++; ++i; i--; i += 2; i -= 3; i *= 2; }";
+    for flavor in NumericFlavor::ALL {
+        let parts = flavor.lower(source);
+        let mut offsets = integer_offsets(&parts, source);
+        offsets.sort_unstable();
+        // Each update writes the original plus or minus one (the written
+        // value maps to the update); a prefix update evaluates to that write
+        // and a postfix update to the original.
+        assert_eq!(
+            offsets,
+            [
+                ("i", "++i", false, 1),
+                ("i", "++i", false, 1),
+                ("i", "i += 2", false, 2),
+                ("i", "i -= 3", true, 3),
+                ("i", "i++", false, 0),
+                ("i", "i++", false, 1),
+                ("i", "i--", false, 0),
+                ("i", "i--", true, 1),
+            ],
+            "{flavor:?}"
+        );
+        // `i` only ever holds primitives, so no conversion runs user code.
+        assert!(parts.gaps.is_empty(), "{flavor:?}: {:?}", parts.gaps);
+    }
+}
+
+#[test]
+fn js_ts_update_conversion_stays_open_unless_the_binding_holds_only_primitives() {
+    let call_gaps = |parts: &ProcedureSemanticsParts| {
+        parts
+            .gaps
+            .iter()
+            .filter(|gap| {
+                gap.capability == SemanticCapability::Calls
+                    && gap.impacts.contains(SemanticGapImpact::CallEvaluation)
+            })
+            .count()
+    };
+    for (source, expected) in [
+        ("function f() { let i = 0, s = \"a\"; i++; s += 1; }", 0),
+        // An object may reach the binding through any one write.
+        ("function f(o) { let i = 0; i = o; i++; }", 1),
+        (
+            "function f(o) { let i = 0; const g = () => { i = o; }; i++; }",
+            1,
+        ),
+        ("function f(o) { let i = 0; i ??= o; i++; }", 1),
+        ("function f(o) { let [i] = o; i++; }", 1),
+        ("function f(i) { i++; }", 1),
+        // The operand of a compound assignment converts as well.
+        ("function f(o) { let i = 0; i += o; }", 1),
+    ] {
+        for flavor in NumericFlavor::ALL {
+            let parts = flavor.lower(source);
+            assert_eq!(call_gaps(&parts), expected, "{flavor:?}: {source}");
+        }
+    }
+    let source = "let i = 0; function f() { i++; }";
+    for flavor in NumericFlavor::ALL {
+        let parts = flavor.lower(source);
+        assert_eq!(
+            call_gaps(&parts),
+            1,
+            "{flavor:?}: a program binding is writable from other scripts"
+        );
     }
 }

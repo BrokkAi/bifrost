@@ -158,6 +158,7 @@ impl DependencyPackAdapter for PythonDependencyPackAdapter {
                 safety: request.safety,
                 carried_sources: Vec::new(),
                 cpp_portability: None,
+                python_correspondence: None,
                 shards: vec![AuthoredShard {
                     id: "declarations.external".to_owned(),
                     activation,
@@ -350,6 +351,7 @@ impl PythonArtifactPackProducer {
                 safety: request.safety.clone(),
                 carried_sources: Vec::new(),
                 cpp_portability: None,
+                python_correspondence: None,
                 shards: vec![AuthoredShard {
                     id: "declarations.external".to_owned(),
                     activation,
@@ -517,6 +519,7 @@ impl PythonArtifactPackProducer {
                 safety: request.safety.clone(),
                 carried_sources: Vec::new(),
                 cpp_portability: None,
+                python_correspondence: None,
                 shards: vec![AuthoredShard {
                     id: "declarations.external".to_owned(),
                     activation,

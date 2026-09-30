@@ -129,6 +129,36 @@ pub fn export_csmi_pack(
         });
     }
     if pack.manifest.language == "python" && decoded.iter().any(|shard| matches!(shard.payload(), CompiledPayload::DeclarationFacts { types, members, .. } if !types.is_empty() || !members.is_empty())) {
+        let fresh_manifest = crate::analyzer::semantic_model::decode_manifest(
+            &pack.manifest_bytes,
+            &DecodeLimits::default(),
+        )
+        .map_err(|error| CsmiExportError::Canonical(error.to_string()))?;
+        if fresh_manifest != pack.manifest
+            || pack.shards.len() != pack.manifest.shards.len()
+            || pack.manifest.shards.iter().any(|descriptor| {
+                pack.shards
+                    .iter()
+                    .filter(|artifact| artifact.descriptor == *descriptor)
+                    .count()
+                    != 1
+            })
+        {
+            return Err(CsmiExportError::Canonical(
+                "Python compiled pack inventory disagrees with its canonical manifest".to_owned(),
+            ));
+        }
+        let authored = crate::analyzer::semantic_model::artifact::authored_pack_from_decoded_shards(
+            &pack.manifest,
+            &decoded,
+        );
+        let mut diagnostics = super::python::validate_profile_evidence(&authored);
+        diagnostics.extend(super::python::validate_native_identities(&authored));
+        if !diagnostics.is_empty() {
+            return Err(CsmiExportError::Canonical(format!(
+                "Python compiled pack has inconsistent full-pack evidence: {diagnostics:?}"
+            )));
+        }
         let (semantic, provenance) = super::python::export_document(&pack.manifest, &decoded, artifact, options)?;
         return logical_pack(semantic, provenance, &pack.manifest.license, options);
     }
@@ -709,6 +739,7 @@ fn export_semantic_document<'a>(
             || !summary.declared_effects.is_empty()
             || summary.preconditions.is_some()
             || !summary.result_contracts.is_empty()
+            || !summary.result_use_obligations.is_empty()
             || !summary.conditional_result_refinements.is_empty()
             || !summary.conditional_indirect_writes.is_empty()
             || !summary.normal_return_refinements.is_empty()
@@ -1222,6 +1253,11 @@ fn logical_pack(
         CSMI_PYTHON_PROFILE_ID,
         CSMI_PYTHON_PROFILE_VERSION,
         CSMI_PYTHON_PROFILE_SCHEMA,
+    );
+    support.add(
+        CSMI_TRANSFER_PARTITIONS_PROFILE_ID,
+        CSMI_TRANSFER_PARTITIONS_PROFILE_VERSION,
+        CSMI_TRANSFER_PARTITIONS_PROFILE_SCHEMA,
     );
     support.add(
         CSMI_VALUE_TRANSFER_PROFILE_ID,
@@ -2452,7 +2488,7 @@ fn core_type_expression(
     }
 }
 
-fn transfer_to_csmi(
+pub(super) fn transfer_to_csmi(
     transfer: &crate::analyzer::semantic_model::CompiledSummaryTransfer,
     symbol_by_bifrost_id: &HashMap<String, String>,
 ) -> Result<CsmiTransfer, CsmiExportError> {

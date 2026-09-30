@@ -1740,6 +1740,18 @@ fn render_code_query_repl_output(output: &CodeQueryResult, use_color: bool) -> S
                         site_id,
                     ));
                 }
+                CodeQueryResultValue::CallResultObligation { value } => {
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  result obligation: {} {} ({})\n  site {}\n",
+                        sanitize_terminal_text(&value.path),
+                        value.range.start_line,
+                        value.range.start_column,
+                        value.obligation_kind.unwrap_or("unavailable"),
+                        value.result_use,
+                        value.coverage,
+                        sanitize_terminal_text(&value.site_id),
+                    ));
+                }
                 CodeQueryResultValue::CallResultContract { value } => {
                     let path = sanitize_terminal_text(&value.path);
                     let site_id = sanitize_terminal_text(&value.site_id);
@@ -1842,6 +1854,80 @@ fn render_code_query_repl_output(output: &CodeQueryResult, use_color: bool) -> S
                         value.verdict,
                         value.proof,
                         value.reason.unwrap_or(value.selector_domain),
+                    ));
+                }
+                CodeQueryResultValue::AssignmentRelation { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  {} {} {} [{}; {}; {}]\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.range.start_line,
+                        value.range.start_column,
+                        paint(
+                            Style::new().fg(Color::Blue),
+                            "assignment relation:",
+                            use_color
+                        ),
+                        value.relation_kind,
+                        value.storage_kind,
+                        value.verdict,
+                        value.proof,
+                        value.reason.unwrap_or(value.coverage),
+                    ));
+                }
+                CodeQueryResultValue::BranchRelation { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  {} {} {} [{}; {}]\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.range.start_line,
+                        value.range.start_column,
+                        paint(Style::new().fg(Color::Blue), "branch relation:", use_color),
+                        value.relation,
+                        value.verdict,
+                        value.orientation.unwrap_or("unspecified"),
+                        value.reason.unwrap_or("complete"),
+                    ));
+                }
+                CodeQueryResultValue::LoopRelation { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  {} {} [{}]\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.range.start_line,
+                        value.range.start_column,
+                        paint(Style::new().fg(Color::Blue), "loop relation:", use_color),
+                        value.loop_kind,
+                        value.verdict,
+                    ));
+                }
+                CodeQueryResultValue::FailureHandlerState { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  {} {} [{}; {}]\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.range.start_line,
+                        value.range.start_column,
+                        paint(Style::new().fg(Color::Blue), "failure handler:", use_color),
+                        value.verdict,
+                        value.proof,
+                        value.reason.unwrap_or(value.coverage),
+                    ));
+                }
+                CodeQueryResultValue::StatementReachability { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  {} {} [{}]\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.range.start_line,
+                        value.range.start_column,
+                        paint(
+                            Style::new().fg(Color::Blue),
+                            "statement reachability:",
+                            use_color
+                        ),
+                        value.statement_kind,
+                        value.verdict,
                     ));
                 }
                 CodeQueryResultValue::DetachedTaskTransfer { value } => {

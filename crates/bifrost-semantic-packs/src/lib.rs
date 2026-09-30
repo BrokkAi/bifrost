@@ -140,6 +140,9 @@ const SCALA_CASE_CLASS_SHARDS: &[&[u8]] = &[include_bytes!(
 const LOMBOK_1_18_42_SHARDS: &[&[u8]] = &[include_bytes!(
     "../embedded/lombok-1.18.42/shards/java.lombok.generated-accessors.deflate"
 )];
+const JDK21_RESULT_USE_OBLIGATION_SHARDS: &[&[u8]] = &[include_bytes!(
+    "../embedded/jdk21-result-use-obligations/shards/jdk21.reviewed-result-use.deflate"
+)];
 const GETSET_0_1_7_SHARDS: &[&[u8]] = &[include_bytes!(
     "../embedded/getset-0.1.7/shards/rust.getset.generated-getter.deflate"
 )];
@@ -284,6 +287,11 @@ const BIFROST_EMBEDDED_PACK_ENTRIES: &[EmbeddedSemanticPack<'static>] = &[
         "bifrost.java.lombok@1.0.0",
         include_bytes!("../embedded/lombok-1.18.42/manifest.json"),
         LOMBOK_1_18_42_SHARDS,
+    ),
+    EmbeddedSemanticPack::new(
+        "bifrost.jdk21.result-use-obligations@1.0.0",
+        include_bytes!("../embedded/jdk21-result-use-obligations/manifest.json"),
+        JDK21_RESULT_USE_OBLIGATION_SHARDS,
     ),
     EmbeddedSemanticPack::new(
         "bifrost.rust.getset@1.0.0",
@@ -558,11 +566,12 @@ mod tests {
         CompiledSummaryOutput, CompiledSummaryTransfer, CompiledSyncMapOperation,
         CompiledTaskSpawnCondition, CompilerOptions, Completeness, DependencyDiscoveryOutcome,
         DependencyPackLimits, DurablePackSource, DurablePackSourceKind, Locator, MemberIdentity,
-        MemberKind, ProcedureSummaryMemberKey, SemanticModelActivationEvidence,
-        SemanticModelActivationRequest, SemanticModelMatchDisposition, SemanticModelRuntimeLimits,
-        SemanticModelRuntimeOutcome, SemanticPackSelectorQuery, SourceFormat, TypeIdentity,
-        TypeKind, TypeRef, Visibility, acquire_active_semantic_models, compile_source,
-        member_declaration_id, prepare_compatible_installed_semantic_packs, type_declaration_id,
+        MemberKind, ProcedureSummaryMemberKey, ResultUseObligationKind,
+        SemanticModelActivationEvidence, SemanticModelActivationRequest,
+        SemanticModelMatchDisposition, SemanticModelRuntimeLimits, SemanticModelRuntimeOutcome,
+        SemanticPackSelectorQuery, SourceFormat, TypeIdentity, TypeKind, TypeRef, Visibility,
+        acquire_active_semantic_models, compile_source, member_declaration_id,
+        prepare_compatible_installed_semantic_packs, type_declaration_id,
     };
     use brokk_bifrost_analysis::analyzer::usages::call_relations::CallRelationLimits;
     use brokk_bifrost_analysis::analyzer::usages::call_shape::call_shapes_in_file;
@@ -645,6 +654,59 @@ mod tests {
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].source_id, "bifrost.fixture.embedded@1");
         assert_eq!(first[0].manifest_digest, compiled.manifest.content_sha256);
+    }
+
+    #[test]
+    fn shipped_jdk21_result_use_obligations_match_reviewed_source() {
+        let source = include_bytes!("../models/jdk21-result-use-obligations.json");
+        let compiled = compile_source(SourceFormat::Json, source, &CompilerOptions::default())
+            .expect("reviewed result-use source compiles");
+        let embedded = BIFROST_EMBEDDED_PACKS
+            .packs()
+            .iter()
+            .find(|pack| pack.source_id() == "bifrost.jdk21.result-use-obligations@1.0.0")
+            .expect("the reviewed JDK pack ships")
+            .decode(&DecodeLimits::default())
+            .expect("the shipped JDK pack decodes");
+        assert_eq!(
+            embedded.manifest.content_sha256,
+            compiled.manifest.content_sha256
+        );
+        assert_eq!(embedded.shards.len(), 1);
+        assert_eq!(embedded.shards[0].bytes, compiled.shards[0].bytes);
+        let shard = decode_shard_for_manifest(
+            &embedded.manifest,
+            &embedded.shards[0].descriptor,
+            &embedded.shards[0].bytes,
+            &DecodeLimits::default(),
+        )
+        .expect("reviewed JDK shard decodes");
+        let summaries = shard.payload().procedure_summaries().unwrap();
+        assert_eq!(summaries.len(), 2);
+        let pure = summaries
+            .iter()
+            .find(|summary| summary.target.symbol == "java.lang.String.trim()")
+            .expect("String.trim is reviewed");
+        assert!(pure.ordinary_heap_unchanged);
+        assert_eq!(
+            pure.result_use_obligations[0].kind,
+            ResultUseObligationKind::PureTransformationValue
+        );
+        let status = summaries
+            .iter()
+            .find(|summary| {
+                summary.target.symbol == "java.nio.file.Files.deleteIfExists(java.nio.file.Path)"
+            })
+            .expect("Files.deleteIfExists is reviewed");
+        assert_eq!(status.completeness, Completeness::Partial);
+        assert_eq!(
+            status.result_use_obligations[0].kind,
+            ResultUseObligationKind::FallibleStatus
+        );
+        assert_eq!(
+            status.result_use_obligations[0].failure_predicate,
+            Some(CompiledResultPredicate::False)
+        );
     }
 
     #[test]

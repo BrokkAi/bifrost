@@ -18,7 +18,7 @@ use crate::imports::{
 use crate::model::*;
 use crate::parse::flow_dialect_blocks_extraction;
 use crate::providers::JsTsSource;
-use crate::syntax::{inline_object_type, js_program_is_external_module};
+use crate::syntax::{inline_object_type, js_program_is_external_module, ts_type_wrapper_operand};
 use brokk_bifrost_core::analyzer::ProjectFile;
 use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentKind};
 use brokk_bifrost_core::analyzer::model::{CodeUnit, SignatureMetadata};
@@ -1179,21 +1179,14 @@ fn ts_expression_preserves_parameter_shape(
     })
 }
 
-fn ts_object_shape_expression(node: Node<'_>) -> Option<Node<'_>> {
-    let mut stack = vec![node];
-    while let Some(node) = stack.pop() {
-        match node.kind() {
-            "as_expression" | "satisfies_expression" | "type_assertion" => {
-                for index in (0..node.named_child_count()).rev() {
-                    if let Some(child) = node.named_child(index) {
-                        stack.push(child);
-                    }
-                }
-            }
-            _ => return Some(node),
-        }
+fn ts_object_shape_expression(mut node: Node<'_>) -> Option<Node<'_>> {
+    while matches!(
+        node.kind(),
+        "as_expression" | "satisfies_expression" | "type_assertion"
+    ) {
+        node = ts_type_wrapper_operand(node)?;
     }
-    None
+    Some(node)
 }
 
 /// The members of a function's result surface, from both places TypeScript

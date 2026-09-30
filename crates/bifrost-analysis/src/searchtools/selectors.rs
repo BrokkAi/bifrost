@@ -1272,10 +1272,27 @@ pub(super) fn split_workspace_definition_selector<'a>(
 /// An anchor that names no file keeps the raw spelling: a slash-bearing anchor
 /// is accepted on shape alone precisely so a typo (`src/wrong.js#Widget`) still
 /// reaches the anchor-recovery diagnostics that quote it back.
+///
+/// The *complete* input naming a real workspace file outranks every `#` split
+/// here, exactly as it does for historical `REV:path#symbol` selectors in
+/// `split_git_history_source_selector` (#1216): a repository chooses its file
+/// names, and `#` is one legal character in a name (marked's
+/// `bin-config#hash.js`, Autofac's `...VerifyGeneratedCode#01.verified.cs`).
+/// So `src/Outer.Part#one.cs`, an existing file, stays that file and is not
+/// read as symbol `one.cs` anchored in `src/Outer.Part` (#3505). When both
+/// readings are possible -- the whole input names a real file *and* a
+/// `path#symbol` split of it names another real file plus a symbol -- the
+/// whole-file reading wins and that one selector spelling is shadowed; the
+/// declaration stays reachable through a bare symbol query or through a
+/// longer selector whose anchor is the real file.
 pub(super) fn split_definition_selector_with_workspace_files<'a>(
     resolver: &WorkspaceFileResolver<'_>,
     input: &'a str,
 ) -> DefinitionSelector<'a> {
+    if input.contains('#') && matches!(resolver.resolve_literal(input), ResolvedFileInput::File(_))
+    {
+        return DefinitionSelector::Name(input);
+    }
     match split_definition_selector_with_resolver(input, |anchor| {
         matches!(resolver.resolve_literal(anchor), ResolvedFileInput::File(_))
     }) {

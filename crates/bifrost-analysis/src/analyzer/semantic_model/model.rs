@@ -9,8 +9,9 @@ use serde::{Deserialize, Serialize};
 
 /// The schema version every producer writes and every compiled artifact this
 /// build mints. Version three adds [`AmbientUseRole`] to `TypeFact` and
-/// `MemberFact`; version four adds the portable runtime-contract companion.
-pub const SEMANTIC_MODEL_SCHEMA_VERSION: u32 = 4;
+/// `MemberFact`; version four adds the portable runtime-contract companion;
+/// version five adds reviewed normal-result use obligations.
+pub const SEMANTIC_MODEL_SCHEMA_VERSION: u32 = 5;
 /// The schema versions a reader accepts.
 ///
 /// Packs reject unknown fields and every object is explicitly tagged, so a
@@ -20,7 +21,10 @@ pub const SEMANTIC_MODEL_SCHEMA_VERSION: u32 = 4;
 /// pack or release asset keeps loading here until its producer regenerates it
 /// on the normal cadence. A version-two pack carries no `ambient_use` fact, so
 /// it answers "unreviewed" for every declaration, which is what absence means.
-pub const SEMANTIC_MODEL_SUPPORTED_SCHEMA_VERSIONS: &[u32] = &[2, 3, 4];
+pub const SEMANTIC_MODEL_SUPPORTED_SCHEMA_VERSIONS: &[u32] = &[2, 3, 4, 5];
+/// Result-use obligations first appeared in version five. Earlier packs have
+/// no such claim, even if a procedure has a result contract or no effects.
+pub const RESULT_USE_OBLIGATIONS_MIN_SCHEMA_VERSION: u32 = 5;
 /// The lowest schema version whose packs may carry an `ambient_use` fact.
 pub const AMBIENT_USE_MIN_SCHEMA_VERSION: u32 = 3;
 /// The lowest native artifact schema that can carry the runtime-contracts 0.2
@@ -45,6 +49,7 @@ pub const MAX_PROCEDURE_SUMMARY_DECLARED_EFFECTS: usize = 64;
 /// These are API contracts, not observed executions, so one summary should
 /// need only a small set.
 pub const MAX_PROCEDURE_SUMMARY_RESULT_CONTRACTS: usize = 64;
+pub const MAX_PROCEDURE_SUMMARY_RESULT_USE_OBLIGATIONS: usize = 64;
 pub const MAX_RESULT_CONTRACT_MEMBER_CONTRACTS: usize = 64;
 pub const MAX_PROCEDURE_SUMMARY_NORMAL_RETURN_REFINEMENTS: usize = 64;
 pub const MAX_PROCEDURE_SUMMARY_NORMAL_RETURN_TYPE_REFINEMENTS: usize = 64;
@@ -746,7 +751,79 @@ pub struct AuthoredSemanticModelPack {
     /// signatures are never identities.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpp_portability: Option<CppPortabilityEvidence>,
+    /// Exact cross-artifact declaration/runtime symbol correspondence retained
+    /// from the CSMI Python profile. Omitted when the pack carries no such
+    /// evidence, preserving the serialized form of existing packs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub python_correspondence: Option<PythonCorrespondenceEvidence>,
     pub shards: Vec<AuthoredShard>,
+}
+
+/// Original CSMI Python declaration-to-runtime correspondence evidence bound
+/// to the native pack bytes that were compiled with it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PythonCorrespondenceEvidence {
+    /// SHA-256 of the normalized full authored pack, with the carrier retained
+    /// and only this field blanked to avoid a recursive digest.
+    pub native_sha256: String,
+    pub declaration_artifact: super::csmi::CsmiArtifactSelector,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub symbols: Vec<PythonCorrespondenceSymbol>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mappings: Vec<PythonCorrespondenceMapping>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(with = "Vec<serde_json::Value>")]
+    pub vocabulary_uses: Vec<super::csmi::CsmiVocabularyUse>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(with = "Vec<serde_json::Value>")]
+    pub extension_facts: Vec<super::csmi::CsmiExtensionFact>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(with = "Vec<serde_json::Value>")]
+    pub completeness_statements: Vec<super::csmi::CsmiCompletenessStatement>,
+    /// Original core completeness claims remain distinct from native pack
+    /// completeness, which carries less scope and limitation detail.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(with = "Vec<serde_json::Value>")]
+    pub core_completeness_statements: Vec<super::csmi::CsmiCompletenessStatement>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(with = "Vec<serde_json::Value>")]
+    pub provenance_records: Vec<super::csmi::CsmiProvenanceRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_provenance: Option<super::csmi::LocalId>,
+}
+
+/// A CSMI symbol definition participating in Python correspondence. The
+/// portable identity is independent of native declaration facts and IDs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PythonCorrespondenceSymbol {
+    pub local_id: super::csmi::LocalId,
+    pub identity: super::csmi::CsmiPortableSymbolIdentity,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provenance: Vec<super::csmi::LocalId>,
+}
+
+/// A typed relation between declaration and runtime CSMI symbol definitions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PythonCorrespondenceMapping {
+    pub declaration: super::csmi::LocalId,
+    pub runtime: super::csmi::LocalId,
+    pub relation: PythonCorrespondenceRelationKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<serde_json::Value>")]
+    pub conditions: Option<super::csmi::CsmiJson>,
+}
+
+/// Relation vocabulary from the CSMI Python 0.1 declaration-correspondence
+/// profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum PythonCorrespondenceRelationKind {
+    Describes,
+    Augments,
+    ReplacesForTypeChecking,
 }
 
 /// Exact C/C++ portability evidence imported from the CSMI 0.1 C/C++ profile.
@@ -1205,7 +1282,8 @@ pub struct AuthoredProcedureSummary {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub normal_continuation_absent: bool,
     /// Number of normal result ports the target returns. It is required when
-    /// `result_contracts` or `conditional_result_refinements` is non-empty so
+    /// `result_contracts`, `result_use_obligations`, or
+    /// `conditional_result_refinements` is non-empty so
     /// the compiler can reject invalid ordinals without materializing a source
     /// declaration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1213,6 +1291,10 @@ pub struct AuthoredProcedureSummary {
     #[serde(default)]
     pub locations: Vec<AuthoredSummaryLocation>,
     pub transfers: Vec<AuthoredSummaryTransfer>,
+    /// Coverage of one source universe into one whole normal-result port.
+    /// This never closes effects, exceptions, heap state, or the whole callable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub transfer_partitions: Vec<NormalResultTransferPartition>,
     #[serde(default)]
     pub effects: Vec<AuthoredSummaryEffect>,
     /// Reviewed concurrency semantics for this exact callable. These effects
@@ -1249,6 +1331,11 @@ pub struct AuthoredProcedureSummary {
     /// does not establish either contract.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub result_contracts: Vec<AuthoredResultContract>,
+    /// Reviewed requirement to use or inspect a normal result. This is
+    /// independent of the conditions under which a result is valid to consume.
+    /// Omission makes no claim about a discarded result.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub result_use_obligations: Vec<AuthoredResultUseObligation>,
     /// Reviewed effects that one boolean normal-result outcome has on a
     /// predicate over a parameter. A negative proof effect says only that the
     /// outcome does not prove the named predicate; it does not establish the
@@ -1275,6 +1362,47 @@ pub struct AuthoredProcedureSummary {
     /// decorator's behavior.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub class_decorator_identity: Option<AuthoredClassDecoratorIdentity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct NormalResultTransferPartition {
+    pub source: TransferPartitionSource,
+    pub normal_result: u32,
+    pub status: TransferPartitionStatus,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub limitations: Vec<TransferPartitionLimitation>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provenance: Vec<String>,
+}
+
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum TransferPartitionSource {
+    AllInputs,
+    InputReceiver,
+    InputParameter { ordinal: u32 },
+    InputCapture { symbol: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TransferPartitionStatus {
+    Unknown,
+    Partial,
+    Complete,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TransferPartitionLimitation {
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic_message: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
@@ -1383,6 +1511,29 @@ pub struct AuthoredResultContract {
     /// attributing the same protocol to the other result ports.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub member_contracts: Vec<AuthoredResultMemberContract>,
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ResultUseObligationKind {
+    /// A returned pure transformation value has no effect when discarded.
+    PureTransformationValue,
+    /// A returned status communicates a fallible outcome that needs inspection.
+    FallibleStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AuthoredResultUseObligation {
+    #[schemars(range(max = 65535))]
+    pub result_ordinal: u32,
+    pub kind: ResultUseObligationKind,
+    /// The reviewed value that reports failure. Required for a fallible
+    /// status and absent for a pure transformation result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_predicate: Option<AuthoredResultPredicate>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
@@ -2665,7 +2816,39 @@ pub enum Locator {
         path: String,
         symbol: String,
         identity: Box<super::csmi::CsmiPortableSymbolIdentity>,
+        /// Validated noncore facts for the exact imported artifact. Exactly
+        /// one declaration owns this carrier; its digest binds the complete
+        /// native pack that was produced from the interchange document.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[schemars(with = "Option<serde_json::Value>")]
+        profile_evidence: Option<Box<PortableProfileEvidence>>,
+        /// Core callable-shape coverage is independent of native callable
+        /// family closure, which also claims all fixed-arity alternatives.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[schemars(with = "Option<serde_json::Value>")]
+        callable_shape_evidence: Option<Box<PortableCallableShapeEvidence>>,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PortableCallableShapeEvidence {
+    pub native_sha256: String,
+    pub statement: super::csmi::CsmiCompletenessStatement,
+    pub provenance_records: Vec<super::csmi::CsmiProvenanceRecord>,
+    pub default_provenance: Option<String>,
+    pub evidence_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PortableProfileEvidence {
+    pub native_sha256: String,
+    pub vocabulary_uses: Vec<super::csmi::CsmiVocabularyUse>,
+    pub extension_facts: Vec<super::csmi::CsmiExtensionFact>,
+    pub completeness_statements: Vec<super::csmi::CsmiCompletenessStatement>,
+    pub provenance_records: Vec<super::csmi::CsmiProvenanceRecord>,
+    pub default_provenance: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

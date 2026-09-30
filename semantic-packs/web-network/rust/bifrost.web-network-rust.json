@@ -1,8 +1,11 @@
 {
   "schema_version": 2,
   "pack_id": "bifrost.web-network-rust",
-  "version": "1.0.0",
-  "producer": { "name": "bifrost-reviewed-web-models", "version": "1.0.0" },
+  "version": "1.1.0",
+  "producer": {
+    "name": "bifrost-reviewed-web-models",
+    "version": "1.0.0"
+  },
   "language": "rust",
   "ecosystem": "cargo",
   "compatibility": {
@@ -15,11 +18,94 @@
   },
   "license": "Apache-2.0",
   "completeness": "complete",
-  "safety": { "generated_code_only": false, "review_required": false },
+  "safety": {
+    "generated_code_only": false,
+    "review_required": false
+  },
   "shards": [
     {
+      "id": "declarations.web-network.rust",
+      "activation": [
+        {
+          "targets": [],
+          "configurations": []
+        }
+      ],
+      "payload": {
+        "kind": "declaration_facts",
+        "types": [
+          {
+            "id": "type.web-network.rust.std",
+            "name": "std",
+            "type_kind": "module",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/lib.rs",
+              "symbol": "std"
+            }
+          },
+          {
+            "id": "type.web-network.rust.std-net",
+            "name": "std.net",
+            "type_kind": "module",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/net/mod.rs",
+              "symbol": "std.net"
+            }
+          },
+          {
+            "id": "type.web-network.rust.std-net-tcpstream",
+            "name": "std.net.TcpStream",
+            "type_kind": "struct",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/net/tcp.rs",
+              "symbol": "std.net.TcpStream"
+            }
+          }
+        ],
+        "members": [
+          {
+            "id": "member.web-network.rust.std-net-tcpstream.connect",
+            "owner": "type.web-network.rust.std-net-tcpstream",
+            "name": "connect",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "addr",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ]
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/net/tcp.rs",
+              "symbol": "std.net.TcpStream.connect"
+            }
+          }
+        ],
+        "relations": []
+      }
+    },
+    {
       "id": "summaries.web-network.rust",
-      "activation": [{ "targets": [], "configurations": [] }],
+      "activation": [
+        {
+          "targets": [],
+          "configurations": []
+        }
+      ],
       "payload": {
         "kind": "procedure_summaries",
         "summaries": [
@@ -35,14 +121,23 @@
             "locations": [],
             "transfers": [
               {
-                "input": { "kind": "parameter", "ordinal": 0 },
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
                 "exit_kind": "normal",
-                "output": { "kind": "normal_return" }
+                "output": {
+                  "kind": "normal_return"
+                }
               }
             ],
             "effects": [],
             "declared_effects": [
-              { "id": "bifrost.network_io", "timing": "immediate", "certainty": "definite" }
+              {
+                "id": "bifrost.network_io",
+                "timing": "immediate",
+                "certainty": "definite"
+              }
             ]
           }
         ]

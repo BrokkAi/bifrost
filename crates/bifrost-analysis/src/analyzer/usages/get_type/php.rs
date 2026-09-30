@@ -302,6 +302,26 @@ class Child extends Base {
                 "App.Product",
             );
         }
+
+        let near_miss_source = r#"<?php
+namespace Wrong {
+    class Product { public function run(): void {} }
+}
+namespace App {
+    function wrongNamespace(): namespace\Product { return new \Wrong\Product(); }
+    function unresolved(): namespace\Missing { return new \Wrong\Product(); }
+    wrongNamespace()->run();
+    unresolved()->run();
+}
+"#;
+        for receiver in ["wrongNamespace()", "unresolved()"] {
+            assert_no_precise_type(resolve_receiver(
+                near_miss_source,
+                receiver,
+                ReceiverAnalysisBudget::default(),
+                None,
+            ));
+        }
     }
 
     /// The #2030 milestone-2 receiver policy: `?T` resolves as `T` because

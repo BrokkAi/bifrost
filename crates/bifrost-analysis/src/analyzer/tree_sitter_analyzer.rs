@@ -286,6 +286,12 @@ fn parse_complete_file_bounded(
     cancellation: Option<&CancellationToken>,
     deadline: Instant,
 ) -> BoundedParse {
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        return BoundedParse::Cancelled;
+    }
+    if Instant::now() >= deadline {
+        return BoundedParse::TimedOut;
+    }
     let mut timed_out = false;
     let mut read = |offset: usize, _| &source.as_bytes()[offset..];
     let mut progress = |_: &tree_sitter::ParseState| {
@@ -300,16 +306,51 @@ fn parse_complete_file_bounded(
         None,
         Some(ParseOptions::new().progress_callback(&mut progress)),
     );
-    if let Some(tree) = tree {
-        return BoundedParse::Complete(tree);
-    }
     if cancellation.is_some_and(CancellationToken::is_cancelled) {
         BoundedParse::Cancelled
-    } else if timed_out {
+    } else if timed_out || Instant::now() >= deadline {
         BoundedParse::TimedOut
+    } else if let Some(tree) = tree {
+        BoundedParse::Complete(tree)
     } else {
         BoundedParse::Rejected
     }
+}
+
+/// Reuse the initial tree when it needs no included-range correction. A
+/// required second parse shares the first parse's deadline, and failure never
+/// turns the uncorrected tree into a complete answer.
+fn parse_complete_file_with_tree_ranges<A: LanguageAdapter + ?Sized>(
+    parser: &mut Parser,
+    adapter: &A,
+    source: &str,
+    cancellation: Option<&CancellationToken>,
+    deadline: Instant,
+) -> BoundedParse {
+    let tree = match parse_complete_file_bounded(parser, source, cancellation, deadline) {
+        BoundedParse::Complete(tree) => tree,
+        incomplete => return incomplete,
+    };
+    let ranges = adapter.parser_included_ranges_from_tree(source, &tree, &mut || {
+        cancellation.is_some_and(CancellationToken::is_cancelled) || Instant::now() >= deadline
+    });
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        return BoundedParse::Cancelled;
+    }
+    if Instant::now() >= deadline {
+        return BoundedParse::TimedOut;
+    }
+    let std::ops::ControlFlow::Continue(ranges) = ranges else {
+        return BoundedParse::Rejected;
+    };
+    let Some(ranges) = ranges else {
+        return BoundedParse::Complete(tree);
+    };
+    drop(tree);
+    if parser.set_included_ranges(&ranges).is_err() {
+        return BoundedParse::Rejected;
+    }
+    parse_complete_file_bounded(parser, source, cancellation, deadline)
 }
 
 fn limited_projection_rows<T: Clone>(rows: Option<&[T]>, limit: usize) -> LimitedQueryRows<T> {
@@ -863,6 +904,21 @@ pub trait LanguageAdapter: Send + Sync + 'static {
         _source: &str,
     ) -> Option<Vec<tree_sitter::Range>> {
         None
+    }
+    /// Included ranges discovered structurally in an initial full parse.
+    ///
+    /// C++ uses the existing tree to find comments inside function-like macro
+    /// replacements. Files without those comments keep that tree; masked
+    /// files require another parse under the caller's original budget.
+    /// Check `should_stop` during traversal and return `Break` on interruption;
+    /// only `Continue` may publish complete range discovery.
+    fn parser_included_ranges_from_tree(
+        &self,
+        _source: &str,
+        _tree: &Tree,
+        _should_stop: &mut dyn FnMut() -> bool,
+    ) -> std::ops::ControlFlow<(), Option<Vec<tree_sitter::Range>>> {
+        std::ops::ControlFlow::Continue(None)
     }
     /// A tree re-parsed around syntax the bundled grammar cannot represent, or
     /// `None` when the tree this adapter was handed stands as parsed.
@@ -4030,24 +4086,29 @@ where
         // One deadline for the parse and for any repair that follows it, so the
         // budget this function documents bounds both.
         let deadline = Instant::now() + budget;
-        let tree = match parse_complete_file_bounded(parser, &source, None, deadline) {
-            BoundedParse::Complete(tree) => {
-                tree_after_grammar_gap_repair(adapter, source.as_str(), tree, None, Some(deadline))
-            }
-            BoundedParse::TimedOut => {
-                let mut parsed = ParsedFile::new(String::new());
-                parsed.add_file_scope(file, &source);
-                return Some(Self::file_state_from_parsed(
-                    source,
-                    parsed,
-                    false,
-                    Some(Vec::new()),
-                    false,
-                ));
-            }
-            BoundedParse::Cancelled => unreachable!("no cancellation token supplied"),
-            BoundedParse::Rejected => return None,
-        };
+        let tree =
+            match parse_complete_file_with_tree_ranges(parser, adapter, &source, None, deadline) {
+                BoundedParse::Complete(tree) => tree_after_grammar_gap_repair(
+                    adapter,
+                    source.as_str(),
+                    tree,
+                    None,
+                    Some(deadline),
+                ),
+                BoundedParse::TimedOut => {
+                    let mut parsed = ParsedFile::new(String::new());
+                    parsed.add_file_scope(file, &source);
+                    return Some(Self::file_state_from_parsed(
+                        source,
+                        parsed,
+                        false,
+                        Some(Vec::new()),
+                        false,
+                    ));
+                }
+                BoundedParse::Cancelled => unreachable!("no cancellation token supplied"),
+                BoundedParse::Rejected => return None,
+            };
         // Every reading of this blob at once, and before the file scope is
         // added: `add_file_scope` contributes the identical module unit to
         // every reading, so an implementor comparing its readings against each
@@ -7047,20 +7108,25 @@ where
         self.record_file_tier_access(InformationTier::Syntax, file);
         let exact_source = source.source();
         let deadline = Instant::now() + COMPLETE_FILE_PARSE_BUDGET;
-        let tree =
-            match parse_complete_file_bounded(&mut parser, exact_source, cancellation, deadline) {
-                BoundedParse::Complete(tree) => tree_after_grammar_gap_repair(
-                    self.adapter.as_ref(),
-                    exact_source,
-                    tree,
-                    cancellation,
-                    Some(deadline),
-                ),
-                BoundedParse::Cancelled => return PreparedSyntaxPreparation::Cancelled,
-                BoundedParse::TimedOut | BoundedParse::Rejected => {
-                    return PreparedSyntaxPreparation::Complete(None);
-                }
-            };
+        let tree = match parse_complete_file_with_tree_ranges(
+            &mut parser,
+            self.adapter.as_ref(),
+            exact_source,
+            cancellation,
+            deadline,
+        ) {
+            BoundedParse::Complete(tree) => tree_after_grammar_gap_repair(
+                self.adapter.as_ref(),
+                exact_source,
+                tree,
+                cancellation,
+                Some(deadline),
+            ),
+            BoundedParse::Cancelled => return PreparedSyntaxPreparation::Cancelled,
+            BoundedParse::TimedOut | BoundedParse::Rejected => {
+                return PreparedSyntaxPreparation::Complete(None);
+            }
+        };
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return PreparedSyntaxPreparation::Cancelled;
         }
@@ -14344,6 +14410,24 @@ where
         let Some(tree) = parser.parse(source, None) else {
             return Vec::new();
         };
+        let std::ops::ControlFlow::Continue(ranges) = self
+            .adapter
+            .parser_included_ranges_from_tree(source, &tree, &mut || false)
+        else {
+            return Vec::new();
+        };
+        let tree = if let Some(ranges) = ranges {
+            drop(tree);
+            if parser.set_included_ranges(&ranges).is_err() {
+                return Vec::new();
+            }
+            let Some(tree) = parser.parse(source, None) else {
+                return Vec::new();
+            };
+            tree
+        } else {
+            tree
+        };
         // This walk's own parse is unbounded, so the repair is too rather than
         // claiming a budget this site never had.
         let tree = tree_after_grammar_gap_repair(self.adapter.as_ref(), source, tree, None, None);
@@ -16713,6 +16797,133 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn cpp_tree_range_parse_matches_search_and_resets_between_files() {
+        let project = crate::inline_project::InlineTestProject::with_language(Language::Cpp)
+            .file("probe.cpp", "int value;")
+            .build();
+        let file = project.file("probe.cpp");
+        let mut parser = Parser::new();
+        let masked = "#define APPLY(x) do { /* macro comment */ x; } while (0)\nint caller() { return 1; }\n";
+        let ordinary = "// ordinary comment\nint final_value() { return 2; }\n";
+        for source in [masked, ordinary, "int malformed( {", masked, ordinary] {
+            assert!(set_parser_for_file(&mut parser, &CppAdapter, &file, source));
+            let BoundedParse::Complete(tree) = parse_complete_file_with_tree_ranges(
+                &mut parser,
+                &CppAdapter,
+                source,
+                None,
+                Instant::now() + COMPLETE_FILE_PARSE_BUDGET,
+            ) else {
+                panic!("C++ fixture should finish parsing");
+            };
+            let search_tree = crate::analyzer::usages::get_definition::parse_tree_for_language(
+                &file,
+                Language::Cpp,
+                source,
+            )
+            .expect("search tree");
+            let rows = |tree: &Tree| {
+                let mut nodes = vec![tree.root_node()];
+                let mut rows = Vec::new();
+                while let Some(node) = nodes.pop() {
+                    rows.push((
+                        node.kind().to_owned(),
+                        node.range(),
+                        node.is_missing(),
+                        node.is_error(),
+                    ));
+                    let mut cursor = node.walk();
+                    nodes.extend(node.children(&mut cursor));
+                }
+                rows
+            };
+            assert_eq!(rows(&tree), rows(&search_tree));
+            if source == ordinary {
+                assert!(!tree.root_node().has_error());
+                assert_eq!(tree.root_node().end_byte(), source.len());
+            }
+        }
+    }
+
+    #[test]
+    fn tree_range_reparse_preserves_cancellation_rejection_and_deadline() {
+        struct RangeAdapter {
+            cancellation: Option<CancellationToken>,
+        }
+        impl LanguageAdapter for RangeAdapter {
+            fn language(&self) -> Language {
+                Language::Cpp
+            }
+            fn query_directory(&self) -> &'static str {
+                CppAdapter.query_directory()
+            }
+            fn file_extension(&self) -> &'static str {
+                "cpp"
+            }
+            fn extract_call_receiver(&self, reference: &str) -> Option<String> {
+                CppAdapter.extract_call_receiver(reference)
+            }
+            fn parse_file(&self, file: &ProjectFile, source: &str, tree: &Tree) -> ParsedFile {
+                CppAdapter.parse_file(file, source, tree)
+            }
+            fn parser_included_ranges_from_tree(
+                &self,
+                _source: &str,
+                tree: &Tree,
+                _should_stop: &mut dyn FnMut() -> bool,
+            ) -> std::ops::ControlFlow<(), Option<Vec<tree_sitter::Range>>> {
+                if let Some(cancellation) = &self.cancellation {
+                    cancellation.cancel();
+                }
+                // Overlapping ranges must be rejected, never answered with
+                // the successful initial tree that the hook just received.
+                std::ops::ControlFlow::Continue(Some(vec![
+                    tree.root_node().range(),
+                    tree.root_node().range(),
+                ]))
+            }
+        }
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_cpp::LANGUAGE.into())
+            .unwrap();
+        let token = CancellationToken::new();
+        let adapter = RangeAdapter {
+            cancellation: Some(token.clone()),
+        };
+        assert!(matches!(
+            parse_complete_file_with_tree_ranges(
+                &mut parser,
+                &adapter,
+                "int value;",
+                Some(&token),
+                Instant::now() + COMPLETE_FILE_PARSE_BUDGET,
+            ),
+            BoundedParse::Cancelled
+        ));
+        assert!(matches!(
+            parse_complete_file_with_tree_ranges(
+                &mut parser,
+                &RangeAdapter { cancellation: None },
+                "int value;",
+                None,
+                Instant::now() + COMPLETE_FILE_PARSE_BUDGET,
+            ),
+            BoundedParse::Rejected
+        ));
+        assert!(matches!(
+            parse_complete_file_with_tree_ranges(
+                &mut parser,
+                &CppAdapter,
+                "int value;",
+                None,
+                Instant::now(),
+            ),
+            BoundedParse::TimedOut
+        ));
     }
 
     #[test]

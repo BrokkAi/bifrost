@@ -1936,6 +1936,8 @@ fn classify_stored_value(
             | SemanticValueKind::Address
             | SemanticValueKind::Null
             | SemanticValueKind::UnsignedInteger(_)
+            | SemanticValueKind::SignedInteger(_)
+            | SemanticValueKind::FloatingPoint { .. }
             | SemanticValueKind::Exception
             | SemanticValueKind::Callable
             | SemanticValueKind::AwaitResult

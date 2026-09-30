@@ -1,11 +1,17 @@
+use super::numeric::{
+    JavaFloatingType, JavaNumericLiteral, integral_domain_contains, java_numeric_literal,
+};
 use super::syntax::*;
 use super::values::java_declaration_inventory;
 use super::*;
+use crate::analyzer::java_integral_parameter::{
+    JavaIntegralDomain, JavaScalarType, decimal_integer_value,
+};
 
 pub(super) fn lower_procedure<'tree, 'targets>(
     prepared: &'tree PreparedSyntaxTree,
     spec: &ProcedureSpec<'tree>,
-    procedure_targets: &'targets HashMap<usize, NestedProcedureTarget>,
+    procedure_targets: &'targets HashMap<usize, NestedProcedureTarget<'tree>>,
     budget: &SemanticBudget,
     cancellation: &'targets CancellationToken,
 ) -> Result<(ProcedureSemanticsParts, SemanticWork), JavaLoweringError> {
@@ -49,6 +55,7 @@ pub(super) fn lower_procedure<'tree, 'targets>(
     };
     context.emit_procedure_inputs(&mut builder, spec.callable, spec.kind, spec.properties)?;
     context.emit_captured_receiver(&mut builder, entry, spec)?;
+    context.emit_lexical_capture_inputs(&mut builder, entry, spec)?;
     context.emit_local_bindings(&mut builder, spec.body)?;
 
     // #2553: "source-order composition across initializer fragments" is the
@@ -157,6 +164,27 @@ pub(super) fn lower_procedure<'tree, 'targets>(
     )
 }
 
+/// One normalized condition. `holds_on_false_arm` marks a negated condition
+/// whose predicate has no negated form, such as `!(x < 1.0)` under NaN: the
+/// guard keeps the un-negated predicate and its true arm is the condition's
+/// false successor.
+struct NormalizedGuard {
+    predicate: GuardPredicate,
+    subject: Option<ValueId>,
+    holds_on_false_arm: bool,
+}
+
+impl NormalizedGuard {
+    /// A predicate that already states the condition's own polarity.
+    const fn folded(predicate: GuardPredicate, subject: Option<ValueId>) -> Self {
+        Self {
+            predicate,
+            subject,
+            holds_on_false_arm: false,
+        }
+    }
+}
+
 impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     fn local_declaration(
         &mut self,
@@ -200,8 +228,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             if self.expression_is_non_null(*initializer) {
                 self.non_null_values.insert(target);
             }
-            let value =
-                self.expression_value(builder, *initializer, expression_value_kind(*initializer))?;
+            let kind = self.assignment_literal_kind(target, *initializer);
+            let value = self.expression_value(builder, *initializer, kind)?;
             self.append_effect(
                 builder,
                 terminals[index],
@@ -243,9 +271,84 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     ) -> Result<(), JavaLoweringError> {
         let left = required_field(node, "left")?;
         let right = required_field(node, "right")?;
+        let plain_assignment = required_field(node, "operator")?.kind() == "=";
+        let lexical_target = (left.kind() == "identifier")
+            .then(|| self.lexical_reference_binding(left))
+            .flatten();
         let terminal = self.point(builder, node, Vec::new())?;
-        let value = self.expression_value(builder, right, expression_value_kind(right))?;
+        // `x += c` or `x -= c` on a primitive integral binding cannot unbox,
+        // divide or convert to a string, so it can neither throw nor call.
+        let compound_offset = self.compound_integer_offset(node, left, right);
+        if !plain_assignment
+            && compound_offset.is_none()
+            && !self.string_compound_assignment_is_call_free(left, right)
+        {
+            self.add_gap(
+                builder,
+                terminal,
+                SemanticGapSubject::Point,
+                SemanticCapability::ExceptionalControlFlow,
+                SemanticGapKind::Unsupported,
+                "compound assignment can throw during unboxing or arithmetic before storing the computed value",
+            )?;
+            // Only a `String` target converts its operand with `toString`. A
+            // primitive numeric local cannot be one.
+            let primitive_target = lexical_target.is_some_and(|(target, _)| {
+                self.is_primitive_integral_binding(target)
+                    || self.primitive_floating_type(target).is_some()
+            });
+            if !primitive_target {
+                self.session.add_gap_with_impacts(
+                    builder,
+                    terminal,
+                    SemanticGapSubject::Point,
+                    SemanticCapability::Calls,
+                    SemanticGapImpacts::CALL_EVALUATION,
+                    SemanticGapKind::Unknown,
+                    "string compound assignment can invoke user-defined toString during conversion",
+                )?;
+            }
+        }
+        let right_kind = if plain_assignment {
+            lexical_target
+                .map(|(target, _)| self.assignment_literal_kind(target, right))
+                .unwrap_or_else(|| expression_value_kind(right))
+        } else {
+            expression_value_kind(right)
+        };
+        let right_value = self.expression_value(builder, right, right_kind)?;
         let result = self.expression_value(builder, node, expression_value_kind(node))?;
+        // A compound assignment reads the old target and computes a new value.
+        // An integral literal offset is exact up to the implicit narrowing,
+        // which the consumer's domain overflow check covers. Other
+        // arithmetic, narrowing, overflow, and string conversion are not
+        // represented by a scalar transfer here. A language-defined flow
+        // retains the operand dependencies while giving scalar consumers an
+        // unknown result instead of incorrectly copying the right operand.
+        let value = if plain_assignment {
+            right_value
+        } else {
+            let old = self.expression_value(builder, left, expression_value_kind(left))?;
+            let computed = self.value(builder, terminal, SemanticValueKind::Temporary)?;
+            match compound_offset {
+                Some(offset) => self.append_effect(
+                    builder,
+                    terminal,
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::IntegerOffset { offset },
+                        source: old,
+                        target: computed,
+                    },
+                )?,
+                None => self.session.append_language_defined_value_flows(
+                    builder,
+                    terminal,
+                    [old, right_value],
+                    computed,
+                )?,
+            }
+            computed
+        };
         self.append_effect(
             builder,
             terminal,
@@ -256,20 +359,13 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         )?;
 
         let evaluations = if left.kind() == "identifier" {
-            let name = node_text(self.prepared.source(), left).ok_or_else(|| {
-                JavaLoweringError::Invalid("assignment has invalid target range".into())
-            })?;
-            let local = self.local_at(name, left.start_byte());
-            let target = local.or_else(|| self.parameters.get(name).copied());
-            if let Some(target) = target {
-                if local.is_some() && self.expression_is_non_null(right) {
+            if let Some((target, kind)) = lexical_target {
+                if plain_assignment
+                    && matches!(kind, ValueFlowKind::Local)
+                    && self.expression_is_non_null(right)
+                {
                     self.non_null_values.insert(target);
                 }
-                let kind = if local.is_some() {
-                    ValueFlowKind::Local
-                } else {
-                    ValueFlowKind::Parameter
-                };
                 self.append_effect(
                     builder,
                     terminal,
@@ -291,9 +387,23 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 // read side (`emit_implicit_field_load`); a no-op when
                 // `left` does not unambiguously name a non-`static` instance
                 // field on the enclosing type.
-                self.emit_implicit_field_store(builder, left, terminal, value)?;
+                let stored = self.emit_implicit_field_store(builder, left, terminal, value)?;
+                if !stored && !plain_assignment {
+                    self.add_gap(
+                        builder,
+                        terminal,
+                        SemanticGapSubject::Point,
+                        SemanticCapability::Assignments,
+                        SemanticGapKind::Unknown,
+                        "compound assignment target has no resolved lexical or field binding",
+                    )?;
+                }
             }
-            vec![right]
+            if plain_assignment {
+                vec![right]
+            } else {
+                vec![left, right]
+            }
         } else if left.kind() == "field_access" && !self.field_access_is_type_qualifier(left) {
             let object = required_field(left, "object")?;
             let field = required_field(left, "field")?;
@@ -316,7 +426,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     value,
                 },
             )?;
-            vec![object, right]
+            if plain_assignment {
+                vec![object, right]
+            } else {
+                vec![left, right]
+            }
         } else if left.kind() == "array_access" {
             let array = required_field(left, "array")?;
             let index = required_field(left, "index")?;
@@ -341,7 +455,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     value,
                 },
             )?;
-            vec![array, index, right]
+            if plain_assignment {
+                vec![array, index, right]
+            } else {
+                vec![left, right]
+            }
         } else {
             runtime_expression_children(node)
         };
@@ -351,6 +469,202 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             entry,
             &evaluations,
             EdgeTarget::normal(terminal),
+            scope,
+            stack,
+        )
+    }
+
+    fn string_compound_assignment_is_call_free(
+        &self,
+        left: Node<'tree>,
+        right: Node<'tree>,
+    ) -> bool {
+        let is_string = |node: Node<'tree>| {
+            self.lexical_reference_binding(node)
+                .and_then(|(binding, _)| self.local_type_nodes.get(&binding).copied())
+                .is_some_and(|ty| {
+                    matches!(ty.kind(), "type_identifier" | "scoped_type_identifier")
+                        && matches!(
+                            node_text(self.prepared.source(), ty),
+                            Some("String" | "java.lang.String")
+                        )
+                })
+        };
+        if !is_string(left) {
+            return false;
+        }
+        let mut pending = vec![right];
+        while let Some(node) = pending.pop() {
+            match node.kind() {
+                "string_literal" => {}
+                "identifier" if is_string(node) => {}
+                "binary_expression"
+                    if node
+                        .child_by_field_name("operator")
+                        .is_some_and(|operator| operator.kind() == "+") =>
+                {
+                    let (Some(left), Some(right)) = (
+                        node.child_by_field_name("left"),
+                        node.child_by_field_name("right"),
+                    ) else {
+                        return false;
+                    };
+                    pending.extend([left, right]);
+                }
+                _ => return false,
+            }
+        }
+        true
+    }
+
+    fn update_expression(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), JavaLoweringError> {
+        let operand = first_runtime_named_child(node)
+            .ok_or_else(|| JavaLoweringError::Invalid("update expression has no operand".into()))?;
+        let operation = self.point(builder, node, Vec::new())?;
+        let terminal = self.point(builder, node, Vec::new())?;
+        let old = self.expression_value(builder, operand, expression_value_kind(operand))?;
+        let computed = self.value(builder, terminal, SemanticValueKind::Temporary)?;
+        // `x++` on a primitive integral binding adds exactly one. The
+        // consumer applies it in the binding's domain, where overflow wraps
+        // and becomes unknown; any other operand stays language-defined.
+        let step = self
+            .lexical_reference_binding(operand)
+            .filter(|(binding, _)| self.is_primitive_integral_binding(*binding))
+            .map(|_| SignedIntegerMagnitude::new(has_child_kind(node, "--"), 1));
+        match step {
+            Some(offset) => self.append_effect(
+                builder,
+                terminal,
+                SemanticEffect::ValueFlow {
+                    kind: ValueFlowKind::IntegerOffset { offset },
+                    source: old,
+                    target: computed,
+                },
+            )?,
+            None => self.session.append_language_defined_value_flows(
+                builder,
+                terminal,
+                [old],
+                computed,
+            )?,
+        }
+
+        let result = self.expression_value(builder, node, expression_value_kind(node))?;
+        let is_prefix = node
+            .child(0)
+            .is_some_and(|first| matches!(first.kind(), "++" | "--"));
+        self.append_effect(
+            builder,
+            terminal,
+            SemanticEffect::Assignment {
+                target: result,
+                value: if is_prefix { computed } else { old },
+            },
+        )?;
+
+        if operand.kind() == "identifier" {
+            if let Some((target, kind)) = self.lexical_reference_binding(operand) {
+                self.append_effect(
+                    builder,
+                    terminal,
+                    SemanticEffect::Assignment {
+                        target,
+                        value: computed,
+                    },
+                )?;
+                self.append_effect(
+                    builder,
+                    terminal,
+                    SemanticEffect::ValueFlow {
+                        kind,
+                        source: computed,
+                        target,
+                    },
+                )?;
+            } else if !self.emit_implicit_field_store(builder, operand, terminal, computed)? {
+                self.add_gap(
+                    builder,
+                    terminal,
+                    SemanticGapSubject::Point,
+                    SemanticCapability::Assignments,
+                    SemanticGapKind::Unknown,
+                    "update target has no resolved lexical or field binding",
+                )?;
+            }
+        } else if operand.kind() == "field_access" && !self.field_access_is_type_qualifier(operand)
+        {
+            let object = required_field(operand, "object")?;
+            let field = required_field(operand, "field")?;
+            let base = self.expression_value(builder, object, expression_value_kind(object))?;
+            let (member, resolved) = self.memory_member_locator(field, object)?;
+            let location = self.session.add_memory_location(
+                builder,
+                terminal,
+                MemoryLocationKind::Field { base, member },
+            )?;
+            if !resolved {
+                self.add_field_identity_gap(builder, terminal, location)?;
+            }
+            self.append_effect(
+                builder,
+                terminal,
+                SemanticEffect::MemoryStore {
+                    kind: MemoryAccessKind::Field,
+                    location,
+                    value: computed,
+                },
+            )?;
+        } else if operand.kind() == "array_access" {
+            let array = required_field(operand, "array")?;
+            let index = required_field(operand, "index")?;
+            let base = self.expression_value(builder, array, expression_value_kind(array))?;
+            let index_value = self.index_value(builder, index)?;
+            let location = self.session.add_memory_location(
+                builder,
+                terminal,
+                MemoryLocationKind::Index {
+                    base,
+                    index: Some(index_value),
+                    constant_index: None,
+                    identity: crate::analyzer::semantic::IndexedLocationIdentity::Element,
+                },
+            )?;
+            self.append_effect(
+                builder,
+                terminal,
+                SemanticEffect::MemoryStore {
+                    kind: MemoryAccessKind::Index,
+                    location,
+                    value: computed,
+                },
+            )?;
+        } else {
+            self.add_gap(
+                builder,
+                terminal,
+                SemanticGapSubject::Point,
+                SemanticCapability::Assignments,
+                SemanticGapKind::Unknown,
+                "update target has unsupported storage form",
+            )?;
+        }
+
+        self.edge(builder, operation, EdgeTarget::normal(terminal))?;
+        self.implicit_abort_edge(builder, node, operation, scope, None, stack)?;
+        self.edge(builder, terminal, next)?;
+        self.schedule_expressions(
+            builder,
+            entry,
+            &[operand],
+            EdgeTarget::normal(operation),
             scope,
             stack,
         )
@@ -371,14 +685,20 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 entry,
                 next,
                 scope,
-            } => self.statement(builder, node, entry, next, scope, None, stack),
+            } => {
+                self.record_statement_entry(builder, node, entry)?;
+                self.statement(builder, node, entry, next, scope, None, stack)
+            }
             Work::LabeledStatement {
                 node,
                 label,
                 entry,
                 next,
                 scope,
-            } => self.statement(builder, node, entry, next, scope, Some(label), stack),
+            } => {
+                self.record_statement_entry(builder, node, entry)?;
+                self.statement(builder, node, entry, next, scope, Some(label), stack)
+            }
             Work::Expression {
                 node,
                 entry,
@@ -393,6 +713,34 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 scope,
             } => self.condition(builder, node, entry, when_true, when_false, scope, stack),
         }
+    }
+
+    fn record_statement_entry(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+    ) -> Result<(), JavaLoweringError> {
+        let point_metadata = self.session.metadata(entry)?;
+        let mapping = builder.source_mapping(point_metadata.source);
+        let span = mapping.locator.anchor().span();
+        let source = if mapping.kind == SourceMappingKind::Exact
+            && span.start_byte() as usize == node.start_byte()
+            && span.end_byte() as usize == node.end_byte()
+        {
+            point_metadata
+        } else {
+            // A do-loop body enters at the loop's own point. Cleanup may also
+            // specialize one statement for several completion paths. In both
+            // cases the producer, not a range search, attests the entry.
+            self.mapping(builder, node)?
+        };
+        builder.add_statement_entry(StatementEntrySite {
+            source: source.source,
+            evidence: source.evidence,
+            point: entry,
+        })?;
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -484,6 +832,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 self.edge(builder, decision, when_true)?;
                 self.edge(builder, decision, when_false)?;
                 self.record_guard(builder, decision, node, Some(when_true), Some(when_false))?;
+                if !self.is_primitive_boolean_expression(node) {
+                    // Boolean conversion happens after expression side effects,
+                    // including inside a short-circuit operand.
+                    self.implicit_abort_edge(builder, node, decision, scope, None, stack)?;
+                }
                 stack.push(Work::Expression {
                     node,
                     entry,
@@ -516,9 +869,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 kind: target.kind,
             })
         };
-        let (predicate, subject) = match self.normalize_condition(builder, condition)? {
+        let guard = match self.normalize_condition(builder, condition)? {
             Some(normalized) => normalized,
-            None => (
+            None => NormalizedGuard::folded(
                 GuardPredicate::Opaque {
                     digest: GuardConditionDigest::from_syntax_kind(condition.kind()),
                 },
@@ -531,13 +884,19 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 )?),
             ),
         };
+        // A guard's true arm is the edge taken when its predicate holds.
+        let (holds, fails) = if guard.holds_on_false_arm {
+            (when_false, when_true)
+        } else {
+            (when_true, when_false)
+        };
         self.session.add_guard_fact(
             builder,
             point,
-            predicate,
-            subject,
-            arm(when_true),
-            arm(when_false),
+            guard.predicate,
+            guard.subject,
+            arm(holds),
+            arm(fails),
         )?;
         Ok(())
     }
@@ -552,12 +911,14 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     ///
     /// `!` and parentheses are peeled iteratively before the match, because a
     /// negated guard is the same guard with its outcome swapped rather than a
-    /// decision of its own.
+    /// decision of its own. A predicate folds the negation into its own
+    /// polarity when it has one; otherwise the guard keeps the un-negated
+    /// predicate and swaps its arms.
     fn normalize_condition(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
         condition: Node<'tree>,
-    ) -> Result<Option<(GuardPredicate, Option<ValueId>)>, JavaLoweringError> {
+    ) -> Result<Option<NormalizedGuard>, JavaLoweringError> {
         let mut cursor = condition;
         let mut negated = false;
         loop {
@@ -585,16 +946,33 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
 
         match cursor.kind() {
             "true" => {
-                return Ok(Some((
+                return Ok(Some(NormalizedGuard::folded(
                     GuardPredicate::ConstantBoolean { value: !negated },
                     None,
                 )));
             }
             "false" => {
-                return Ok(Some((
+                return Ok(Some(NormalizedGuard::folded(
                     GuardPredicate::ConstantBoolean { value: negated },
                     None,
                 )));
+            }
+            // A primitive or boxed Boolean local is tested for its own value;
+            // a null boxed one throws before the guard decides.
+            "identifier" => {
+                let Some((binding, _)) = self.lexical_reference_binding(cursor) else {
+                    return Ok(None);
+                };
+                if self.unboxed_scalar_type(binding) != Some(JavaScalarType::Boolean) {
+                    return Ok(None);
+                }
+                let subject =
+                    self.expression_value(builder, cursor, expression_value_kind(cursor))?;
+                return Ok(Some(NormalizedGuard {
+                    predicate: GuardPredicate::Truthy { value: subject },
+                    subject: Some(subject),
+                    holds_on_false_arm: negated,
+                }));
             }
             "binary_expression" => {}
             _ => return Ok(None),
@@ -603,18 +981,123 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let Some(operator) = cursor.child_by_field_name("operator") else {
             return Ok(None);
         };
-        let equal_on_true = match operator.kind() {
-            "==" => !negated,
-            "!=" => negated,
-            _ => return Ok(None),
-        };
         let (Some(left), Some(right)) = (
             cursor.child_by_field_name("left"),
             cursor.child_by_field_name("right"),
         ) else {
             return Ok(None);
         };
-
+        let same_binding = self.same_lexical_binding(left, right);
+        if let Some(binding) = same_binding {
+            // Ordering unboxes a boxed operand, so it compares numbers either
+            // way. `==` and `!=` on a boxed operand compare references and
+            // are left to the identity rule below.
+            let integral = self.unboxed_integral_domain(binding).is_some();
+            let floating = self.unboxed_floating_type(binding).is_some();
+            let primitive_floating = self.primitive_floating_type(binding).is_some();
+            // NaN is unordered and unequal to itself, so strict self-ordering
+            // is false for every number, while self-equality and non-strict
+            // self-ordering are true for every integral value and for every
+            // floating value except NaN. `!=` alone accepts NaN.
+            let value = match operator.kind() {
+                "<" | ">" if integral || floating => Some(false),
+                "<=" | ">=" if integral => Some(true),
+                _ => None,
+            };
+            if let Some(value) = value {
+                return Ok(Some(NormalizedGuard::folded(
+                    GuardPredicate::ConstantBoolean {
+                        value: value != negated,
+                    },
+                    None,
+                )));
+            }
+            let nan_on_true = match operator.kind() {
+                "<=" | ">=" if floating => Some(false),
+                "==" if primitive_floating => Some(false),
+                "!=" if primitive_floating => Some(true),
+                _ => None,
+            };
+            if let Some(nan_on_true) = nan_on_true {
+                let subject = self.expression_value(builder, left, expression_value_kind(left))?;
+                return Ok(Some(NormalizedGuard::folded(
+                    GuardPredicate::NanComparison {
+                        nan_on_true: nan_on_true != negated,
+                    },
+                    Some(subject),
+                )));
+            }
+        }
+        let source = self.prepared.source();
+        let left_literal = java_numeric_literal(source, left);
+        let right_literal = java_numeric_literal(source, right);
+        let ordered_relation = match operator.kind() {
+            "<" => Some(IntegerComparison::LessThan),
+            "<=" => Some(IntegerComparison::LessThanOrEqual),
+            ">" => Some(IntegerComparison::GreaterThan),
+            ">=" => Some(IntegerComparison::GreaterThanOrEqual),
+            _ => None,
+        };
+        if let Some(relation) = ordered_relation {
+            let (subject, constant, literal, relation) = match (left_literal, right_literal) {
+                (Some(literal), None) => (right, left, literal, relation.reverse()),
+                (None, Some(literal)) => (left, right, literal, relation),
+                _ => return Ok(None),
+            };
+            // A Java `<` expression can compare values of any numeric type,
+            // and a boxed operand unboxes first; a `null` one throws before
+            // the guard decides. Require the exact lexical binding's declared
+            // primitive or wrapper type before publishing a guard.
+            let Some((binding, _)) = self.lexical_reference_binding(subject) else {
+                return Ok(None);
+            };
+            let (constant_kind, floating) = if self.unboxed_integral_domain(binding).is_some() {
+                (literal.integer_kind(), false)
+            } else if let Some(subject_type) = self.unboxed_floating_type(binding) {
+                (literal.floating_kind(subject_type), true)
+            } else {
+                (None, false)
+            };
+            let Some(constant_kind) = constant_kind else {
+                return Ok(None);
+            };
+            let constant = self.expression_value(builder, constant, constant_kind)?;
+            let subject =
+                self.expression_value(builder, subject, expression_value_kind(subject))?;
+            if floating {
+                // A NaN subject fails both `x < c` and the negated relation
+                // `x >= c`, so `!(x < c)` keeps `x < c` on swapped arms.
+                return Ok(Some(NormalizedGuard {
+                    predicate: GuardPredicate::OrderedFloatComparison { relation, constant },
+                    subject: Some(subject),
+                    holds_on_false_arm: negated,
+                }));
+            }
+            return Ok(Some(NormalizedGuard::folded(
+                GuardPredicate::OrderedIntegerComparison {
+                    relation: if negated { relation.negate() } else { relation },
+                    constant,
+                },
+                Some(subject),
+            )));
+        }
+        let equal_on_true = match operator.kind() {
+            "==" => !negated,
+            "!=" => negated,
+            _ => return Ok(None),
+        };
+        // Reading one local twice performs no intervening operation. Primitive
+        // floating values are excluded because NaN is not equal to itself.
+        // Two reads of the same reference, including a boxed value, compare
+        // by identity without unboxing.
+        if same_binding.is_some_and(|binding| self.has_reflexive_equality_binding(binding)) {
+            return Ok(Some(NormalizedGuard::folded(
+                GuardPredicate::ConstantBoolean {
+                    value: equal_on_true,
+                },
+                None,
+            )));
+        }
         // The null literal is itself a constant, so the null comparison has to
         // be decided before the general constant comparison.
         let null_subject = match (
@@ -628,7 +1111,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         if let Some(subject) = null_subject {
             let subject =
                 self.expression_value(builder, subject, expression_value_kind(subject))?;
-            return Ok(Some((
+            return Ok(Some(NormalizedGuard::folded(
                 GuardPredicate::NullComparison {
                     null_on_true: equal_on_true,
                 },
@@ -636,24 +1119,229 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             )));
         }
 
-        let left_constant = matches!(expression_value_kind(left), SemanticValueKind::Constant);
-        let right_constant = matches!(expression_value_kind(right), SemanticValueKind::Constant);
+        let left_constant = left_literal.is_some()
+            || matches!(expression_value_kind(left), SemanticValueKind::Constant);
+        let right_constant = right_literal.is_some()
+            || matches!(expression_value_kind(right), SemanticValueKind::Constant);
         // Two constants compared with each other name no subject, so the
         // comparison is not a guard over anything and stays opaque.
-        let (subject, constant) = match (left_constant, right_constant) {
-            (true, false) => (right, left),
-            (false, true) => (left, right),
+        let (subject, constant, literal) = match (left_constant, right_constant) {
+            (true, false) => (right, left, left_literal),
+            (false, true) => (left, right, right_literal),
             (true, true) | (false, false) => return Ok(None),
         };
-        let constant = self.expression_value(builder, constant, SemanticValueKind::Constant)?;
+        // A numeric constant is typed only for a primitive or boxed numeric
+        // subject: against a numeric literal a boxed subject unboxes, so the
+        // comparison is numeric after promotion. Anything else stays an
+        // unrepresented constant.
+        let constant_kind = literal
+            .zip(self.lexical_reference_binding(subject))
+            .and_then(|(literal, (binding, _))| {
+                if self.unboxed_integral_domain(binding).is_some() {
+                    literal.integer_kind()
+                } else {
+                    self.unboxed_floating_type(binding)
+                        .and_then(|subject_type| literal.floating_kind(subject_type))
+                }
+            })
+            .unwrap_or(SemanticValueKind::Constant);
+        let constant = self.expression_value(builder, constant, constant_kind)?;
         let subject = self.expression_value(builder, subject, expression_value_kind(subject))?;
-        Ok(Some((
+        Ok(Some(NormalizedGuard::folded(
             GuardPredicate::ConstantEquality {
                 negated: !equal_on_true,
                 constant,
             },
             Some(subject),
         )))
+    }
+
+    fn is_primitive_integral_binding(&self, binding: ValueId) -> bool {
+        self.primitive_integral_domain(binding).is_some()
+    }
+
+    fn same_lexical_binding(&self, left: Node<'tree>, right: Node<'tree>) -> Option<ValueId> {
+        if left.kind() != "identifier" || right.kind() != "identifier" {
+            return None;
+        }
+        let (binding, _) = self.lexical_reference_binding(left)?;
+        self.lexical_reference_binding(right)
+            .filter(|(other, _)| *other == binding)
+            .map(|_| binding)
+    }
+
+    fn has_reflexive_equality_binding(&self, binding: ValueId) -> bool {
+        let Some(ty) = self.local_type_nodes.get(&binding).copied() else {
+            return false;
+        };
+        if ty.has_error() {
+            return false;
+        }
+        if self.array_values.contains(&binding) {
+            return true;
+        }
+        self.is_primitive_integral_binding(binding)
+            || matches!(
+                ty.kind(),
+                "boolean_type" | "generic_type" | "scoped_type_identifier"
+            )
+            || (ty.kind() == "type_identifier"
+                && node_text(self.prepared.source(), ty) != Some("var"))
+    }
+
+    fn primitive_integral_domain(&self, binding: ValueId) -> Option<JavaIntegralDomain> {
+        (!self.array_values.contains(&binding))
+            .then(|| self.local_type_nodes.get(&binding).copied())
+            .flatten()
+            .and_then(JavaIntegralDomain::from_type)
+    }
+
+    fn primitive_floating_type(&self, binding: ValueId) -> Option<JavaFloatingType> {
+        (!self.array_values.contains(&binding))
+            .then(|| self.local_type_nodes.get(&binding).copied())
+            .flatten()
+            .and_then(JavaFloatingType::from_type)
+    }
+
+    /// The primitive numeric type a comparison or a store reads `binding`
+    /// as: its declared primitive type, or the type its numeric wrapper type
+    /// unboxes to. See [`JavaScalarType::from_wrapper_type`] for why a
+    /// wrapper name suffices where the value is unboxed.
+    fn unboxed_scalar_type(&self, binding: ValueId) -> Option<JavaScalarType> {
+        let type_node = (!self.array_values.contains(&binding))
+            .then(|| self.local_type_nodes.get(&binding).copied())
+            .flatten()?;
+        JavaScalarType::from_type(type_node)
+            .or_else(|| JavaScalarType::from_wrapper_type(type_node, self.prepared.source()))
+    }
+
+    fn unboxed_integral_domain(&self, binding: ValueId) -> Option<JavaIntegralDomain> {
+        match self.unboxed_scalar_type(binding)? {
+            JavaScalarType::Integral(domain) => Some(domain),
+            JavaScalarType::Float | JavaScalarType::Double | JavaScalarType::Boolean => None,
+        }
+    }
+
+    fn unboxed_floating_type(&self, binding: ValueId) -> Option<JavaFloatingType> {
+        match self.unboxed_scalar_type(binding)? {
+            JavaScalarType::Float => Some(JavaFloatingType::Float),
+            JavaScalarType::Double => Some(JavaFloatingType::Double),
+            JavaScalarType::Integral(_) | JavaScalarType::Boolean => None,
+        }
+    }
+
+    /// The value kind for `expression` stored into the lexical binding
+    /// `target`. A numeric literal the assignment converts without changing
+    /// its value (JLS 5.2) publishes its typed constant: an integer literal
+    /// keeps its integer value even for a floating target, whose conversion
+    /// the scalar solver applies from the target's declared type.
+    fn assignment_literal_kind(
+        &self,
+        target: ValueId,
+        expression: Node<'tree>,
+    ) -> SemanticValueKind {
+        if matches!(expression.kind(), "true" | "false")
+            && self.unboxed_scalar_type(target) == Some(JavaScalarType::Boolean)
+        {
+            return SemanticValueKind::Boolean(expression.kind() == "true");
+        }
+        let typed = java_numeric_literal(self.prepared.source(), expression).and_then(|literal| {
+            if let Some(domain) = self.unboxed_integral_domain(target) {
+                literal
+                    .assignable_to_integral(domain)
+                    .then(|| literal.integer_kind())
+                    .flatten()
+            } else {
+                let target_type = self.unboxed_floating_type(target)?;
+                match literal {
+                    JavaNumericLiteral::Int(_) | JavaNumericLiteral::Long(_) => {
+                        literal.integer_kind()
+                    }
+                    JavaNumericLiteral::Float(_) => literal.floating_kind(target_type),
+                    JavaNumericLiteral::Double(_) => (target_type == JavaFloatingType::Double)
+                        .then(|| literal.floating_kind(target_type))
+                        .flatten(),
+                }
+            }
+        });
+        typed.unwrap_or_else(|| expression_value_kind(expression))
+    }
+
+    /// The operand and exact offset of `x + c`, `c + x` or `x - c`, where `x`
+    /// is a lexical reference to a primitive integral binding and `c` is an
+    /// integer literal. Binary numeric promotion can widen the computation
+    /// beyond `x`'s type; a consumer that applies the offset in `x`'s domain
+    /// and treats overflow as unknown stays sound.
+    fn integer_offset_operand(
+        &self,
+        node: Node<'tree>,
+    ) -> Option<(Node<'tree>, SignedIntegerMagnitude)> {
+        if node.kind() != "binary_expression" {
+            return None;
+        }
+        let subtract = match node.child_by_field_name("operator")?.kind() {
+            "+" => false,
+            "-" => true,
+            _ => return None,
+        };
+        let left = node.child_by_field_name("left")?;
+        let right = node.child_by_field_name("right")?;
+        let source = self.prepared.source();
+        let integer = |operand| java_numeric_literal(source, operand)?.integer();
+        let (operand, constant) = match (integer(left), integer(right)) {
+            (None, Some(constant)) => (left, constant),
+            (Some(constant), None) if !subtract => (right, constant),
+            _ => return None,
+        };
+        let (binding, _) = self.lexical_reference_binding(operand)?;
+        self.primitive_integral_domain(binding)?;
+        Some((operand, literal_offset(constant, subtract)))
+    }
+
+    /// The exact offset of `x += c` or `x -= c`, where `x` is a lexical
+    /// reference to a primitive integral binding and `c` is an integer
+    /// literal. The implicit narrowing back to `x`'s type only matters on
+    /// overflow, which a consumer applying the offset in `x`'s domain treats
+    /// as unknown.
+    fn compound_integer_offset(
+        &self,
+        node: Node<'tree>,
+        left: Node<'tree>,
+        right: Node<'tree>,
+    ) -> Option<SignedIntegerMagnitude> {
+        let subtract = match node.child_by_field_name("operator")?.kind() {
+            "+=" => false,
+            "-=" => true,
+            _ => return None,
+        };
+        if left.kind() != "identifier" {
+            return None;
+        }
+        let (binding, _) = self.lexical_reference_binding(left)?;
+        self.primitive_integral_domain(binding)?;
+        let constant = java_numeric_literal(self.prepared.source(), right)?.integer()?;
+        Some(literal_offset(constant, subtract))
+    }
+
+    /// The operand of a cast that converts a lexical reference to a primitive
+    /// binding by identity or widening without changing its value: a wider
+    /// or equal integral type (`char` only to `char`, `int` or `long`), or
+    /// `float` to `double`.
+    fn value_preserving_cast_operand(&self, node: Node<'tree>) -> Option<Node<'tree>> {
+        let target = node.child_by_field_name("type")?;
+        let operand = node.child_by_field_name("value")?;
+        let (binding, _) = self.lexical_reference_binding(operand)?;
+        let preserves = if let Some(target) = JavaIntegralDomain::from_type(target) {
+            self.primitive_integral_domain(binding)
+                .is_some_and(|source| integral_domain_contains(target, source))
+        } else if let Some(target) = JavaFloatingType::from_type(target) {
+            self.primitive_floating_type(binding).is_some_and(|source| {
+                source == JavaFloatingType::Float || target == JavaFloatingType::Double
+            })
+        } else {
+            false
+        };
+        preserves.then_some(operand)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -964,10 +1652,14 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 let label = node_text(self.prepared.source(), label_node).ok_or_else(|| {
                     JavaLoweringError::Invalid("labeled statement has invalid source range".into())
                 })?;
+                // The label and its statement have distinct source identities.
+                // In particular, a labeled loop must retain its own header span.
+                let body_entry = self.point(builder, body, Vec::new())?;
+                self.edge(builder, entry, EdgeTarget::normal(body_entry))?;
                 stack.push(Work::LabeledStatement {
                     node: body,
                     label,
-                    entry,
+                    entry: body_entry,
                     next,
                     scope,
                 });
@@ -980,24 +1672,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 self.call_expression(builder, node, entry, next, scope, stack)
             }
             "assert_statement" => {
-                self.add_gap(
-                    builder,
-                    entry,
-                    SemanticGapSubject::Point,
-                    SemanticCapability::NormalControlFlow,
-                    SemanticGapKind::Unsupported,
-                    "assert enablement and conditional message evaluation are not yet lowered",
-                )?;
-                self.add_gap(
-                    builder,
-                    entry,
-                    SemanticGapSubject::Point,
-                    SemanticCapability::ExceptionalControlFlow,
-                    SemanticGapKind::Unsupported,
-                    "assert enablement and AssertionError construction are not yet lowered",
-                )?;
-                let values = named_children(node);
-                self.schedule_expressions(builder, entry, &values, next, scope, stack)
+                self.assertion_statement(builder, node, entry, next, scope, stack)
             }
             "empty_statement"
             | "class_declaration"
@@ -1011,6 +1686,131 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             | "static_initializer" => self.edge(builder, entry, next),
             _ => self.unhandled_control_syntax(builder, node, entry),
         }
+    }
+
+    fn is_primitive_boolean_expression(&self, node: Node<'tree>) -> bool {
+        match node.kind() {
+            "true" | "false" | "instanceof_expression" => true,
+            "binary_expression" => matches!(
+                binary_operator(node),
+                Some("&&" | "||" | "==" | "!=" | "<" | "<=" | ">" | ">=" | "&" | "|" | "^")
+            ),
+            "unary_expression" => node
+                .child_by_field_name("operator")
+                .is_some_and(|operator| operator.kind() == "!"),
+            "identifier" => self
+                .lexical_reference_binding(node)
+                .and_then(|(binding, _)| self.local_type_nodes.get(&binding))
+                .is_some_and(|ty| ty.kind() == "boolean_type"),
+            _ => false,
+        }
+    }
+
+    fn assertion_statement(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), JavaLoweringError> {
+        let operands = named_children(node);
+        let (condition, detail) = match operands.as_slice() {
+            [condition] => (*condition, None),
+            [condition, detail] => (*condition, Some(*detail)),
+            _ => return self.unhandled_control_syntax(builder, node, entry),
+        };
+        // Keep a caller-supplied loop-back continuation on its own edge.
+        let continuation = self.point(builder, node, Vec::new())?;
+        self.edge(builder, continuation, next)?;
+        let enabled = self.point(builder, condition, Vec::new())?;
+        let failure = self.point(builder, node, Vec::new())?;
+        let throwing = self.point(builder, node, Vec::new())?;
+        let enabled_arm = EdgeTarget {
+            point: enabled,
+            kind: ControlEdgeKind::ConditionalTrue,
+        };
+        let disabled_arm = EdgeTarget {
+            point: continuation,
+            kind: ControlEdgeKind::ConditionalFalse,
+        };
+        self.edge(builder, entry, enabled_arm)?;
+        self.edge(builder, entry, disabled_arm)?;
+        // Assertion enablement belongs to the analyzed class/host. Retaining
+        // both paths also covers execution during class initialization.
+        self.session.add_guard_fact(
+            builder,
+            entry,
+            GuardPredicate::Opaque {
+                digest: GuardConditionDigest::from_syntax_kind(node.kind()),
+            },
+            None,
+            Some(GuardArm {
+                target_point: enabled,
+                kind: enabled_arm.kind,
+            }),
+            Some(GuardArm {
+                target_point: continuation,
+                kind: disabled_arm.kind,
+            }),
+        )?;
+        let success_arm = EdgeTarget {
+            point: continuation,
+            kind: ControlEdgeKind::ConditionalTrue,
+        };
+        let failure_arm = EdgeTarget {
+            point: failure,
+            kind: ControlEdgeKind::ConditionalFalse,
+        };
+        stack.push(Work::Condition {
+            node: condition,
+            entry: enabled,
+            when_true: success_arm,
+            when_false: failure_arm,
+            scope,
+        });
+        let thrown = self.value(builder, throwing, SemanticValueKind::Exception)?;
+        if let Some(detail) = detail {
+            let detail_value =
+                self.expression_value(builder, detail, expression_value_kind(detail))?;
+            self.append_effect(
+                builder,
+                throwing,
+                SemanticEffect::ValueFlow {
+                    kind: ValueFlowKind::Local,
+                    source: detail_value,
+                    target: thrown,
+                },
+            )?;
+            stack.push(Work::Expression {
+                node: detail,
+                entry: failure,
+                next: EdgeTarget::normal(throwing),
+                scope,
+            });
+        } else {
+            self.edge(builder, failure, EdgeTarget::normal(throwing))?;
+        }
+        // Construction can throw as well; either outcome is abrupt here.
+        // Its implicit calls (including reference-detail conversion) remain
+        // explicitly unmodeled effects, not an invented pure constructor.
+        self.add_gap(
+            builder,
+            throwing,
+            SemanticGapSubject::Point,
+            SemanticCapability::Calls,
+            SemanticGapKind::Unsupported,
+            "implicit AssertionError construction effects are not yet modeled",
+        )?;
+        self.append_effect(
+            builder,
+            throwing,
+            SemanticEffect::Throw {
+                value: Some(thrown),
+            },
+        )?;
+        self.abrupt_throw(builder, throwing, scope, thrown, stack)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1307,17 +2107,32 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             "assignment_expression" => {
                 self.assignment_expression(builder, node, entry, next, scope, stack)
             }
+            "update_expression" => self.update_expression(builder, node, entry, next, scope, stack),
             "binary_expression" | "unary_expression" => {
                 let children = runtime_expression_children(node);
                 let terminal = self.point(builder, node, Vec::new())?;
-                let operands = children
-                    .iter()
-                    .map(|child| {
-                        self.expression_value(builder, *child, expression_value_kind(*child))
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                self.session
-                    .append_language_defined_value_flows(builder, terminal, operands, result)?;
+                if let Some((operand, offset)) = self.integer_offset_operand(node) {
+                    let source =
+                        self.expression_value(builder, operand, expression_value_kind(operand))?;
+                    self.append_effect(
+                        builder,
+                        terminal,
+                        SemanticEffect::ValueFlow {
+                            kind: ValueFlowKind::IntegerOffset { offset },
+                            source,
+                            target: result,
+                        },
+                    )?;
+                } else {
+                    let operands = children
+                        .iter()
+                        .map(|child| {
+                            self.expression_value(builder, *child, expression_value_kind(*child))
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    self.session
+                        .append_language_defined_value_flows(builder, terminal, operands, result)?;
+                }
                 self.edge(builder, terminal, next)?;
                 if operation_can_throw_implicitly(node) {
                     // ArithmeticException on integral division, and
@@ -1334,8 +2149,35 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     stack,
                 )
             }
-            "update_expression"
-            | "cast_expression"
+            "cast_expression" if self.value_preserving_cast_operand(node).is_some() => {
+                // An identity or widening primitive conversion of a primitive
+                // binding keeps its value and cannot throw.
+                let operand = self
+                    .value_preserving_cast_operand(node)
+                    .expect("guarded by the match arm");
+                let terminal = self.point(builder, node, Vec::new())?;
+                let source =
+                    self.expression_value(builder, operand, expression_value_kind(operand))?;
+                self.append_effect(
+                    builder,
+                    terminal,
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::Local,
+                        source,
+                        target: result,
+                    },
+                )?;
+                self.edge(builder, terminal, next)?;
+                self.schedule_expressions(
+                    builder,
+                    entry,
+                    &[operand],
+                    EdgeTarget::normal(terminal),
+                    scope,
+                    stack,
+                )
+            }
+            "cast_expression"
             | "instanceof_expression"
             | "array_creation_expression"
             | "array_initializer"
@@ -1520,14 +2362,23 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 continue_edge_kind: ControlEdgeKind::LoopBack,
             },
         );
-        self.add_gap(
-            builder,
-            test,
-            SemanticGapSubject::Point,
-            SemanticCapability::ExceptionalControlFlow,
-            SemanticGapKind::Unsupported,
-            "implicit iterator acquisition and advancement exceptions are not yet lowered",
-        )?;
+        // Every test acquires or advances the iteration (JLS 14.14.2), and
+        // each can abort: a null array or `Iterable`, or an exception from
+        // `iterator()`, `hasNext()` or `next()`. The binding assignment after
+        // a successful test changes nothing an abort could observe.
+        self.implicit_abort_edge(builder, node, test, scope, None, stack)?;
+        // Array iteration runs no user code. `Iterable` iteration calls user
+        // methods whose value and effect semantics are not modeled.
+        if !self.expression_is_array(iterable) {
+            self.add_gap(
+                builder,
+                test,
+                SemanticGapSubject::Point,
+                SemanticCapability::Calls,
+                SemanticGapKind::Unknown,
+                "enhanced-for iteration calls iterator(), hasNext() and next() user code whose value and effect semantics are not modeled",
+            )?;
+        }
         self.edge(
             builder,
             test,
@@ -1544,6 +2395,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 kind: ControlEdgeKind::ConditionalFalse,
             },
         )?;
+        self.establish_enhanced_for_variable(builder, iterable, binding, binding_entry)?;
         self.edge(builder, binding_entry, EdgeTarget::normal(body_entry))?;
         stack.push(Work::Statement {
             node: body,
@@ -1561,6 +2413,66 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             scope: loop_scope,
         });
         Ok(())
+    }
+
+    /// Establish an enhanced-`for` loop variable on each iteration (JLS
+    /// 14.14.2). The variable receives a fresh element of the array or
+    /// `Iterable` every time the loop test succeeds, so it is an ordinary
+    /// local initialized before its body runs. The element read is a
+    /// language-defined value that depends on the iterable value. The loop
+    /// test carries the iteration's abort edge and, for an `Iterable`, its
+    /// user-code call gap.
+    fn establish_enhanced_for_variable(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        iterable: Node<'tree>,
+        binding: Node<'tree>,
+        point: ProgramPointId,
+    ) -> Result<(), JavaLoweringError> {
+        // An unnamed variable (`_`) declares no local.
+        if binding.kind() != "identifier" {
+            return Ok(());
+        }
+        let name = node_text(self.prepared.source(), binding).ok_or_else(|| {
+            JavaLoweringError::Invalid("enhanced-for variable has invalid name range".into())
+        })?;
+        let target = self
+            .local_declaration_value(name, binding.start_byte())
+            .ok_or_else(|| {
+                JavaLoweringError::Invalid("enhanced-for variable was not preindexed".into())
+            })?;
+        let source = self.expression_value(builder, iterable, expression_value_kind(iterable))?;
+        let element = self.source_value(
+            builder,
+            binding,
+            SemanticValueKind::LanguageDefined("java.enhanced_for.element".into()),
+        )?;
+        self.append_effect(
+            builder,
+            point,
+            SemanticEffect::ValueFlow {
+                kind: ValueFlowKind::LanguageDefined,
+                source,
+                target: element,
+            },
+        )?;
+        self.append_effect(
+            builder,
+            point,
+            SemanticEffect::Assignment {
+                target,
+                value: element,
+            },
+        )?;
+        self.append_effect(
+            builder,
+            point,
+            SemanticEffect::ValueFlow {
+                kind: ValueFlowKind::Local,
+                source: element,
+                target,
+            },
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2274,14 +3186,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             },
         )?;
         self.edge(builder, normal, next)?;
-        self.abrupt(
-            builder,
-            exceptional,
-            scope,
-            CompletionKind::Throw,
-            None,
-            stack,
-        )?;
+        // The call's thrown value binds a catch parameter that handles it,
+        // like any other throw.
+        self.abrupt_throw(builder, exceptional, scope, thrown, stack)?;
         self.resolution_gaps(builder, invoke, callee, call_site, &resolution)?;
 
         if node.kind() == "method_invocation" {
@@ -2323,8 +3230,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         next: EdgeTarget,
     ) -> Result<(), JavaLoweringError> {
         let result = self.expression_value(builder, node, SemanticValueKind::Callable)?;
-        let target = self.procedure_targets.get(&node.id()).copied();
+        let target = self.procedure_targets.get(&node.id()).cloned();
         let resolution = target
+            .as_ref()
             .map(|target| CallableTargetResolution::Proven(CallableTarget::Local(target.id)))
             .unwrap_or(CallableTargetResolution::Unknown);
         let metadata = self.metadata(entry)?;
@@ -2333,17 +3241,18 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         } else {
             CallableReferenceKind::UnboundMethod
         };
-        let environment =
-            if target.is_some_and(|target| target.receiver_capture_destination.is_some()) {
-                Some(self.session.add_allocation(
-                    builder,
-                    entry,
-                    result,
-                    AllocationKind::ClosureEnvironment,
-                )?)
-            } else {
-                None
-            };
+        let environment = if target.as_ref().is_some_and(|target| {
+            target.receiver_capture_destination.is_some() || !target.captures.is_empty()
+        }) {
+            Some(self.session.add_allocation(
+                builder,
+                entry,
+                result,
+                AllocationKind::ClosureEnvironment,
+            )?)
+        } else {
+            None
+        };
         let callable = CallableValue {
             kind,
             targets: resolution.clone(),
@@ -2357,11 +3266,27 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             SemanticEffect::CallableReference { result, callable }
         };
         self.append_effect(builder, entry, effect)?;
+        if node.kind() == "lambda_expression"
+            && target
+                .as_ref()
+                .is_none_or(|target| target.captures_incomplete)
+        {
+            self.add_gap(
+                builder,
+                entry,
+                SemanticGapSubject::Procedure,
+                SemanticCapability::Captures,
+                SemanticGapKind::Unsupported,
+                "lambda capture inventory includes an unsupported binding or enclosing-class boundary",
+            )?;
+        }
         if let (Some(target), Some(environment), Some(captured), Some(destination)) = (
-            target,
+            target.as_ref(),
             environment,
             self.receiver.or(self.captured_receiver),
-            target.and_then(|target| target.receiver_capture_destination),
+            target
+                .as_ref()
+                .and_then(|target| target.receiver_capture_destination),
         ) {
             self.session.add_capture(
                 builder,
@@ -2373,6 +3298,28 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 destination,
                 CaptureMode::Value,
             )?;
+        }
+        if let (Some(target), Some(environment)) = (target.as_ref(), environment) {
+            for (index, capture) in target.captures.iter().enumerate() {
+                let name = node_text(self.prepared.source(), capture.binding.name)
+                    .expect("inventoried capture has a source name");
+                let source = self
+                    .local_declaration_value(name, capture.binding.name.start_byte())
+                    .or_else(|| self.parameters.get(name).copied())
+                    .expect("inventoried capture has an exact parent binding");
+                let destination =
+                    java_capture_destination(target.receiver_capture_destination.is_some(), index)?;
+                self.session.add_capture(
+                    builder,
+                    entry,
+                    result,
+                    target.id,
+                    environment,
+                    CaptureSource::Value(source),
+                    destination,
+                    CaptureMode::Value,
+                )?;
+            }
         }
         if resolution == CallableTargetResolution::Unknown {
             self.add_gap(
@@ -2516,15 +3463,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     },
                 )?;
             }
-            self.append_effect(
-                builder,
-                abort,
-                SemanticEffect::ValueFlow {
-                    kind: ValueFlowKind::Local,
-                    source: thrown,
-                    target: binder,
-                },
-            )?;
+            self.bind_catch_parameter(builder, abort, binder, thrown)?;
         }
         self.edge(
             builder,
@@ -2680,17 +3619,39 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             .get(&route.destination().target())
             .copied()
         {
-            self.append_effect(
-                builder,
-                from,
-                SemanticEffect::ValueFlow {
-                    kind: ValueFlowKind::Local,
-                    source: value,
-                    target,
-                },
-            )?;
+            self.bind_catch_parameter(builder, from, target, value)?;
         }
         self.route(builder, from, &route, stack)
+    }
+
+    /// Assign the thrown value to the catch parameter on one path into its
+    /// handler. Like a local initializer, this is both the binding's
+    /// establishment and its value flow, so the parameter is initialized in
+    /// the catch body on every path that binds it.
+    fn bind_catch_parameter(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        binder: ValueId,
+        thrown: ValueId,
+    ) -> Result<(), JavaLoweringError> {
+        self.append_effect(
+            builder,
+            point,
+            SemanticEffect::Assignment {
+                target: binder,
+                value: thrown,
+            },
+        )?;
+        self.append_effect(
+            builder,
+            point,
+            SemanticEffect::ValueFlow {
+                kind: ValueFlowKind::Local,
+                source: thrown,
+                target: binder,
+            },
+        )
     }
 
     fn route(
@@ -2912,11 +3873,15 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     }
 }
 
-fn decimal_integer_value(source: &str, node: Node<'_>) -> Option<i64> {
-    (node.kind() == "decimal_integer_literal")
-        .then(|| node_text(source, node))
-        .flatten()
-        .and_then(|text| text.parse().ok())
+/// The exact offset that adds (or, when `subtract`, removes) an integer
+/// literal's value.
+fn literal_offset(constant: i64, subtract: bool) -> SignedIntegerMagnitude {
+    let offset = if subtract {
+        -i128::from(constant)
+    } else {
+        i128::from(constant)
+    };
+    SignedIntegerMagnitude::new(offset < 0, offset.unsigned_abs())
 }
 
 /// The resource value expressions of a try-with-resources statement, in

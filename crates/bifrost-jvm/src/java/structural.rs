@@ -46,6 +46,185 @@ pub struct JavaStructuralSpec;
 
 pub static JAVA_STRUCTURAL_SPEC: JavaStructuralSpec = JavaStructuralSpec;
 
+/// Whether Java syntax directly discards an invocation's normal result.
+///
+/// The caller must pass the call node from the prepared tree for the exact
+/// source snapshot it is analyzing. An invocation used by an argument,
+/// initializer, return, or condition is consumed, even if the enclosing
+/// expression is later discarded. Recovered syntax and method references do
+/// not establish a result-use fact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JavaCallResultUse {
+    Discarded,
+    /// Another syntax context. It may consume the result or discard it by a
+    /// separate construct; this proof makes no claim beyond the recognized
+    /// expression-statement and `for` initializer/update shapes.
+    OtherContext,
+}
+
+/// Why an exact structural call cannot prove its result-use role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JavaCallResultUseOpen {
+    MissingCall,
+    AmbiguousCall,
+    UnclassifiedSyntax,
+}
+
+/// One exact AST call span in a prepared Java source snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct JavaCallResultUseSite {
+    start_byte: usize,
+    end_byte: usize,
+    result_use: Option<JavaCallResultUse>,
+}
+
+/// Index every invocation once. Callers must build this from the prepared tree
+/// for the same immutable source snapshot as their structural/semantic rows.
+pub struct JavaCallResultUseIndex {
+    sites: Vec<JavaCallResultUseSite>,
+}
+
+impl JavaCallResultUseIndex {
+    pub fn new(root: Node<'_>) -> Self {
+        let mut sites = Vec::new();
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            if matches!(
+                node.kind(),
+                "method_invocation" | "object_creation_expression" | "method_reference"
+            ) {
+                sites.push(JavaCallResultUseSite {
+                    start_byte: node.start_byte(),
+                    end_byte: node.end_byte(),
+                    result_use: java_call_result_use(node),
+                });
+            }
+            for index in (0..node.named_child_count()).rev() {
+                stack.push(node.named_child(index).expect("named child exists"));
+            }
+        }
+        sites.sort_unstable_by_key(|site| (site.start_byte, site.end_byte));
+        Self { sites }
+    }
+
+    pub fn at_span(
+        &self,
+        start_byte: usize,
+        end_byte: usize,
+    ) -> Result<JavaCallResultUse, JavaCallResultUseOpen> {
+        let key = (start_byte, end_byte);
+        let start = self
+            .sites
+            .partition_point(|site| (site.start_byte, site.end_byte) < key);
+        let end = self
+            .sites
+            .partition_point(|site| (site.start_byte, site.end_byte) <= key);
+        match &self.sites[start..end] {
+            [] => Err(JavaCallResultUseOpen::MissingCall),
+            [site] => site
+                .result_use
+                .ok_or(JavaCallResultUseOpen::UnclassifiedSyntax),
+            _ => Err(JavaCallResultUseOpen::AmbiguousCall),
+        }
+    }
+}
+
+pub fn java_call_result_use(call: Node<'_>) -> Option<JavaCallResultUse> {
+    if !matches!(
+        call.kind(),
+        "method_invocation" | "object_creation_expression"
+    ) || call.has_error()
+    {
+        return None;
+    }
+    let mut expression = call;
+    while let Some(parent) = expression.parent() {
+        if parent.has_error() {
+            return None;
+        }
+        // An expression lambda may adapt the same invocation to either a
+        // value-returning or void functional method. Syntax alone cannot
+        // establish whether that adapter discards the result.
+        if parent.kind() == "lambda_expression" {
+            return None;
+        }
+        if parent.kind() == "parenthesized_expression"
+            && parent.named_child_count() == 1
+            && parent
+                .named_child(0)
+                .is_some_and(|child| child.id() == expression.id())
+        {
+            expression = parent;
+            continue;
+        }
+        return Some(
+            if parent.kind() == "expression_statement"
+                && parent.named_child_count() == 1
+                && parent
+                    .named_child(0)
+                    .is_some_and(|child| child.id() == expression.id())
+                && !java_switch_rule_value_expression_statement(parent)
+                || parent.kind() == "for_statement"
+                    && matches!(
+                        field_name_in_parent(parent, expression),
+                        Some("init" | "update")
+                    )
+            {
+                JavaCallResultUse::Discarded
+            } else {
+                JavaCallResultUse::OtherContext
+            },
+        );
+    }
+    None
+}
+
+/// A switch rule's expression statement can produce the enclosing switch
+/// expression's value. It is not a discarded statement result in that role.
+pub fn java_switch_rule_value_expression_statement(node: Node<'_>) -> bool {
+    if !node
+        .parent()
+        .is_some_and(|parent| parent.kind() == "switch_rule")
+    {
+        return false;
+    }
+    let mut ancestor = node.parent();
+    while let Some(current) = ancestor {
+        if current.kind() == "switch_expression" {
+            return current
+                .parent()
+                .is_some_and(|parent| !java_parent_statement_body(parent, current));
+        }
+        ancestor = current.parent();
+    }
+    false
+}
+
+pub fn java_parent_statement_body(parent: Node<'_>, node: Node<'_>) -> bool {
+    match parent.kind() {
+        "block" | "constructor_body" | "program" | "switch_block_statement_group" => true,
+        "if_statement" => ["consequence", "alternative"].into_iter().any(|field| {
+            parent
+                .child_by_field_name(field)
+                .is_some_and(|child| child.id() == node.id())
+        }),
+        "while_statement"
+        | "do_statement"
+        | "for_statement"
+        | "enhanced_for_statement"
+        | "switch_rule" => parent
+            .child_by_field_name("body")
+            .is_some_and(|body| body.id() == node.id()),
+        "labeled_statement" => {
+            let mut cursor = parent.walk();
+            parent
+                .named_children(&mut cursor)
+                .any(|child| child.id() == node.id() && child.kind() != "identifier")
+        }
+        _ => false,
+    }
+}
+
 pub const JAVA_KIND_TABLE: &[(&str, NormalizedKind)] = &[
     ("method_invocation", NormalizedKind::Call),
     ("method_reference", NormalizedKind::Call),
@@ -628,5 +807,216 @@ impl StructuralSpec for JavaStructuralSpec {
                 }
             }
         }
+    }
+}
+
+/// The identifier introduced by one Java pattern node, without inferring its scope.
+pub fn java_pattern_binding_name(node: Node<'_>) -> Option<Node<'_>> {
+    match node.kind() {
+        "instanceof_expression" => node.child_by_field_name("name"),
+        "type_pattern" | "record_pattern_component" => {
+            let mut cursor = node.walk();
+            node.named_children(&mut cursor)
+                .find(|child| child.kind() == "identifier")
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod result_use_tests {
+    use super::{
+        JavaCallResultUse, JavaCallResultUseIndex, JavaCallResultUseOpen, java_call_result_use,
+    };
+    use tree_sitter::{Node, Parser};
+
+    #[test]
+    fn direct_java_statement_discards_only_its_own_call_result() {
+        let source = "class C {\n\
+            String trim(String s) {\n\
+                s.trim();\n\
+                sink(s.trim());\n\
+                String result = s.trim();\n\
+                if (s.isEmpty()) {}\n\
+                return s.trim();\n\
+            }\n\
+            void sink(String s) {}\n\
+        }";
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_java::LANGUAGE.into())
+            .expect("Java grammar");
+        let tree = parser.parse(source, None).expect("Java tree");
+        let mut calls = Vec::new();
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "method_invocation" {
+                calls.push((node.start_position().row, java_call_result_use(node)));
+            }
+            for index in (0..node.named_child_count()).rev() {
+                if let Some(child) = node.named_child(index) {
+                    stack.push(child);
+                }
+            }
+        }
+        assert_eq!(
+            calls,
+            vec![
+                (2, Some(JavaCallResultUse::Discarded)),
+                (3, Some(JavaCallResultUse::Discarded)),
+                (3, Some(JavaCallResultUse::OtherContext)),
+                (4, Some(JavaCallResultUse::OtherContext)),
+                (5, Some(JavaCallResultUse::OtherContext)),
+                (6, Some(JavaCallResultUse::OtherContext)),
+            ]
+        );
+    }
+
+    #[test]
+    fn method_reference_and_recovered_invocation_are_open() {
+        fn first<'tree>(root: Node<'tree>, kind: &str) -> Option<Node<'tree>> {
+            let mut stack = vec![root];
+            while let Some(node) = stack.pop() {
+                if node.kind() == kind {
+                    return Some(node);
+                }
+                for index in (0..node.named_child_count()).rev() {
+                    stack.push(node.named_child(index).expect("named child exists"));
+                }
+            }
+            None
+        }
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_java::LANGUAGE.into())
+            .expect("Java grammar");
+        let reference = parser
+            .parse("class C { void f() { Runnable r = this::f; } }", None)
+            .expect("Java tree");
+        let node = first(reference.root_node(), "method_reference").expect("method reference");
+        assert_eq!(java_call_result_use(node), None);
+        assert_eq!(
+            JavaCallResultUseIndex::new(reference.root_node())
+                .at_span(node.start_byte(), node.end_byte()),
+            Err(JavaCallResultUseOpen::UnclassifiedSyntax)
+        );
+        let recovered = parser
+            .parse("class C { void f() { call(1, ); } }", None)
+            .expect("recovered Java tree");
+        let node = first(recovered.root_node(), "method_invocation")
+            .expect("recovered invocation remains a syntax node");
+        assert_eq!(java_call_result_use(node), None);
+        assert_eq!(
+            JavaCallResultUseIndex::new(recovered.root_node())
+                .at_span(node.start_byte(), node.end_byte()),
+            Err(JavaCallResultUseOpen::UnclassifiedSyntax)
+        );
+    }
+
+    #[test]
+    fn constructor_result_is_discarded_only_at_direct_statement_site() {
+        let source =
+            "class C { void f() { new C(); C c = new C(); sink(new C()); } void sink(C c) {} }";
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_java::LANGUAGE.into())
+            .expect("Java grammar");
+        let tree = parser.parse(source, None).expect("Java tree");
+        let mut uses = Vec::new();
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "object_creation_expression" {
+                uses.push(java_call_result_use(node));
+            }
+            for index in (0..node.named_child_count()).rev() {
+                stack.push(node.named_child(index).expect("named child exists"));
+            }
+        }
+        assert_eq!(
+            uses,
+            vec![
+                Some(JavaCallResultUse::Discarded),
+                Some(JavaCallResultUse::OtherContext),
+                Some(JavaCallResultUse::OtherContext),
+            ]
+        );
+        let index = JavaCallResultUseIndex::new(tree.root_node());
+        let sites = &index.sites;
+        assert_eq!(sites.len(), 4, "three constructors and one outer sink call");
+        assert_eq!(sites[0].result_use, Some(JavaCallResultUse::Discarded));
+        assert_eq!(
+            index.at_span(sites[0].start_byte, sites[0].end_byte),
+            Ok(JavaCallResultUse::Discarded)
+        );
+        assert_eq!(
+            index.at_span(source.len(), source.len()),
+            Err(JavaCallResultUseOpen::MissingCall)
+        );
+        assert!(sites.windows(2).all(|pair| {
+            (pair[0].start_byte, pair[0].end_byte) <= (pair[1].start_byte, pair[1].end_byte)
+        }));
+    }
+
+    #[test]
+    fn switch_expression_rule_consumes_its_call_value() {
+        let source =
+            "class C { String f(String s) { return switch (s) { default -> s.trim(); }; } }";
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_java::LANGUAGE.into())
+            .expect("Java grammar");
+        let tree = parser.parse(source, None).expect("Java tree");
+        let sites = JavaCallResultUseIndex::new(tree.root_node()).sites;
+        assert_eq!(sites.len(), 1);
+        assert_eq!(sites[0].result_use, Some(JavaCallResultUse::OtherContext));
+    }
+
+    #[test]
+    fn for_initializer_and_update_discard_direct_call_results() {
+        let source = "class C { void f(String s) { \
+            for (s.trim(); s.isEmpty(); s.trim(), sink(s.trim())) {} \
+        } void sink(String s) {} }";
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_java::LANGUAGE.into())
+            .expect("Java grammar");
+        let tree = parser.parse(source, None).expect("Java tree");
+        assert!(!tree.root_node().has_error(), "{tree:?}");
+        let mut calls = Vec::new();
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "method_invocation" {
+                calls.push((
+                    &source[node.start_byte()..node.end_byte()],
+                    java_call_result_use(node),
+                ));
+            }
+            for index in (0..node.named_child_count()).rev() {
+                stack.push(node.named_child(index).expect("named child exists"));
+            }
+        }
+        assert_eq!(
+            calls,
+            vec![
+                ("s.trim()", Some(JavaCallResultUse::Discarded)),
+                ("s.isEmpty()", Some(JavaCallResultUse::OtherContext)),
+                ("s.trim()", Some(JavaCallResultUse::Discarded)),
+                ("sink(s.trim())", Some(JavaCallResultUse::Discarded)),
+                ("s.trim()", Some(JavaCallResultUse::OtherContext)),
+            ]
+        );
+    }
+
+    #[test]
+    fn expression_lambda_needs_a_functional_return_contract() {
+        let source = "class C { void f(String s) { Runnable discard = () -> s.trim(); java.util.function.Supplier<String> keep = () -> s.trim(); } }";
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_java::LANGUAGE.into())
+            .expect("Java grammar");
+        let tree = parser.parse(source, None).expect("Java tree");
+        let index = JavaCallResultUseIndex::new(tree.root_node());
+        assert_eq!(index.sites.len(), 2);
+        assert!(index.sites.iter().all(|site| site.result_use.is_none()));
     }
 }

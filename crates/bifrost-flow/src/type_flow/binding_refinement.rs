@@ -366,6 +366,8 @@ fn guard_predicate_subject(guard: &GuardFact) -> Option<ValueId> {
         GuardPredicate::ConstantBoolean { .. }
         | GuardPredicate::ConstantEquality { .. }
         | GuardPredicate::OrderedIntegerComparison { .. }
+        | GuardPredicate::OrderedFloatComparison { .. }
+        | GuardPredicate::NanComparison { .. }
         | GuardPredicate::Opaque { .. } => None,
     }
 }

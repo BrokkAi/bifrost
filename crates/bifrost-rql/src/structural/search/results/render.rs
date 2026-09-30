@@ -37,10 +37,12 @@ impl CodeQueryResult {
                 | CodeQueryResultValue::CallBinding { .. }
                 | CodeQueryResultValue::CallEffect { .. }
                 | CodeQueryResultValue::CallResultContract { .. }
+                | CodeQueryResultValue::CallResultObligation { .. }
                 | CodeQueryResultValue::ResultContractUse { .. }
                 | CodeQueryResultValue::ResultContractFailureUse { .. }
                 | CodeQueryResultValue::NilnessOperation { .. }
                 | CodeQueryResultValue::SwitchCoverage { .. }
+                | CodeQueryResultValue::AssignmentRelation { .. }
                 | CodeQueryResultValue::DetachedTaskTransfer { .. }
                 | CodeQueryResultValue::ProcedureEffect { .. }
                 | CodeQueryResultValue::CallableSignature { .. }
@@ -67,6 +69,10 @@ impl CodeQueryResult {
                 | CodeQueryResultValue::StateEvent { .. }
                 | CodeQueryResultValue::FlowRelation { .. }
                 | CodeQueryResultValue::ControlRelation { .. }
+                | CodeQueryResultValue::BranchRelation { .. }
+                | CodeQueryResultValue::LoopRelation { .. }
+                | CodeQueryResultValue::FailureHandlerState { .. }
+                | CodeQueryResultValue::StatementReachability { .. }
                 | CodeQueryResultValue::Guard { .. }
                 | CodeQueryResultValue::SourceSet { .. }
                 | CodeQueryResultValue::BuildTarget { .. }
@@ -579,6 +585,21 @@ impl CodeQueryResult {
                             value.site_id,
                         ));
                     }
+                    CodeQueryResultValue::CallResultObligation { value } => {
+                        out.push_str(&format!(
+                            "{}:{}:{} [call result obligation; {}; {}] {}; site={}\n",
+                            value.path,
+                            value.range.start_line,
+                            value.range.start_column,
+                            value.result_use,
+                            value.coverage,
+                            value
+                                .obligation_kind
+                                .or(value.reason)
+                                .unwrap_or("no reviewed obligation"),
+                            value.site_id,
+                        ));
+                    }
                     CodeQueryResultValue::ResultContractUse { value } => {
                         out.push_str(&format!(
                             "{}:{}:{} [result contract use; {}; {}; {}; {}] {}\n",
@@ -635,6 +656,19 @@ impl CodeQueryResult {
                             value.verdict,
                             value.proof,
                             value.reason.unwrap_or(value.selector_domain),
+                        ));
+                    }
+                    CodeQueryResultValue::AssignmentRelation { value } => {
+                        out.push_str(&format!(
+                            "{}:{}:{} [assignment relation; {}; {}; {}; {}] {}\n",
+                            value.path,
+                            value.range.start_line,
+                            value.range.start_column,
+                            value.relation_kind,
+                            value.storage_kind,
+                            value.verdict,
+                            value.proof,
+                            value.reason.unwrap_or(value.coverage),
                         ));
                     }
                     CodeQueryResultValue::ConcurrentAccessConflict { value } => {
@@ -1085,6 +1119,60 @@ impl CodeQueryResult {
                                 "  uncovered relations: {}\n",
                                 value.uncovered_relations.join(", ")
                             ));
+                        }
+                    }
+                    CodeQueryResultValue::BranchRelation { value } => {
+                        out.push_str(&format!(
+                            "{}:{}:{} [branch_relation; {}; {}] {} -> {}\n",
+                            value.path,
+                            value.range.start_line,
+                            value.range.start_column,
+                            value.relation,
+                            value.verdict,
+                            value.earlier_range.start_line,
+                            value.later_range.start_line
+                        ));
+                        if let Some(reason) = value.reason {
+                            out.push_str(&format!("  reason: {reason}\n"));
+                        }
+                    }
+                    CodeQueryResultValue::LoopRelation { value } => {
+                        out.push_str(&format!(
+                            "{}:{}:{} [loop_relation; {}; {}]\n",
+                            value.path,
+                            value.range.start_line,
+                            value.range.start_column,
+                            value.loop_kind,
+                            value.verdict,
+                        ));
+                        for reason in &value.reasons {
+                            out.push_str(&format!("  reason: {reason:?}\n"));
+                        }
+                    }
+                    CodeQueryResultValue::FailureHandlerState { value } => {
+                        out.push_str(&format!(
+                            "{}:{}:{} [failure_handler_state; {}; {}]\n",
+                            value.path,
+                            value.range.start_line,
+                            value.range.start_column,
+                            value.verdict,
+                            value.proof
+                        ));
+                        if let Some(reason) = value.reason {
+                            out.push_str(&format!("  reason: {reason}\n"));
+                        }
+                    }
+                    CodeQueryResultValue::StatementReachability { value } => {
+                        out.push_str(&format!(
+                            "{}:{}:{} [statement_reachability; {}; {}]\n",
+                            value.path,
+                            value.range.start_line,
+                            value.range.start_column,
+                            value.statement_kind,
+                            value.verdict,
+                        ));
+                        if let Some(reason) = &value.reason {
+                            out.push_str(&format!("  reason: {reason}\n"));
                         }
                     }
                     CodeQueryResultValue::Guard { value } => {

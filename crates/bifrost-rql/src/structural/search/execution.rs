@@ -908,6 +908,8 @@ pub(super) fn execute_parallel_seed_union(
                     flow_state_cache: FlowStateTraversalCache::default(),
                     control_relation_cache:
                         control_relations::ControlRelationTraversalCache::default(),
+                    branch_relation_cache: BranchRelationTraversalCache::default(),
+                    failure_handler_state_cache: FailureHandlerStateCache::default(),
                     topology_cache: topology_rows::TopologyTraversalCache::default(),
                     rewrite_path_cache: RewritePathTraversalCache::default(),
                     path_cache: PathTraversalCache::default(),
@@ -1206,12 +1208,17 @@ pub(super) fn append_diagnostic_terminations(
             | CodeQueryDiagnosticCode::RewriteDomainUnsupported
             | CodeQueryDiagnosticCode::RewritePathDerivationIncomplete
             | CodeQueryDiagnosticCode::ControlRelationDerivationIncomplete
+            | CodeQueryDiagnosticCode::BranchRelationDerivationIncomplete
+            | CodeQueryDiagnosticCode::LoopRelationDerivationIncomplete
+            | CodeQueryDiagnosticCode::FailureHandlerDerivationIncomplete
+            | CodeQueryDiagnosticCode::StatementReachabilityDerivationIncomplete
             | CodeQueryDiagnosticCode::ControlRelationExitPartitionPartial
             | CodeQueryDiagnosticCode::TopologyDerivationIncomplete
             | CodeQueryDiagnosticCode::TopologyOwnershipAmbiguous
             | CodeQueryDiagnosticCode::PathDerivationIncomplete
             | CodeQueryDiagnosticCode::EffectDerivationIncomplete
             | CodeQueryDiagnosticCode::ResultContractDerivationIncomplete
+            | CodeQueryDiagnosticCode::ResultObligationDerivationIncomplete
             | CodeQueryDiagnosticCode::CallShapeCoverageIncomplete
             | CodeQueryDiagnosticCode::JsxProjectionIncomplete => {
                 Some(QueryOperatorTermination::AnalysisIncomplete)

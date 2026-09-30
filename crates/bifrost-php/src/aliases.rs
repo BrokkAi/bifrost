@@ -947,12 +947,19 @@ pub fn resolve_php_type_node(
         match node.kind() {
             "named_type" | "optional_type" => {
                 let child = php_only_named_child(node, &mut step)?;
-                if !matches!(child.kind(), "name" | "qualified_name" | "named_type") {
+                if !matches!(
+                    child.kind(),
+                    "name" | "qualified_name" | "relative_name" | "named_type"
+                ) {
                     return None;
                 }
                 node = child;
             }
-            "name" | "qualified_name" | "namespace_name" | "fully_qualified_name" => break,
+            "name"
+            | "qualified_name"
+            | "relative_name"
+            | "namespace_name"
+            | "fully_qualified_name" => break,
             "union_type"
             | "intersection_type"
             | "disjunctive_normal_form_type"
@@ -1039,7 +1046,7 @@ pub fn resolve_php_function_node(
 ) -> Option<PhpCallableCandidates> {
     if !matches!(
         node.kind(),
-        "name" | "qualified_name" | "namespace_name" | "fully_qualified_name"
+        "name" | "qualified_name" | "relative_name" | "namespace_name" | "fully_qualified_name"
     ) {
         return None;
     }
@@ -1057,7 +1064,7 @@ pub fn resolve_php_constant_node(
 ) -> Option<PhpCallableCandidates> {
     if !matches!(
         node.kind(),
-        "name" | "qualified_name" | "namespace_name" | "fully_qualified_name"
+        "name" | "qualified_name" | "relative_name" | "namespace_name" | "fully_qualified_name"
     ) {
         return None;
     }
@@ -1101,12 +1108,16 @@ fn php_structured_path(
         return None;
     }
     let absolute = php_path_has_leading_separator(node, step)?;
-    let segments = php_path_segments(node, source, step)?;
+    let mut segments = php_path_segments(node, source, step)?;
     if segments.is_empty() {
         return None;
     }
-    let namespace_relative =
-        !absolute && segments[0].eq_ignore_ascii_case("namespace") && segments.len() > 1;
+    let namespace_relative = !absolute
+        && (node.kind() == "relative_name"
+            || (segments[0].eq_ignore_ascii_case("namespace") && segments.len() > 1));
+    if node.kind() != "relative_name" && namespace_relative {
+        segments.remove(0);
+    }
     Some(PhpStructuredPath {
         segments,
         absolute,
@@ -1142,11 +1153,7 @@ fn resolve_php_structured_path(
     aliases: &HashMap<String, String>,
     step: &mut impl FnMut() -> bool,
 ) -> Option<String> {
-    let segments = if path.namespace_relative {
-        path.segments.get(1..)?
-    } else {
-        path.segments.as_slice()
-    };
+    let segments = path.segments.as_slice();
     let first = segments.first()?;
     if matches!(
         first.to_ascii_lowercase().as_str(),
@@ -1418,7 +1425,7 @@ mod source_alias_tests {
     use super::{
         PhpFileContextIndex, PhpUseAliases, parse_php_tree, parse_php_use_aliases,
         parse_php_use_aliases_by_kind, parse_php_use_aliases_from_source,
-        php_file_context_from_tree_at,
+        php_file_context_from_tree_at, resolve_php_type_node,
     };
     use brokk_bifrost_core::hash::HashSet;
 
@@ -1566,6 +1573,35 @@ mod source_alias_tests {
         let third = index.context_at(source.find("class C").expect("C"));
         assert_eq!(third.namespace, "Third");
         assert!(!third.aliases.type_aliases.contains_key("Shared"));
+    }
+
+    #[test]
+    fn namespace_relative_type_keeps_ast_provenance_and_ignores_aliases() {
+        let source = concat!(
+            "<?php\n",
+            "namespace App;\n",
+            "use Vendor\\Model as Model;\n",
+            "function make(): namespace\\Model\\Product {}\n",
+        );
+        let tree = parse_php_tree(source).expect("PHP source parses");
+        let mut stack = vec![tree.root_node()];
+        let relative = loop {
+            let node = stack.pop().expect("namespace-relative type node");
+            if node.kind() == "relative_name" {
+                break node;
+            }
+            for index in (0..node.named_child_count()).rev() {
+                stack.push(node.named_child(index).expect("named child"));
+            }
+        };
+        let context =
+            php_file_context_from_tree_at(tree.root_node(), source, relative.start_byte(), || true)
+                .expect("file context");
+
+        assert_eq!(
+            resolve_php_type_node(relative, source, &context, || true).as_deref(),
+            Some("App.Model.Product")
+        );
     }
 
     #[test]

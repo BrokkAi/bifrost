@@ -93,6 +93,8 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 mod applicability;
+mod assignment_relations;
+mod branch_relations;
 mod call_binding;
 mod call_shape;
 mod callable_signature;
@@ -106,23 +108,28 @@ mod effects;
 mod environment;
 mod execution;
 pub(crate) mod expansions;
+mod failure_handler_state;
 mod field_write;
 mod flow_state;
 mod guards;
 mod imports;
 mod jsx;
+mod loop_relations;
 mod materialization;
 mod member_family;
 mod occurrences;
+mod statement_reachability;
 use edges::{EdgeKey, EdgeTraversalCache, EdgeValue};
 mod paths;
 mod pipeline;
 mod receiver;
 mod relations;
 mod render;
+mod scalar_conditions;
 use super::occurrence_rows::OccurrenceDerivationOptions;
 use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 use applicability::{CallableApplicabilityValue, OverloadSelectionValue};
+use branch_relations::{BranchRelationTraversalCache, BranchRelationValue};
 use call_binding::CallBindingValue;
 use callable_signature::{CallableSignatureValue, SignatureParameterValue};
 use concurrency::ConcurrentAccessConflictValue;
@@ -134,18 +141,20 @@ use control_relations::{ControlRelationKey, ControlRelationTraversalCache, Contr
 use decorator_binding::DecoratedParameterValue;
 use dispatch::{DispatchSiteValue, DispatchTargetValue};
 use effects::{
-    CallEffectValue, CallResultContractValue, DetachedTaskTransferValue, EffectTraversalCache,
-    NilnessOperationValue, ProcedureEffectValue, ResultContractFailureUseValue,
-    ResultContractUseValue, SwitchCoverageValue,
+    AssignmentRelationValue, CallEffectValue, CallResultContractValue, CallResultObligationValue,
+    DetachedTaskTransferValue, EffectTraversalCache, NilnessOperationValue, ProcedureEffectValue,
+    ResultContractFailureUseValue, ResultContractUseValue, SwitchCoverageValue,
 };
 use environment::{
     BindingKey, BindingValue, CandidateHopKey, CandidateHopValue, CandidateKey, CandidateValue,
     EnvironmentTraversalCache, ScopeKey, ScopeValue,
 };
+use failure_handler_state::{FailureHandlerStateCache, FailureHandlerStateValue};
 use flow_state::{
     FlowRelationKey, FlowRelationValue, FlowStateTraversalCache, StateEventKey, StateEventValue,
 };
 use guards::{GuardKey, GuardValue};
+use loop_relations::LoopRelationValue;
 use member_family::{MemberFamilyEdgeValue, MemberFamilyValue};
 use occurrences::{OccurrenceKey, OccurrenceTraversalCache, OccurrenceValue};
 use paths::{
@@ -153,6 +162,7 @@ use paths::{
     SegmentValue, public_path, public_segment,
 };
 use rewrite_paths::{RewritePathKey, RewritePathTraversalCache, RewritePathValue};
+use statement_reachability::StatementReachabilityValue;
 use topology_rows::{
     TopologyEdgeKey, TopologyEdgeValue, TopologyEntityKey, TopologyEntityValue,
     TopologyTraversalCache,
@@ -382,6 +392,7 @@ pub use results::ALL_DETAILED_CODE_QUERY_DOMAINS;
 pub use results::CodeQueryAbsentMemberFinding;
 pub use results::CodeQueryAbsentMemberWitness;
 pub use results::CodeQueryAbsentMemberWitnessStatus;
+pub use results::CodeQueryAssignmentRelation;
 pub use results::CodeQueryBinding;
 pub use results::CodeQueryBudgetedWork;
 pub use results::CodeQueryCallArgument;
@@ -390,6 +401,7 @@ pub use results::CodeQueryCallBinding;
 pub use results::CodeQueryCallEffect;
 pub use results::CodeQueryCallResult;
 pub use results::CodeQueryCallResultContract;
+pub use results::CodeQueryCallResultObligation;
 pub use results::CodeQueryCallShape;
 pub use results::CodeQueryCallShapeArgument;
 pub use results::CodeQueryCallSite;
@@ -438,6 +450,8 @@ pub use results::CodeQueryGenerationSite;
 pub use results::CodeQueryImportBinder;
 pub use results::CodeQueryJsxAttributeValue;
 pub use results::CodeQueryLexicalScope;
+pub use results::CodeQueryLoopReason;
+pub use results::CodeQueryLoopRelation;
 pub use results::CodeQueryMatch;
 pub use results::CodeQueryMemberFamily;
 pub use results::CodeQueryMemberFamilyEdge;
@@ -491,6 +505,7 @@ pub use results::CodeQuerySignatureParameter;
 pub use results::CodeQuerySourceSite;
 pub use results::CodeQueryStableOwnerCandidate;
 pub use results::CodeQueryStableOwnerDerivation;
+pub use results::CodeQueryStatementReachability;
 pub use results::CodeQuerySwitchCoverage;
 pub use results::CodeQueryTaintFinding;
 pub use results::CodeQueryTaintLimits;
@@ -524,6 +539,9 @@ pub use results::SUPPRESSED_ROW_SET_CAPABILITY;
 pub(crate) use results::UnionExecutionStrategy;
 pub use results::VALUE_FLOW_CAPABILITY;
 pub use results::code_query_completion;
+#[cfg(feature = "query-result-fixtures")]
+pub use results::code_query_result_fixtures_json;
+pub use results::code_query_result_json_schema;
 pub use results::render_exhausted_roots;
 pub use results::{CodeQueryFlowRelation, CodeQueryStateEvent, CodeQueryStateEventRef};
 pub use results::{CodeQueryRewritePath, CodeQueryRewriteStep};
@@ -619,7 +637,7 @@ struct SeedMatch {
     fact_match: FactMatch,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone)]
 struct DeclarationValue {
     unit: CodeUnit,
     range: Range,
@@ -627,7 +645,34 @@ struct DeclarationValue {
     // An exact structural projection retains the normalized leaf kind so the
     // public declaration does not erase method/constructor distinctions
     // already proved by the seed facts.
+    //
+    // The leaf kind is presentation evidence about the declaration, never part
+    // of its identity: one declaration reached by a member list and by an
+    // enclosing-declaration selection must key, intersect and deduplicate as
+    // one row even though only the structural projection proved a leaf kind.
+    // `merge_structural_kind` folds the evidence together when an intersection
+    // combines two spellings of one row; unions and renders keep the first
+    // writer's value.
     structural_kind: Option<NormalizedKind>,
+}
+
+/// A declaration row is identified by the declaration it names -- the
+/// `CodeUnit` and the exact range that code unit covers -- and by nothing
+/// else. See the `structural_kind` field for why the optional leaf kind cannot
+/// participate.
+impl PartialEq for DeclarationValue {
+    fn eq(&self, other: &Self) -> bool {
+        self.unit == other.unit && self.range == other.range
+    }
+}
+
+impl Eq for DeclarationValue {}
+
+impl std::hash::Hash for DeclarationValue {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.unit.hash(state);
+        self.range.hash(state);
+    }
 }
 
 impl DeclarationValue {
@@ -643,6 +688,17 @@ impl DeclarationValue {
         debug_assert!(kind.satisfies(NormalizedKind::Declaration));
         self.structural_kind = Some(kind);
         self
+    }
+
+    /// Fold the exact structural leaf kind another projection of this same
+    /// declaration proved into this value. Identity matched before the merge,
+    /// so the only thing two spellings of one row can disagree about is this
+    /// presentation metadata; keep whichever spelling carries it.
+    fn merge_structural_kind(&mut self, other: Self) {
+        debug_assert_eq!(self, &other, "declaration evidence merges by identity");
+        if self.structural_kind.is_none() {
+            self.structural_kind = other.structural_kind;
+        }
     }
 
     /// The label the rendered declaration's visible `kind` field carries: the
@@ -968,10 +1024,12 @@ enum PipelineValue {
     CallBinding(Box<CallBindingValue>),
     CallEffect(Box<CallEffectValue>),
     CallResultContract(Box<CallResultContractValue>),
+    CallResultObligation(Box<CallResultObligationValue>),
     ResultContractUse(Box<ResultContractUseValue>),
     ResultContractFailureUse(Box<ResultContractFailureUseValue>),
     NilnessOperation(Box<NilnessOperationValue>),
     SwitchCoverage(Box<SwitchCoverageValue>),
+    AssignmentRelation(Box<AssignmentRelationValue>),
     ConcurrentAccessConflict(Box<ConcurrentAccessConflictValue>),
     ClassSetRow(Box<ClassSetRowValue>),
     AbsentMemberFinding(Box<AbsentMemberFindingValue>),
@@ -999,6 +1057,10 @@ enum PipelineValue {
     StateEvent(Box<StateEventValue>),
     FlowRelation(Box<FlowRelationValue>),
     ControlRelation(Box<ControlRelationValue>),
+    BranchRelation(Box<BranchRelationValue>),
+    LoopRelation(Box<LoopRelationValue>),
+    FailureHandlerState(Box<FailureHandlerStateValue>),
+    StatementReachability(Box<StatementReachabilityValue>),
     Guard(Box<GuardValue>),
     SourceSet(Box<TopologyEntityValue>),
     BuildTarget(Box<TopologyEntityValue>),
@@ -1140,10 +1202,12 @@ enum PipelineKey {
     CallBinding(String),
     CallEffect(String),
     CallResultContract(String),
+    CallResultObligation(String),
     ResultContractUse(String),
     ResultContractFailureUse(String),
     NilnessOperation(String),
     SwitchCoverage(String),
+    AssignmentRelation(String),
     ConcurrentAccessConflict(String),
     ClassSetRow(String),
     AbsentMemberFinding(String),
@@ -1171,6 +1235,10 @@ enum PipelineKey {
     StateEvent(StateEventKey),
     FlowRelation(FlowRelationKey),
     ControlRelation(ControlRelationKey),
+    BranchRelation(String),
+    LoopRelation(String),
+    FailureHandlerState(String),
+    StatementReachability(String),
     Guard(GuardKey),
     SourceSet(TopologyEntityKey),
     BuildTarget(TopologyEntityKey),
@@ -1198,11 +1266,42 @@ enum SemanticPipelineKey {
 impl PipelineValue {
     /// Set identity does not include the evidence used to establish a value.
     /// Preserve independent caller contexts when equal finding rows combine.
+    /// A union or deduplicating render keeps the first writer's value, so this
+    /// merge must not upgrade declaration kind evidence: upgrading here would
+    /// make a whole-execution union diverge from the sliced per-seed-file
+    /// merge, which renders each branch before it deduplicates.
     fn merge_evidence(&mut self, other: Self) {
         if let (Self::AbsentMemberFinding(value), Self::AbsentMemberFinding(other)) = (self, other)
         {
             value.merge_evidence(*other);
         }
+    }
+
+    /// Merge one contribution into an intersection survivor. Intersections and
+    /// differences are never sliced, so a declaration survivor may adopt the
+    /// exact structural leaf kind the other spelling proved, including for
+    /// declarations embedded in a reference site, without diverging from a
+    /// per-seed-file merge; every other value family then
+    /// falls back to the ordinary set merge.
+    fn merge_intersect_evidence(&mut self, other: Self) {
+        let other = match (&mut *self, other) {
+            (Self::Declaration(value), Self::Declaration(other)) => {
+                value.merge_structural_kind(other);
+                return;
+            }
+            (Self::ReferenceSite(value), Self::ReferenceSite(other)) => {
+                debug_assert_eq!(value, &other, "reference evidence merges by identity");
+                value.target.merge_structural_kind(other.target);
+                match (&mut value.enclosing, other.enclosing) {
+                    (Some(value), Some(other)) => value.merge_structural_kind(other),
+                    (None, None) => {}
+                    _ => unreachable!("equal reference sites have equal enclosing presence"),
+                }
+                return;
+            }
+            (_, other) => other,
+        };
+        self.merge_evidence(other);
     }
 
     fn key(&self) -> PipelineKey {
@@ -1243,12 +1342,16 @@ impl PipelineValue {
             Self::CallBinding(value) => PipelineKey::CallBinding(value.row().id.clone()),
             Self::CallEffect(value) => PipelineKey::CallEffect(value.row().id.clone()),
             Self::CallResultContract(value) => PipelineKey::CallResultContract(value.id.clone()),
+            Self::CallResultObligation(value) => {
+                PipelineKey::CallResultObligation(value.id.clone())
+            }
             Self::ResultContractUse(value) => PipelineKey::ResultContractUse(value.id.clone()),
             Self::ResultContractFailureUse(value) => {
                 PipelineKey::ResultContractFailureUse(value.id.clone())
             }
             Self::NilnessOperation(value) => PipelineKey::NilnessOperation(value.id.clone()),
             Self::SwitchCoverage(value) => PipelineKey::SwitchCoverage(value.id.clone()),
+            Self::AssignmentRelation(value) => PipelineKey::AssignmentRelation(value.id.clone()),
             Self::ConcurrentAccessConflict(value) => {
                 PipelineKey::ConcurrentAccessConflict(value.id.clone())
             }
@@ -1290,6 +1393,12 @@ impl PipelineValue {
             Self::StateEvent(value) => PipelineKey::StateEvent(value.key()),
             Self::FlowRelation(value) => PipelineKey::FlowRelation(value.key()),
             Self::ControlRelation(value) => PipelineKey::ControlRelation(value.key()),
+            Self::BranchRelation(value) => PipelineKey::BranchRelation(value.key()),
+            Self::LoopRelation(value) => PipelineKey::LoopRelation(value.row.id.clone()),
+            Self::FailureHandlerState(value) => PipelineKey::FailureHandlerState(value.key()),
+            Self::StatementReachability(value) => {
+                PipelineKey::StatementReachability(value.row.id.clone())
+            }
             Self::Guard(value) => PipelineKey::Guard(value.key()),
             Self::SourceSet(value) => PipelineKey::SourceSet(value.key()),
             Self::BuildTarget(value) => PipelineKey::BuildTarget(value.key()),
@@ -1565,10 +1674,12 @@ enum PipelineTraceValue {
     CallBinding(Box<CallBindingValue>),
     CallEffect(Box<CallEffectValue>),
     CallResultContract(Box<CallResultContractValue>),
+    CallResultObligation(Box<CallResultObligationValue>),
     ResultContractUse(Box<ResultContractUseValue>),
     ResultContractFailureUse(Box<ResultContractFailureUseValue>),
     NilnessOperation(Box<NilnessOperationValue>),
     SwitchCoverage(Box<SwitchCoverageValue>),
+    AssignmentRelation(Box<AssignmentRelationValue>),
     ConcurrentAccessConflict(Box<ConcurrentAccessConflictValue>),
     ClassSetRow(Box<ClassSetRowValue>),
     AbsentMemberFinding(Box<AbsentMemberFindingValue>),
@@ -1596,6 +1707,10 @@ enum PipelineTraceValue {
     StateEvent(Box<StateEventValue>),
     FlowRelation(Box<FlowRelationValue>),
     ControlRelation(Box<ControlRelationValue>),
+    BranchRelation(Box<BranchRelationValue>),
+    LoopRelation(Box<LoopRelationValue>),
+    FailureHandlerState(Box<FailureHandlerStateValue>),
+    StatementReachability(Box<StatementReachabilityValue>),
     Guard(Box<GuardValue>),
     SourceSet(Box<TopologyEntityValue>),
     BuildTarget(Box<TopologyEntityValue>),
@@ -2398,6 +2513,8 @@ struct QueryExecutionState<'a> {
     edge_cache: EdgeTraversalCache,
     flow_state_cache: FlowStateTraversalCache,
     control_relation_cache: ControlRelationTraversalCache,
+    branch_relation_cache: BranchRelationTraversalCache,
+    failure_handler_state_cache: FailureHandlerStateCache,
     topology_cache: TopologyTraversalCache,
     rewrite_path_cache: RewritePathTraversalCache,
     path_cache: PathTraversalCache,
@@ -3700,6 +3817,8 @@ fn execute_internal_with_analysis_strategy_and_row_family_session(
         edge_cache: EdgeTraversalCache::default(),
         flow_state_cache: FlowStateTraversalCache::new(active_semantic_model_snapshot.clone()),
         control_relation_cache: ControlRelationTraversalCache::default(),
+        branch_relation_cache: BranchRelationTraversalCache::default(),
+        failure_handler_state_cache: FailureHandlerStateCache::default(),
         topology_cache: TopologyTraversalCache::default(),
         rewrite_path_cache: RewritePathTraversalCache::default(),
         path_cache: PathTraversalCache::default(),
@@ -4615,6 +4734,22 @@ fn detailed_evidence_for_pipeline_value(
             decorated_parameter: None,
             runtime_keyed_read: None,
         },
+        PipelineValue::CallResultObligation(value) => DetailedCodeQueryEvidence {
+            result_index,
+            domain: DetailedCodeQueryDomain::CallResultObligation,
+            key: DetailedCodeQueryKey::CallResultObligation {
+                id: value.id.clone(),
+                site_id: value.site_id.clone(),
+            },
+            file: value.file.clone(),
+            source_slice_sha256: None,
+            byte_span: Some(range_byte_span(value.range)),
+            identities: DetailedCodeQueryProvenanceIdentities::None,
+            stable_owner_candidate: None,
+            provenance: Vec::new(),
+            decorated_parameter: None,
+            runtime_keyed_read: None,
+        },
         PipelineValue::ResultContractUse(value) => DetailedCodeQueryEvidence {
             result_index,
             domain: DetailedCodeQueryDomain::ResultContractUse,
@@ -4667,6 +4802,22 @@ fn detailed_evidence_for_pipeline_value(
             result_index,
             domain: DetailedCodeQueryDomain::SwitchCoverage,
             key: DetailedCodeQueryKey::SwitchCoverage {
+                id: value.id.clone(),
+                procedure_id: value.procedure_id.clone(),
+            },
+            file: value.file.clone(),
+            source_slice_sha256: None,
+            byte_span: Some(range_byte_span(value.range)),
+            identities: DetailedCodeQueryProvenanceIdentities::None,
+            stable_owner_candidate: None,
+            provenance: Vec::new(),
+            decorated_parameter: None,
+            runtime_keyed_read: None,
+        },
+        PipelineValue::AssignmentRelation(value) => DetailedCodeQueryEvidence {
+            result_index,
+            domain: DetailedCodeQueryDomain::AssignmentRelation,
+            key: DetailedCodeQueryKey::AssignmentRelation {
                 id: value.id.clone(),
                 procedure_id: value.procedure_id.clone(),
             },
@@ -5084,6 +5235,74 @@ fn detailed_evidence_for_pipeline_value(
                 runtime_keyed_read: None,
             }
         }
+        PipelineValue::FailureHandlerState(value) => {
+            let byte_span = value.anchor.start_byte..value.anchor.end_byte;
+            DetailedCodeQueryEvidence {
+                result_index,
+                domain: DetailedCodeQueryDomain::FailureHandlerState,
+                key: failure_handler_state::detailed_key(value),
+                file: value.file.clone(),
+                source_slice_sha256: retained_source
+                    .and_then(|source| source_slice_sha256(source, &byte_span)),
+                byte_span: Some(byte_span),
+                identities: DetailedCodeQueryProvenanceIdentities::None,
+                stable_owner_candidate: None,
+                provenance: Vec::new(),
+                decorated_parameter: None,
+                runtime_keyed_read: None,
+            }
+        }
+        PipelineValue::BranchRelation(value) => {
+            let byte_span = value.anchor.start_byte..value.anchor.end_byte;
+            DetailedCodeQueryEvidence {
+                result_index,
+                domain: DetailedCodeQueryDomain::BranchRelation,
+                key: branch_relations::detailed_key(value),
+                file: value.file.clone(),
+                source_slice_sha256: retained_source
+                    .and_then(|source| source_slice_sha256(source, &byte_span)),
+                byte_span: Some(byte_span),
+                identities: DetailedCodeQueryProvenanceIdentities::None,
+                stable_owner_candidate: None,
+                provenance: Vec::new(),
+                decorated_parameter: None,
+                runtime_keyed_read: None,
+            }
+        }
+        PipelineValue::LoopRelation(value) => {
+            let byte_span = value.anchor.start_byte..value.anchor.end_byte;
+            DetailedCodeQueryEvidence {
+                result_index,
+                domain: DetailedCodeQueryDomain::LoopRelation,
+                key: loop_relations::detailed_key(value),
+                file: value.file.clone(),
+                source_slice_sha256: retained_source
+                    .and_then(|source| source_slice_sha256(source, &byte_span)),
+                byte_span: Some(byte_span),
+                identities: DetailedCodeQueryProvenanceIdentities::None,
+                stable_owner_candidate: None,
+                provenance: Vec::new(),
+                decorated_parameter: None,
+                runtime_keyed_read: None,
+            }
+        }
+        PipelineValue::StatementReachability(value) => {
+            let byte_span = value.anchor.start_byte..value.anchor.end_byte;
+            DetailedCodeQueryEvidence {
+                result_index,
+                domain: DetailedCodeQueryDomain::StatementReachability,
+                key: statement_reachability::detailed_key(value),
+                file: value.file.clone(),
+                source_slice_sha256: retained_source
+                    .and_then(|source| source_slice_sha256(source, &byte_span)),
+                byte_span: Some(byte_span),
+                identities: DetailedCodeQueryProvenanceIdentities::None,
+                stable_owner_candidate: None,
+                provenance: Vec::new(),
+                decorated_parameter: None,
+                runtime_keyed_read: None,
+            }
+        }
         PipelineValue::Guard(value) => {
             let (file, range) = guards::anchor(value);
             let byte_span = range.start_byte..range.end_byte;
@@ -5427,10 +5646,12 @@ fn terminal_source_file(value: &PipelineValue) -> Option<&ProjectFile> {
         PipelineValue::CallBinding(value) => Some(value.file()),
         PipelineValue::CallEffect(value) => Some(value.file()),
         PipelineValue::CallResultContract(value) => Some(value.file()),
+        PipelineValue::CallResultObligation(value) => Some(value.file()),
         PipelineValue::ResultContractUse(value) => Some(value.file()),
         PipelineValue::ResultContractFailureUse(value) => Some(value.file()),
         PipelineValue::NilnessOperation(value) => Some(value.file()),
         PipelineValue::SwitchCoverage(value) => Some(value.file()),
+        PipelineValue::AssignmentRelation(value) => Some(value.file()),
         PipelineValue::ConcurrentAccessConflict(value) => Some(value.file()),
         PipelineValue::ClassSetRow(value) => Some(value.file()),
         PipelineValue::AbsentMemberFinding(value) => Some(value.file()),
@@ -5456,6 +5677,10 @@ fn terminal_source_file(value: &PipelineValue) -> Option<&ProjectFile> {
         PipelineValue::StateEvent(value) => Some(value.file()),
         PipelineValue::FlowRelation(value) => Some(value.file()),
         PipelineValue::ControlRelation(value) => Some(value.procedure.file()),
+        PipelineValue::BranchRelation(value) => Some(&value.file),
+        PipelineValue::LoopRelation(value) => Some(&value.file),
+        PipelineValue::FailureHandlerState(value) => Some(&value.file),
+        PipelineValue::StatementReachability(value) => Some(&value.file),
         PipelineValue::Guard(value) => Some(value.procedure.file()),
         PipelineValue::SourceSet(value) | PipelineValue::BuildTarget(value) => Some(value.file()),
         PipelineValue::TopologyEdge(value) => Some(value.file()),
@@ -5596,6 +5821,9 @@ fn collect_pipeline_value_source_files(value: &PipelineValue, files: &mut BTreeS
         PipelineValue::CallResultContract(value) => {
             files.insert(value.file().clone());
         }
+        PipelineValue::CallResultObligation(value) => {
+            files.insert(value.file().clone());
+        }
         PipelineValue::ResultContractUse(value) => {
             files.insert(value.file().clone());
         }
@@ -5606,6 +5834,9 @@ fn collect_pipeline_value_source_files(value: &PipelineValue, files: &mut BTreeS
             files.insert(value.file().clone());
         }
         PipelineValue::SwitchCoverage(value) => {
+            files.insert(value.file().clone());
+        }
+        PipelineValue::AssignmentRelation(value) => {
             files.insert(value.file().clone());
         }
         PipelineValue::ConcurrentAccessConflict(value) => {
@@ -5688,6 +5919,18 @@ fn collect_pipeline_value_source_files(value: &PipelineValue, files: &mut BTreeS
         }
         PipelineValue::ControlRelation(value) => {
             files.insert(value.procedure.file().clone());
+        }
+        PipelineValue::BranchRelation(value) => {
+            files.insert(value.file.clone());
+        }
+        PipelineValue::LoopRelation(value) => {
+            files.insert(value.file.clone());
+        }
+        PipelineValue::FailureHandlerState(value) => {
+            files.insert(value.file.clone());
+        }
+        PipelineValue::StatementReachability(value) => {
+            files.insert(value.file.clone());
         }
         PipelineValue::Guard(value) => {
             files.insert(value.procedure.file().clone());
@@ -5773,6 +6016,9 @@ fn collect_trace_value_source_files(value: &PipelineTraceValue, files: &mut BTre
         PipelineTraceValue::CallResultContract(value) => {
             files.insert(value.file().clone());
         }
+        PipelineTraceValue::CallResultObligation(value) => {
+            files.insert(value.file().clone());
+        }
         PipelineTraceValue::ResultContractUse(value) => {
             files.insert(value.file().clone());
         }
@@ -5783,6 +6029,9 @@ fn collect_trace_value_source_files(value: &PipelineTraceValue, files: &mut BTre
             files.insert(value.file().clone());
         }
         PipelineTraceValue::SwitchCoverage(value) => {
+            files.insert(value.file().clone());
+        }
+        PipelineTraceValue::AssignmentRelation(value) => {
             files.insert(value.file().clone());
         }
         PipelineTraceValue::ConcurrentAccessConflict(value) => {
@@ -5865,6 +6114,18 @@ fn collect_trace_value_source_files(value: &PipelineTraceValue, files: &mut BTre
         }
         PipelineTraceValue::ControlRelation(value) => {
             files.insert(value.procedure.file().clone());
+        }
+        PipelineTraceValue::BranchRelation(value) => {
+            files.insert(value.file.clone());
+        }
+        PipelineTraceValue::LoopRelation(value) => {
+            files.insert(value.file.clone());
+        }
+        PipelineTraceValue::FailureHandlerState(value) => {
+            files.insert(value.file.clone());
+        }
+        PipelineTraceValue::StatementReachability(value) => {
+            files.insert(value.file.clone());
         }
         PipelineTraceValue::Guard(value) => {
             files.insert(value.procedure.file().clone());
@@ -6216,6 +6477,16 @@ fn detailed_trace_provenance_ref(
             value.range,
             cache,
         ),
+        PipelineTraceValue::CallResultObligation(value) => detailed_call_shape_provenance_ref(
+            DetailedCodeQueryDomain::CallResultObligation,
+            DetailedCodeQueryKey::CallResultObligation {
+                id: value.id.clone(),
+                site_id: value.site_id.clone(),
+            },
+            value.file(),
+            value.range,
+            cache,
+        ),
         PipelineTraceValue::ResultContractUse(value) => detailed_call_shape_provenance_ref(
             DetailedCodeQueryDomain::ResultContractUse,
             DetailedCodeQueryKey::ResultContractUse {
@@ -6249,6 +6520,16 @@ fn detailed_trace_provenance_ref(
         PipelineTraceValue::SwitchCoverage(value) => detailed_call_shape_provenance_ref(
             DetailedCodeQueryDomain::SwitchCoverage,
             DetailedCodeQueryKey::SwitchCoverage {
+                id: value.id.clone(),
+                procedure_id: value.procedure_id.clone(),
+            },
+            value.file(),
+            value.range,
+            cache,
+        ),
+        PipelineTraceValue::AssignmentRelation(value) => detailed_call_shape_provenance_ref(
+            DetailedCodeQueryDomain::AssignmentRelation,
+            DetailedCodeQueryKey::AssignmentRelation {
                 id: value.id.clone(),
                 procedure_id: value.procedure_id.clone(),
             },
@@ -6575,6 +6856,34 @@ fn detailed_trace_provenance_ref(
                 cache,
             )
         }
+        PipelineTraceValue::FailureHandlerState(value) => detailed_environment_provenance_ref(
+            DetailedCodeQueryDomain::FailureHandlerState,
+            failure_handler_state::detailed_key(value),
+            &value.file,
+            value.anchor,
+            cache,
+        ),
+        PipelineTraceValue::BranchRelation(value) => detailed_environment_provenance_ref(
+            DetailedCodeQueryDomain::BranchRelation,
+            branch_relations::detailed_key(value),
+            &value.file,
+            value.anchor,
+            cache,
+        ),
+        PipelineTraceValue::LoopRelation(value) => detailed_environment_provenance_ref(
+            DetailedCodeQueryDomain::LoopRelation,
+            loop_relations::detailed_key(value),
+            &value.file,
+            value.anchor,
+            cache,
+        ),
+        PipelineTraceValue::StatementReachability(value) => detailed_environment_provenance_ref(
+            DetailedCodeQueryDomain::StatementReachability,
+            statement_reachability::detailed_key(value),
+            &value.file,
+            value.anchor,
+            cache,
+        ),
         PipelineTraceValue::Guard(value) => {
             let (file, range) = guards::anchor(value);
             detailed_environment_provenance_ref(
@@ -7189,6 +7498,9 @@ fn pipeline_trace_value(value: &PipelineValue) -> Option<PipelineTraceValue> {
         PipelineValue::CallResultContract(value) => {
             Some(PipelineTraceValue::CallResultContract(value.clone()))
         }
+        PipelineValue::CallResultObligation(value) => {
+            Some(PipelineTraceValue::CallResultObligation(value.clone()))
+        }
         PipelineValue::ResultContractUse(value) => {
             Some(PipelineTraceValue::ResultContractUse(value.clone()))
         }
@@ -7200,6 +7512,9 @@ fn pipeline_trace_value(value: &PipelineValue) -> Option<PipelineTraceValue> {
         }
         PipelineValue::SwitchCoverage(value) => {
             Some(PipelineTraceValue::SwitchCoverage(value.clone()))
+        }
+        PipelineValue::AssignmentRelation(value) => {
+            Some(PipelineTraceValue::AssignmentRelation(value.clone()))
         }
         PipelineValue::ConcurrentAccessConflict(value) => {
             Some(PipelineTraceValue::ConcurrentAccessConflict(value.clone()))
@@ -7260,6 +7575,16 @@ fn pipeline_trace_value(value: &PipelineValue) -> Option<PipelineTraceValue> {
         PipelineValue::FlowRelation(value) => Some(PipelineTraceValue::FlowRelation(value.clone())),
         PipelineValue::ControlRelation(value) => {
             Some(PipelineTraceValue::ControlRelation(value.clone()))
+        }
+        PipelineValue::BranchRelation(value) => {
+            Some(PipelineTraceValue::BranchRelation(value.clone()))
+        }
+        PipelineValue::LoopRelation(value) => Some(PipelineTraceValue::LoopRelation(value.clone())),
+        PipelineValue::FailureHandlerState(value) => {
+            Some(PipelineTraceValue::FailureHandlerState(value.clone()))
+        }
+        PipelineValue::StatementReachability(value) => {
+            Some(PipelineTraceValue::StatementReachability(value.clone()))
         }
         PipelineValue::Guard(value) => Some(PipelineTraceValue::Guard(value.clone())),
         PipelineValue::SourceSet(value) => Some(PipelineTraceValue::SourceSet(value.clone())),

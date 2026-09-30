@@ -11,9 +11,10 @@
 
 use brokk_bifrost_lsp::lsp::conversion::path_to_uri_string;
 use serde_json::{Value, json};
-use std::io::{BufRead, BufReader, Read, Write};
-use std::path::Path;
-use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
@@ -45,7 +46,8 @@ pub struct LspServer {
     child: Option<Child>,
     stdin: Option<ChildStdin>,
     reader: Option<BufReader<ChildStdout>>,
-    stderr: Option<ChildStderr>,
+    stderr_path: PathBuf,
+    _stderr_dir: TempDir,
     next_id: u64,
     /// Owned by the server object for the default spawn, which creates the
     /// isolated cache directory itself. The machine-cache-root variant lets the
@@ -58,21 +60,21 @@ impl LspServer {
     /// handshake.
     pub fn spawn(root: &Path) -> Self {
         let (mut command, cache_dir) = lsp_command(root);
+        let (stderr_dir, stderr_path) = capture_stderr(&mut command);
         let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
             .spawn()
             .expect("spawn bifrost");
         let stdin = child.stdin.take().expect("stdin");
         let stdout = child.stdout.take().expect("stdout");
-        let stderr = child.stderr.take().expect("stderr");
 
         Self {
             child: Some(child),
             stdin: Some(stdin),
             reader: Some(BufReader::new(stdout)),
-            stderr: Some(stderr),
+            stderr_path,
+            _stderr_dir: stderr_dir,
             next_id: 1,
             _cache_dir: Some(cache_dir),
         }
@@ -91,21 +93,21 @@ impl LspServer {
     /// developer's own cache.
     pub fn spawn_with_machine_cache_root(root: &Path, machine_cache_root: &Path) -> Self {
         let mut command = lsp_command_with_machine_cache_root(root, machine_cache_root);
+        let (stderr_dir, stderr_path) = capture_stderr(&mut command);
         let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
             .spawn()
             .expect("spawn bifrost");
         let stdin = child.stdin.take().expect("stdin");
         let stdout = child.stdout.take().expect("stdout");
-        let stderr = child.stderr.take().expect("stderr");
 
         Self {
             child: Some(child),
             stdin: Some(stdin),
             reader: Some(BufReader::new(stdout)),
-            stderr: Some(stderr),
+            stderr_path,
+            _stderr_dir: stderr_dir,
             next_id: 1,
             _cache_dir: None,
         }
@@ -130,15 +132,14 @@ impl LspServer {
     /// initialize response for wire-contract assertions.
     pub fn start_with_params_and_result(root: &Path, initialize_params: Value) -> (Self, Value) {
         let (mut command, cache_dir) = lsp_command(root);
+        let (stderr_dir, stderr_path) = capture_stderr(&mut command);
         let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
             .spawn()
             .expect("spawn bifrost");
         let mut stdin = child.stdin.take().expect("stdin");
         let stdout = child.stdout.take().expect("stdout");
-        let mut stderr = child.stderr.take().expect("stderr");
         let mut reader = BufReader::new(stdout);
 
         write_message(
@@ -150,7 +151,7 @@ impl LspServer {
                 "params": initialize_params
             }),
         );
-        let initialize_response = read_response_for_id(&mut reader, &mut stderr, 1);
+        let initialize_response = read_response_for_id(&mut reader, &stderr_path, 1);
         write_message(
             &mut stdin,
             json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}),
@@ -160,7 +161,8 @@ impl LspServer {
             child: Some(child),
             stdin: Some(stdin),
             reader: Some(reader),
-            stderr: Some(stderr),
+            stderr_path,
+            _stderr_dir: stderr_dir,
             next_id: 2,
             _cache_dir: Some(cache_dir),
         };
@@ -181,10 +183,9 @@ impl LspServer {
         self.stdin.as_mut().expect("stdin")
     }
 
-    fn reader_and_stderr_mut(&mut self) -> (&mut BufReader<ChildStdout>, &mut ChildStderr) {
+    fn reader_and_stderr(&mut self) -> (&mut BufReader<ChildStdout>, &Path) {
         let reader = self.reader.as_mut().expect("stdout");
-        let stderr = self.stderr.as_mut().expect("stderr");
-        (reader, stderr)
+        (reader, &self.stderr_path)
     }
 
     /// Send an arbitrary request and return the matching response `Value`. The
@@ -210,7 +211,7 @@ impl LspServer {
 
     /// Read the next inbound JSON-RPC message.
     pub fn read_message(&mut self) -> Value {
-        let (reader, stderr) = self.reader_and_stderr_mut();
+        let (reader, stderr) = self.reader_and_stderr();
         read_message(reader, stderr)
     }
 
@@ -244,7 +245,7 @@ impl LspServer {
 
     /// Read inbound messages until the response with `id` arrives.
     pub fn read_response_for_id(&mut self, id: u64) -> Value {
-        let (reader, stderr) = self.reader_and_stderr_mut();
+        let (reader, stderr) = self.reader_and_stderr();
         read_response_for_id(reader, stderr, id)
     }
 
@@ -476,13 +477,7 @@ impl LspServer {
     pub fn shutdown_with_stderr(mut self) -> String {
         let status = self.shutdown_with_id_status(999);
         assert!(status.success(), "bifrost exited unsuccessfully: {status}");
-        let mut output = String::new();
-        self.stderr
-            .take()
-            .expect("stderr")
-            .read_to_string(&mut output)
-            .expect("read stderr");
-        output
+        fs::read_to_string(&self.stderr_path).expect("read stderr")
     }
 
     /// Graceful `shutdown`/`exit` using an explicit request id.
@@ -597,6 +592,14 @@ fn lsp_command(root: &Path) -> (Command, TempDir) {
     (command, cache_dir)
 }
 
+fn capture_stderr(command: &mut Command) -> (TempDir, PathBuf) {
+    let dir = TempDir::new().expect("create isolated LSP stderr directory");
+    let path = dir.path().join("stderr.log");
+    let file = File::create(&path).expect("create LSP stderr file");
+    command.stderr(Stdio::from(file));
+    (dir, path)
+}
+
 fn lsp_command_with_machine_cache_root(root: &Path, machine_cache_root: &Path) -> Command {
     let binary = option_env!("CARGO_BIN_EXE_bifrost-lsp-test-server")
         .or(option_env!("CARGO_BIN_EXE_bifrost"))
@@ -633,14 +636,13 @@ pub fn write_message(stdin: &mut impl Write, payload: Value) {
     try_write_message(stdin, payload).expect("write");
 }
 
-pub fn read_message(reader: &mut impl BufRead, stderr: &mut impl Read) -> Value {
+pub fn read_message(reader: &mut impl BufRead, stderr: &Path) -> Value {
     let mut content_length: Option<usize> = None;
     loop {
         let mut header = String::new();
         let bytes = reader.read_line(&mut header).expect("read header");
         if bytes == 0 {
-            let mut buf = String::new();
-            let _ = stderr.read_to_string(&mut buf);
+            let buf = fs::read_to_string(stderr).expect("read server stderr after stdout closed");
             panic!("server closed; stderr:\n{buf}");
         }
         let trimmed = header.trim_end_matches(['\r', '\n']);
@@ -657,7 +659,7 @@ pub fn read_message(reader: &mut impl BufRead, stderr: &mut impl Read) -> Value 
     serde_json::from_slice(&body).expect("valid json response")
 }
 
-pub fn read_response_for_id(reader: &mut impl BufRead, stderr: &mut impl Read, id: u64) -> Value {
+pub fn read_response_for_id(reader: &mut impl BufRead, stderr: &Path, id: u64) -> Value {
     for _ in 0..32 {
         let msg = read_message(reader, stderr);
         if msg["id"].as_u64() == Some(id) {

@@ -1,17 +1,22 @@
 use super::*;
+use schemars::JsonSchema;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct CodeQueryProcedure {
     pub id: String,
     pub artifact_id: String,
     pub path: String,
     pub language: &'static str,
+    /// The artifact's exact parser and semantic dialect (for example `cpp-c`).
+    pub dialect: &'static str,
     pub procedure_kind: &'static str,
     pub range: CodeQueryRange,
     pub evidence: CodeQuerySemanticEvidence,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct CodeQueryProgramPoint {
     pub id: String,
     pub procedure_id: String,
@@ -24,7 +29,8 @@ pub struct CodeQueryProgramPoint {
     pub evidence: CodeQuerySemanticEvidence,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct CodeQueryControlEdge {
     pub id: String,
     pub procedure_id: String,
@@ -37,13 +43,14 @@ pub struct CodeQueryControlEdge {
     pub evidence: CodeQuerySemanticEvidence,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct CodeQueryTypestateSubject {
     pub class: String,
     pub identity: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CodeQueryTypestateFindingKind {
     ErrorTransition {
@@ -73,9 +80,11 @@ impl CodeQueryTypestateFindingKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CodeQueryTypestateCertainty {
+    #[cfg_attr(feature = "query-result-fixtures", default)]
     May,
     Must,
     Inconclusive,
@@ -91,7 +100,7 @@ impl CodeQueryTypestateCertainty {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CodeQueryTypestateUncertainty {
     AmbiguousDispatch,
@@ -102,7 +111,8 @@ pub enum CodeQueryTypestateUncertainty {
     UnmatchedEvent,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct CodeQueryTypestateFinding {
     pub id: String,
     pub protocol_ref: String,
@@ -118,22 +128,31 @@ pub struct CodeQueryTypestateFinding {
     pub path_complete: bool,
     pub analysis_complete: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[schemars(default)]
     pub uncertainty: Vec<CodeQueryTypestateUncertainty>,
     #[serde(skip_serializing_if = "is_false")]
+    #[schemars(default)]
     pub abstained: bool,
     pub retained_witnesses: usize,
     pub omitted_witnesses: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CodeQueryTypestateWitnessStepKind {
+    #[cfg_attr(feature = "query-result-fixtures", default)]
     Seed,
-    Edge { edge_kind: &'static str },
-    EndSummaryGap { return_kind: &'static str },
+    Edge {
+        edge_kind: &'static str,
+    },
+    EndSummaryGap {
+        return_kind: &'static str,
+    },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct CodeQueryTypestateWitnessStep {
     pub kind: CodeQueryTypestateWitnessStepKind,
     pub source: CodeQuerySourceSite,
@@ -144,7 +163,8 @@ pub struct CodeQueryTypestateWitnessStep {
     pub evidence: CodeQuerySemanticEvidence,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct CodeQueryTypestateWitness {
     pub id: String,
     pub finding_id: String,
@@ -160,37 +180,47 @@ pub struct CodeQueryTypestateWitness {
     pub range: CodeQueryRange,
     pub evidence: CodeQuerySemanticEvidence,
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[schemars(default)]
     pub uncertainty: Vec<CodeQueryTypestateUncertainty>,
     #[serde(skip_serializing_if = "is_false")]
+    #[schemars(default)]
     pub abstained: bool,
     pub steps: Vec<CodeQueryTypestateWitnessStep>,
     pub retained_bytes: usize,
     #[serde(skip_serializing_if = "is_false")]
+    #[schemars(default)]
     pub truncated: bool,
     pub omitted_steps_lower_bound: usize,
     #[serde(skip_serializing_if = "is_false")]
+    #[schemars(default)]
     pub alternatives_truncated: bool,
     #[serde(skip_serializing_if = "is_false")]
+    #[schemars(default)]
     pub retention_truncated: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CodeQueryFlowReachability {
+    #[cfg_attr(feature = "query-result-fixtures", default)]
     Reached,
     NotReached,
     Inconclusive,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CodeQueryFlowCertainty {
     Exact,
     May,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, JsonSchema)]
+#[serde(rename_all = "snake_case")]
 pub enum CodeQueryFlowStatus {
+    #[cfg_attr(feature = "query-result-fixtures", default)]
     Complete,
     Partial,
     Ambiguous,
@@ -247,7 +277,8 @@ impl Serialize for CodeQueryFlowStatus {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct CodeQueryFlowEvent {
     pub id: String,
     pub site: CodeQueryFlowSymbolSite,
@@ -263,7 +294,8 @@ pub struct CodeQueryFlowEvent {
 /// `id` deliberately omits the workspace mount and every run-local dense ID.
 /// The declaration path retains enough structure to distinguish anonymous or
 /// same-named declarations that share a source range.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct CodeQueryFlowSymbolSite {
     pub id: String,
     pub path: String,
@@ -276,7 +308,8 @@ pub struct CodeQueryFlowSymbolSite {
     pub range: CodeQueryRange,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct CodeQueryFlowDeclarationSegment {
     pub kind: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -287,7 +320,7 @@ pub struct CodeQueryFlowDeclarationSegment {
     pub sibling_ordinal: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CodeQueryFlowPortSymbol {
     Receiver,
@@ -298,7 +331,7 @@ pub enum CodeQueryFlowPortSymbol {
     Capture { slot: u32 },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CodeQueryFlowSelectorSymbol {
     Field {
@@ -318,7 +351,7 @@ pub enum CodeQueryFlowSelectorSymbol {
     AnyIndex,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CodeQueryFlowCarrierSymbol {
     Value {
@@ -370,7 +403,7 @@ pub enum CodeQueryFlowCarrierSymbol {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CodeQueryFlowFactSymbol {
     Zero,
@@ -378,17 +411,20 @@ pub enum CodeQueryFlowFactSymbol {
         source: Box<CodeQueryFlowEvent>,
         carrier: Box<CodeQueryFlowCarrierSymbol>,
         #[serde(skip_serializing_if = "is_false")]
+        #[schemars(default)]
         uncertain: bool,
     },
     Meeting {
         source: Box<CodeQueryFlowEvent>,
         sink: Box<CodeQueryFlowEvent>,
         #[serde(skip_serializing_if = "is_false")]
+        #[schemars(default)]
         uncertain: bool,
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct CodeQueryFlowEndpoint {
     pub id: String,
     pub plan_ref: String,
@@ -399,6 +435,7 @@ pub struct CodeQueryFlowEndpoint {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub certainty: Option<CodeQueryFlowCertainty>,
     #[serde(skip_serializing_if = "is_false")]
+    #[schemars(default)]
     pub ambiguous: bool,
     pub status: CodeQueryFlowStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -407,20 +444,28 @@ pub struct CodeQueryFlowEndpoint {
     pub language: &'static str,
     pub range: CodeQueryRange,
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[schemars(default)]
     pub path_qualities: Vec<CodeQuerySemanticEvidence>,
     pub retained_witnesses: usize,
     pub omitted_witnesses: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CodeQueryFlowWitnessStepKind {
+    #[cfg_attr(feature = "query-result-fixtures", default)]
     Seed,
-    Edge { edge_kind: &'static str },
-    EndSummaryGap { return_kind: &'static str },
+    Edge {
+        edge_kind: &'static str,
+    },
+    EndSummaryGap {
+        return_kind: &'static str,
+    },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct CodeQueryFlowWitnessStep {
     pub kind: CodeQueryFlowWitnessStepKind,
     pub source: CodeQuerySourceSite,
@@ -443,7 +488,8 @@ pub struct CodeQueryFlowWitnessStep {
     pub evidence: CodeQuerySemanticEvidence,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct CodeQueryFlowWitness {
     pub id: String,
     pub endpoint_id: String,
@@ -456,11 +502,14 @@ pub struct CodeQueryFlowWitness {
     pub steps: Vec<CodeQueryFlowWitnessStep>,
     pub retained_bytes: usize,
     #[serde(skip_serializing_if = "is_false")]
+    #[schemars(default)]
     pub truncated: bool,
     pub omitted_steps_lower_bound: usize,
     #[serde(skip_serializing_if = "is_false")]
+    #[schemars(default)]
     pub alternatives_truncated: bool,
     #[serde(skip_serializing_if = "is_false")]
+    #[schemars(default)]
     pub retention_truncated: bool,
 }
 
@@ -470,7 +519,8 @@ pub struct CodeQueryFlowWitness {
 /// `unknown:<reason>` for a value the engine could not classify; an unknown
 /// origin carries no `class`, and a row whose `status` is not `known` carries
 /// no proof.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct CodeQueryClassSetRow {
     pub id: String,
     pub file: String,
@@ -490,7 +540,8 @@ pub struct CodeQueryClassSetRow {
 /// class that does not declare the member. `origin_file`/`origin_range` name
 /// the site that introduced the class; `caller` is the root procedure the
 /// propagation ran from; `witness_steps` counts the retained path steps.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct CodeQueryAbsentMemberFinding {
     pub id: String,
     pub file: String,
@@ -503,9 +554,11 @@ pub struct CodeQueryAbsentMemberFinding {
     pub witness_steps: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CodeQueryAbsentMemberWitnessStatus {
+    #[cfg_attr(feature = "query-result-fixtures", default)]
     Available,
     Truncated,
     Unavailable,
@@ -524,7 +577,8 @@ impl CodeQueryAbsentMemberWitnessStatus {
 /// One bounded retained path (or an explicit unavailable marker) for an
 /// absent-member finding. The finding itself remains independently Proven;
 /// `witness_status` describes only this evidence sidecar.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct CodeQueryAbsentMemberWitness {
     pub id: String,
     pub finding_id: String,
@@ -536,11 +590,14 @@ pub struct CodeQueryAbsentMemberWitness {
     pub steps: Vec<CodeQueryFlowWitnessStep>,
     pub retained_bytes: usize,
     #[serde(skip_serializing_if = "is_false")]
+    #[schemars(default)]
     pub truncated: bool,
     pub omitted_steps_lower_bound: usize,
     #[serde(skip_serializing_if = "is_false")]
+    #[schemars(default)]
     pub alternatives_truncated: bool,
     #[serde(skip_serializing_if = "is_false")]
+    #[schemars(default)]
     pub retention_truncated: bool,
     pub witness_status: CodeQueryAbsentMemberWitnessStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -548,7 +605,8 @@ pub struct CodeQueryAbsentMemberWitness {
 }
 
 /// One bounded source occurrence contributing to an aggregated taint sink.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct CodeQueryTaintOrigin {
     pub id: String,
     pub event_id: String,
@@ -561,7 +619,8 @@ pub struct CodeQueryTaintOrigin {
 /// Steps reuse the source-backed flow witness representation. The envelope is
 /// taint-specific because one finding can aggregate several origins and is not
 /// itself a registered value-flow endpoint.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct CodeQueryTaintWitness {
     pub id: String,
     pub finding_id: String,
@@ -573,17 +632,21 @@ pub struct CodeQueryTaintWitness {
     pub steps: Vec<CodeQueryFlowWitnessStep>,
     pub retained_bytes: usize,
     #[serde(skip_serializing_if = "is_false")]
+    #[schemars(default)]
     pub truncated: bool,
     pub omitted_steps_lower_bound: usize,
     #[serde(skip_serializing_if = "is_false")]
+    #[schemars(default)]
     pub alternatives_truncated: bool,
     #[serde(skip_serializing_if = "is_false")]
+    #[schemars(default)]
     pub retention_truncated: bool,
     /// Stable label of the exact first cause when `truncated` is set.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub truncation_cause: Option<String>,
 }
 
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CodeQueryTaintProjectionLimits {
     pub max_origins_per_finding: usize,
@@ -613,7 +676,8 @@ impl CodeQueryTaintProjectionLimits {
 /// Flow witness steps deliberately reuse [`CodeQueryFlowWitnessStep`]; this
 /// envelope adds only taint-specific aggregation that a flow endpoint cannot
 /// represent.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct CodeQueryTaintFinding {
     pub id: String,
     pub path: String,
@@ -624,16 +688,20 @@ pub struct CodeQueryTaintFinding {
     pub reached_labels: Vec<String>,
     pub origins: Vec<CodeQueryTaintOrigin>,
     #[serde(skip_serializing_if = "is_false")]
+    #[schemars(default)]
     pub origins_truncated: bool,
     pub witnesses: Vec<CodeQueryTaintWitness>,
     #[serde(skip_serializing_if = "is_false")]
+    #[schemars(default)]
     pub witnesses_truncated: bool,
     pub evidence: CodeQuerySemanticEvidence,
     #[serde(skip_serializing_if = "is_false")]
+    #[schemars(default)]
     pub ambiguous: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct CodeQueryProgramPointRef {
     pub id: String,
     pub procedure_id: String,
@@ -643,7 +711,7 @@ pub struct CodeQueryProgramPointRef {
     pub boundary: Option<CodeQueryProgramPointBoundary>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CodeQueryProgramPointBoundary {
     Entry,
@@ -694,7 +762,8 @@ impl CodeQueryProgramPointBoundary {
 /// reachability and loop membership are forward claims that do not depend on
 /// the exits; they carry the same label because they were computed over the
 /// same single whole-procedure universe, never as a claim about exits.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct CodeQueryControlRelation {
     pub id: String,
     /// The wire identity of the procedure whose control-flow graph the relation
@@ -723,8 +792,99 @@ pub struct CodeQueryControlRelation {
     /// The relations the derivation does not answer for. Empty exactly when the
     /// whole derivation is complete.
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[schemars(default)]
     pub uncovered_relations: Vec<&'static str>,
     pub generation: u64,
+}
+
+/// One ordered relation between arms of a structural `if`.
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct CodeQueryBranchRelation {
+    pub id: String,
+    pub path: String,
+    pub language: &'static str,
+    pub range: CodeQueryRange,
+    pub owner_id: String,
+    pub owner_range: CodeQueryRange,
+    pub earlier_range: CodeQueryRange,
+    pub later_range: CodeQueryRange,
+    pub earlier_ordinal: usize,
+    pub later_ordinal: usize,
+    pub relation: &'static str,
+    pub verdict: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub orientation: Option<&'static str>,
+}
+
+/// One exact Java source loop and its own repeat-edge proof.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CodeQueryLoopReason {
+    Source { detail: String },
+    Flow { detail: String },
+    SourceJoin { stage: String },
+    GuardEvidence,
+    ControlEvidence,
+    IntentionalConstantFalseDo,
+    UnreachableBody,
+}
+
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct CodeQueryLoopRelation {
+    pub id: String,
+    pub procedure_id: String,
+    pub path: String,
+    pub language: &'static str,
+    pub range: CodeQueryRange,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body_range: Option<CodeQueryRange>,
+    pub loop_kind: &'static str,
+    /// `proven`, `excluded`, or `open`.
+    pub verdict: &'static str,
+    /// Specific source joins, flow gaps, or deliberate exclusion evidence.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[schemars(default)]
+    pub reasons: Vec<CodeQueryLoopReason>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repeat_edge_id: Option<String>,
+}
+
+/// One exact catch handler and its immediate body shape.
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct CodeQueryFailureHandlerState {
+    pub id: String,
+    pub path: String,
+    pub language: &'static str,
+    pub range: CodeQueryRange,
+    pub catch_ast_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body_range: Option<CodeQueryRange>,
+    pub verdict: &'static str,
+    pub proof: &'static str,
+    pub coverage: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<&'static str>,
+}
+
+/// One exact Java syntax statement and its procedure entry reachability.
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct CodeQueryStatementReachability {
+    pub id: String,
+    pub procedure_id: String,
+    pub path: String,
+    pub language: &'static str,
+    pub range: CodeQueryRange,
+    pub statement_kind: &'static str,
+    /// `reachable`, `unreachable`, or `open`.
+    pub verdict: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// One normalized branch condition of one procedure (#2443 slice 2).
@@ -740,7 +900,8 @@ pub struct CodeQueryControlRelation {
 /// condition keeps only one arm after lowering folds the other away, so the
 /// absent columns are exactly the evidence that a branch could not execute;
 /// nothing else in the frozen artifact records it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct CodeQueryGuard {
     pub id: String,
     /// The wire identity of the procedure the decision belongs to; equal to a
@@ -819,7 +980,8 @@ pub struct CodeQueryGuard {
 /// path-specialized semantic executions distinct, while `ordinal` and
 /// `value_id` expose the language-level result position and its procedure-local
 /// value identity for joins with state events.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct CodeQueryCallResult {
     pub id: String,
     pub site_id: String,
@@ -836,7 +998,8 @@ pub struct CodeQueryCallResult {
     pub completeness: &'static str,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct CodeQuerySemanticEvidence {
     pub proof: CodeQuerySemanticProof,
     pub completeness: CodeQuerySemanticCompleteness,
@@ -883,9 +1046,11 @@ impl CodeQuerySemanticEvidence {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CodeQuerySemanticProof {
+    #[cfg_attr(feature = "query-result-fixtures", default)]
     Proven,
     Unproven,
 }
@@ -901,9 +1066,11 @@ impl CodeQuerySemanticProof {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CodeQuerySemanticCompleteness {
+    #[cfg_attr(feature = "query-result-fixtures", default)]
     Complete,
     Partial,
 }

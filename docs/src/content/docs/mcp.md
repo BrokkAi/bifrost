@@ -300,6 +300,16 @@ For MCP tool arguments that name files, directories, or file globs, callers may 
 
 A path selector names one of three things: a file, a directory, or a glob. A directory selects every file beneath it, with or without a trailing separator, so `paths: ["src/parser"]` and `paths: ["src/parser/**"]` select the same files. A selector that names none of the three selected nothing, so the tool reports it instead of answering from a search it never ran. `scan_usages_by_reference` and `scan_usages_by_location` list it in `scope.unmatched_paths`, set `complete` to false with `incomplete_reason: "unmatched_paths"`, and report absence as `unverified_absent` rather than `verified_absent`. `usage_graph` adds an `unmatched_paths` entry to `incomplete_reasons`, and `search_file_contents` returns the selector in `unmatched_paths`.
 
+### File names and `path#symbol` selectors
+
+Several tools also accept a definition selector, `path#symbol`, which names the declaration `symbol` inside the workspace file `path`. A repository chooses its file names, so `$`, `.`, `#`, and spaces are ordinary characters inside one. All of these are legal targets: `src/Node$.scala`, `src/Outer.Part.cs`, `src/Outer.Part#one.cs`, and `src/$ dir/Node.part#two.scala`.
+
+A target that names an existing workspace file is that file, whole. On file-capable surfaces such as `get_summaries` targets, the complete literal file wins over any `#` split of the same string: `targets: ["src/Outer.Part#one.cs"]` lists that file rather than reading `#one.cs` as a symbol inside `src/Outer.Part`. When both readings are possible -- an existing file whose name happens to spell a `path#symbol` selector for a different file, such as `src/a.cs#Widget` while `src/a.cs` also exists -- the whole-file reading still wins and that one spelling is shadowed; the declaration stays reachable through a bare symbol query or through a longer selector that anchors on the real file.
+
+A target that is not itself an existing file is split at `#`. When the anchor also contains `#`, the split at the longest prefix that names a real file wins, so `src/Outer.Part#one.cs#Demo.Outer.Inner` resolves `Demo.Outer.Inner` in the file `src/Outer.Part#one.cs`. Ordinary selectors are unchanged: `src/db_column.rs#describe` still means the member `describe` in `src/db_column.rs`, and the Rust raw identifier `src/db_column.rs#r#type` keeps its first-`#` split because `src/db_column.rs#r` is not a file.
+
+Selector characters never merge two declarations into one name. In Scala a trailing `$` in the name part is Bifrost's companion-object decoration, so `CharsetRange` and its companion print `CharsetRange` and `CharsetRange$`; a `$` the source itself writes remains part of the identifier, so `object Foo` and `object Foo$` in one file stay distinct declarations with distinct selectors.
+
 For JSON-based MCP hosts, configure Bifrost as a stdio server:
 
 ```json

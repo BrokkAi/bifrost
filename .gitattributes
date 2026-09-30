@@ -8,6 +8,7 @@ tests/fixtures/typestate/*.canonical*.json text eol=lf
 schemas/semantic-model-pack-v2.schema.json text eol=lf
 schemas/semantic-model-pack-v3.schema.json text eol=lf
 schemas/semantic-model-pack-v4.schema.json text eol=lf
+schemas/semantic-model-pack-v5.schema.json text eol=lf
 tests/fixtures/semantic-model-packs/*.json text eol=lf
 tests/fixtures/semantic-model-packs/*.yaml text eol=lf
 tests/fixtures/semantic-model-packs/*.deflate binary
@@ -33,3 +34,6 @@ vendor/tree-sitter-kotlin/src/scanner.c whitespace=-trailing-space
 # C++ recovery fixtures depend on exact byte lengths and brace offsets (#3087).
 tests/suite_issues/issue_3087_fixture.hpp text eol=lf
 tests/suite_issues/issue_3087_namespace_overrun.cc text eol=lf whitespace=-trailing-space
+
+# The #3633 test finds the namespace close by an LF-joined needle and pins line numbers.
+tests/suite_issues/issue_3633_basictests_reduced.cpp text eol=lf

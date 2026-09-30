@@ -18,7 +18,7 @@ use crate::analyzer::usages::get_definition::{
 };
 use crate::analyzer::usages::reference_site::reference_target_match_offsets;
 use crate::analyzer::usages::workspace_graph::{
-    UsageEcosystem, WorkspaceUsageCatalog, is_graph_declaration,
+    UsageEcosystem, WorkspaceUsageCatalog, WorkspaceUsageNode, is_graph_declaration,
 };
 use crate::analyzer::usages::{
     CONFIDENCE_THRESHOLD, CandidateFileProvider, DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES,

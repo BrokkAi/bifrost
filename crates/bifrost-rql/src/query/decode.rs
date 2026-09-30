@@ -1,5 +1,6 @@
 use super::ir::{
-    ArityConstraint, BindingFilter, BindingOfOptions, BindingSeed, CallArgumentSelector,
+    ArityConstraint, AssignmentRelationFilter, AssignmentRelationKind, BindingFilter,
+    BindingOfOptions, BindingSeed, BranchRelationFilter, BranchRelationKind, CallArgumentSelector,
     CallIdentity, CallInputSelector, CallSiteTraversalFilter, CallTraversalFilter, CandidateFilter,
     CandidateOutcomeLabel, CodeQuery, CodeQueryPlan, CodeQueryPlanSource, CodeQueryResultDetail,
     CodeQuerySeed, ConfigurationCompletenessFilter, ConfigurationFactsFilter,
@@ -968,6 +969,23 @@ pub(super) fn decode_result_contract_failure_use_filter(
     })
 }
 
+pub(super) fn decode_branch_relation_filter(
+    object: &Map<String, Value>,
+    path: &str,
+) -> Result<BranchRelationFilter, QueryError> {
+    let field = QueryStepField::BranchRelations.label();
+    reject_unknown_filter_fields(object, path, &[field, "op"], "branch relation")?;
+    Ok(BranchRelationFilter {
+        relations: decode_environment_axis(
+            object,
+            path,
+            field,
+            "branch relation",
+            BranchRelationKind::from_label,
+        )?,
+    })
+}
+
 pub(super) fn decode_control_relation_filter(
     object: &Map<String, Value>,
     path: &str,
@@ -994,6 +1012,23 @@ pub(super) fn decode_control_relation_filter(
             partitions,
             "control exit partition",
             ControlExitPartition::from_label,
+        )?,
+    })
+}
+
+fn decode_assignment_relation_filter(
+    object: &Map<String, Value>,
+    path: &str,
+) -> Result<AssignmentRelationFilter, QueryError> {
+    let field = QueryStepField::AssignmentRelations.label();
+    reject_unknown_filter_fields(object, path, &[field, "op"], "assignment relation")?;
+    Ok(AssignmentRelationFilter {
+        relations: decode_environment_axis(
+            object,
+            path,
+            field,
+            "assignment relation",
+            AssignmentRelationKind::from_label,
         )?,
     })
 }
@@ -2135,6 +2170,8 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
         let state_event = matches!(step, QueryStep::StateEventsOf(_));
         let flow_relation = matches!(step, QueryStep::FlowRelationsOf(_));
         let control_relation = matches!(step, QueryStep::ControlRelations(_));
+        let assignment_relation = matches!(step, QueryStep::AssignmentRelations(_));
+        let branch_relation = matches!(step, QueryStep::BranchRelations(_));
         let rewrite_path = matches!(step, QueryStep::RewritePathsOf(_));
         let failure_use = matches!(step, QueryStep::ResultContractFailureUses(_));
         let segments = matches!(step, QueryStep::SegmentsOf(_));
@@ -2228,6 +2265,8 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                     if rewrite_path => {}
                 Some(QueryStepField::ControlRelations | QueryStepField::ControlExitPartitions)
                     if control_relation => {}
+                Some(QueryStepField::AssignmentRelations) if assignment_relation => {}
+                Some(QueryStepField::BranchRelations) if branch_relation => {}
                 Some(
                     QueryStepField::FailureUseProvenances | QueryStepField::FailureUseConsumers,
                 ) if failure_use => {}
@@ -2286,6 +2325,8 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                     | QueryStepField::RewriteDomains
                     | QueryStepField::RewriteOutcomes
                     | QueryStepField::ControlRelations
+                    | QueryStepField::AssignmentRelations
+                    | QueryStepField::BranchRelations
                     | QueryStepField::ControlExitPartitions
                     | QueryStepField::FailureUseProvenances
                     | QueryStepField::FailureUseConsumers
@@ -2434,9 +2475,16 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
             step = QueryStep::StateEventsOf(decode_state_event_filter(object, &entry_path)?);
         } else if flow_relation {
             step = QueryStep::FlowRelationsOf(decode_flow_relation_filter(object, &entry_path)?);
+        } else if branch_relation {
+            step = QueryStep::BranchRelations(decode_branch_relation_filter(object, &entry_path)?);
         } else if control_relation {
             step =
                 QueryStep::ControlRelations(decode_control_relation_filter(object, &entry_path)?);
+        } else if assignment_relation {
+            step = QueryStep::AssignmentRelations(decode_assignment_relation_filter(
+                object,
+                &entry_path,
+            )?);
         } else if rewrite_path {
             step = QueryStep::RewritePathsOf(decode_rewrite_path_filter(object, &entry_path)?);
         } else if failure_use {
